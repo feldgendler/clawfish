@@ -278,6 +278,10 @@ The calibration pass is one-time per role. Re-run if the workflow changes shape 
 
 - **2026-04-27 — plan-reviewer (M2.C v1 plan).** Sonnet + Opus reviewed in parallel. Sonnet returned 3 must-fix / 6 should-fix; Opus returned 4 must-fix / 8 should-fix. Two of Opus's must-fix items were absent from Sonnet's critique: (a) `Box<dyn Search>` is not `Clone` and cannot be moved into `thread::spawn`, which would have stalled Coder-B at impl time; (b) reader-loop EOF synthesis vs. orchestrator channel-disconnect handling created an unreachable defensive branch (mutation-test survivor). Outcome: plan-reviewer reverted from Sonnet to Opus.
 
+**Watchlist** (tiers without calibration data — next time the role fires, run Sonnet + Opus in parallel before relying on the cheaper tier):
+
+- **chess-researcher.** Pre-M2 research (`docs/research/m2-uci-threading.md`, `docs/research/m2-tournament-harness.md`) predates the tier system and used a single agent on Sonnet. No comparison data point exists. Research outputs are particularly hazardous to drop without calibration because the failure mode is *silent omission* (a missed source, a missed gotcha) rather than visibly-wrong output, and the user reading chat can only catch what the report says — not what it leaves out. Next time a research subagent is needed, spawn Sonnet + Opus in parallel on the same brief, diff the synthesis sections, and decide.
+
 ### Stop-loss
 
 The tiered drop is a working hypothesis, not a settled commitment. Trigger a re-evaluation if any of these fire:
