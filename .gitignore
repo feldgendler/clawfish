@@ -3,3 +3,4 @@
 .envrc
 mutants.out
 mutants.out.old
+.claude/scheduled_tasks.lock
