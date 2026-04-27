@@ -4,7 +4,45 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1 complete; M2.A and M2.B landed; M2.C next — Engine I/O loop + position state (binds ADR-0011 on UCI threading).**
+**M1 complete; M2.A / M2.B / M2.C landed; M2.D next — random-mover Search impl + `bestmove` plumbing (no new ADR).**
+
+### M2.C — what landed
+
+The `engine` and `search` modules — the UCI I/O loop, command dispatch, and `Search` trait scaffolding:
+
+- **`Engine<W, S>`** generic over stdout writer + Search impl. Holds `Position`, `debug` flag, `Arc<AtomicBool>` cancellation, `Arc<Mutex<W>>` stdout, `Arc<Mutex<S>>` search, and an `Option<JoinHandle>` for the in-flight worker.
+- **Reader thread + mpsc** — `reader_loop(impl BufRead, Sender<Command>)`; EOF synthesizes `Quit`; reader exits on any `Quit` (parsed or synthesized). No double-Quit on `quit\n` + EOF.
+- **Per-`go` worker thread** — `handle_go` joins the previous worker, clears the flag, builds `SearchContext`, spawns a new worker. Worker locks the search mutex, calls `Search::go`, writes `bestmove` directly to stdout under the shared mutex.
+- **`Stub` Search impl** — deterministic lex-first legal move; honors `infinite` / `movetime` / `ponder` by polling `should_abort` (1 ms cadence) until cancelled / deadline expires. Always computes the candidate before checking cancellation — race-free under quit-immediately-after-go.
+- **`run_stdio()` -> !** — production wrapper: spawns reader thread on `io::stdin()`, builds `Engine` with `io::stdout()` and `Stub`, drives `run`, then `process::exit(0)`.
+
+### M2.C — implementation highlights
+
+- **Threading model codified by ADR-0011** — reader thread → mpsc → main-as-orchestrator + per-`go` worker + `Arc<AtomicBool>` cancellation. Same primitive scales unchanged through M3 alpha-beta and M8 lazy-SMP.
+- **`handle_quit` joins the worker** (bounded by cancellation polling cadence) so `bestmove` is in stdout before `run` returns. Required for testability outside `run_stdio`'s `process::exit` safety net; documented as a v3 amendment to ADR-0011.
+- **`position` reset-on-error**, asymmetric:
+  - FEN-parse-error → keep prior position (no safe base to fall back to).
+  - Move-error → reset to spec base (parsed `startpos` or successfully-parsed FEN), no moves applied.
+  - Both emit `info string position rejected: …` unconditionally (protocol-legal; silent rejection in tournament play would be the worst failure mode).
+- **`searchmoves` filtering** silently drops bad entries (parse error or illegal-for-position). All-bad list yields `bestmove 0000`.
+- **`handle_debug` is silent** — only toggles `self.debug`. `setoption` / `register` / `ponderhit` / `Unknown` are silent when debug=off; emit `info string … received: …` when debug=on.
+- **Always-spawn handle_go** — back-to-back `go` joins the previous worker before spawning the new one (matches Stockfish). Implicit-stop semantics.
+- **Generics over trait objects** — `Engine<W: Write + Send + 'static, S: Search + Send + 'static>` for cleaner stack traces and zero virtual-call overhead. `search: Arc<Mutex<S>>` lets `handle_go` clone the Arc into the spawned worker (Search::go takes `&mut self`).
+- **`Stub` always computes the candidate before checking cancellation** — eliminates a race where `quit` arriving immediately after `go` could flip the flag before the worker thread was scheduled, causing `bestmove 0000` instead of the legitimate lex-first move.
+
+### M2.C — verification (Apple M4, dev machine)
+
+| Metric | Result |
+|---|---|
+| Tests | 583 lib + 3 uci-integration + 24 other = **610 fast + 4 ignored**. All passing. |
+| `cargo build --release` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo llvm-cov --summary-only --lib` | `engine.rs`: 97.30% region / 97.09% line / 93.44% function. `search.rs`: 98.29% region / 97.58% line. Remaining uncovered: `unreachable!()` on rx disconnect, `Err(_)` reader break (untestable with Cursor), `run_stdio` body (covered via integration tests through the binary). |
+| `cargo mutants --in-diff` | 30 mutants generated; **25 caught + 2 timeouts (effective catches via test hangs) + 3 unviable; 0 missed**. |
+| Smoke | `printf 'uci\nquit\n' | target/release/chess` → `id name chess 0.1.0 / id author Alex Feldgendler / uciok` and exits within 2 s. |
+| Benchmark | **Skipped** — UCI dispatch is per-line, never on a search hot path. Same precedent as M2.A / M2.B. |
+
+All three review loops converged. Plan archived at `docs/plans/m2.c.md`. ADR-0011 codifies the threading model.
 
 ### M2.B — what landed
 
@@ -250,7 +288,7 @@ Plays legal random moves through a tournament harness (fastchess; see ADR-0012 b
 |---|---|---|
 | **M2.A** ✓ — UCI move encoding | `Move::to_uci` (Display delegate) + `Move::from_uci` (generate-and-match against `generate_moves`) + `UciMoveError` (4 variants). Long algebraic per UCI spec; null move `0000` rejected; strict lowercase input. Defers legality entirely to movegen (consistent with ADR-0007). Debug-only `debug_assert!` on `(from, to, promo)` uniqueness inside `from_uci` (defense-in-depth alongside property test) | ~400–600 lines (actual: ~860 lines incl. 38 new tests) |
 | **M2.B** ✓ — UCI command parser | `uci` module: `Command` enum + helper types + `parse_uci_line(&str) -> Command`. Per-command leniency rules grounded in 12 empirical Stockfish 18 probes (strict-first-token, `debug` strict-exact-2-tokens, `position` lenient-stop, `go` lenient-skip). Move strings + FEN strings collected raw — M2.C parses. Total function: no `Result`, no panics. 96 tests; 99.9% line coverage; 0 missed mutants on `--in-diff` (49 caught, 6 unviable). | ~600–900 lines (actual: ~1430 lines incl. ~700 lines of impl + ~700 lines of 96 tests) |
-| **M2.C** — Engine I/O loop + position state | `Engine` struct (current `Position`, options, RNG seed), main `run()` loop reads lines from stdin and dispatches parsed `Command`s to handlers, writes responses to stdout. Handlers: `uci` (emits `id name`/`id author`/`option …`/`uciok`), `isready` (always answers `readyok`, even mid-search), `setoption`, `ucinewgame` (resets state), `position` (parses moves via M2.A `from_uci` and applies them), `quit`. `info string …` debug logging behind `debug on`. `go` parsed but answered with placeholder until M2.D. Threading model (ADR-0011) lands here so `isready` and `stop` work concurrently with future search | ~800–1200 lines |
+| **M2.C** ✓ — Engine I/O loop + Search trait | `Engine<W, S>` orchestrator + reader thread + per-`go` worker + `Arc<AtomicBool>` cancellation per ADR-0011. Handlers for every UCI 2006 GUI→engine command. `position` reset-on-error (FEN err keeps prior; move err resets to base; both info-string-rejected unconditionally). `searchmoves` silently drops bad entries. `Search` trait + `SearchContext` + `Stub` impl (lex-first legal move; honors `infinite`/`movetime`/`ponder`). `handle_quit` joins worker (bounded by polling cadence) so `bestmove` is in stdout before `run` returns. Always-compute-candidate-before-cancellation eliminates quit-vs-go race. 7 new tests added in final-review pass closed all 3 missed mutants. | ~800–1200 lines (actual: ~1300 lines impl + tests + ~330 lines plan + ~140 lines ADR-0011) |
 | **M2.D** — Random search + `go`/`bestmove` | `Search` trait/struct with `start(pos, params, output) -> Handle` and `Handle::stop()`, preserving the eval/search interception point per ADR-0004 (NNUE + skill-dial future hooks). Random move via SplitMix64; seed from system time or a custom `Random_Seed` UCI option for reproducibility. Honors `go movetime <ms>` (sleeps then emits), `go infinite` (waits for `stop`), `stop` (cancels pending emit), `searchmoves` (filters legal-move pool). `bestmove <uci>` output. End-to-end test: drive a full game from `position startpos` through repeated `go movetime 10` until terminal | ~700–1000 lines |
 | **M2.E** — Tournament harness + fastchess | `scripts/match.sh` wrapper around `fastchess`; documentation for downloading the `mac-arm64` release and reading PGN/log output. Integration test that spawns the release binary, drives it through a complete self-game via piped stdin/stdout, asserts the game terminates legally (checkmate / stalemate / 50-move / threefold / insufficient material per FIDE) and that the PGN parses. ADR-0012 codifies the harness layout. `docs/workflow.md` gains a "running a match" runbook | ~400–700 lines |
 

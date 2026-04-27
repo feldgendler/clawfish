@@ -6,12 +6,48 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M2.B complete; M2.C next.** Architectural commitments settled (see `docs/decisions/`).
+**Phase: M2.C complete; M2.D next.** Architectural commitments settled (see `docs/decisions/`).
 
 - M1: complete through M1.G (perft + criterion benchmark harness; 119 Mnps bulk on starting D4).
 - M2.A: complete — `Move::to_uci` + `Move::from_uci` + `UciMoveError`. Generate-and-match parsing strategy; null move `0000` rejected as `NullMove`; strict lowercase input. No new ADR.
-- M2.B: complete — `uci` module: `Command` enum + `parse_uci_line(&str) -> Command`. Pure string→AST function, no I/O, no engine state. Per-command leniency rules grounded in empirical Stockfish 18 probes (strict-first-token deviates from the spec's literal "joho debug on → debug on" rule, which Stockfish itself doesn't honor). No new ADR.
-- M2: C–E remain. Pre-M2 research complete: `docs/research/m2-uci-threading.md` (binds ADR-0011 on M2.C) and `docs/research/m2-tournament-harness.md` (binds ADR-0012 on M2.E).
+- M2.B: complete — `uci` module: `Command` enum + `parse_uci_line(&str) -> Command`. Pure string→AST function, no I/O, no engine state. Per-command leniency rules grounded in empirical Stockfish 18 probes. No new ADR.
+- M2.C: complete — `engine` + `search` modules: `Engine<W, S>` orchestrator + reader thread + per-`go` worker + `Arc<AtomicBool>` cancellation per **ADR-0011**. `Search` trait + `SearchContext` + `Stub` impl. End-to-end exercisable: `printf 'uci\nquit\n' | target/release/chess` produces `id name chess 0.1.0 / id author Alex Feldgendler / uciok`.
+- M2: D–E remain. Pre-M2 research note `docs/research/m2-tournament-harness.md` binds ADR-0012 on M2.E.
+
+### What M2.C landed
+
+The `engine` and `search` modules — the UCI I/O layer that ties M2.A and M2.B together with a working command loop:
+
+- **`Engine<W, S>` in `src/engine.rs`** — generic orchestrator over stdout writer + Search impl. Holds `Position`, `debug` flag, `Arc<AtomicBool>` cancellation, `Arc<Mutex<W>>` stdout, `Arc<Mutex<S>>` search, `Option<JoinHandle>` for the in-flight worker.
+- **Reader thread + mpsc** — `reader_loop(impl BufRead, Sender<Command>)`. EOF synthesizes `Quit`; reader exits on any `Quit` (parsed or synthesized) — no double-Quit.
+- **Per-`go` worker thread** — `handle_go` joins the previous worker, clears the cancellation flag, builds `SearchContext`, spawns a new worker. The worker locks the search mutex, calls `Search::go`, writes `bestmove` directly to stdout under the shared mutex.
+- **`Search` trait + `SearchContext` + `SearchLimits` + `SearchResult` in `src/search.rs`** — committed at M2.C so M2.D / M3 / M8 plug in without trait churn.
+- **`Stub` Search impl** — deterministic lex-first legal move; honors `infinite` / `movetime` / `ponder` by polling `should_abort` (1 ms cadence) until cancelled. Always computes the candidate before checking cancellation — race-free under quit-immediately-after-go.
+- **`run_stdio()` -> !** — production wrapper: spawns reader thread on `io::stdin()`, builds Engine with `io::stdout()` and `Stub`, drives `run`, then `process::exit(0)`. `src/main.rs` is now `fn main() { chess::run_stdio(); }`.
+
+### M2.C — implementation highlights
+
+- **ADR-0011 codifies the threading model** — reader thread → mpsc → main-as-orchestrator + per-`go` worker + `Arc<AtomicBool>` cancellation. Same primitive scales unchanged through M3 alpha-beta and M8 lazy-SMP.
+- **`handle_quit` joins the worker** (bounded by cancellation polling cadence ≤ 1 ms) so `bestmove` is in stdout before `run` returns. Required for testability outside `run_stdio`'s `process::exit` safety net. ADR-0011 was amended to v3 to document this.
+- **`position` reset-on-error** — asymmetric: FEN-parse-error keeps prior position (no safe base); move-error resets to spec base (parsed `startpos` or successfully-parsed FEN), no moves applied. Both emit `info string position rejected: …` *unconditionally* (protocol-legal; silent rejection in tournament play would be the worst failure mode).
+- **`searchmoves` filtering** silently drops bad entries. All-bad list yields `bestmove 0000`.
+- **`handle_debug` is silent** — only toggles `self.debug`. `setoption` / `register` / `ponderhit` / `Unknown` are silent when debug=off; emit `info string … received: …` when debug=on.
+- **Generics over trait objects** — `Engine<W: Write + Send + 'static, S: Search + Send + 'static>` for cleaner stack traces and zero virtual-call overhead. `search: Arc<Mutex<S>>` is the chosen idiom (Search::go takes `&mut self`; back-to-back `go` joins before spawning so the mutex is uncontended in normal flow).
+- **`Stub` always computes the candidate before checking cancellation** — eliminates a race where `quit` arriving immediately after `go` could flip the flag before the worker thread was scheduled, causing `bestmove 0000` instead of the legitimate lex-first move. Spec-aligned: bestmove is the best legal move available; `0000` only when no legal moves exist (mate / stalemate / empty `searchmoves` filter).
+
+### M2.C — verification (Apple M4, dev machine)
+
+| Metric | Result |
+|---|---|
+| Tests | 583 lib + 3 uci-integration + 24 other = **610 fast + 4 ignored**. All passing. |
+| `cargo build --release` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo llvm-cov --summary-only --lib` | `engine.rs`: 97.30% region / 97.09% line / 93.44% function. `search.rs`: 98.29% region / 97.58% line. Remaining uncovered: `unreachable!()` on rx disconnect (by-design), `Err(_)` reader break (untestable with `Cursor`), `run_stdio` body (covered via integration tests through the binary path). |
+| `cargo mutants --in-diff` | 30 mutants generated; **25 caught + 2 timeouts (effective catches via test hangs) + 3 unviable; 0 missed**. |
+| Smoke | `printf 'uci\nquit\n' | target/release/chess` produces `id name chess 0.1.0 / id author Alex Feldgendler / uciok` and exits within 2 s. |
+| Benchmark | **Skipped** — UCI dispatch is per-line, never on a search hot path. Same precedent as M2.A / M2.B. |
+
+All three review loops converged. Plan archived at `docs/plans/m2.c.md`; ADR-0011 codifies the threading model. The plan went through 3 reviewer passes (Sonnet+Opus calibration on v1, then Opus-only on v2/v3); the test suite through 4; the final review through 2 (the second pass closed 3 missed mutants and a coverage gap on `searchmoves`).
 
 ### What M2.B landed
 
@@ -89,14 +125,14 @@ All four loops (plan, test-suite, final code+tests, benchmark capture) converged
 
 ### What's next
 
-**M2.C — Engine I/O loop + position state.** `Engine` struct (current `Position`, options, RNG seed), main `run()` loop reads lines from stdin and dispatches parsed `Command`s to handlers. Handlers: `uci` (emits `id name`/`id author`/`option …`/`uciok`), `isready` (always answers `readyok`, even mid-search), `setoption`, `ucinewgame` (resets state), `position` (parses moves via M2.A's `from_uci` and applies them), `quit`. `info string …` debug logging behind `debug on`. `go` parsed but answered with placeholder until M2.D.
+**M2.D — Random-mover Search impl + `bestmove` reproducibility.** Replaces `Stub` with a SplitMix64-seeded random-mover. Adds a custom `Random_Seed` UCI option (the engine's first real `setoption`) so games are reproducible. Honors `go movetime <ms>` exactly (sleeps then emits — already plumbed by `Stub`), `go infinite`, `searchmoves` filtering. End-to-end test: drive a full game from `position startpos` through repeated `go movetime 10` until terminal.
 
-- **Binds ADR-0011** — UCI threading model (reader thread + mpsc + per-`go` worker + `Arc<AtomicBool>` cancellation per `docs/research/m2-uci-threading.md`).
-- Approx size: 800–1200 lines.
-- M2.A's `from_uci` is a dependency for the `position … moves` and `go searchmoves` move-list application.
-- M2.B's `Command` enum + `parse_uci_line` is the sole input source.
+- No new ADR.
+- The plug-in point is `Search::go`'s body; orchestrator unchanged.
+- A14 (`handle_setoption_silent_no_output_when_debug_off`) will need revising when `Random_Seed` lands — its forward-compat caveat is documented in M2.C's tests.
+- Approx size: 700–1000 lines.
 
-Full M2 plan and the two remaining sub-phases (M2.D–E) are in `docs/roadmap.md`. Exit criteria for M2 as a whole: complete game through `fastchess` against itself or another engine without protocol errors or illegal moves.
+Full M2 plan and the remaining sub-phase M2.E is in `docs/roadmap.md`. Exit criteria for M2 as a whole: complete game through `fastchess` against itself or another engine without protocol errors or illegal moves.
 
 ## How to pick up a new session
 
