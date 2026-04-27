@@ -24,6 +24,9 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 - Chess strength ~1000 Elo. Casual player, serious engineer.
 - **Does not know Rust, by design.** The language choice is a self-imposed gatekeeper to keep the work vibe-coded. The user will not be inspecting code line-by-line; chat explanations are the primary signal. Be unusually rigorous in chat about explaining decisions and surfacing risks, since bugs cannot be caught by reading.
 
+### Interaction conventions
+- **When asking the user questions, use the `AskUserQuestion` tool.** Plain-text questions in chat are easy to miss and lack a structured-choice UI; the tool surfaces the question with its options as discrete picks. Applies to clarifying requirements, choosing between approaches, or any other decision-soliciting prompt — not to status updates or summaries.
+
 ### Domain code restrictions
 - **No third-party chess-domain code.** Move generation, search, eval, NNUE inference, opening-book parsers — all written from scratch.
 - **No reading chess-themed source code online.** Even for inspiration. The user does not want me influenced by existing engine implementations. Browsing `github.com/.../engine/src/` is out, *even when wiki articles link to it*. The Chess Programming Wiki itself, papers, blog posts, TalkChess discussions, and articles containing illustrative code snippets are all fine — the prohibition is on browsing the *source repos* of existing engines (Stockfish, Fairy-Stockfish, Leela, any open-source Rust engine, etc.).
@@ -31,9 +34,9 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 - **Public chess data is encouraged**: perft suites, opening books (data files), Syzygy endgame tablebases, PGN game databases, eval test suites (STS, Bratko-Kopec, WAC).
 
 ### Workflow loop (per feature or major component)
-Loop: **research → discuss → plan → tests → implement → final review → benchmark.** Each of the plan, the test suite, and the final code+tests goes through a **blind-review loop** with a fresh subagent (continued via `SendMessage` across iterations). Plans must identify parallelization opportunities for coding agents. Implementation may proceed in parallel across coding agents per the plan. See `docs/workflow.md` for the full per-feature loop, the dimensions checked at each review, and the rationale for each step.
+Loop: **research → choose approach → plan → tests → implement → final review → benchmark → commit.** Runs **unattended by default** — a session goes end-to-end on a single prompt ("plan and implement M1.X") without proactive pauses. Each of the plan, test suite, and final code+tests goes through a **blind-review loop** with a fresh subagent (continued via `SendMessage` across iterations); reviewer convergence is the gate, not user approval. Plans must identify parallelization opportunities; implementation runs in parallel across coding agents per the plan. Reviewer concerns surface in chat as informational — the user can override by interjecting; absent intervention the agent proceeds.
 
-Skipping research/discussion or any review loop strips the user of his only architectural review channels. He does not read code. When in doubt, propose before implementing.
+If the agent gets genuinely stuck (ambiguous spec, hard tool failure, architectural fork contradicting ADRs), it surfaces the issue and pauses. "Uncertain" is not stuck — pick the most defensible path, note alternatives in chat, continue. See `docs/workflow.md` for the full structure and reviewer dimensions.
 
 ### Architectural commitments (settled — see `docs/decisions/`)
 - Rust.

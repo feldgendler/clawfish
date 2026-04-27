@@ -4,20 +4,27 @@ How we work together on this project.
 
 ## The per-feature loop
 
-Every feature or major component follows the same cycle:
+The loop is **designed to run unattended**. The user starts a session with a prompt like "plan and implement M1.X," and the agent proceeds through every step to commit without proactively pausing. The user can interject at any point by sending a message — the agent pauses to read and respond, then resumes. But the default trajectory is end-to-end execution.
 
-1. **Deep prior-art research.** Web search, not training-data recall. Chess Programming Wiki, papers, blog posts, TalkChess threads, articles with illustrative snippets. **Not** engine source code (see restriction below). Devil is in the details. Delegate to a research subagent when it spans more than a few queries.
-2. **Explain findings in chat.** Tradeoffs, alternatives, gotchas. Pre-implementation, before any code.
-3. **Discuss and converge.** User pushes back, asks for alternatives, picks an approach.
+The blind-review loops at steps 4, 6, and 9 are the **primary quality control**, replacing the per-step user-approval gate of more interactive workflows. Reviewer concerns surface in chat as the loop runs (so the user reading along — synchronously or after the fact — sees what was raised and how it was addressed). The user can override any concern by sending a message; otherwise the agent acts on all reviewer concerns and continues.
+
+**Stuck vs. uncertain.** If the agent gets genuinely stuck (ambiguous spec the research can't resolve, hard tool failure that's not a transient retry, an unforeseen architectural fork that contradicts ADRs), it surfaces the issue in chat and pauses. "Stuck" is the only break in the unattended trajectory. "Uncertain" is not stuck — when uncertain, the agent picks the most defensible path, notes the alternatives in chat, and continues.
+
+The cycle:
+
+1. **Deep prior-art research.** Web search, not training-data recall. Chess Programming Wiki, papers, blog posts, TalkChess threads, articles with illustrative snippets. **Not** engine source code (see restriction below). Devil is in the details. Delegate to a research subagent when it spans more than a few queries. Skippable when the unit is fully covered by prior-art notes already in `docs/prior-art.md` or `docs/research/` — the agent justifies the skip in chat.
+2. **Synthesize findings in chat.** Tradeoffs, alternatives, gotchas. Informational; the agent does not wait.
+3. **Choose approach.** The agent picks based on the research synthesis, consistency with project decisions (ADRs and `docs/architecture.md`), and the path of least architectural surprise. If multiple defensible options exist, the agent picks one and notes the alternatives in chat for awareness.
 4. **Plan with plan-review loop.** Every implementable unit gets a written plan. The plan must identify **parallelization opportunities** — which subtasks can run on parallel coding agents. The plan goes through a blind-review loop until convergent. See "Plan mode and plan-review loop" below.
 5. **Write tests** for the entire task scope, where the layer admits TDD (see TDD scope below). Parallelizable across coding agents per the plan.
-6. **Test-suite review loop.** Independent reviewer checks the test suite for correctness to spec, confirmation bias, adequate checks, corner case coverage. See "Test-suite review loop" below. Implementation does not begin until tests pass review.
+6. **Test-suite review loop.** Independent reviewer checks the test suite for correctness to spec, confirmation bias, adequate checks, corner case coverage. See "Test-suite review loop" below. Implementation does not begin until the test suite passes review.
 7. **Implement.** Parallelizable across coding agents per the plan.
 8. **All tests pass.** No final review or commit until they do.
 9. **Final review loop on code + tests jointly.** Independent reviewer checks correctness, corner cases, code quality, readability, simplicity, performance considerations. See "Final review loop" below.
 10. **Benchmark and profile.** Record results. Compare to previous baseline.
+11. **Commit.** Final step of the unit's loop. Conventional commit message describing what landed (e.g. `M1.A: project skeleton, square and bitboard primitives`). Stage only the files belonging to this unit; leave any unrelated in-flight work in the working tree alone. Do **not** push to remote — that's a separate explicit user action.
 
-Skipping research/discussion or any review loop strips the user of his only architectural review channels. The user does not read code; chat, reviewed plans, reviewed tests, and reviewed final artifacts are how he understands what's being built. When uncertain, propose before implementing.
+Skipping any review loop strips the project of its primary quality control (the user is no longer the per-step gate; the reviewers are). When the agent skips a step, it must justify in chat.
 
 ## Plan mode and plan-review loop
 
@@ -57,12 +64,11 @@ The plan itself, **written to a file** (`docs/plans/<unit>.md`) so the reviewer 
 4. **Main agent surfaces the critique in chat — every concern, with its substance.** The user does not read code; the reviewer's findings are part of the design conversation he sees. Posting just counts (e.g. "5 should-fix items, 8 nits") is **not** sufficient — the user needs to see what each concern actually *is*, with enough detail to push back if the reviewer is wrong. For `must-fix` and `should-fix`, post the full text; for `nit`s, a compact one-line-per-nit list is fine. The user can override any concern before the main agent acts on it (e.g. "ignore concern 4, the reviewer is wrong about X").
 5. **Main agent incorporates the feedback** (with any user overrides from step 4), revises the plan in place, and **continues the same reviewer subagent** (via `SendMessage`) for the next pass — context stays cached (faster) and the reviewer's judgment stays consistent from pass to pass (more stable than spawning a fresh reviewer each iteration, which restarts calibration). **Prerequisite:** `SendMessage` is part of Claude Code's experimental Agent Teams and requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the env block of `.claude/settings.json`. Already set in this project; if a future session reports that `SendMessage` is unavailable, that's the first thing to check.
 6. **Loop continues** until the reviewer returns "no further substantive issues."
-7. **User approves the converged plan.**
-8. **Execute** (steps 5–10 of the per-feature loop above: tests → test-suite review → implement → final review → benchmark).
+7. **Execute.** No user-approval gate by default — the reviewer's convergence is the gate. The agent proceeds directly to steps 5–11 of the per-feature loop above (tests → test-suite review → implement → final review → benchmark → commit). The user can override mid-loop at any point by sending a message ("wait, change X"); absent intervention, the agent runs through to commit.
 
 **Loop convergence is the reviewer's call, not the main agent's.** The main agent does not declare a plan done.
 
-The user, who does not read code, gets to review the plan as the primary architectural review channel — and the blind-review loop ensures the plan that reaches the user has already been pressure-tested by an independent reader.
+The reviewer is the primary architectural review channel. The user reads the chat — synchronously or asynchronously — to see the reviewer's findings and the agent's responses. The blind-review loop's standing instruction is to be adversarial; a plan that the reviewer has signed off on has been pressure-tested against project decisions and best practices.
 
 ## Test-suite review loop
 
@@ -77,7 +83,7 @@ The dimensions of test-suite review:
 - **Adequate checks.** Are there enough assertions per test? Or are tests perfunctory ("call the function, check it doesn't panic") versus genuinely verifying behavior?
 - **Corner case coverage.** Are edge cases tested? Empty inputs, max sizes, boundary conditions, failure paths, malformed inputs, ambiguous-spec cases?
 
-Tests pass review **before** any implementation work begins. Implementation written against unreviewed tests is hard to course-correct — by the time you discover the tests were inadequate, you've shaped the code around them.
+Tests pass review **before** any implementation work begins. On reviewer convergence, the agent proceeds directly to implementation — no user-approval gate. Implementation written against unreviewed tests is hard to course-correct: by the time you discover the tests were inadequate, you've shaped the code around them.
 
 ## Final review loop
 
@@ -94,7 +100,7 @@ The dimensions of final review:
 - **Simplicity.** Anything overengineered? Anything that could be cut, merged, or deferred without loss?
 - **Performance considerations.** Any obvious algorithmic, data-layout, or hot-path inefficiencies that should be flagged now? (Concrete optimization happens at the benchmark step that follows; review just flags candidates.)
 
-The final review's purpose is to catch what the plan didn't anticipate and the tests didn't cover. The user, who again does not read code, gets the final review's report as his last opportunity to push back before the work commits.
+The final review's purpose is to catch what the plan didn't anticipate and the tests didn't cover. On reviewer convergence, the agent proceeds directly to benchmarking and commit — no user-approval gate. The user can interject at any point during the loop by sending a message; absent intervention, the work commits when the loop terminates.
 
 ## Source-code reading restriction
 
