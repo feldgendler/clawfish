@@ -30,7 +30,7 @@ Skipping any review loop strips the project of its primary quality control (the 
 
 **Every implementable unit goes through plan mode.** No code is written until a plan exists, has survived the plan-review loop, and has user approval.
 
-A "unit" is a phase of a milestone (e.g. M1.A, M1.B), or a discrete feature within a phase if the phase is large. The roadmap decomposes milestones into units sized for ~500–1500 lines of resulting code each. Larger should be sub-divided.
+A "unit" is a phase of a milestone (e.g. M1.A, M1.B), or a discrete feature within a phase if the phase is large. The roadmap decomposes milestones into units sized for **~300–800 lines of resulting code, with ~500 as the typical target**. Review-loop cost scales roughly linearly with artifact size, and smaller units keep the prompt cache warm across passes. Sub-divide larger units unless decomposition would genuinely fragment a coherent change.
 
 The plan itself, **written to a file** (`docs/plans/<unit>.md`) so the reviewer can read it, names:
 
@@ -41,6 +41,8 @@ The plan itself, **written to a file** (`docs/plans/<unit>.md`) so the reviewer 
 - Order of operations.
 - Dependencies on other units.
 - **Parallelization map.** Which subtasks (writing tests, implementing modules) can be executed concurrently by separate coding agents, or "none — sequential" if parallelism is not practical for this unit. Honest about dependencies; don't overstate parallelism.
+
+**Target plan length: ~300 lines.** Plans are re-tokenized on every reviewer pass — past ~300 lines, cost grows faster than quality contribution. Keep in the plan: file/function/type signatures, test names, parallelization map, order of operations, dependencies. Push to a referenced `docs/research/<unit>.md` note: empirical probe tables, full re-derivation of already-decided ADRs, speculative future-extension notes, background on alternatives that were considered and rejected.
 
 ### The plan-review loop
 
@@ -63,7 +65,7 @@ The plan itself, **written to a file** (`docs/plans/<unit>.md`) so the reviewer 
    - Final verdict: either `no further substantive issues` (loop terminates) or `revisions required`.
 4. **Main agent surfaces the critique in chat — every concern, with its substance.** The user does not read code; the reviewer's findings are part of the design conversation he sees. Posting just counts (e.g. "5 should-fix items, 8 nits") is **not** sufficient — the user needs to see what each concern actually *is*, with enough detail to push back if the reviewer is wrong. For `must-fix` and `should-fix`, post the full text; for `nit`s, a compact one-line-per-nit list is fine. The user can override any concern before the main agent acts on it (e.g. "ignore concern 4, the reviewer is wrong about X").
 5. **Main agent incorporates the feedback** (with any user overrides from step 4), revises the plan in place, and **continues the same reviewer subagent** (via `SendMessage`) for the next pass — context stays cached (faster) and the reviewer's judgment stays consistent from pass to pass (more stable than spawning a fresh reviewer each iteration, which restarts calibration). **Prerequisite:** `SendMessage` is part of Claude Code's experimental Agent Teams and requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the env block of `.claude/settings.json`. Already set in this project; if a future session reports that `SendMessage` is unavailable, that's the first thing to check.
-6. **Loop continues** until the reviewer returns "no further substantive issues."
+6. **Loop continues** until the reviewer returns "no further substantive issues" — OR after the **3rd reviewer pass** when no `must-fix` items remain. Beyond pass 3, residual `should-fix`/`nit` items are surfaced in chat and the loop terminates; final review and the user reading along are the next safety nets. The pass cap exists because each pass re-tokenizes the plan (and reviewer cache); diminishing returns set in fast once architectural concerns are resolved. The cap applies to all three review loops (plan, test-suite, final).
 7. **Execute.** No user-approval gate by default — the reviewer's convergence is the gate. The agent proceeds directly to steps 5–11 of the per-feature loop above (tests → test-suite review → implement → final review → benchmark → commit). The user can override mid-loop at any point by sending a message ("wait, change X"); absent intervention, the agent runs through to commit.
 
 **Loop convergence is the reviewer's call, not the main agent's.** The main agent does not declare a plan done.
@@ -248,6 +250,51 @@ Sequential Probability Ratio Test. The standard for accepting/rejecting engine c
 - Profile hot paths with `samply` or Instruments (macOS, Apple Silicon).
 - Use `criterion` for microbenchmarks.
 - Never optimize without profiling first; never optimize without a benchmark to compare.
+
+## Model assignment
+
+Subagents inherit the orchestrator's model unless their definition specifies otherwise. Custom agent definitions in `.claude/agents/` set the model per role. The assignment is **tiered to balance cost against the reasoning each role demands**, not flat.
+
+| Role | Agent file | Model | Why this tier |
+|---|---|---|---|
+| Main orchestrator | (no file — inherited) | Opus | Holds full conversation context; coordinates all subagents. |
+| Plan reviewer | `plan-reviewer.md` | Sonnet | Highest cascade-failure surface, but the dimensions are written-artifact pattern-matching against project docs. Cheapest reasonable drop. |
+| Test-suite reviewer | `test-suite-reviewer.md` | Sonnet | Drops cleanly on confirmation-bias and corner-case dimensions. Haiku too risky on "would this pass against a stub?" reasoning. |
+| Final reviewer | `final-reviewer.md` | Opus | Last gate before commit; absorbs cascade from cheaper plan/test reviewers. Cheap insurance — typically converges in 1 pass. |
+| Research subagent | `chess-researcher.md` | Sonnet | Cross-source synthesis still needs reasoning. Output is reviewed downstream by the user reading chat and by the plan reviewer. |
+| Coder (default) | `chess-coder.md` | Sonnet | Plans here are prescriptive (signatures, test names, order spelled out). Transcription is largely model-independent. |
+| Coder (architecturally tricky) | (override via `Agent` tool's `model: opus`) | Opus | Plan flags which subtasks need it (e.g. tricky lifetime / trait choices, novel invariants). Opt-in at spawn time. |
+
+### Calibration
+
+The first time this assignment runs on a substantive phase (M2.C is the natural first candidate), spawn the plan reviewer **in parallel on both Sonnet and Opus** for the v1 plan. Compare critiques:
+
+- If Sonnet flagged everything Opus did (modulo wording), the drop is confirmed empirically.
+- If Sonnet missed something material, you've found the cost-quality boundary; revisit that tier (Opus for plan-review, retry Sonnet for the others).
+
+The calibration pass is one-time per role. Re-run if the workflow changes shape (e.g. new ADR-rich phase, new spec being interpreted) or if the stop-loss fires.
+
+### Stop-loss
+
+The tiered drop is a working hypothesis, not a settled commitment. Trigger a re-evaluation if any of these fire:
+
+- **Late-caught regression.** A defect that final review catches — or worse, ships and surfaces in a later phase — that a stronger plan- or test-reviewer would plausibly have caught earlier. "Plausibly" is judgment but not a low bar: the regression has to be the kind of issue that role's listed dimensions explicitly cover.
+- **Reviewer rubber-stamping.** Reviewer outputs trend toward "no further substantive issues" on first pass when prior baselines averaged 3+. Could be the agent internalizing past feedback proactively (good) or the reviewer not probing as hard (bad). Spot-check by re-running the same artifact past Opus and comparing.
+- **User-as-corrector.** If the user's interjections become a substantive correction channel rather than a sanity check, the reviewer gate is too weak.
+
+When a trigger fires:
+
+- Revert the implicated role to Opus by editing the agent file's `model:` field.
+- Document the trigger and the missed defect in the next milestone's `roadmap.md` notes (so the rollback isn't silently forgotten).
+- Re-run the calibration step before any future re-attempt at dropping that role.
+
+## Main-agent context discipline
+
+The main agent's context grows across a cycle (subagent return messages, plan revisions, file reads). Sessions past ~150k tokens are materially more expensive even with cache hits. Discipline:
+
+- **Don't re-`Read` files that are already in this conversation's context.** The Read tool re-injects the entire file even when nothing has changed. Use `offset`/`limit` to fetch only the specific lines you need; or rely on the prior read if the relevant content is still in scrollback.
+- **`/clear` between M-phases.** Persistent state lives in `CLAUDE.md`, `MEMORY.md`, plan files, and source. A new phase has nothing to gain from the prior phase's transcript.
+- **Compact mid-cycle if context drifts past ~120k**, especially before kicking off a parallel coding-agent batch — the orchestrator's spawn payload includes context it considers relevant, so a bloated main context inflates every spawned agent.
 
 ## Communication norms
 
