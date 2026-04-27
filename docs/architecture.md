@@ -29,6 +29,8 @@ Current architectural state. Decisions and their rationale live in `docs/decisio
 | Move encoding | 16-bit `Move(u16)` — bits 0–5 from-square, bits 6–11 to-square, bits 12–15 flag nibble (`[promotion][capture][special1][special0]`). 14 valid flag codes; codes 6 and 7 are deliberately absent (no public path constructs them). Re-exported as `chess::Move` and `chess::MoveFlag`. | `docs/research/m1-engine-architecture.md` §2 |
 | Make/unmake | Free functions `make_move(&mut Position, Move) -> Undo` and `unmake_move(&mut Position, Move, Undo)` in `src/mov.rs` (plus ergonomic `Position::make_move` / `Position::unmake_move` delegates). `Undo` (~16 B) carries `captured`, `prior_castling`, `prior_ep`, `prior_halfmove`, `prior_zobrist`. Castling-rights update via 64-entry `CASTLING_MASK` table indexed by `from`/`to` (handles rook-captured-on-corner edge cases). Incremental Zobrist update with debug-build round-trip assert against `from_scratch`; release-build perf sentinel guards against accidental from-scratch reintroduction. | `decisions/0004-nnue-hooks-from-day-one.md`, `docs/plans/m1.e.md` |
 | Move generation | Legal-direct, mask-based, with check-evasion specialization. Per-call (not cached) computation of `checkers` / `pinned` / `capture_mask` / `push_mask`. King-flee gotcha: opponent attacks computed against `occupancy ^ king_bb`. EP horizontal-pin checked at emission. | `decisions/0007-legal-direct-movegen.md` |
+| Perft (validation) | `src/perft.rs` exposes `perft`, `perft_bulk` (CPW depth-1 leaf-skip), `divide` (UCI-sorted), `perft_categorized` (internal-only category counts per ADR-0006). Stockfish 18 is the sole oracle for fixture totals + divide. Recursion driver is monomorphized over bulk-vs-plain via a `const BULK: bool` generic. | `decisions/0006-stockfish-as-perft-oracle.md` |
+| Benchmark baseline | `criterion 0.7` for microbenchmarks (gitignored `target/criterion/` raw artifacts + per-machine `--save-baseline` workflow); committed `bench/<milestone>.md` table is the cross-commit regression-tracking artifact. | `decisions/0010-benchmark-baseline-format.md` |
 
 ## Sliding-piece attack lookup
 
@@ -90,6 +92,25 @@ Both functions trust their callers to supply pseudo-legal moves; movegen (M1.F) 
 - *Release builds:* trust the incremental delta exclusively. Always-on `make_move_no_from_scratch_in_release` perf sentinel guards against accidental from-scratch reintroduction.
 
 **NNUE-readiness (ADR-0004).** Satisfied by the discrete-function shape: when an accumulator lands, its update slots into `make_move`'s body without any signature change. `Move` and `Undo` carry every input the delta needs (from, to, mover, captured piece, promotion target, castling rook movement, EP capture square).
+
+## Perft validation
+
+**Public API.** The `perft` module exposes:
+
+- `perft(&Position, depth: u32) -> u64` — plain recursive perft.
+- `perft_bulk(&Position, depth: u32) -> u64` — bulk-counting variant (CPW depth-1 leaf-skip; ~3.6× faster than plain at D4 from start).
+- `divide(&Position, depth: u32) -> Vec<(Move, u64)>` — per-move sub-counts, **sorted by UCI move notation ascending** for direct text-diff against `sort` of Stockfish's `go perft N` output.
+- `perft_categorized(&Position, depth: u32) -> PerftCounts` — internal-only category counts (captures, EP, castles, promotions, checks, discovery checks, double checks, checkmates) per ADR-0006.
+
+**Recursion driver.** Plain and bulk share `perft_inner<const BULK: bool>`, monomorphized so the `BULK && depth == 1` leaf-skip branch is dead-code-eliminated from the plain path. Stack-allocated `MoveList` per recursion frame (~512 B / frame; D8 ≈ 4 KiB total stack — well under macOS 8 MiB default).
+
+**Categorized recursion.** Separate `perft_categorized_inner` path (no bulk-skip) classifies each move's flag category and post-make check / mate state. Mate detection is anchored at the leaf-classification ply (depth==1 post-make), not at depth==0 — see `docs/plans/m1.g.md` §3 "Recursion-base contract" for the why.
+
+**Test fixtures.** `tests/fixtures/perft_canonical6.txt` (canonical 6 D1–D6) and `tests/fixtures/perft_whittington.epd` (174 positions D1–D4) regenerated from Stockfish 18 by `scripts/regen-perft-fixtures.sh`. Per ADR-0006 Stockfish is the sole oracle; we use the Whittington FEN list as a diversity corpus and regenerate counts ourselves. Test partition: D1–D3 + light-D4 default-fast; heavy-D4 + D5 + D6 + Whittington `#[ignore]`-gated.
+
+**Benchmarking.** `benches/perft.rs` (criterion: starting D4 plain + bulk, Kiwipete D3 bulk) and `benches/movegen.rs` (`generate_moves` per canonical-6 position). Baseline numbers in `bench/<milestone>.md` per ADR-0010.
+
+See `docs/plans/m1.g.md` for the full design.
 
 ## Hot-path implications of Apple Silicon target
 

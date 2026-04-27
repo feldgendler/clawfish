@@ -2,23 +2,15 @@
 
 Industry-best-practice items surfaced during the 2026-04-27 workflow review but not yet adopted. **Listed in recommended implementation order** — pick from the top when the next slot opens for tooling work.
 
-## 1. Benchmark baseline format
+## 1. Fuzzing (`cargo-fuzz`)
 
-**Why first now.** Both `workflow.md` and `roadmap.md` mark `bench/` as "TBD format". M1.G (perft + benchmarks) is two phases away; deciding the format before then avoids retrofit and ensures the first measurement is comparable to the second. Pure decision work — no code until M1.G actually lands.
-
-**Effort.** A short ADR (`docs/decisions/`) deciding: criterion + `--save-baseline` for the raw artifact (gitignored under `target/criterion/`), plus a human-readable `bench/<milestone>.md` table committed to git. The committed table is the regression-tracking artifact across commits; `criterion` files give per-machine detail.
-
-**Integration.** Ratify as part of M1.G's plan-mode pass.
-
-## 2. Fuzzing (`cargo-fuzz`)
-
-**Why next.** Highest-ROI target is the FEN parser (already shipped — strict spec, lots of edge cases). UCI parser at M2 is the next obvious one. Defer until UCI lands so the same setup amortizes across two targets. Nightly-Rust requirement is friction; alternative is structure-aware property testing with `arbitrary` + `proptest` on stable, which the property-testing infrastructure already covers partially.
+**Why first now.** Highest-ROI target is the FEN parser (already shipped — strict spec, lots of edge cases). UCI parser at M2 is the next obvious one. Defer until UCI lands so the same setup amortizes across two targets. Nightly-Rust requirement is friction; alternative is structure-aware property testing with `arbitrary` + `proptest` on stable, which the property-testing infrastructure already covers partially.
 
 **Effort.** Nightly toolchain installation, `cargo fuzz init`, write a fuzz target wrapping `Fen::parse`, run for a few CPU-hours. Investigate any panic. Repeat for UCI at M2.
 
 **Integration.** Run periodically on parsers (any module that ingests external strings). Standalone `cargo fuzz` invocation, not in the pre-commit hook.
 
-## 3. CI (GitHub Actions)
+## 2. CI (GitHub Actions)
 
 **Why last in the active queue.** Blocked: the project is not on GitHub yet. When it moves, this consolidates everything above (fmt, clippy, test, coverage, audit, deny, plus any of the items implemented by then). Especially valuable since the user doesn't read code and depends on external green/red signals.
 
@@ -41,6 +33,7 @@ Industry-best-practice items surfaced during the 2026-04-27 workflow review but 
 
 ## Done in the 2026-04-27 review
 
+- **Benchmark baseline format** — ratified at M1.G's plan-mode pass; ADR-0010 (`docs/decisions/0010-benchmark-baseline-format.md`) committed alongside the M1.G `bench/m1.g.md` first baseline. `criterion 0.7` + `--save-baseline` on per-machine `target/criterion/` (gitignored) + committed human-readable table.
 - `cargo fmt --check` enforcement (commits `5ca6c86` style + `eaf9d37` workflow).
 - Pre-commit hook at `.claude/hooks/pre-commit-check.sh`, wired via `.claude/settings.json`.
 - `cargo audit` + `cargo deny` with policy in `deny.toml`; `Cargo.toml` marked `publish = false`.

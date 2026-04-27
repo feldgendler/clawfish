@@ -6,43 +6,35 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M1.F complete; M1.G next.** Architectural commitments settled (see `docs/decisions/`).
+**Phase: M1 complete (M1.G landed); M2 next — UCI random mover.** Architectural commitments settled (see `docs/decisions/`).
 
-### What M1.F landed
+### What M1.G landed
 
-The `movegen` module — the engine's legal-move enumeration surface:
+The `perft` module — move-generation validation + measurement:
 
-- **`MoveList`** — 256-slot stack-allocated `[MaybeUninit<Move>; 256]` + `len: u16`. `push`/`clear` are `pub(crate)`; `as_slice` exposes `&[Move]` via one justified `unsafe` block. The 218-move legal ceiling makes over-push unreachable in practice.
-- **`generate_moves(&Position, &mut MoveList)`** — legal-direct emission, mask-based, with check-evasion specialization (no check / single check → king + capture-the-checker + block / double check → king-only).
-- **`in_check(&Position) -> bool`** — public helper; thin wrapper around `checkers_of`.
-- **Per-call `MaskInfo`** — `checkers`, `pinned`, `capture_mask`, `push_mask`, `king_danger` (computed against `occupancy ^ king_bb` per the king-flee gotcha), `pin_rays[64]`. Recomputed each `generate_moves` call; not cached on `Position`.
-- **EP horizontal-pin filter** AND symmetric **diagonal-discovery filter** — both at emission time. The symmetric diagonal case is needed because the standard pin filter doesn't catch it (the capturing pawn isn't on the king-pinner diagonal).
-- **Castling** — gated on no-check + transit/destination not in `king_danger`. Mailbox `debug_assert!` on king/rook starting squares (release-trusted).
-- **`validate_post_parse` extended** — rejects FENs whose castling rights don't match the king/rook mailbox; new `FenError::InconsistentCastlingRights`.
-- **Defensive-checks-debug-only convention** — added to `docs/workflow.md` "Final review loop" → Code quality. Validation goes at the boundary that creates the invariant; consumers `debug_assert!`; release trusts.
+- **`src/perft.rs`** with `perft`, `perft_bulk` (CPW depth-1 leaf-skip), `divide` (UCI-sorted), `perft_categorized` (internal-only category counts per ADR-0006), and the `PerftCounts` struct.
+- **Recursion driver** `perft_inner<const BULK: bool>` monomorphized over plain/bulk; the leaf-skip branch is dead-code-eliminated from the plain path.
+- **Stockfish-regenerated fixtures** — canonical 6 D1–D6 + 174-position Whittington corpus D1–D4. Per ADR-0006 Stockfish 18 is the sole oracle; `scripts/regen-perft-fixtures.sh` reproduces them.
+- **Test partition** — D1–D3 (all 6 positions, plain + bulk parity) + light-D4 fast (`cargo test`); heavy-D4, D5, D6, Whittington D4 `#[ignore]`-gated. Default fast suite finishes in 0.02s release.
+- **`criterion 0.7` benchmark harness** — `benches/perft.rs` + `benches/movegen.rs`; first baseline at `bench/m1.g.md`. Format ratified by **ADR-0010**.
+- **M1.F smoke benchmark deleted** — criterion supersedes it.
 
-### Implementation highlights
-
-- **`const fn` pre-computed leaf attack tables** (`PAWN_ATTACKS`, `KNIGHT_ATTACKS`, `KING_ATTACKS`) — built at compile time; no `LazyLock` per-call atomic on the hot path.
-- **`prop_no_legal_move_leaves_us_in_check`** — proptest with deterministic SplitMix64 random walk over §6 edge fixtures + canonical 6 seeds. Pins the legal-direct invariant.
-- **In-crate `count == 2` assertion** for the EP-double-check fixture (uses crate-private `checkers_of`) — pins §6.3 taxonomy point.
-
-### Verification (Apple Silicon, dev machine)
+### M1.G — verification (Apple M4, dev machine)
 
 | Metric | Result |
 |---|---|
-| Tests | **401 passing** + 4 ignored benches (372 lib + 12 movegen integration + 9 zobrist-vector + 3 fen + 2 magic + 3 make_unmake) |
-| `cargo clippy --all-targets -- -D warnings` | clean |
+| Tests | 446 fast + 9 ignored. All ignored verified to pass: D4-heavy 0.23s; D5 + Whittington 2.47s combined; **D6 117.93s** (~22B nodes). |
 | `cargo build --release` | clean |
-| Smoke throughput (release, ns/call) | starting 68, Kiwipete 114, Pos-3 37, Pos-4 43, Pos-5 129, Pos-6 99 — all 50× under the 5 µs/call regression-tripwire threshold |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo audit` + `cargo deny check` | clean |
+| `cargo llvm-cov` (`perft.rs`) | 98.32% region / 98.25% line / 93.75% function. Crate total 95.19%. |
+| **Headline throughput (`bench/m1.g.md`)** | starting D4 plain **33 Mnps**; starting D4 bulk **119 Mnps**; Kiwipete D3 bulk **168 Mnps**. Meets M1 ≥100 Mnps exit criterion on bulk path. |
 
-### Process
-
-All three review loops (plan, test-suite, final) converged after 3 / 3 / 2 rounds. Plan archived at `docs/plans/m1.f.md`. ADR-0007 codifies the binding architectural choices.
+All four loops (plan, test-suite, final code+tests, benchmark capture) converged. Plan archived at `docs/plans/m1.g.md`. ADR-0010 codifies the bench-baseline format.
 
 ### What's next
 
-**M1.G — perft + benchmarks.** Recursive perft driver with bulk-counting at depth 1, Stockfish-generated fixtures on the canonical 6 to depth 6/7, EPD-corpus regression (Whittington `perft.epd`), `criterion` benchmark harness with baseline saving. Target ≥100 Mnps single-threaded perft on Apple Silicon (≥200 Mnps would be excellent).
+**M2 — Random-mover engine speaking UCI.** Plays legal random moves through Cute Chess. Establishes the UCI skeleton, time-management harness, and tournament tooling before any search complexity. Exit criteria: a complete game through Cute Chess against itself or another engine without protocol errors or illegal moves.
 
 ## How to pick up a new session
 

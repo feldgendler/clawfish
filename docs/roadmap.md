@@ -4,7 +4,34 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1.F complete; M1.G next.**
+**M1 complete (M1.G landed); M2 next — UCI random mover.**
+
+### M1.G — what landed
+
+The `perft` module — the engine's move-generation validation + measurement layer:
+
+- **`src/perft.rs`** with `perft`, `perft_bulk` (CPW depth-1 leaf-skip), `divide` (UCI-sorted), `perft_categorized` (internal-only category counts per ADR-0006), and the `PerftCounts` struct.
+- **Stockfish-regenerated fixtures** at `tests/fixtures/perft_canonical6.txt` (canonical 6 D1–D6) + `tests/fixtures/perft_whittington.epd` (174 positions D1–D4). Per ADR-0006 Stockfish 18 is the sole oracle.
+- **`scripts/regen-perft-fixtures.sh`** — idempotent fixture-regeneration script; spawns one Stockfish per (fen, depth) pair, parses `Nodes searched:` lines.
+- **Test partition** matching the plan's §"Fast-suite wall-clock budget": D1–D3 + light-D4 default-fast (sub-second); heavy-D4 + D5 + D6 + Whittington D4 `#[ignore]`-gated.
+- **`criterion 0.7` benchmark harness** at `benches/perft.rs` + `benches/movegen.rs`; first baseline committed at `bench/m1.g.md` per **ADR-0010** (this phase's binding ADR).
+- **M1.F smoke benchmark deleted** — replaced by the criterion harness.
+
+### M1.G — verification
+
+| Metric | Result |
+|---|---|
+| Tests | 446 fast + 9 ignored (4 perft-integration ignored slow + 1 perft-unit Kiwipete D4 + 4 prior). All ignored slow tests verified to pass: D4-heavy 0.23s; D5 + Whittington 2.47s combined; **D6 117.93s**. |
+| `cargo build --release` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo fmt --check` | clean |
+| `cargo audit` + `cargo deny check` | clean (criterion + transitives MIT/Apache-2.0) |
+| `cargo llvm-cov --summary-only --lib` | `perft.rs`: 98.32% region / 98.25% line / 93.75% function. Crate total 95.19%. |
+| Headline perft throughput (Apple M4, release) | starting D4 plain **33 Mnps**; starting D4 bulk **119 Mnps**; Kiwipete D3 bulk **168 Mnps** — meeting the M1 ≥100 Mnps exit criterion on the bulk path. |
+| Headline movegen throughput | 81–277 ns/call across canonical-6, ~200 ns/call typical. |
+| D6 end-to-end | ~22B nodes / 117.93s ≈ ~187 Mnps (consistent with bench numbers). |
+
+All four review loops (plan, test-suite, final code+tests, plus the post-final benchmark capture) converged. Plan archived at `docs/plans/m1.g.md`. ADR-0010 codifies the bench format.
 
 ### M1.F — what landed
 
@@ -126,7 +153,7 @@ Bitboards, all rules of standard chess, no search, no eval. Validated against pe
 | **M1.D** ✓ — Zobrist | Polyglot 781-key table vendored from in-tree spec, EP-only-when-pseudo-legal hashing rule, side-to-move asymmetric turn key, `Position::zobrist` field + `refresh_zobrist()` setter; 9 published test vectors as gold-standard interop check. M1.E will add the incremental hash update + debug round-trip assert in make/unmake. | ~250–350 lines (actual: ~787 lines including 121-line vendored data file and ~120-line ADR; 30 unit + 5 property + 3 position + 9 integration tests) |
 | **M1.E** ✓ — Make/unmake | `Move` (16-bit), `MoveFlag` (14 valid), `Undo` (~16 B), free functions `make_move`/`unmake_move` per ADR-0004, all special cases (castling, EP, all 8 promotion variants, double-push), incremental Zobrist with debug round-trip assert + release-build perf sentinel, round-trip property tests, ergonomic `Position::make_move`/`Position::unmake_move` delegates | ~600–900 lines (actual: ~2050 lines including ~700-line plan; 65 new tests) |
 | **M1.F** ✓ — Legal move generation | `movegen` module with `MoveList` + `generate_moves` + `in_check`; per-call `MaskInfo` (checkers, pinned, capture/push masks, king_danger, pin_rays); per-piece emit fns; EP horizontal-pin + symmetric diagonal-pin filters; castling with mailbox `debug_assert!`s; `validate_post_parse` extended for castling consistency; defensive-checks-debug-only convention codified | ~1500–2000 lines (actual: ~3700 lines including ~700-line plan, ~110-line ADR; 91 new tests) |
-| **M1.G** — Perft + benchmarks | Recursive perft with bulk-counting at depth 1, canonical 6 fixtures generated via Stockfish, EPD-corpus regression tests (Whittington `perft.epd` positions, Stockfish-generated counts), `criterion` benchmarks with baseline saving | ~500–800 lines |
+| **M1.G** ✓ — Perft + benchmarks | Recursive perft (plain + bulk-count + divide + categorized) with 174-position Whittington EPD regression suite (Stockfish-regenerated counts) and canonical-6 D1–D6 fixtures, `criterion` benchmark harness with baseline saving (ADR-0010), 119 Mnps bulk on starting D4 (meets M1 exit criterion) | ~500–800 lines (actual: ~1300 lines incl. ~700-line plan, ~80-line ADR; 21 perft unit tests + 14 integration tests, plus the fixture parser) |
 
 Phases A→F are foundational and largely sequential. G is the validation layer.
 

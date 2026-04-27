@@ -243,7 +243,7 @@ Sequential Probability Ratio Test. The standard for accepting/rejecting engine c
 
 ## Benchmarking conventions
 
-- Each milestone produces a benchmark baseline saved to `bench/` (TBD format).
+- Each milestone produces a benchmark baseline at `bench/<milestone>.md` per `docs/decisions/0010-benchmark-baseline-format.md` (committed human-readable table; raw `target/criterion/` artifacts are per-machine and gitignored).
 - Standard UCI `bench` command runs a fixed set of positions and reports nodes searched — used as a deterministic regression check across changes.
 - Profile hot paths with `samply` or Instruments (macOS, Apple Silicon).
 - Use `criterion` for microbenchmarks.

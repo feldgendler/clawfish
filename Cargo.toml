@@ -11,6 +11,17 @@ publish = false
 # Property-based testing. Used in unit tests (modules under `#[cfg(test)]`)
 # and integration tests under `tests/`. Stable-Rust only — no nightly.
 proptest = "1.11"
+# Microbenchmarks. See ADR-0010 (`docs/decisions/0010-benchmark-baseline-format.md`).
+# Used by `benches/perft.rs` and `benches/movegen.rs`.
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[[bench]]
+name = "perft"
+harness = false
+
+[[bench]]
+name = "movegen"
+harness = false
 
 [profile.release]
 opt-level = 3
