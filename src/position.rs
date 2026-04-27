@@ -94,6 +94,11 @@ pub struct Position {
     ep_target: Option<Square>,
     halfmove_clock: u8,
     fullmove_number: u16,
+    /// Polyglot Zobrist hash. Maintained from-scratch via [`refresh_zobrist`]
+    /// after parse / construction; M1.E will switch this to incremental
+    /// XOR updates inside `make_move` / `unmake_move`. Private — cross-module
+    /// mutation goes through `refresh_zobrist`. See ADR-0009.
+    zobrist: u64,
 }
 
 impl Position {
@@ -116,10 +121,11 @@ impl Position {
             ep_target: None,
             halfmove_clock: 0,
             fullmove_number: 1,
+            zobrist: 0,
         }
     }
 
-    pub const fn starting_position() -> Position {
+    pub fn starting_position() -> Position {
         // White pieces.
         let white_pawns = Bitboard::RANK_2;
         let white_rooks =
@@ -183,7 +189,7 @@ impl Position {
         // color_bb is indexed by `Color as usize` (White=0, Black=1).
         // king_sq mirrors the color order. This dependency is load-bearing
         // across `pieces`, `pieces_colored`, `occupied`, `king_square`.
-        Position {
+        let mut p = Position {
             piece_bb: [pawns, knights, bishops, rooks, queens, kings],
             color_bb: [white_occ, black_occ],
             mailbox,
@@ -193,7 +199,10 @@ impl Position {
             ep_target: None,
             halfmove_clock: 0,
             fullmove_number: 1,
-        }
+            zobrist: 0,
+        };
+        p.refresh_zobrist();
+        p
     }
 
     pub fn from_fen(s: &str) -> Result<Position, FenError> {
@@ -222,6 +231,14 @@ impl Position {
 
     pub const fn fullmove_number(&self) -> u16 {
         self.fullmove_number
+    }
+
+    /// Polyglot Zobrist hash of the position (per ADR-0009). Maintained
+    /// from-scratch by [`Position::refresh_zobrist`] after parse and
+    /// construction; M1.E will switch to incremental XOR updates inside
+    /// `make_move` / `unmake_move`.
+    pub const fn zobrist(&self) -> u64 {
+        self.zobrist
     }
 
     pub const fn piece_at(&self, sq: Square) -> Option<Piece> {
@@ -326,6 +343,12 @@ impl Position {
     /// Debug-asserts if the previous occupant was a king (overwriting a
     /// king would silently invalidate `king_sq`). The FEN parser walks
     /// each square exactly once so it never triggers the assert.
+    ///
+    /// **Does not refresh `zobrist`.** Callers that need a consistent hash
+    /// after a sequence of `set_piece` / `set_aux_state` mutations must
+    /// call [`refresh_zobrist`](Self::refresh_zobrist) afterward. The FEN
+    /// parser does this once after all set_* calls complete; M1.E's
+    /// `make_move` will use incremental XOR updates instead.
     pub(crate) fn set_piece(&mut self, sq: Square, piece: Piece) {
         let prev = self.mailbox[sq.index() as usize];
         debug_assert!(
@@ -349,6 +372,11 @@ impl Position {
         }
     }
 
+    /// Set side-to-move, castling, EP, halfmove, and fullmove fields in one go.
+    ///
+    /// **Does not refresh `zobrist`.** Same contract as [`set_piece`](Self::set_piece):
+    /// callers that need a consistent hash must call
+    /// [`refresh_zobrist`](Self::refresh_zobrist) afterward.
     pub(crate) fn set_aux_state(
         &mut self,
         side: Color,
@@ -362,6 +390,16 @@ impl Position {
         self.ep_target = ep;
         self.halfmove_clock = halfmove;
         self.fullmove_number = fullmove;
+    }
+
+    /// Recompute and store the Polyglot Zobrist hash from the current
+    /// position state via [`crate::zobrist::from_scratch`]. Called by
+    /// `starting_position()`, by the FEN parser after `validate_post_parse`,
+    /// and by tests that mutate via `set_piece` / `set_aux_state` and want
+    /// a consistent hash. M1.E's `make_move` / `unmake_move` will replace
+    /// this with incremental XOR updates.
+    pub(crate) fn refresh_zobrist(&mut self) {
+        self.zobrist = crate::zobrist::from_scratch(self);
     }
 
     pub(crate) fn validate_post_parse(&self) -> Result<(), FenError> {
@@ -742,6 +780,32 @@ mod tests {
         assert_eq!(from_const, from_parser);
     }
 
+    // Zobrist field tests — prove the field is populated correctly, not just
+    // that `zobrist::from_scratch` returns the right value.
+
+    /// Starting-position Polyglot hash (test vector #1 from the published spec).
+    #[test]
+    fn zobrist_starting_position_matches_polyglot() {
+        assert_eq!(Position::starting_position().zobrist(), 0x463b96181691fc9c,);
+    }
+
+    /// `empty()` initialises the zobrist field to zero; the parser fills it in.
+    #[test]
+    fn zobrist_empty_is_zero() {
+        assert_eq!(Position::empty().zobrist(), 0);
+    }
+
+    /// FEN parser hooks `from_scratch`; result equals the same Polyglot vector #1.
+    #[test]
+    fn zobrist_field_present_after_parse() {
+        assert_eq!(
+            Position::from_fen(Position::STARTING_FEN)
+                .unwrap()
+                .zobrist(),
+            0x463b96181691fc9c,
+        );
+    }
+
     #[test]
     fn to_fen_matches_display() {
         // The canonical six perft positions, pinned per docs/plans/m1.b.md.
@@ -772,6 +836,10 @@ mod tests {
         p.set_piece(Square::E8, BLACK_KING);
         p.set_piece(Square::G8, BLACK_KNIGHT);
         p.set_aux_state(Color::White, CastlingRights::NONE, None, 3, 17);
+        // set_piece/set_aux_state don't refresh the Zobrist field; do it once
+        // at the end so structural equality with the FEN-roundtripped position
+        // (whose parser refreshes zobrist) holds.
+        p.refresh_zobrist();
 
         let formatted = format!("{}", p);
         let parsed = Position::from_fen(&formatted).expect("formatted FEN must parse");
@@ -800,6 +868,10 @@ mod tests {
         p.set_piece(Square::D4, WHITE_PAWN);
         let castling = CastlingRights::WHITE_KING.with(CastlingRights::BLACK_QUEEN);
         p.set_aux_state(Color::Black, castling, Some(Square::D3), 0, 8);
+        // set_piece/set_aux_state don't refresh the Zobrist field; do it once
+        // at the end so structural equality with the FEN-roundtripped position
+        // holds.
+        p.refresh_zobrist();
 
         let formatted = format!("{}", p);
         let parsed = Position::from_fen(&formatted).expect("formatted castle/EP FEN must parse");

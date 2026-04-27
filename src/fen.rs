@@ -106,6 +106,11 @@ pub(crate) fn parse(s: &str) -> Result<Position, FenError> {
     // 9. Cross-field invariant: king count.
     p.validate_post_parse()?;
 
+    // 10. Compute the Polyglot Zobrist hash from scratch (per ADR-0009).
+    //     M1.E will switch to incremental updates inside make/unmake; the
+    //     parser path stays at from-scratch.
+    p.refresh_zobrist();
+
     Ok(p)
 }
 
@@ -1088,6 +1093,11 @@ mod tests {
             // not the round-trip property below.
             p.validate_post_parse()
                 .expect("constructed position must pass validate_post_parse");
+
+            // set_piece/set_aux_state don't refresh the Zobrist field; do it
+            // once at the end so structural equality with the FEN-roundtripped
+            // position (whose parser refreshes zobrist) holds.
+            p.refresh_zobrist();
 
             let s = p.to_fen();
             let parsed = Position::from_fen(&s).map_err(|e| {

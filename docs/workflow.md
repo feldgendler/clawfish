@@ -121,15 +121,18 @@ Mutation testing runtime grows roughly linearly with codebase size. A full-repo 
 `cargo mutants --in-diff <FILE>` accepts a unified diff and only generates mutants on lines the diff touches. At the final-review step, the unit's work is in the working tree (uncommitted — the commit lands at step 11), so the invocation is:
 
 ```sh
+git add -N $(git ls-files --others --exclude-standard 'src/**/*.rs')   # see note
 git diff HEAD -- 'src/**/*.rs' > /tmp/<unit>.diff
 cargo mutants --in-diff /tmp/<unit>.diff
 ```
+
+**`git add -N` is load-bearing for new files.** `git diff HEAD` shows nothing for *untracked* files (only files git already knows about). When a unit introduces new `.rs` files (every `M1.X` so far has done this), the diff would silently exclude them and `cargo mutants --in-diff` would generate **zero mutants for the new code** — a false-positive clean run. `git add -N` ("intent to add") tells git to track the file's existence without staging contents, so subsequent `git diff` includes the new file in full. The `add -N`-d files can be `git restore --staged` afterward if needed; they're not actually staged.
 
 The runtime is proportional to the *new* surface area, not the cumulative codebase. Lines that haven't changed since the previous unit are not mutated.
 
 This is the default cargo-mutants invocation at the final-review step.
 
-When in-flight work from a parallel agent is sitting in the same working tree, scope the diff to the unit's files explicitly with extra pathspec args, e.g. `git diff HEAD -- src/zobrist.rs src/position.rs > /tmp/m1.d.diff`, so unrelated unstaged work doesn't broaden the mutant set.
+When in-flight work from a parallel agent is sitting in the same working tree, scope the diff to the unit's files explicitly with extra pathspec args, e.g. `git diff HEAD -- src/zobrist.rs src/position.rs > /tmp/m1.d.diff`, so unrelated unstaged work doesn't broaden the mutant set. Combine with `git add -N` on any new files in the unit's scope.
 
 ### Iterating: `--iterate`
 

@@ -5,6 +5,7 @@ pub mod piece;
 pub mod position;
 pub mod slow_attacks;
 pub mod square;
+pub mod zobrist;
 
 pub use bitboard::Bitboard;
 pub use fen::FenError;

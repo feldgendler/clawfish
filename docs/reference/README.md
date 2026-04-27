@@ -116,6 +116,23 @@ Use these line ranges with the Read tool's `offset` and `limit` parameters to co
 | 20 | 2700–2914 | Binary representation (PGC) — binary encoding of PGN |
 | 21 | 2916–2921 | E-mail correspondence usage (stub — under development) |
 
+## Polyglot opening-book format
+
+The binary format for opening books used across the Polyglot/XBoard ecosystem, plus the 781-entry Zobrist random-number table that defines the position hash key on which all such books are indexed. Authored by Hartmut Kapsch (HGM) by inspecting the freely-available Polyglot source; the table-of-randoms and algorithm description are public-domain.
+
+Vendored because the engine's Zobrist hashing implements this spec verbatim (per [ADR-0009](decisions/0009-polyglot-zobrist.md), pending) — the in-tree spec is the truth-of-record for what each hash key bit means, the canonical 781-constant table, and the test vectors used to validate the implementation. The future opening-book reader will follow the binary entry layout (`key`/`move`/`weight`/`learn`, big-endian, sorted by key) defined in the same document.
+
+- **File:** [`polyglot-book-format.md`](polyglot-book-format.md) — HTML converted to Markdown, prose preserved verbatim, all 781 `U64(...)` constants intact and in original order.
+- **Source URL:** <http://hgm.nubati.net/book_format.html>
+- **Snapshot date:** 2026-04-27.
+- **Upstream Last-Modified:** Tue, 17 Sep 2013 10:00:43 GMT — the format has been frozen since.
+- **Re-fetch:**
+  ```sh
+  curl -fsSL -o /tmp/book_format.html http://hgm.nubati.net/book_format.html
+  ```
+  Note the URL is HTTP, not HTTPS — the upstream certificate is self-signed; this specific URL is pre-approved.
+- **Local secondary copy:** the Homebrew `polyglot` package ships a functionally-similar (slightly extended for variant chess) HTML copy at `/opt/homebrew/Cellar/polyglot/<version>/share/doc/polyglot/book_format.html`.
+
 ## Refresh policy
 
 These are vendored snapshots, not live links. If FIDE issues a new Laws of Chess revision, or Shredder posts a revised UCI spec, re-fetch and update the in-tree copy (and the FIDE slices in `rules/`). The PGN spec has been frozen since 1994; refresh is essentially never. Snapshot dates above are the source of truth for what version we actually built against.
