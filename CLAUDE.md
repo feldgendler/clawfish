@@ -100,5 +100,6 @@ If the agent gets genuinely stuck (ambiguous spec, hard tool failure, architectu
 - `docs/prior-art.md` — reference landscape; per-feature research notes accumulate here.
 - `docs/decisions/` — ADR-style records, one file per substantive decision.
 - `docs/reference/` — vendored authoritative specs (FIDE Laws of Chess, UCI protocol).
+- `docs/tooling-backlog.md` — prioritized list of tooling/QA items not yet adopted. Pull from the top when a tooling slot opens.
 
 Keep these files current as the project evolves. When a session ends with new commitments or learnings, update the relevant doc before stopping.
