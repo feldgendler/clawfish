@@ -6,7 +6,12 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M1 complete (M1.G landed); M2 next — UCI random mover.** Architectural commitments settled (see `docs/decisions/`).
+**Phase: M1 complete; M2 decomposed and researched; M2.A next.** Architectural commitments settled (see `docs/decisions/`).
+
+- M1: complete through M1.G (perft + criterion benchmark harness; 119 Mnps bulk on starting D4).
+- M2: decomposed into five sub-phases (A→E) in `docs/roadmap.md`.
+- Pre-M2 research complete: `docs/research/m2-uci-threading.md` (binds ADR-0011 on M2.C) and `docs/research/m2-tournament-harness.md` (binds ADR-0012 on M2.E).
+- M2.A — UCI move encoding — needs no extra research; UCI spec at `docs/reference/uci-protocol-2006.txt` covers it.
 
 ### What M1.G landed
 
@@ -34,7 +39,14 @@ All four loops (plan, test-suite, final code+tests, benchmark capture) converged
 
 ### What's next
 
-**M2 — Random-mover engine speaking UCI.** Plays legal random moves through Cute Chess. Establishes the UCI skeleton, time-management harness, and tournament tooling before any search complexity. Exit criteria: a complete game through Cute Chess against itself or another engine without protocol errors or illegal moves.
+**M2.A — UCI move encoding.** Plan-mode pass on `Move::to_uci(self) -> String` and `Move::from_uci(&str, &Position) -> Result<Move, _>`.
+
+- Long algebraic per UCI spec: `e2e4`, `e1g1`/`e1c1` for castling, `e7e8q` lowercase promotion, `0000` null.
+- Round-trip tests against canonical-6 perft moves; reject malformed input.
+- No ADR binds on this phase.
+- Approx size: 400–600 lines.
+
+Full M2 plan and the four other sub-phases (M2.B–E) are in `docs/roadmap.md`. Exit criteria for M2 as a whole: complete game through `fastchess` against itself or another engine without protocol errors or illegal moves.
 
 ## How to pick up a new session
 

@@ -65,6 +65,31 @@ Three parallel research passes covered M1's design space:
 - **[`research/m1-magic-bitboards.md`](research/m1-magic-bitboards.md)** (4.4k words) — deep dive on the magic-bitboard technique. Headline calls: **fancy magic with variable shift** (~840 KiB), **magic constants hardcoded in a generated source file** with attack tables built at runtime startup, **separate `magicgen` binary** for the search/validation/codegen step, slow ray-walker kept as **permanent `slow_attacks` differential-test oracle**, skip PEXT entirely (ARM has no equivalent).
 - **[`research/m1-perft-and-rust.md`](research/m1-perft-and-rust.md)** (2.5k words) — perft methodology and Rust project layout. Headline calls: bulk-counting at depth 1 for 20–30% perft speedup, `go perft N` UCI extension following Stockfish convention, `perftree` for divide automation, Chris Whittington's `perft.epd` (175 positions) as bulk regression position corpus, `tests/perft.rs` integration with `#[ignore]` for slow depths, **`src/lib.rs` introduced now in M1**, flat module hierarchy with `mov` for the `move`-keyword clash, `lto = "thin"` + `codegen-units = 1` + `panic = "abort"` from the start.
 
+### UCI I/O & threading (M2) — researched 2026-04-27
+
+- **[`research/m2-uci-threading.md`](research/m2-uci-threading.md)** (5.3k words) — how a UCI engine handles stdin concurrent with a search.
+  - Recommended architecture: reader thread → mpsc → main-as-orchestrator + per-`go` search worker.
+  - Cancellation: `Arc<AtomicBool>` polled every 4096 nodes (`Ordering::Relaxed`).
+  - Deadline: lives in `SearchContext`, polled on the same cadence (no timer thread).
+  - Stdout via shared `Mutex<Stdout>`; `bestmove` printed by the worker, never the orchestrator.
+  - EOF on stdin = synthetic `Quit`; `std::process::exit(0)` on quit (reader thread is uncancellable per `std::io::Stdin`).
+  - Latency budget: `isready` <1 ms, `stop` → `bestmove` <10 ms, `quit` → exit <1 s.
+  - `Search::go(&Position, &SearchContext, &dyn Fn(&str))` trait sketched so M3+ alpha-beta plugs in without signature change.
+  - Binds **ADR-0011** on M2.C.
+
+### Tournament harness (M2) — researched 2026-04-27
+
+- **[`research/m2-tournament-harness.md`](research/m2-tournament-harness.md)** (3.6k words) — match-runner choice and integration patterns on Apple Silicon macOS.
+  - Recommended runner: **fastchess** 1.8.0-alpha (pre-built `mac-arm64` binary on each release).
+  - Why not Cute Chess: 1.4.0 ships zero macOS assets, requires Qt6 source build (~1 GB).
+  - Confidence signal: Stockfish/Fishtest themselves migrated cutechess-cli → fastchess in 2024.
+  - No `engines.json` (fastchess has no registry); use `scripts/match.sh` wrapper.
+  - Output layout: raw PGN/log → `target/matches/` (gitignored); milestone summaries → `bench/m2.md` per ADR-0010.
+  - M2 smoke contract: 4 self-play + 4 vs Stockfish at `tc=10+0.1`, all legally terminated, no protocol errors, fastchess UCI-compliance checker silent.
+  - Integration test pattern (~30 lines `tests/uci_smoke.rs`): `env!("CARGO_BIN_EXE_chess")` + reader thread + `recv_timeout` to convert hangs into failures.
+  - Cute Chess GUI on macOS: skip; suggest `chessx` cask or Lichess paste-import for PGN replay.
+  - Binds **ADR-0012** on M2.E.
+
 ### Search
 *Not yet researched.*
 
@@ -72,7 +97,7 @@ Three parallel research passes covered M1's design space:
 *Not yet researched.*
 
 ### Time management
-*Not yet researched.*
+*Partially covered by `m2-uci-threading.md` for the deadline-polling interface; algorithm not yet researched.*
 
 ### NNUE
 *Not yet researched.*

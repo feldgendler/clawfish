@@ -158,9 +158,9 @@ Bitboards, all rules of standard chess, no search, no eval. Validated against pe
 Phases A→F are foundational and largely sequential. G is the validation layer.
 
 ### M2 — Random-mover engine speaking UCI
-Plays legal random moves through Cute Chess. No search depth. Establishes the UCI skeleton, time-management harness, and tournament tooling before any search complexity.
+Plays legal random moves through a tournament harness (fastchess; see ADR-0012 below). No search depth. Establishes the UCI skeleton, time-management harness, and tournament tooling before any search complexity.
 
-**Exit criteria:** plays a complete game through Cute Chess against itself or another engine without protocol errors or illegal moves.
+**Exit criteria:** plays a complete game through `fastchess` against itself or another engine without protocol errors or illegal moves.
 
 **TDD applicability:** very high. UCI is a text-in/text-out protocol — parsers and command dispatch are pure functions. Random move selection is deterministic given a seed. The end-to-end game loop is the only piece needing process-spawning integration tests.
 
