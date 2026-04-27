@@ -9,11 +9,45 @@ Every feature or major component follows the same cycle:
 1. **Deep prior-art research.** Web search, not training-data recall. Chess Programming Wiki, papers, blog posts, TalkChess threads, articles with illustrative snippets. **Not** engine source code (see restriction below). Devil is in the details. Delegate to a research subagent when it spans more than a few queries.
 2. **Explain findings in chat.** Tradeoffs, alternatives, gotchas. Pre-implementation, before any code.
 3. **Discuss and converge.** User pushes back, asks for alternatives, picks an approach.
-4. **Write tests first** where the layer admits it (see TDD scope below).
-5. **Implement.**
-6. **Benchmark and profile.** Record results. Compare to previous baseline.
+4. **Plan mode with self-review loop.** Every implementable unit goes through plan mode before any code is written. The plan is then critiqued and revised in a loop until convergent. See "Plan mode and self-review" below for the loop's structure.
+5. **Write tests first** where the layer admits it (see TDD scope below).
+6. **Implement.**
+7. **Benchmark and profile.** Record results. Compare to previous baseline.
 
-Skipping research-and-discussion strips the user of his only review channel. When uncertain, propose before implementing.
+Skipping research-and-discussion strips the user of his only review channel. Skipping plan mode strips the user of his only architectural review channel. When uncertain, propose before implementing.
+
+## Plan mode and self-review
+
+**Every implementable unit goes through plan mode.** No code is written until a plan exists, has survived the blind-review loop, and has user approval.
+
+A "unit" is a phase of a milestone (e.g. M1.A, M1.B), or a discrete feature within a phase if the phase is large. The roadmap decomposes milestones into units sized for ~500–1500 lines of resulting code each. Larger should be sub-divided.
+
+The plan itself, **written to a file** (`docs/plans/<unit>.md`) so the reviewer can read it, names: files created/modified, the type definitions and function signatures the plan introduces, module boundaries, test coverage strategy and specific test names, the order of operations, and any dependencies on other units.
+
+### The blind-review loop
+
+**Self-review is done by a fresh subagent, never by the main agent on its own work.** Main-agent self-review fails because the main agent is biased by the context that produced the plan — it can rationalize weaknesses because it remembers *why* the plan ended up that way. A fresh agent reading only the artifact has no such bias.
+
+1. **Main agent writes v1 of the plan** to `docs/plans/<unit>.md`.
+2. **Main agent launches a blind reviewer subagent.** The subagent's *only* inputs are:
+   - The plan file.
+   - Anything else in the project directory it chooses to read (CLAUDE.md, `docs/architecture.md`, the ADRs in `docs/decisions/`, `docs/prior-art.md`, `docs/research/`, the existing source code).
+   - It does **not** see the main conversation.
+   The reviewer's prompt asks for critique along these dimensions:
+   - **Correctness.** Does the plan implement the actual semantics? Are edge cases handled? Are types, signatures, and invariants consistent across the plan?
+   - **Simplicity.** Could anything be cut, merged, or deferred without losing the goal?
+   - **Performance considerations.** Are there algorithmic or data-layout choices that should be flagged now versus left for later optimization?
+   - **Best practices.** Idiomatic Rust, sensible test layout, conventional naming, error-handling style, etc.
+   - **Adherence to project decisions.** ADRs in `docs/decisions/`, commitments in `docs/architecture.md`, workflow rules in this file. The reviewer must catch plans that drift from settled decisions.
+3. **Reviewer returns a structured critique** plus an explicit verdict — either "no further substantive issues" (loop terminates) or a list of specific concerns with severity.
+4. **Main agent incorporates the feedback**, revises the plan in place, and **continues the same reviewer subagent** (via `SendMessage`) for the next pass — context stays cached (faster) and the reviewer's judgment stays consistent from pass to pass (more stable than spawning a fresh reviewer each iteration, which restarts calibration). **Prerequisite:** `SendMessage` is part of Claude Code's experimental Agent Teams and requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the env block of `.claude/settings.json`. Already set in this project; if a future session reports that `SendMessage` is unavailable, that's the first thing to check.
+5. **Loop continues** until the reviewer returns "no further substantive issues."
+6. **User approves the converged plan.**
+7. **Execute** (steps 5–7 of the per-feature loop above: tests first, implement, benchmark).
+
+**Loop convergence is the reviewer's call, not the main agent's.** The main agent does not declare a plan done.
+
+The user, who does not read code, gets to review the plan as the primary architectural review channel — and the blind-review loop ensures the plan that reaches the user has already been pressure-tested by an independent reader.
 
 ## Source-code reading restriction
 

@@ -54,10 +54,15 @@ Search via Google Scholar / arXiv for specific techniques as needed. Papers ofte
 
 ## Per-component research notes
 
-(Empty. Populated as each feature passes through the research phase of the workflow loop.)
+Detailed research reports live in `docs/research/`. Summaries here; consult the full reports for citations and depth.
 
-### Move generation (M1)
-*Not yet researched. First M1 task: prior-art pass on magic bitboards, make/unmake patterns, perft methodology.*
+### Move generation (M1) — researched 2026-04-27
+
+Three parallel research passes covered M1's design space:
+
+- **[`research/m1-engine-architecture.md`](research/m1-engine-architecture.md)** (3.1k words) — bitboard layout, square indexing, move encoding, generation strategy, make/unmake, Zobrist hashing, edge case taxonomy, performance baselines on Apple Silicon. Headline calls: LERF indexing, 6+2 bitboard scheme + mailbox, 16-bit moves with `[Move; 256]` lists, **legal-direct generation with check-evasion specialization**, ~16-byte Undo struct, **Polyglot Zobrist key set** with the **EP-only-when-pseudo-legal hashing rule**, target ≥100 Mnps perft on M4 (≥200 excellent).
+- **[`research/m1-magic-bitboards.md`](research/m1-magic-bitboards.md)** (4.4k words) — deep dive on the magic-bitboard technique. Headline calls: **fancy magic with variable shift** (~840 KiB), **magic constants hardcoded in a generated source file** with attack tables built at runtime startup, **separate `magicgen` binary** for the search/validation/codegen step, slow ray-walker kept as **permanent `slow_attacks` differential-test oracle**, skip PEXT entirely (ARM has no equivalent).
+- **[`research/m1-perft-and-rust.md`](research/m1-perft-and-rust.md)** (2.5k words) — perft methodology and Rust project layout. Headline calls: bulk-counting at depth 1 for 20–30% perft speedup, `go perft N` UCI extension following Stockfish convention, `perftree` for divide automation, Chris Whittington's `perft.epd` (175 positions) as bulk regression position corpus, `tests/perft.rs` integration with `#[ignore]` for slow depths, **`src/lib.rs` introduced now in M1**, flat module hierarchy with `mov` for the `move`-keyword clash, `lto = "thin"` + `codegen-units = 1` + `panic = "abort"` from the start.
 
 ### Search
 *Not yet researched.*

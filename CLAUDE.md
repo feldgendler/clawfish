@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M0 complete; project scaffolded.** Architectural commitments settled (see `docs/decisions/`). Cargo project initialized; `cargo run` produces a hello-world binary (placeholder, will be replaced as M1 lands). Stockfish 18 installed via Homebrew per `decisions/0006`. Next: M1 prior-art research on bitboard move generation.
+**Phase: M0 complete; M1 planning.** Architectural commitments settled (see `docs/decisions/`). Cargo project initialized; `cargo run` produces a hello-world binary. Stockfish 18 installed via Homebrew per `decisions/0006`. M1 prior-art research complete (three reports in `docs/research/`, synthesized into `docs/prior-art.md`). M1 is decomposed into seven sub-phases M1.A–M1.G in `docs/roadmap.md`; each goes through plan mode with the blind-review loop per `docs/workflow.md`. ADRs 0007/0008/0009 are pre-decided (material in prior-art and research files) but written per-phase as each binds — none binds on M1.A. Next: enter plan mode for M1.A.
 
 ## How to pick up a new session
 
