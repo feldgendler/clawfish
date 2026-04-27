@@ -51,11 +51,14 @@ The plan itself, **written to a file** (`docs/plans/<unit>.md`) so the reviewer 
    - **Best practices.** Idiomatic Rust, sensible test layout, conventional naming, error-handling style, etc.
    - **Adherence to project decisions.** ADRs in `docs/decisions/`, commitments in `docs/architecture.md`, workflow rules in this file. The reviewer must catch plans that drift from settled decisions.
    - **Parallelization soundness.** Does the parallelization map identify genuinely independent subtasks? Are dependencies between them honest? Or is parallelism overstated?
-3. **Reviewer returns a structured critique** plus an explicit verdict — either "no further substantive issues" (loop terminates) or a list of specific concerns with severity.
-4. **Main agent incorporates the feedback**, revises the plan in place, and **continues the same reviewer subagent** (via `SendMessage`) for the next pass — context stays cached (faster) and the reviewer's judgment stays consistent from pass to pass (more stable than spawning a fresh reviewer each iteration, which restarts calibration). **Prerequisite:** `SendMessage` is part of Claude Code's experimental Agent Teams and requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the env block of `.claude/settings.json`. Already set in this project; if a future session reports that `SendMessage` is unavailable, that's the first thing to check.
-5. **Loop continues** until the reviewer returns "no further substantive issues."
-6. **User approves the converged plan.**
-7. **Execute** (steps 5–10 of the per-feature loop above: tests → test-suite review → implement → final review → benchmark).
+3. **Reviewer returns a structured critique** plus an explicit verdict. The reviewer's prompt asks for output in a fixed format so the main agent can post it directly:
+   - Each concern listed as: `[severity] Title — one-paragraph description.` Severity is one of `must-fix`, `should-fix`, or `nit`.
+   - Final verdict: either `no further substantive issues` (loop terminates) or `revisions required`.
+4. **Main agent surfaces the critique in chat — every concern, with its substance.** The user does not read code; the reviewer's findings are part of the design conversation he sees. Posting just counts (e.g. "5 should-fix items, 8 nits") is **not** sufficient — the user needs to see what each concern actually *is*, with enough detail to push back if the reviewer is wrong. For `must-fix` and `should-fix`, post the full text; for `nit`s, a compact one-line-per-nit list is fine. The user can override any concern before the main agent acts on it (e.g. "ignore concern 4, the reviewer is wrong about X").
+5. **Main agent incorporates the feedback** (with any user overrides from step 4), revises the plan in place, and **continues the same reviewer subagent** (via `SendMessage`) for the next pass — context stays cached (faster) and the reviewer's judgment stays consistent from pass to pass (more stable than spawning a fresh reviewer each iteration, which restarts calibration). **Prerequisite:** `SendMessage` is part of Claude Code's experimental Agent Teams and requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the env block of `.claude/settings.json`. Already set in this project; if a future session reports that `SendMessage` is unavailable, that's the first thing to check.
+6. **Loop continues** until the reviewer returns "no further substantive issues."
+7. **User approves the converged plan.**
+8. **Execute** (steps 5–10 of the per-feature loop above: tests → test-suite review → implement → final review → benchmark).
 
 **Loop convergence is the reviewer's call, not the main agent's.** The main agent does not declare a plan done.
 
@@ -63,7 +66,7 @@ The user, who does not read code, gets to review the plan as the primary archite
 
 ## Test-suite review loop
 
-After tests are written for the unit (step 6 of the per-feature loop) and **before** any implementation begins, the test suite goes through its own blind-review loop. Same mechanics as the plan-review loop above (fresh subagent, blind to main-conversation context, `SendMessage` continuation, reviewer-determined convergence).
+After tests are written for the unit (step 6 of the per-feature loop) and **before** any implementation begins, the test suite goes through its own blind-review loop. Same mechanics as the plan-review loop above (fresh subagent, blind to main-conversation context, `SendMessage` continuation, **chat-surfacing of every reviewer concern at each pass**, reviewer-determined convergence).
 
 The reviewer reads the test files plus enough project context to evaluate whether the tests adequately exercise the contract — the plan, the relevant ADRs, the spec being tested (e.g. `docs/reference/rules/` for chess rule semantics, `docs/reference/pgn-spec-1994.txt` for FEN/PGN, the UCI spec for protocol).
 
@@ -78,7 +81,7 @@ Tests pass review **before** any implementation work begins. Implementation writ
 
 ## Final review loop
 
-After implementation is complete and **all tests pass** (step 9 of the per-feature loop), the entire task scope (code + tests jointly) goes through a final blind-review loop. Same mechanics as the others.
+After implementation is complete and **all tests pass** (step 9 of the per-feature loop), the entire task scope (code + tests jointly) goes through a final blind-review loop. Same mechanics as the others (fresh subagent, blind to main-conversation context, `SendMessage` continuation, **chat-surfacing of every reviewer concern at each pass**, reviewer-determined convergence).
 
 The reviewer reads the new/modified code, the tests, the plan that authorized the work, and any project context relevant to the unit.
 
