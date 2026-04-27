@@ -485,6 +485,52 @@ impl Position {
             1 => {}
             _ => return Err(FenError::TooManyKings(Color::Black)),
         }
+
+        // M1.F §13: castling-rights ↔ mailbox consistency. For each set bit,
+        // verify the implied king and rook are present on their starting
+        // squares with the correct color. Mailbox check (not just bitboards)
+        // is load-bearing: a bitboard-only check would accept a black rook on
+        // h1 when `K` is set, masking a real bug in callers that trust the
+        // post-parse FEN. This is parser-boundary validation — full release
+        // build, not debug-only (per workflow.md).
+        const WHITE_KING_PIECE: Piece = Piece::new(Color::White, PieceKind::King);
+        const WHITE_ROOK_PIECE: Piece = Piece::new(Color::White, PieceKind::Rook);
+        const BLACK_KING_PIECE: Piece = Piece::new(Color::Black, PieceKind::King);
+        const BLACK_ROOK_PIECE: Piece = Piece::new(Color::Black, PieceKind::Rook);
+
+        if self.castling.has(CastlingRights::WHITE_KING)
+            && (self.piece_at(Square::E1) != Some(WHITE_KING_PIECE)
+                || self.piece_at(Square::H1) != Some(WHITE_ROOK_PIECE))
+        {
+            return Err(FenError::InconsistentCastlingRights {
+                right: CastlingRights::WHITE_KING,
+            });
+        }
+        if self.castling.has(CastlingRights::WHITE_QUEEN)
+            && (self.piece_at(Square::E1) != Some(WHITE_KING_PIECE)
+                || self.piece_at(Square::A1) != Some(WHITE_ROOK_PIECE))
+        {
+            return Err(FenError::InconsistentCastlingRights {
+                right: CastlingRights::WHITE_QUEEN,
+            });
+        }
+        if self.castling.has(CastlingRights::BLACK_KING)
+            && (self.piece_at(Square::E8) != Some(BLACK_KING_PIECE)
+                || self.piece_at(Square::H8) != Some(BLACK_ROOK_PIECE))
+        {
+            return Err(FenError::InconsistentCastlingRights {
+                right: CastlingRights::BLACK_KING,
+            });
+        }
+        if self.castling.has(CastlingRights::BLACK_QUEEN)
+            && (self.piece_at(Square::E8) != Some(BLACK_KING_PIECE)
+                || self.piece_at(Square::A8) != Some(BLACK_ROOK_PIECE))
+        {
+            return Err(FenError::InconsistentCastlingRights {
+                right: CastlingRights::BLACK_QUEEN,
+            });
+        }
+
         Ok(())
     }
 

@@ -20,7 +20,9 @@ use crate::square::Square;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FenError {
-    WrongFieldCount { found: usize },
+    WrongFieldCount {
+        found: usize,
+    },
     BadPiecePlacement(String),
     BadActiveColor(String),
     BadCastlingRights(String),
@@ -30,6 +32,14 @@ pub enum FenError {
     MissingKing(Color),
     TooManyKings(Color),
     PawnOnBackRank(Square),
+    /// A castling-rights letter is set, but the implied king/rook positions
+    /// are absent or wrong-colored. M1.F §13 of `docs/plans/m1.f.md`:
+    /// e.g. `K` set but no white rook on h1, or king not on e1. The
+    /// `right` value is the *single* offending right (one variant per
+    /// failure: `WHITE_KING`, `WHITE_QUEEN`, `BLACK_KING`, `BLACK_QUEEN`).
+    InconsistentCastlingRights {
+        right: CastlingRights,
+    },
 }
 
 impl fmt::Display for FenError {
@@ -47,6 +57,9 @@ impl fmt::Display for FenError {
             FenError::MissingKing(color) => write!(f, "missing {color:?} king"),
             FenError::TooManyKings(color) => write!(f, "too many {color:?} kings"),
             FenError::PawnOnBackRank(sq) => write!(f, "pawn on back rank at {sq}"),
+            FenError::InconsistentCastlingRights { right } => {
+                write!(f, "inconsistent castling rights: {right}")
+            }
         }
     }
 }
@@ -799,6 +812,121 @@ mod tests {
         assert!(matches!(r, Err(FenError::PawnOnBackRank(sq)) if sq == Square::A8));
     }
 
+    // ---------------------------------------------------------------------
+    // M1.F §13: castling-rights ↔ mailbox consistency.
+    //
+    // Tests in this block assert FEN parser rejection of FENs whose
+    // castling-rights letters do not match the implied king/rook positions
+    // on the relevant starting squares. Implementation lives inside
+    // `validate_post_parse` and is wired up in the M1.F impl pass — these
+    // tests are red until the impl lands.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn castling_k_without_white_king_on_e1() {
+        // `K` set but white king is on d1, not e1. Black king on e8 (so
+        // king-count check passes); white rook is on h1 (so the rook-side
+        // half of the consistency check passes); the only failure path is
+        // the white-king-on-e1 mailbox check.
+        let r = Position::from_fen("4k3/8/8/8/8/8/8/3K3R w K - 0 1");
+        assert!(
+            matches!(
+                r,
+                Err(FenError::InconsistentCastlingRights {
+                    right: CastlingRights::WHITE_KING
+                })
+            ),
+            "expected InconsistentCastlingRights{{WHITE_KING}}, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn castling_k_without_white_rook_on_h1() {
+        // `K` set, white king on e1, but no white rook on h1.
+        let r = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w K - 0 1");
+        assert!(
+            matches!(
+                r,
+                Err(FenError::InconsistentCastlingRights {
+                    right: CastlingRights::WHITE_KING
+                })
+            ),
+            "expected InconsistentCastlingRights{{WHITE_KING}}, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn castling_k_with_black_rook_on_h1() {
+        // `K` set; white king on e1; a black (wrong-colored) rook on h1.
+        // The mailbox check (not just bitboards) distinguishes color.
+        let r = Position::from_fen("4k3/8/8/8/8/8/8/4K2r w K - 0 1");
+        assert!(
+            matches!(
+                r,
+                Err(FenError::InconsistentCastlingRights {
+                    right: CastlingRights::WHITE_KING
+                })
+            ),
+            "expected InconsistentCastlingRights{{WHITE_KING}}, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn castling_q_without_white_rook_on_a1() {
+        // `Q` set, white king on e1, no white rook on a1. (No `K` set, so
+        // the kingside half of the validation is skipped — only `Q` fires.)
+        let r = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w Q - 0 1");
+        assert!(
+            matches!(
+                r,
+                Err(FenError::InconsistentCastlingRights {
+                    right: CastlingRights::WHITE_QUEEN
+                })
+            ),
+            "expected InconsistentCastlingRights{{WHITE_QUEEN}}, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn castling_k_without_black_king_on_e8() {
+        // `k` set, but black king on d8 (not e8). White king on e1 to satisfy
+        // king-count; black rook on h8 so only the king-square check fires.
+        let r = Position::from_fen("3k3r/8/8/8/8/8/8/4K3 b k - 0 1");
+        assert!(
+            matches!(
+                r,
+                Err(FenError::InconsistentCastlingRights {
+                    right: CastlingRights::BLACK_KING
+                })
+            ),
+            "expected InconsistentCastlingRights{{BLACK_KING}}, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn castling_q_without_black_rook_on_a8() {
+        // `q` set, black king on e8, no black rook on a8.
+        let r = Position::from_fen("4k3/8/8/8/8/8/8/4K3 b q - 0 1");
+        assert!(
+            matches!(
+                r,
+                Err(FenError::InconsistentCastlingRights {
+                    right: CastlingRights::BLACK_QUEEN
+                })
+            ),
+            "expected InconsistentCastlingRights{{BLACK_QUEEN}}, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn castling_kqkq_full_consistency_passes() {
+        // Standard starting position: `KQkq` set, all four implied pieces
+        // on their starting squares. Must parse cleanly.
+        let p = Position::from_fen(Position::STARTING_FEN)
+            .expect("standard starting position must satisfy castling-mailbox consistency");
+        assert_eq!(p.castling_rights(), CastlingRights::ALL);
+    }
+
     #[test]
     fn parse_rejects_halfmove_above_u8_max() {
         // 256 overflows u8.
@@ -1021,7 +1149,13 @@ mod tests {
         ///   on rank 1 or 8 are silently skipped. The remaining entries
         ///   guarantee placement validity (no overwrites, no back-rank pawns).
         /// - Side to move from `{White, Black}`.
-        /// - Castling: every 4-bit subset of the four named flags.
+        /// - Castling: every 4-bit subset of the four named flags, **masked
+        ///   down** post-placement so that each retained bit's implied king
+        ///   and rook are present on their starting squares (M1.F §13).
+        ///   Bits whose implied pieces are absent are silently cleared rather
+        ///   than rejecting the case via `prop_filter` (which would shrink
+        ///   coverage hard, since fewer than 1 in 1000 random placements have
+        ///   pieces on a1/e1/h1/a8/e8/h8).
         /// - EP target: None, or a square on rank 3 or rank 6.
         /// - Halfmove: any `u8`.
         /// - Fullmove: any non-zero `u16` (parser rejects 0).
@@ -1033,8 +1167,9 @@ mod tests {
         /// strategy deliberately does **not** exercise the parser's rejection
         /// paths (WrongFieldCount, BadPiecePlacement, MissingKing,
         /// TooManyKings, PawnOnBackRank, BadActiveColor, BadCastlingRights,
-        /// BadEnPassant, BadHalfmoveClock, BadFullmoveNumber); those remain
-        /// covered by the targeted unit tests above.
+        /// BadEnPassant, BadHalfmoveClock, BadFullmoveNumber,
+        /// InconsistentCastlingRights); those remain covered by the
+        /// targeted unit tests above.
         #[test]
         fn prop_fen_round_trip(
             (wk_idx, bk_idx) in (0u8..64, 0u8..64).prop_filter(
@@ -1079,9 +1214,31 @@ mod tests {
                 p.set_piece(sq, piece);
             }
 
+            // Mask castling_mask down to only those bits whose implied
+            // king/rook pieces are present after placement (FENVAL §13).
+            // The parser would otherwise reject the formatted FEN with
+            // InconsistentCastlingRights.
+            let wk = Some(Piece::new(Color::White, PieceKind::King));
+            let wr = Some(Piece::new(Color::White, PieceKind::Rook));
+            let bk_piece = Some(Piece::new(Color::Black, PieceKind::King));
+            let br = Some(Piece::new(Color::Black, PieceKind::Rook));
+            let mut effective_mask = castling_mask;
+            if !(p.piece_at(Square::E1) == wk && p.piece_at(Square::H1) == wr) {
+                effective_mask &= !0b0001;
+            }
+            if !(p.piece_at(Square::E1) == wk && p.piece_at(Square::A1) == wr) {
+                effective_mask &= !0b0010;
+            }
+            if !(p.piece_at(Square::E8) == bk_piece && p.piece_at(Square::H8) == br) {
+                effective_mask &= !0b0100;
+            }
+            if !(p.piece_at(Square::E8) == bk_piece && p.piece_at(Square::A8) == br) {
+                effective_mask &= !0b1000;
+            }
+
             p.set_aux_state(
                 side,
-                rights_from_mask(castling_mask),
+                rights_from_mask(effective_mask),
                 ep,
                 halfmove,
                 fullmove,

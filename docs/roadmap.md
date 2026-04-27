@@ -4,7 +4,42 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1.E complete; M1.F next.**
+**M1.F complete; M1.G next.**
+
+### M1.F — what landed
+
+The `movegen` module — the engine's legal-move-enumeration surface:
+
+- **`MoveList`** — stack-allocated `[MaybeUninit<Move>; 256]` + `len: u16`. `push` and `clear` are `pub(crate)` so the soundness contract stays inside the crate; `as_slice` exposes `&[Move]` via a single justified `unsafe` block.
+- **`generate_moves(pos, &mut MoveList)`** — legal-direct emission, mask-based, with check-evasion specialization (single check → king + capture-the-checker + block; double check → king-only).
+- **`in_check(pos)`** — public side-to-move checker.
+- **Per-call `MaskInfo`** — `checkers`, `pinned`, `capture_mask`, `push_mask`, `king_danger` (computed against `occupancy ^ king_bb` per the king-flee gotcha), `pin_rays[64]`. No cache on `Position`.
+- **EP horizontal-pin filter** AND symmetric **diagonal discovery filter** at emission time (covers Position-3 trap and the diagonal counterpart).
+- **Castling** — only when not in check; transit + destination squares not in `king_danger`. Mailbox `debug_assert!` on king/rook starting squares (release-trusted; the FEN parser validates at the boundary).
+- **`validate_post_parse` extended** — rejects FENs whose castling rights don't match the king/rook mailbox; new `FenError::InconsistentCastlingRights`.
+
+### M1.F — implementation highlights
+
+- **Const-fn pre-computed leaf attack tables** (`PAWN_ATTACKS`, `KNIGHT_ATTACKS`, `KING_ATTACKS`) — built at compile time; no `LazyLock` overhead on the hot path.
+- **Defensive-checks-debug-only convention** added to `docs/workflow.md` "Final review loop" → Code quality. Codified by the castling §13 invariant: validation at FEN parse, `debug_assert!` at consumers, release trusts.
+- **`prop_no_legal_move_leaves_us_in_check`** — proptest with deterministic SplitMix64 random walk over §6 edge fixtures + canonical 6 seeds. Pins the legal-direct invariant against any future regression.
+- **EP-double-check `count == 2` assertion** — in-crate test using crate-private `checkers_of` to verify §6.3 taxonomy.
+
+### M1.F — verification
+
+| Metric | Result |
+|---|---|
+| Tests | **401 passing** (372 lib + 12 movegen integration + 9 zobrist-vector + 3 fen + 2 magic + 3 make_unmake) |
+| `cargo build --release` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test --release --test movegen -- --ignored` (smoke throughput) | starting 68 ns/call, Kiwipete 114, Pos-3 37, Pos-4 43, Pos-5 129, Pos-6 99 — all 50× under the 5 µs/call threshold |
+| Plan, test-suite, final review loops | converged after 3 / 3 / 2 rounds |
+
+Plan archived at `docs/plans/m1.f.md`. ADR-0007 codifies legal-direct + mask-based + check-evasion specialization.
+
+### M1.E — prior milestone
+
+## Prior status
 
 ### M1.E — what landed
 
@@ -39,9 +74,7 @@ All three review loops (plan, test-suite, final) converged. Plan archived at `do
 
 ### What's next
 
-**M1.F — legal move generation.** Per-piece-type generation, pin computation, check-evasion specialization, legal-direct emission. ADR-0007 binds here.
-
-## Prior status
+**M1.G — perft + benchmarks.** Recursive perft driver with bulk-counting at depth 1, canonical-6 fixtures via Stockfish, EPD-corpus regression (Whittington `perft.epd`, Stockfish-generated counts), `criterion` benchmark harness with baseline saving.
 
 ### M1.D ✓ — Polyglot Zobrist hashing
 
@@ -92,10 +125,10 @@ Bitboards, all rules of standard chess, no search, no eval. Validated against pe
 | **M1.C** ✓ — Sliding-piece attacks | Slow ray-walker as permanent `slow_attacks` oracle module, `src/bin/magicgen.rs` (search + validation + codegen), generated magic constants source file, fancy-magic attack lookups, differential tests over all ~108k (square, occupancy) pairs | ~800–1200 lines (actual: ~1934 lines including ~145-line generated constants file and ~68-line ADR; 50 new unit + 2 integration tests) |
 | **M1.D** ✓ — Zobrist | Polyglot 781-key table vendored from in-tree spec, EP-only-when-pseudo-legal hashing rule, side-to-move asymmetric turn key, `Position::zobrist` field + `refresh_zobrist()` setter; 9 published test vectors as gold-standard interop check. M1.E will add the incremental hash update + debug round-trip assert in make/unmake. | ~250–350 lines (actual: ~787 lines including 121-line vendored data file and ~120-line ADR; 30 unit + 5 property + 3 position + 9 integration tests) |
 | **M1.E** ✓ — Make/unmake | `Move` (16-bit), `MoveFlag` (14 valid), `Undo` (~16 B), free functions `make_move`/`unmake_move` per ADR-0004, all special cases (castling, EP, all 8 promotion variants, double-push), incremental Zobrist with debug round-trip assert + release-build perf sentinel, round-trip property tests, ergonomic `Position::make_move`/`Position::unmake_move` delegates | ~600–900 lines (actual: ~2050 lines including ~700-line plan; 65 new tests) |
-| **M1.F** — Legal move generation | Per-piece-type generation, pin computation, check-evasion specialization (single check → king/capture/block; double check → king only), legal-direct emission. Most likely candidate for further sub-splitting once we reach it | ~1500–2000 lines |
+| **M1.F** ✓ — Legal move generation | `movegen` module with `MoveList` + `generate_moves` + `in_check`; per-call `MaskInfo` (checkers, pinned, capture/push masks, king_danger, pin_rays); per-piece emit fns; EP horizontal-pin + symmetric diagonal-pin filters; castling with mailbox `debug_assert!`s; `validate_post_parse` extended for castling consistency; defensive-checks-debug-only convention codified | ~1500–2000 lines (actual: ~3700 lines including ~700-line plan, ~110-line ADR; 91 new tests) |
 | **M1.G** — Perft + benchmarks | Recursive perft with bulk-counting at depth 1, canonical 6 fixtures generated via Stockfish, EPD-corpus regression tests (Whittington `perft.epd` positions, Stockfish-generated counts), `criterion` benchmarks with baseline saving | ~500–800 lines |
 
-Phases A→E are foundational and largely sequential. F is the heart of M1 and the most likely to be further sub-divided. G is the validation layer.
+Phases A→F are foundational and largely sequential. G is the validation layer.
 
 ### M2 — Random-mover engine speaking UCI
 Plays legal random moves through Cute Chess. No search depth. Establishes the UCI skeleton, time-management harness, and tournament tooling before any search complexity.

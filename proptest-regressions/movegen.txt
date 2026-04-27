@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 901908cf432cd90a6255bb0ca054ba9185b014684424c3122120dafc2a143c5f # shrinks to pos = 8 r n b q k b n r 7 p p p p p p p p 6 . . . . . . . . 5 . . . . . . . . 4 . . . . . . . . 3 . . . . . . . . 2 P P P P P P P P 1 R N B Q K B N R   a b c d e f g h White to move, halfmove=0, fullmove=1, castling=KQkq, ep=- 

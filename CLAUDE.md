@@ -6,44 +6,43 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M1.E complete; M1.F next.** Architectural commitments settled (see `docs/decisions/`).
+**Phase: M1.F complete; M1.G next.** Architectural commitments settled (see `docs/decisions/`).
 
-### What M1.E landed
+### What M1.F landed
 
-The `mov` module — the engine's first mutating layer:
+The `movegen` module — the engine's legal-move enumeration surface:
 
-- **`Move`** — 16-bit packed encoding: bits 0–5 from-square, bits 6–11 to-square, bits 12–15 flag nibble.
-- **`MoveFlag`** — 14 valid codes (codes 6 and 7 deliberately absent; no public path constructs them).
-- **`Undo`** (~16 B) — carries captured piece, prior castling/EP/halfmove, and prior zobrist.
-- **`make_move(&mut Position, Move) -> Undo`** and **`unmake_move(&mut Position, Move, Undo)`** — free functions per ADR-0004; ergonomic `Position::make_move`/`Position::unmake_move` method delegates also present.
-
-All special cases handled: quiet, double-push, capture, en passant, kingside/queenside castle, four `*Promo` and four `*PromoCapture` flags.
+- **`MoveList`** — 256-slot stack-allocated `[MaybeUninit<Move>; 256]` + `len: u16`. `push`/`clear` are `pub(crate)`; `as_slice` exposes `&[Move]` via one justified `unsafe` block. The 218-move legal ceiling makes over-push unreachable in practice.
+- **`generate_moves(&Position, &mut MoveList)`** — legal-direct emission, mask-based, with check-evasion specialization (no check / single check → king + capture-the-checker + block / double check → king-only).
+- **`in_check(&Position) -> bool`** — public helper; thin wrapper around `checkers_of`.
+- **Per-call `MaskInfo`** — `checkers`, `pinned`, `capture_mask`, `push_mask`, `king_danger` (computed against `occupancy ^ king_bb` per the king-flee gotcha), `pin_rays[64]`. Recomputed each `generate_moves` call; not cached on `Position`.
+- **EP horizontal-pin filter** AND symmetric **diagonal-discovery filter** — both at emission time. The symmetric diagonal case is needed because the standard pin filter doesn't catch it (the capturing pawn isn't on the king-pinner diagonal).
+- **Castling** — gated on no-check + transit/destination not in `king_danger`. Mailbox `debug_assert!` on king/rook starting squares (release-trusted).
+- **`validate_post_parse` extended** — rejects FENs whose castling rights don't match the king/rook mailbox; new `FenError::InconsistentCastlingRights`.
+- **Defensive-checks-debug-only convention** — added to `docs/workflow.md` "Final review loop" → Code quality. Validation goes at the boundary that creates the invariant; consumers `debug_assert!`; release trusts.
 
 ### Implementation highlights
 
-- **Castling-rights update** via a 64-entry `CASTLING_MASK` table indexed by from/to. Handles the rook-captured-on-corner edge case (the Kiwipete depth-4 perft trap).
-- **Incremental Zobrist update** with a debug-build round-trip assert against `from_scratch`.
-- **Always-on release-build perf sentinel** (`make_move_no_from_scratch_in_release`) at 100 ns/cycle threshold — guards against accidental from-scratch reintroduction on the hot path.
-- **`Position` extensions:** `clear_square`, `refresh_zobrist_from`, ergonomic method delegates, `BitAnd` impl on `CastlingRights`.
+- **`const fn` pre-computed leaf attack tables** (`PAWN_ATTACKS`, `KNIGHT_ATTACKS`, `KING_ATTACKS`) — built at compile time; no `LazyLock` per-call atomic on the hot path.
+- **`prop_no_legal_move_leaves_us_in_check`** — proptest with deterministic SplitMix64 random walk over §6 edge fixtures + canonical 6 seeds. Pins the legal-direct invariant.
+- **In-crate `count == 2` assertion** for the EP-double-check fixture (uses crate-private `checkers_of`) — pins §6.3 taxonomy point.
 
 ### Verification (Apple Silicon, dev machine)
 
 | Metric | Result |
 |---|---|
-| Tests | **303 passing** + 3 ignored benches (286 lib + 3 fen + 2 magic + 3 make/unmake integration + 9 zobrist-vector) |
+| Tests | **401 passing** + 4 ignored benches (372 lib + 12 movegen integration + 9 zobrist-vector + 3 fen + 2 magic + 3 make_unmake) |
 | `cargo clippy --all-targets -- -D warnings` | clean |
 | `cargo build --release` | clean |
-| `cargo llvm-cov` on `mov.rs` | 95.65% region / 94.71% line (gaps are const-fn evaluated at compile time + provably-unreachable `unreachable!()` arms + debug_assert formatters) |
-| `cargo mutants --in-diff` | **0 survivors** on 123 mutants (107 caught, 16 unviable) — full-suite per-milestone backstop |
-| Throughput (release, ns/cycle) | quiet 27, capture 38, EP 36, castle 42, promo 22 — all under the <50 ns/cycle target |
+| Smoke throughput (release, ns/call) | starting 68, Kiwipete 114, Pos-3 37, Pos-4 43, Pos-5 129, Pos-6 99 — all 50× under the 5 µs/call regression-tripwire threshold |
 
 ### Process
 
-All three review loops (plan, test-suite, final) converged. Plan archived at `docs/plans/m1.e.md`.
+All three review loops (plan, test-suite, final) converged after 3 / 3 / 2 rounds. Plan archived at `docs/plans/m1.f.md`. ADR-0007 codifies the binding architectural choices.
 
 ### What's next
 
-**M1.F — legal move generation.** Per-piece-type generation, pin computation, check-evasion specialization (single-check → king/capture/block; double-check → king only), legal-direct emission. ADR-0007 (legal-direct movegen) binds here. M1 prior-art research is in `docs/research/`, synthesized into `docs/prior-art.md`.
+**M1.G — perft + benchmarks.** Recursive perft driver with bulk-counting at depth 1, Stockfish-generated fixtures on the canonical 6 to depth 6/7, EPD-corpus regression (Whittington `perft.epd`), `criterion` benchmark harness with baseline saving. Target ≥100 Mnps single-threaded perft on Apple Silicon (≥200 Mnps would be excellent).
 
 ## How to pick up a new session
 

@@ -90,4 +90,62 @@ exclude_re = [
     # magic.)
     "replace != with == in build_rook_table",
     "replace != with == in build_bishop_table",
+
+    # ---- masks: opponent rook+queen / bishop+queen unions ------------
+    #
+    # `pos.pieces_colored(c, Rook) | pos.pieces_colored(c, Queen)` ORs two
+    # bitboards that share zero bits (a square holds a rook OR a queen,
+    # not both). Same for bishop+queen. Disjoint by construction → `|` ≡
+    # `^` for every input. Same applies to the assemble of pawn-attack
+    # shifts inside `compute_attacked_squares` (NW and NE shifts are
+    # never the same square because they differ in file by 2).
+    "replace \\| with \\^ in checkers_of",
+    "replace \\| with \\^ in compute_attacked_squares",
+    "replace \\| with \\^ in MaskInfo::compute",
+    "replace \\| with \\^ in emit_pawn_moves",
+
+    # ---- masks::is_slider_at — equivalent on knight/pawn checker -----
+    #
+    # `is_slider_at` is consumed only inside MaskInfo::compute's
+    # single-checker branch to pick `push_mask = between_bb(king,
+    # checker)` vs `EMPTY`. For knight or pawn checkers (the only
+    # non-slider checkers), the checker is never on a rank/file/diagonal
+    # ray from the king at >1 distance — knight checks are L-jumps;
+    # pawn checks are diagonally adjacent. In both cases `between_bb`
+    # returns EMPTY regardless of `is_slider_at`, so mutating the fn to
+    # always return `true` doesn't affect the resulting mask. Equivalent.
+    "replace is_slider_at -> bool with true",
+
+    # ---- knight/king attack-table builders: `+` ↔ `-` on symmetric deltas ----
+    #
+    # `build_knight_attacks` and `build_king_attacks` both iterate over a
+    # deltas array that is closed under negation (knight: {(±2,±1),(±1,±2)};
+    # king: {(±1,0),(0,±1),(±1,±1)}). Mutating `file + df` → `file - df` (or
+    # the rank counterpart) only swaps which delta produces which target;
+    # the SET of (target_file, target_rank) pairs is invariant under
+    # negation of df (or dr). The resulting attack table is byte-identical,
+    # and no test can distinguish. (Pawn-attack table is NOT in this class:
+    # its offsets are constant per direction, not drawn from a closed-under-
+    # negation set.)
+    "replace \\+ with - in build_knight_attacks",
+    "replace \\+ with - in build_king_attacks",
+
+    # ---- emit_*_moves: `capture_mask | push_mask` is disjoint -----
+    #
+    # The single-check / no-check / double-check formulas guarantee
+    # `capture_mask` and `push_mask` are always disjoint:
+    #   - no check:    capture = enemy_occupied, push = empty_squares (∅ overlap)
+    #   - single check: capture = {checker_sq}, push = between_bb(king, checker)
+    #     (between excludes endpoints, so checker_sq ∉ between)
+    #   - double check: both EMPTY
+    # So `mask | mask` ≡ `mask ^ mask` for every emit. Equivalent.
+    "replace \\| with \\^ in emit_knight_moves",
+    "replace \\| with \\^ in emit_slider_moves",
+
+    # ---- pawn.rs: 2 * push_dr equivalent under push_dr ∈ {-1, +1} ----
+    #
+    # `(from_rank as i8 + 2 * push_dr) as u8` is the double-push target
+    # rank. push_dr is hardcoded to ±1. For x ∈ {-1, +1}: 2 * x == 2 / x
+    # (both yield ±2). Equivalent for the only inputs that ever appear.
+    "replace \\* with / in emit_pawn_moves",
 ]

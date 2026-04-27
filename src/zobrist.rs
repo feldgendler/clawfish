@@ -521,17 +521,27 @@ mod tests {
 
     #[test]
     fn from_scratch_castling_xor_decomposes() {
-        // Two kings + all four castling rights, no EP, white to move.
-        // Pins the per-right XOR composition path inside from_scratch.
-        // A "skipped XOR for one of the four rights" bug breaks this
-        // test directly (instead of leaving diagnostics to ~6 of the 9
-        // integration vectors failing simultaneously).
-        let pos =
-            Position::from_fen("4k3/8/8/8/8/8/8/4K3 w KQkq - 0 1").expect("test FEN must parse");
+        // Two kings + all four rooks on starting squares + all four castling
+        // rights, no EP, white to move. Pins the per-right XOR composition
+        // path inside from_scratch. A "skipped XOR for one of the four rights"
+        // bug breaks this test directly (instead of leaving diagnostics to
+        // ~6 of the 9 integration vectors failing simultaneously).
+        //
+        // Rooks on a1/h1/a8/h8 are required by the FENVAL §13 castling-mailbox
+        // check; the test FEN previously omitted them, which the M1.F
+        // validation now rejects.
+        let pos = Position::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
+            .expect("test FEN must parse");
         let wk = Piece::new(Color::White, PieceKind::King);
         let bk = Piece::new(Color::Black, PieceKind::King);
+        let wr = Piece::new(Color::White, PieceKind::Rook);
+        let br = Piece::new(Color::Black, PieceKind::Rook);
         let expected = piece_key(wk, Square::E1)
             ^ piece_key(bk, Square::E8)
+            ^ piece_key(wr, Square::A1)
+            ^ piece_key(wr, Square::H1)
+            ^ piece_key(br, Square::A8)
+            ^ piece_key(br, Square::H8)
             ^ castling_key(CastlingRights::WHITE_KING)
             ^ castling_key(CastlingRights::WHITE_QUEEN)
             ^ castling_key(CastlingRights::BLACK_KING)
