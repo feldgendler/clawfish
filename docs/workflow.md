@@ -258,7 +258,7 @@ Subagents inherit the orchestrator's model unless their definition specifies oth
 | Role | Agent file | Model | Why this tier |
 |---|---|---|---|
 | Main orchestrator | (no file — inherited) | Opus | Holds full conversation context; coordinates all subagents. |
-| Plan reviewer | `plan-reviewer.md` | Sonnet | Highest cascade-failure surface, but the dimensions are written-artifact pattern-matching against project docs. Cheapest reasonable drop. |
+| Plan reviewer | `plan-reviewer.md` | Opus | Originally tiered to Sonnet; M2.C calibration found Sonnet missed two must-fix items Opus caught (Box<dyn Search> non-movability into `thread::spawn`; reader EOF / channel-disconnect dead code). Reverted to Opus per the stop-loss. |
 | Test-suite reviewer | `test-suite-reviewer.md` | Sonnet | Drops cleanly on confirmation-bias and corner-case dimensions. Haiku too risky on "would this pass against a stub?" reasoning. |
 | Final reviewer | `final-reviewer.md` | Opus | Last gate before commit; absorbs cascade from cheaper plan/test reviewers. Cheap insurance — typically converges in 1 pass. |
 | Research subagent | `chess-researcher.md` | Sonnet | Cross-source synthesis still needs reasoning. Output is reviewed downstream by the user reading chat and by the plan reviewer. |
@@ -267,12 +267,16 @@ Subagents inherit the orchestrator's model unless their definition specifies oth
 
 ### Calibration
 
-The first time this assignment runs on a substantive phase (M2.C is the natural first candidate), spawn the plan reviewer **in parallel on both Sonnet and Opus** for the v1 plan. Compare critiques:
+The first time this assignment runs on a substantive phase, spawn the plan reviewer **in parallel on both Sonnet and Opus** for the v1 plan. Compare critiques:
 
 - If Sonnet flagged everything Opus did (modulo wording), the drop is confirmed empirically.
 - If Sonnet missed something material, you've found the cost-quality boundary; revisit that tier (Opus for plan-review, retry Sonnet for the others).
 
 The calibration pass is one-time per role. Re-run if the workflow changes shape (e.g. new ADR-rich phase, new spec being interpreted) or if the stop-loss fires.
+
+**Calibration log:**
+
+- **2026-04-27 — plan-reviewer (M2.C v1 plan).** Sonnet + Opus reviewed in parallel. Sonnet returned 3 must-fix / 6 should-fix; Opus returned 4 must-fix / 8 should-fix. Two of Opus's must-fix items were absent from Sonnet's critique: (a) `Box<dyn Search>` is not `Clone` and cannot be moved into `thread::spawn`, which would have stalled Coder-B at impl time; (b) reader-loop EOF synthesis vs. orchestrator channel-disconnect handling created an unreachable defensive branch (mutation-test survivor). Outcome: plan-reviewer reverted from Sonnet to Opus.
 
 ### Stop-loss
 

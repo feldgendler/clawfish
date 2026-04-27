@@ -44,6 +44,16 @@ The `engine` and `search` modules — the UCI I/O loop, command dispatch, and `S
 
 All three review loops converged. Plan archived at `docs/plans/m2.c.md`. ADR-0011 codifies the threading model.
 
+### M2.C — workflow notes (stop-loss trigger on plan-reviewer tier)
+
+Per `docs/workflow.md` "Stop-loss" runbook — recording the trigger so the rollback isn't silently forgotten:
+
+- **Trigger.** Sonnet plan-reviewer (the originally-tiered model) missed two must-fix items on the M2.C v1 plan that Opus plan-reviewer caught when run in parallel during the calibration pass. Both fall squarely in the "correctness" dimension that plan-review is supposed to cover:
+  - `Box<dyn Search>` is not `Clone` and cannot be moved into `thread::spawn`, so the orchestrator's `handle_go` could not have spawned a per-`go` worker as planned. Would have stalled Coder-B at implementation time.
+  - The reader-loop's "EOF synthesizes `Quit`" rule made the orchestrator's "channel-disconnect" defensive branch unreachable — a latent dead-code path and mutation-test survivor.
+- **Action taken.** Reverted plan-reviewer from Sonnet to Opus (`.claude/agents/plan-reviewer.md`, table row in `docs/workflow.md`, calibration-log entry in `docs/workflow.md`). Sonnet for test-suite-reviewer / coder / research stays — those tiers haven't fired the stop-loss.
+- **Re-eval condition.** If a future milestone presents a substantively different artifact shape (e.g. simpler plans, novel domain), re-run the calibration pass before re-attempting Sonnet for plan-review.
+
 ### M2.B — what landed
 
 The `uci` module — pure-function parser for UCI 2006 GUI→engine commands:
