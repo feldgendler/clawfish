@@ -9,24 +9,35 @@ Every feature or major component follows the same cycle:
 1. **Deep prior-art research.** Web search, not training-data recall. Chess Programming Wiki, papers, blog posts, TalkChess threads, articles with illustrative snippets. **Not** engine source code (see restriction below). Devil is in the details. Delegate to a research subagent when it spans more than a few queries.
 2. **Explain findings in chat.** Tradeoffs, alternatives, gotchas. Pre-implementation, before any code.
 3. **Discuss and converge.** User pushes back, asks for alternatives, picks an approach.
-4. **Plan mode with self-review loop.** Every implementable unit goes through plan mode before any code is written. The plan is then critiqued and revised in a loop until convergent. See "Plan mode and self-review" below for the loop's structure.
-5. **Write tests first** where the layer admits it (see TDD scope below).
-6. **Implement.**
-7. **Benchmark and profile.** Record results. Compare to previous baseline.
+4. **Plan with plan-review loop.** Every implementable unit gets a written plan. The plan must identify **parallelization opportunities** — which subtasks can run on parallel coding agents. The plan goes through a blind-review loop until convergent. See "Plan mode and plan-review loop" below.
+5. **Write tests** for the entire task scope, where the layer admits TDD (see TDD scope below). Parallelizable across coding agents per the plan.
+6. **Test-suite review loop.** Independent reviewer checks the test suite for correctness to spec, confirmation bias, adequate checks, corner case coverage. See "Test-suite review loop" below. Implementation does not begin until tests pass review.
+7. **Implement.** Parallelizable across coding agents per the plan.
+8. **All tests pass.** No final review or commit until they do.
+9. **Final review loop on code + tests jointly.** Independent reviewer checks correctness, corner cases, code quality, readability, simplicity, performance considerations. See "Final review loop" below.
+10. **Benchmark and profile.** Record results. Compare to previous baseline.
 
-Skipping research-and-discussion strips the user of his only review channel. Skipping plan mode strips the user of his only architectural review channel. When uncertain, propose before implementing.
+Skipping research/discussion or any review loop strips the user of his only architectural review channels. The user does not read code; chat, reviewed plans, reviewed tests, and reviewed final artifacts are how he understands what's being built. When uncertain, propose before implementing.
 
-## Plan mode and self-review
+## Plan mode and plan-review loop
 
-**Every implementable unit goes through plan mode.** No code is written until a plan exists, has survived the blind-review loop, and has user approval.
+**Every implementable unit goes through plan mode.** No code is written until a plan exists, has survived the plan-review loop, and has user approval.
 
 A "unit" is a phase of a milestone (e.g. M1.A, M1.B), or a discrete feature within a phase if the phase is large. The roadmap decomposes milestones into units sized for ~500–1500 lines of resulting code each. Larger should be sub-divided.
 
-The plan itself, **written to a file** (`docs/plans/<unit>.md`) so the reviewer can read it, names: files created/modified, the type definitions and function signatures the plan introduces, module boundaries, test coverage strategy and specific test names, the order of operations, and any dependencies on other units.
+The plan itself, **written to a file** (`docs/plans/<unit>.md`) so the reviewer can read it, names:
 
-### The blind-review loop
+- Files created/modified.
+- The type definitions and function signatures the plan introduces.
+- Module boundaries.
+- Test coverage strategy and specific test names.
+- Order of operations.
+- Dependencies on other units.
+- **Parallelization map.** Which subtasks (writing tests, implementing modules) can be executed concurrently by separate coding agents, or "none — sequential" if parallelism is not practical for this unit. Honest about dependencies; don't overstate parallelism.
 
-**Self-review is done by a fresh subagent, never by the main agent on its own work.** Main-agent self-review fails because the main agent is biased by the context that produced the plan — it can rationalize weaknesses because it remembers *why* the plan ended up that way. A fresh agent reading only the artifact has no such bias.
+### The plan-review loop
+
+**Review is done by a fresh subagent, never by the main agent on its own work.** Main-agent self-review fails because the main agent is biased by the context that produced the plan — it can rationalize weaknesses because it remembers *why* the plan ended up that way. A fresh agent reading only the artifact has no such bias.
 
 1. **Main agent writes v1 of the plan** to `docs/plans/<unit>.md`.
 2. **Main agent launches a blind reviewer subagent.** The subagent's *only* inputs are:
@@ -39,15 +50,48 @@ The plan itself, **written to a file** (`docs/plans/<unit>.md`) so the reviewer 
    - **Performance considerations.** Are there algorithmic or data-layout choices that should be flagged now versus left for later optimization?
    - **Best practices.** Idiomatic Rust, sensible test layout, conventional naming, error-handling style, etc.
    - **Adherence to project decisions.** ADRs in `docs/decisions/`, commitments in `docs/architecture.md`, workflow rules in this file. The reviewer must catch plans that drift from settled decisions.
+   - **Parallelization soundness.** Does the parallelization map identify genuinely independent subtasks? Are dependencies between them honest? Or is parallelism overstated?
 3. **Reviewer returns a structured critique** plus an explicit verdict — either "no further substantive issues" (loop terminates) or a list of specific concerns with severity.
 4. **Main agent incorporates the feedback**, revises the plan in place, and **continues the same reviewer subagent** (via `SendMessage`) for the next pass — context stays cached (faster) and the reviewer's judgment stays consistent from pass to pass (more stable than spawning a fresh reviewer each iteration, which restarts calibration). **Prerequisite:** `SendMessage` is part of Claude Code's experimental Agent Teams and requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the env block of `.claude/settings.json`. Already set in this project; if a future session reports that `SendMessage` is unavailable, that's the first thing to check.
 5. **Loop continues** until the reviewer returns "no further substantive issues."
 6. **User approves the converged plan.**
-7. **Execute** (steps 5–7 of the per-feature loop above: tests first, implement, benchmark).
+7. **Execute** (steps 5–10 of the per-feature loop above: tests → test-suite review → implement → final review → benchmark).
 
 **Loop convergence is the reviewer's call, not the main agent's.** The main agent does not declare a plan done.
 
 The user, who does not read code, gets to review the plan as the primary architectural review channel — and the blind-review loop ensures the plan that reaches the user has already been pressure-tested by an independent reader.
+
+## Test-suite review loop
+
+After tests are written for the unit (step 6 of the per-feature loop) and **before** any implementation begins, the test suite goes through its own blind-review loop. Same mechanics as the plan-review loop above (fresh subagent, blind to main-conversation context, `SendMessage` continuation, reviewer-determined convergence).
+
+The reviewer reads the test files plus enough project context to evaluate whether the tests adequately exercise the contract — the plan, the relevant ADRs, the spec being tested (e.g. `docs/reference/rules/` for chess rule semantics, `docs/reference/pgn-spec-1994.txt` for FEN/PGN, the UCI spec for protocol).
+
+The dimensions of test-suite review:
+
+- **Correctness to spec.** Do the tests actually check what the spec says they should? Are the assertions correct, or do they bake in a misreading of the spec?
+- **Confirmation bias.** Are the tests suspiciously easy to pass? Do they assume the implementation, or assert behavior independently? Would the test pass against a stub that returns the expected value without doing real work?
+- **Adequate checks.** Are there enough assertions per test? Or are tests perfunctory ("call the function, check it doesn't panic") versus genuinely verifying behavior?
+- **Corner case coverage.** Are edge cases tested? Empty inputs, max sizes, boundary conditions, failure paths, malformed inputs, ambiguous-spec cases?
+
+Tests pass review **before** any implementation work begins. Implementation written against unreviewed tests is hard to course-correct — by the time you discover the tests were inadequate, you've shaped the code around them.
+
+## Final review loop
+
+After implementation is complete and **all tests pass** (step 9 of the per-feature loop), the entire task scope (code + tests jointly) goes through a final blind-review loop. Same mechanics as the others.
+
+The reviewer reads the new/modified code, the tests, the plan that authorized the work, and any project context relevant to the unit.
+
+The dimensions of final review:
+
+- **Correctness.** Does the code actually do what the tests claim it does? Are there situations the tests don't cover where the code would behave incorrectly?
+- **Corner cases.** Same dimension as test-suite review, now on the implementation side: are there situations not covered by tests that the code should handle? (If yes, write more tests, then re-implement to satisfy them.)
+- **Code quality.** Idiomatic Rust, error-handling style, no dead code, no premature abstractions, no commented-out blocks.
+- **Readability.** Clear naming, sensible structure, comments only where the *why* is non-obvious. A future reader (including a future Claude session) should be able to follow the code without consulting the conversation that produced it.
+- **Simplicity.** Anything overengineered? Anything that could be cut, merged, or deferred without loss?
+- **Performance considerations.** Any obvious algorithmic, data-layout, or hot-path inefficiencies that should be flagged now? (Concrete optimization happens at the benchmark step that follows; review just flags candidates.)
+
+The final review's purpose is to catch what the plan didn't anticipate and the tests didn't cover. The user, who again does not read code, gets the final review's report as his last opportunity to push back before the work commits.
 
 ## Source-code reading restriction
 

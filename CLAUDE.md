@@ -31,14 +31,9 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 - **Public chess data is encouraged**: perft suites, opening books (data files), Syzygy endgame tablebases, PGN game databases, eval test suites (STS, Bratko-Kopec, WAC).
 
 ### Workflow loop (per feature or major component)
-1. **Deep online research** on prior art — prose sources only (no engine source code). Don't rely on training-data recall. Delegate to a research subagent if it spans more than a few queries.
-2. **Explain findings in chat** before writing code.
-3. **Discuss and converge** on the approach.
-4. **Write tests first** where applicable (TDD strongest for rules / bitboard primitives; perft is the gold standard).
-5. **Implement.**
-6. **Benchmark and profile.**
+Loop: **research → discuss → plan → tests → implement → final review → benchmark.** Each of the plan, the test suite, and the final code+tests goes through a **blind-review loop** with a fresh subagent (continued via `SendMessage` across iterations). Plans must identify parallelization opportunities for coding agents. Implementation may proceed in parallel across coding agents per the plan. See `docs/workflow.md` for the full per-feature loop, the dimensions checked at each review, and the rationale for each step.
 
-Skipping the research/discussion phase removes the user's ability to course-correct. When in doubt, propose before implementing.
+Skipping research/discussion or any review loop strips the user of his only architectural review channels. He does not read code. When in doubt, propose before implementing.
 
 ### Architectural commitments (settled — see `docs/decisions/`)
 - Rust.
