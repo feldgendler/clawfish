@@ -846,4 +846,53 @@ mod tests {
         p.set_piece(Square::E1, WHITE_KING);
         p.set_piece(Square::E1, WHITE_PAWN);
     }
+
+    // -------------------------------------------------------------------------
+    // Coverage backfill: paths not exercised by the contract-driven tests above.
+    // -------------------------------------------------------------------------
+
+    /// `set_piece` has a branch that removes the previous piece when a square
+    /// is overwritten by a non-king piece. All existing tests only place pieces
+    /// on empty squares or trigger the debug-assert panic. This test exercises
+    /// the "previous non-king piece is replaced" path (lines 349-352).
+    #[test]
+    fn set_piece_overwrites_non_king_updates_bitboards() {
+        let mut p = Position::empty();
+        // Place a white rook, then overwrite it with a white bishop.
+        p.set_piece(Square::E4, WHITE_ROOK);
+        // Verify rook is present before overwrite.
+        assert!(p.pieces_colored(Color::White, PieceKind::Rook).contains(Square::E4));
+
+        p.set_piece(Square::E4, WHITE_BISHOP);
+
+        // After overwrite: bishop must be on e4, rook must not be.
+        assert!(
+            p.pieces_colored(Color::White, PieceKind::Bishop).contains(Square::E4),
+            "bishop must appear on e4 after overwrite"
+        );
+        assert!(
+            !p.pieces_colored(Color::White, PieceKind::Rook).contains(Square::E4),
+            "rook must be removed from e4 after overwrite"
+        );
+        assert_eq!(
+            p.piece_at(Square::E4),
+            Some(WHITE_BISHOP),
+            "mailbox must reflect the new piece"
+        );
+        // Color bitboard should still claim e4 for White.
+        assert!(p.occupied(Color::White).contains(Square::E4));
+    }
+
+    /// `validate_post_parse` checks for TooManyKings for both colors, but only
+    /// the White path was reachable via `Position::from_fen` in the existing
+    /// tests (the two-White-kings FEN). Cover the Black path directly.
+    #[test]
+    fn parse_rejects_two_black_kings() {
+        // Two black kings: one on e8, one on d8. White king on e1.
+        let r = Position::from_fen("3kk3/8/8/8/8/8/8/4K3 w - - 0 1");
+        assert!(
+            matches!(r, Err(FenError::TooManyKings(Color::Black))),
+            "two black kings must yield TooManyKings(Black), got {r:?}"
+        );
+    }
 }

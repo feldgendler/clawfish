@@ -135,6 +135,13 @@ fn parse_placement(p: &mut Position, s: &str) -> Result<(), FenError> {
                 if file != 8 {
                     return Err(FenError::BadPiecePlacement(s.to_string()));
                 }
+                // NOTE: With the pre-check above guaranteeing exactly 8
+                // slash-separated chunks (7 slashes), `rank` decrements once
+                // per slash and starts at 8, so it reaches 1 only after the
+                // 7th slash — and the input has no 8th slash. This guard is
+                // therefore unreachable via `Position::from_fen`. It exists as
+                // a defensive guard for hypothetical direct callers of
+                // `parse_placement`. Coverage backfill audit 2026-04-27.
                 if rank == 1 {
                     return Err(FenError::BadPiecePlacement(s.to_string()));
                 }
@@ -194,6 +201,12 @@ fn parse_castling(s: &str) -> Result<CastlingRights, FenError> {
     if s == "-" {
         return Ok(CastlingRights::NONE);
     }
+    // NOTE: `s.is_empty()` is unreachable via `Position::from_fen` because an
+    // empty field-2 requires two consecutive spaces, which produce 7 fields and
+    // are rejected by the WrongFieldCount check before `parse_castling` is
+    // called. This guard is defensive code for direct callers — not dead code
+    // per se, but untestable through the public API without bypassing the
+    // field-count gate. Coverage backfill audit 2026-04-27.
     if s.is_empty() {
         return Err(FenError::BadCastlingRights(s.to_string()));
     }
@@ -878,4 +891,101 @@ mod tests {
         assert!(matches!(r, Err(FenError::WrongFieldCount { found: 7 })));
     }
 
+    // -------------------------------------------------------------------------
+    // Coverage backfill: paths not exercised by the contract-driven tests above.
+    // -------------------------------------------------------------------------
+
+    /// `FenError::Display` was never exercised — tests only matched on the enum
+    /// variant, never called `.to_string()`. Pin every arm of the Display impl.
+    #[test]
+    fn fen_error_display_all_variants() {
+        // WrongFieldCount
+        assert_eq!(
+            FenError::WrongFieldCount { found: 3 }.to_string(),
+            "FEN must have 6 fields, found 3"
+        );
+        // BadPiecePlacement
+        assert!(FenError::BadPiecePlacement("bad".to_string())
+            .to_string()
+            .contains("bad piece placement"));
+        // BadActiveColor
+        assert!(FenError::BadActiveColor("X".to_string())
+            .to_string()
+            .contains("bad active color"));
+        // BadCastlingRights
+        assert!(FenError::BadCastlingRights("xx".to_string())
+            .to_string()
+            .contains("bad castling rights"));
+        // BadEnPassant
+        assert!(FenError::BadEnPassant("e5".to_string())
+            .to_string()
+            .contains("bad en passant target"));
+        // BadHalfmoveClock
+        assert!(FenError::BadHalfmoveClock("x".to_string())
+            .to_string()
+            .contains("bad halfmove clock"));
+        // BadFullmoveNumber
+        assert!(FenError::BadFullmoveNumber("0".to_string())
+            .to_string()
+            .contains("bad fullmove number"));
+        // MissingKing — both colors
+        assert!(FenError::MissingKing(Color::White)
+            .to_string()
+            .contains("missing"));
+        assert!(FenError::MissingKing(Color::Black)
+            .to_string()
+            .contains("missing"));
+        // TooManyKings — both colors
+        assert!(FenError::TooManyKings(Color::White)
+            .to_string()
+            .contains("too many"));
+        assert!(FenError::TooManyKings(Color::Black)
+            .to_string()
+            .contains("too many"));
+        // PawnOnBackRank
+        assert!(FenError::PawnOnBackRank(Square::A1)
+            .to_string()
+            .contains("pawn on back rank"));
+    }
+
+    /// `FenError` implements `std::error::Error`; pin that the impl compiles
+    /// and is usable (source() returns None for leaf errors).
+    #[test]
+    fn fen_error_is_std_error() {
+        use std::error::Error;
+        let e: &dyn Error = &FenError::WrongFieldCount { found: 1 };
+        // Leaf error — no source.
+        assert!(e.source().is_none());
+    }
+
+    /// Line 148: digit causes cumulative file overflow within a rank.
+    /// "81" in a single rank means 8 empty + 1 more = 9 squares — overflow
+    /// caught by `new_file > 8`. This is distinct from "too many piece letters"
+    /// (caught by `file >= 8`) and from "wrong chunk count" (pre-check).
+    #[test]
+    fn parse_rejects_digit_cumulative_overflow() {
+        // Rank 8 = "81" (eight empties then digit 1 → 9 total). Both kings
+        // present so king-count is not the trigger.
+        let r = Position::from_fen("81/8/8/8/8/8/8/4K2k w - - 0 1");
+        assert!(
+            matches!(r, Err(FenError::BadPiecePlacement(_))),
+            "digit cumulative overflow must be BadPiecePlacement, got {r:?}"
+        );
+    }
+
+    /// Line 179: placement field ends with the last rank incomplete (fewer than
+    /// 8 squares on rank 1). The pre-check passes (8 chunks), slashes are fine,
+    /// but the final `rank != 1 || file != 8` guard fires.
+    #[test]
+    fn parse_rejects_last_rank_incomplete() {
+        // Rank 1 has only "4K2" = 4+1+2 = 7 squares (missing the h-file square).
+        // Black king on e8, white king on e1 but rank-1 encoded short.
+        let r = Position::from_fen("4k3/8/8/8/8/8/8/4K2 w - - 0 1");
+        assert!(
+            matches!(r, Err(FenError::BadPiecePlacement(_))),
+            "incomplete last rank must be BadPiecePlacement, got {r:?}"
+        );
+    }
+
 }
+
