@@ -103,6 +103,38 @@ The dimensions of final review:
 
 The final review's purpose is to catch what the plan didn't anticipate and the tests didn't cover. On reviewer convergence, the agent proceeds directly to benchmarking and commit — no user-approval gate. The user can interject at any point during the loop by sending a message; absent intervention, the work commits when the loop terminates.
 
+## Static analysis and dependency hygiene
+
+Standing checks that complement the review loops. The review loops catch reasoning errors; these catch mechanical drift.
+
+### Continuously enforced (pre-commit hook)
+
+A Claude Code `PreToolUse` hook (`.claude/hooks/pre-commit-check.sh`, wired in `.claude/settings.json`) intercepts `git commit` invocations and runs:
+
+- **`rustfmt --check`** against the **staged `.rs` files only** (not the whole crate). This way, parallel agents' in-flight unstaged or untracked work doesn't block a clean commit in another scope.
+- **`cargo clippy --all-targets -- -D warnings`** and **`cargo test`** on the whole crate — but **only if the working tree exactly matches the staged set** (no unstaged tracked changes, no untracked files) **and** `cargo check` confirms it compiles. If a parallel agent has WIP in the tree or the build is mid-edit, clippy + tests are skipped with a note rather than blocking. Solo work stages everything before committing, so this naturally runs the full check.
+
+Failure of any check that does run blocks the commit and surfaces the diagnostic to the agent. The hook is a safety net, not a replacement for running these inside the per-feature loop.
+
+If the hook ever blocks unexpectedly on something *in your scope*, fix the underlying issue rather than bypassing. Never use `--no-verify`.
+
+### Dependency-change checks
+
+Whenever `Cargo.toml` or `Cargo.lock` changes (a dep is added, updated, or removed), run:
+
+- **`cargo audit`** — checks `Cargo.lock` against the [RustSec advisory DB](https://rustsec.org/) for known-vulnerable crates. Surface any advisory in chat before continuing.
+- **`cargo deny check`** — enforces `deny.toml` policy: license allowlist, source restriction (crates.io only), advisory denial, duplicate-version warnings, wildcard-version ban.
+
+Project policy (encoded in `deny.toml`):
+
+- License allowlist limited to common permissive licenses (MIT, Apache-2.0, BSD-2/3-Clause, ISC, Zlib, CC0-1.0, Unicode-3.0). Anything else needs an explicit decision.
+- Sources: crates.io only. No git deps, no alternative registries.
+- Wildcard versions (`"*"`) denied — pin or range.
+- Multiple versions of the same crate: warn (informational; transitives sometimes force this).
+- Yanked crates: deny.
+
+These tools are **not** in the pre-commit hook because they are slower and only relevant on dep changes. They are agent discipline plus a periodic refresh as new advisories land in the DB.
+
 ## Source-code reading restriction
 
 We do not read the source code of existing chess engines, even for prior-art research, even when wiki articles link to specific lines. See `docs/decisions/0003-no-third-party-source-code-reading.md`.

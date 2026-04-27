@@ -3,6 +3,7 @@ name = "chess"
 version = "0.1.0"
 edition = "2024"
 description = "Standard chess engine"
+publish = false
 
 [dependencies]
 
