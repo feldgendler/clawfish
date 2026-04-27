@@ -6,12 +6,31 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M1 complete; M2 decomposed and researched; M2.A next.** Architectural commitments settled (see `docs/decisions/`).
+**Phase: M2.A complete; M2.B next.** Architectural commitments settled (see `docs/decisions/`).
 
 - M1: complete through M1.G (perft + criterion benchmark harness; 119 Mnps bulk on starting D4).
-- M2: decomposed into five sub-phases (A→E) in `docs/roadmap.md`.
-- Pre-M2 research complete: `docs/research/m2-uci-threading.md` (binds ADR-0011 on M2.C) and `docs/research/m2-tournament-harness.md` (binds ADR-0012 on M2.E).
-- M2.A — UCI move encoding — needs no extra research; UCI spec at `docs/reference/uci-protocol-2006.txt` covers it.
+- M2.A: complete — `Move::to_uci` + `Move::from_uci` + `UciMoveError`. Generate-and-match parsing strategy; null move `0000` rejected as `NullMove`; strict lowercase input. No new ADR.
+- M2: B–E remain. Pre-M2 research complete: `docs/research/m2-uci-threading.md` (binds ADR-0011 on M2.C) and `docs/research/m2-tournament-harness.md` (binds ADR-0012 on M2.E).
+
+### What M2.A landed
+
+- **`Move::to_uci(self) -> String`** in `src/mov.rs`. Thin wrapper around the existing `Display` impl (canonical writer); both produce identical bytes. Self-documenting at M2 protocol call sites.
+- **`Move::from_uci(s: &str, pos: &Position) -> Result<Move, UciMoveError>`** in `src/mov.rs`. Generate-and-match: enumerates `generate_moves(pos)`, finds the unique move matching the parsed `(from, to, promotion_kind)`. Defers legality entirely to movegen (consistent with ADR-0007).
+- **`UciMoveError`** enum: `Malformed` / `IllegalPromotionPiece` / `NullMove` / `IllegalForPosition`. Implements `Display` + `std::error::Error`. Re-exported from `src/lib.rs`.
+- **Tests** — 38 new test fns in `src/mov.rs::tests`: 12 `to_uci` anchors + 10 `from_uci` positive anchors (including check-evasion) + table-driven negative-parse + 10 position-dependent rejection tests + round-trip on `CASES` + round-trip on D1 enumeration of `UCI_SEED_FENS` (canonical 6 + EP-horizontal-pin + EP-double-check + mate + stalemate) + two proptests (round-trip on D2-reachable positions; `(from, to, promo)` uniqueness invariant).
+
+### M2.A — verification (Apple M4, dev machine)
+
+| Metric | Result |
+|---|---|
+| Tests | 484 fast + 4 ignored (446 lib + 38 new M2.A; integration + doctests as before). All passing. |
+| `cargo build --release` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo llvm-cov --summary-only --lib` (`mov.rs`) | 96.55% region / 95.75% line / 95.20% function. Uncovered lines = pre-existing `#[ignore]`-gated bench + pre-existing `unreachable!()` arms + `unwrap_or_else` panic branches in tests that don't fire when tests pass. No M2.A-specific gaps. |
+| `cargo mutants --in-diff` | 19 mutants generated; **18 caught, 1 unviable** (`from_uci -> Ok(Default::default())` — `Move` has no `Default`); 0 missed. |
+| Benchmark | **Skipped** — UCI move parsing is per-`position` command, not on a search hot path; a microbenchmark would measure noise. |
+
+All three review loops (plan, test-suite, final code+tests) converged. Plan archived at `docs/plans/m2.a.md`.
 
 ### What M1.G landed
 
@@ -39,14 +58,13 @@ All four loops (plan, test-suite, final code+tests, benchmark capture) converged
 
 ### What's next
 
-**M2.A — UCI move encoding.** Plan-mode pass on `Move::to_uci(self) -> String` and `Move::from_uci(&str, &Position) -> Result<Move, _>`.
+**M2.B — UCI command parser.** New `uci` module: `Command` enum + `parse_uci_line(&str) -> Command` covering the GUI→engine command set (`uci`, `isready`, `setoption`, `ucinewgame`, `position`, `go`, `stop`, `quit`, etc. per UCI spec). Returns `Command::Unknown` for unrecognized tokens (per spec "ignore unknown command or token"). Property tests for whitespace tolerance and grammar coverage.
 
-- Long algebraic per UCI spec: `e2e4`, `e1g1`/`e1c1` for castling, `e7e8q` lowercase promotion, `0000` null.
-- Round-trip tests against canonical-6 perft moves; reject malformed input.
 - No ADR binds on this phase.
-- Approx size: 400–600 lines.
+- Approx size: 600–900 lines.
+- M2.A's `from_uci` is a dependency for parsing the `position … moves m1 m2 …` command's move list.
 
-Full M2 plan and the four other sub-phases (M2.B–E) are in `docs/roadmap.md`. Exit criteria for M2 as a whole: complete game through `fastchess` against itself or another engine without protocol errors or illegal moves.
+Full M2 plan and the three remaining sub-phases (M2.C–E) are in `docs/roadmap.md`. Exit criteria for M2 as a whole: complete game through `fastchess` against itself or another engine without protocol errors or illegal moves.
 
 ## How to pick up a new session
 

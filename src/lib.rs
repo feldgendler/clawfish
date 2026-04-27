@@ -13,7 +13,7 @@ pub mod zobrist;
 pub use bitboard::Bitboard;
 pub use fen::FenError;
 pub use magic::{bishop_attacks, queen_attacks, rook_attacks};
-pub use mov::{Move, MoveFlag, Undo};
+pub use mov::{Move, MoveFlag, Undo, UciMoveError};
 pub use movegen::{MoveList, generate_moves, in_check};
 pub use perft::{PerftCounts, divide, perft, perft_bulk, perft_categorized};
 pub use piece::{Color, Piece, PieceKind};

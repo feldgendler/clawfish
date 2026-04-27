@@ -4,7 +4,39 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1 complete (M1.G landed); M2 next — UCI random mover.**
+**M1 complete; M2.A landed; M2.B next — UCI command parser.**
+
+### M2.A — what landed
+
+The two functions bridging our internal `Move` type and the UCI long-algebraic wire format:
+
+- **`Move::to_uci(self) -> String`** — thin wrapper around the existing `Display` impl; both produce identical bytes. Self-documenting at M2 protocol call sites.
+- **`Move::from_uci(s: &str, pos: &Position) -> Result<Move, UciMoveError>`** — generate-and-match: enumerates `generate_moves(pos)`, finds the unique move matching the parsed `(from, to, promotion_kind)`. Defers legality entirely to movegen (consistent with ADR-0007).
+- **`UciMoveError`** — four-variant enum: `Malformed` / `IllegalPromotionPiece` / `NullMove` / `IllegalForPosition`. Re-exported from `src/lib.rs`.
+- **38 new tests** in `src/mov.rs::tests`: 12 `to_uci` anchors (one per flag, including all four PromoCapture kinds) + 10 `from_uci` positive anchors (including a check-evasion case) + table-driven negative-parse + 10 position-dependent rejection tests + round-trip on the curated `CASES` corpus + round-trip on D1 enumeration of `UCI_SEED_FENS` (canonical 6 + EP-horizontal-pin + EP-double-check + mate + stalemate) + round-trip proptest on D2-reachable positions + `(from, to, promo)` uniqueness invariant proptest.
+
+### M2.A — implementation highlights
+
+- **Generate-and-match strategy.** Avoids ~150 lines of hand-rolled disambiguation logic (king-step vs. castle, push vs. EP, single vs. double, promo-capture inference) by reusing `generate_moves`'s legality filter. Cost is irrelevant — UCI move parsing is per-`position` command, not on the search hot path.
+- **`(from, to, promotion_kind)` uniqueness invariant** — derived from chess-rules first principles in the plan. `from_uci` includes a debug-only `debug_assert!` on the invariant in addition to the property test, so a future regression in `generate_moves` fires loudly at the consumer site.
+- **Strict lowercase input.** Files a–h and promo letter n/b/r/q lowercase only. Relax cost (if a real GUI ever sends uppercase) is a one-line `match bytes[4] | 0x20` change.
+- **Null move `0000`** rejected as `UciMoveError::NullMove`. We have no `Move::NULL` sentinel today (deferred to null-move pruning, M5).
+- **ASCII guard** before any byte slicing — without it, `&s[0..2]` / `&s[2..4]` would panic on a non-char-boundary index for inputs like `"e2e°"` (5 bytes, `&s[2..4]` ends mid-codepoint).
+
+### M2.A — verification
+
+| Metric | Result |
+|---|---|
+| Tests | 484 fast + 4 ignored. All passing. |
+| `cargo build --release` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo llvm-cov --summary-only --lib` (`mov.rs`) | 96.55% region / 95.75% line / 95.20% function. Uncovered lines = pre-existing `#[ignore]`-gated bench + pre-existing `unreachable!()` arms + `unwrap_or_else` panic branches in tests that don't fire when tests pass. |
+| `cargo mutants --in-diff` | 19 mutants generated; **18 caught, 1 unviable** (`from_uci -> Ok(Default::default())` — `Move` has no `Default`); 0 missed. |
+| Benchmark | **Skipped** — UCI move parsing is per-`position` command, not on the search hot path; a microbenchmark would measure noise. |
+
+All three review loops (plan, test-suite, final code+tests) converged. Plan archived at `docs/plans/m2.a.md`. No ADR binds on this phase.
+
+### M1 — prior milestone
 
 ### M1.G — what landed
 
@@ -182,7 +214,7 @@ Plays legal random moves through a tournament harness (fastchess; see ADR-0012 b
 
 | Phase | Scope | Approx size |
 |---|---|---|
-| **M2.A** — UCI move encoding | `Move::to_uci(self) -> String` (no Position needed — flag distinguishes promo/castle) and `Move::from_uci(&str, &Position) -> Result<Move, _>` (needs Position to resolve king-move vs. castling, pawn-to vs. EP, single- vs. double-push, infer promo-capture flag). Long algebraic per UCI spec: `e2e4`, `e1g1`/`e1c1` for castling, `e7e8q` for promotion (lowercase), `0000` for null. Round-trip tests against canonical-6 perft moves; reject malformed input | ~400–600 lines |
+| **M2.A** ✓ — UCI move encoding | `Move::to_uci` (Display delegate) + `Move::from_uci` (generate-and-match against `generate_moves`) + `UciMoveError` (4 variants). Long algebraic per UCI spec; null move `0000` rejected; strict lowercase input. Defers legality entirely to movegen (consistent with ADR-0007). Debug-only `debug_assert!` on `(from, to, promo)` uniqueness inside `from_uci` (defense-in-depth alongside property test) | ~400–600 lines (actual: ~860 lines incl. 38 new tests) |
 | **M2.B** — UCI command parser | New `uci` module: `Command` enum + `parse_uci_line(&str) -> Command` (returns `Command::Unknown` for stuff to silently skip per spec §"unknown command or token"). Covers `uci`, `debug on/off`, `isready`, `setoption name … [value …]`, `register`, `ucinewgame`, `position [startpos\|fen …] [moves …]`, `go` (with `searchmoves`/`ponder`/`wtime`/`btime`/`winc`/`binc`/`movestogo`/`depth`/`nodes`/`mate`/`movetime`/`infinite`), `stop`, `ponderhit`, `quit`. Strict whitespace tolerance per spec §arbitrary-whitespace. Property tests for grammar coverage | ~600–900 lines |
 | **M2.C** — Engine I/O loop + position state | `Engine` struct (current `Position`, options, RNG seed), main `run()` loop reads lines from stdin and dispatches parsed `Command`s to handlers, writes responses to stdout. Handlers: `uci` (emits `id name`/`id author`/`option …`/`uciok`), `isready` (always answers `readyok`, even mid-search), `setoption`, `ucinewgame` (resets state), `position` (parses moves via M2.A `from_uci` and applies them), `quit`. `info string …` debug logging behind `debug on`. `go` parsed but answered with placeholder until M2.D. Threading model (ADR-0011) lands here so `isready` and `stop` work concurrently with future search | ~800–1200 lines |
 | **M2.D** — Random search + `go`/`bestmove` | `Search` trait/struct with `start(pos, params, output) -> Handle` and `Handle::stop()`, preserving the eval/search interception point per ADR-0004 (NNUE + skill-dial future hooks). Random move via SplitMix64; seed from system time or a custom `Random_Seed` UCI option for reproducibility. Honors `go movetime <ms>` (sleeps then emits), `go infinite` (waits for `stop`), `stop` (cancels pending emit), `searchmoves` (filters legal-move pool). `bestmove <uci>` output. End-to-end test: drive a full game from `position startpos` through repeated `go movetime 10` until terminal | ~700–1000 lines |

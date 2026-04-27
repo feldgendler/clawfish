@@ -25,6 +25,7 @@
 
 use std::fmt;
 
+use crate::movegen::{MoveList, generate_moves};
 use crate::piece::{Color, Piece, PieceKind};
 use crate::position::{CastlingRights, Position};
 use crate::square::Square;
@@ -224,7 +225,153 @@ impl Move {
     pub const fn bits(self) -> u16 {
         self.0
     }
+
+    /// UCI long-algebraic encoding of this move. Examples: `"e2e4"`,
+    /// `"e1g1"` (king-side castle), `"e7e8q"` (queen promotion).
+    /// Produces identical bytes to the `Display` impl on `Move`;
+    /// `Display::fmt` is the canonical writer (zero-alloc when piped to
+    /// a `Write`), and this method exists for self-documenting call
+    /// sites in M2 protocol code.
+    pub fn to_uci(self) -> String {
+        self.to_string()
+    }
+
+    /// Parse a UCI long-algebraic move string in the context of `pos`.
+    ///
+    /// Returns `IllegalForPosition` if no legal move in `pos` matches the
+    /// requested `(from, to, promotion_kind)` triple — this subsumes the
+    /// many ways a syntactically valid string can fail to identify a real
+    /// legal move (no piece on `from`, opposite-color piece on `from`,
+    /// blocked target, missing castling rights, EP target not set, promo
+    /// where none is legal, missing promo where one is required, would
+    /// leave the king in check, etc.).
+    ///
+    /// Rejects the literal string `"0000"` with `NullMove`. The UCI spec
+    /// describes `0000` as engine→GUI only; we have no `Move::NULL`
+    /// sentinel today (deferred to null-move pruning, M5).
+    ///
+    /// Rejects strings of any length other than 4 or 5, non-ASCII input,
+    /// and malformed square substrings with `Malformed`. Rejects 5-char
+    /// strings whose promo letter is not one of `n`/`b`/`r`/`q` (lowercase)
+    /// with `IllegalPromotionPiece`.
+    pub fn from_uci(s: &str, pos: &Position) -> Result<Move, UciMoveError> {
+        // 1. Reject the null move explicitly.
+        if s == "0000" {
+            return Err(UciMoveError::NullMove);
+        }
+
+        // 2. ASCII-only guard. Without this, the byte slices below can
+        //    panic on non-char-boundary indices. Concretely: the input
+        //    `"e2e°"` is 5 bytes (`e`/`2`/`e` = 3 ASCII bytes plus `°`
+        //    = 2 UTF-8 bytes 0xC2 0xB0). It passes the length-5 check
+        //    in step 3, then `&s[2..4]` would end at byte 4 — the
+        //    middle of the `°` codepoint — and panic.
+        if !s.is_ascii() {
+            return Err(UciMoveError::Malformed);
+        }
+
+        // 3. Length: only 4 or 5 are accepted.
+        let bytes = s.as_bytes();
+        if bytes.len() != 4 && bytes.len() != 5 {
+            return Err(UciMoveError::Malformed);
+        }
+
+        // 4. Parse the squares first, then the promo letter. Order
+        //    matters for error categorization: a malformed square
+        //    dominates a malformed promo letter.
+        let from = Square::parse_uci(&s[0..2]).ok_or(UciMoveError::Malformed)?;
+        let to = Square::parse_uci(&s[2..4]).ok_or(UciMoveError::Malformed)?;
+        let promo: Option<PieceKind> = if bytes.len() == 5 {
+            match bytes[4] {
+                b'n' => Some(PieceKind::Knight),
+                b'b' => Some(PieceKind::Bishop),
+                b'r' => Some(PieceKind::Rook),
+                b'q' => Some(PieceKind::Queen),
+                _ => return Err(UciMoveError::IllegalPromotionPiece),
+            }
+        } else {
+            None
+        };
+
+        // 5. Generate-and-match. `MoveList` may be empty (checkmate /
+        //    stalemate); `find` on an empty iterator returns None
+        //    cleanly. The (from, to, promotion_kind) match key uniquely
+        //    identifies a legal move; see the M2.A plan for the
+        //    chess-rules derivation of that uniqueness invariant.
+        let mut moves = MoveList::new();
+        generate_moves(pos, &mut moves);
+        let slice = moves.as_slice();
+        let pred = |mv: &&Move| {
+            mv.from_square() == from
+                && mv.to_square() == to
+                && mv.promotion_kind() == promo
+        };
+        let result = slice.iter().find(pred).copied();
+        // Defense-in-depth: the uniqueness invariant is pinned externally
+        // by `prop_at_most_one_legal_move_per_from_to_promo`, but if it
+        // ever silently broke (movegen refactor, etc.), `find` would
+        // pick the first match and `from_uci` would parse the wrong
+        // move. Debug-only check so a regression fires loudly at the
+        // consumer site, not just in the property test. Release trusts
+        // the invariant — no overhead on the protocol path.
+        debug_assert!(
+            result.is_none() || slice.iter().filter(pred).count() == 1,
+            "(from, to, promo) uniqueness violated for from={from:?}, to={to:?}, promo={promo:?} in pos={}",
+            pos.to_fen(),
+        );
+        result.ok_or(UciMoveError::IllegalForPosition)
+    }
 }
+
+// ---------------------------------------------------------------------------
+// UciMoveError — error type for `Move::from_uci`.
+// ---------------------------------------------------------------------------
+
+/// Reasons `Move::from_uci` can reject an input string.
+///
+/// See `Move::from_uci` for the categorization rules. The four buckets
+/// give M2.B/C readable error messages without duplicating chunks of
+/// `generate_moves` for diagnostic-only purposes.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum UciMoveError {
+    /// Length not 4 or 5; non-ASCII input; or one of the square
+    /// substrings is not a valid algebraic square.
+    Malformed,
+    /// Length is 5 but the promo letter is not one of `n`, `b`, `r`,
+    /// `q` (lowercase per spec). Pawn `p` and king `k` are
+    /// syntactically possible SAN piece letters but illegal as
+    /// promotion targets per FIDE rules. Uppercase `N`/`B`/`R`/`Q`
+    /// also rejects here.
+    IllegalPromotionPiece,
+    /// The literal string `"0000"`. UCI describes `0000` as engine→GUI
+    /// only; we have no `Move::NULL` sentinel today.
+    NullMove,
+    /// The string parsed cleanly but no legal move in the position
+    /// matches the requested `(from, to, promotion_kind)` triple.
+    IllegalForPosition,
+}
+
+impl fmt::Display for UciMoveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let msg = match self {
+            UciMoveError::Malformed => {
+                "malformed UCI move (expected 4 or 5 ASCII chars: `from-to[promo]`)"
+            }
+            UciMoveError::IllegalPromotionPiece => {
+                "illegal UCI promotion piece (expected lowercase `n`, `b`, `r`, or `q`)"
+            }
+            UciMoveError::NullMove => {
+                "null move `0000` not accepted (UCI defines it as engine→GUI only)"
+            }
+            UciMoveError::IllegalForPosition => {
+                "UCI move not legal in the given position"
+            }
+        };
+        f.write_str(msg)
+    }
+}
+
+impl std::error::Error for UciMoveError {}
 
 impl fmt::Display for Move {
     /// Long algebraic, lowercase. Quiet/capture/castle/EP all format as
@@ -1919,5 +2066,696 @@ mod tests {
         );
         // Sanity: the loop did run.
         assert_eq!(pos, pos0);
+    }
+
+    // ===========================================================================
+    // M2.A — UCI move encoding tests.
+    //
+    // Layout per docs/plans/m2.a.md §"Test coverage strategy":
+    //   - to_uci anchor tests (one per flag/form)
+    //   - from_uci positive anchor tests (one per disambiguation)
+    //   - from_uci negative-parse table (one test, table-driven)
+    //   - from_uci position-dependent rejection tests
+    //   - round-trip on the curated CASES corpus
+    //   - round-trip on every D1 legal move from the canonical 6
+    //   - proptest: round-trip on D2-reachable positions
+    //   - proptest: uniqueness of (from, to, promotion_kind) per position
+    // ===========================================================================
+
+    use crate::mov::UciMoveError;
+
+    // -----------------------------------------------------------------------
+    // to_uci anchor tests — one per flag/form.
+    //
+    // These intentionally duplicate the literals pinned by the existing
+    // `move_display_*` tests above. Both sets survive: the duplication
+    // pins `to_uci` independently of `Display`, so a future refactor
+    // splitting them apart cannot break the wire format silently.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn to_uci_quiet_pawn() {
+        assert_eq!(Move::quiet(Square::E2, Square::E3).to_uci(), "e2e3");
+    }
+
+    #[test]
+    fn to_uci_double_push() {
+        assert_eq!(
+            Move::new(Square::E2, Square::E4, MoveFlag::DoublePush).to_uci(),
+            "e2e4"
+        );
+    }
+
+    #[test]
+    fn to_uci_quiet_knight() {
+        assert_eq!(Move::quiet(Square::G1, Square::F3).to_uci(), "g1f3");
+    }
+
+    #[test]
+    fn to_uci_capture() {
+        assert_eq!(Move::capture(Square::F3, Square::E5).to_uci(), "f3e5");
+    }
+
+    #[test]
+    fn to_uci_en_passant() {
+        assert_eq!(
+            Move::new(Square::E5, Square::D6, MoveFlag::EnPassant).to_uci(),
+            "e5d6"
+        );
+    }
+
+    #[test]
+    fn to_uci_kingside_castle_white() {
+        assert_eq!(
+            Move::new(Square::E1, Square::G1, MoveFlag::KingCastle).to_uci(),
+            "e1g1"
+        );
+    }
+
+    #[test]
+    fn to_uci_queenside_castle_white() {
+        assert_eq!(
+            Move::new(Square::E1, Square::C1, MoveFlag::QueenCastle).to_uci(),
+            "e1c1"
+        );
+    }
+
+    #[test]
+    fn to_uci_kingside_castle_black() {
+        assert_eq!(
+            Move::new(Square::E8, Square::G8, MoveFlag::KingCastle).to_uci(),
+            "e8g8"
+        );
+    }
+
+    #[test]
+    fn to_uci_queenside_castle_black() {
+        assert_eq!(
+            Move::new(Square::E8, Square::C8, MoveFlag::QueenCastle).to_uci(),
+            "e8c8"
+        );
+    }
+
+    #[test]
+    fn to_uci_promotion_each_kind() {
+        let promos: &[(MoveFlag, &str)] = &[
+            (MoveFlag::KnightPromo, "e7e8n"),
+            (MoveFlag::BishopPromo, "e7e8b"),
+            (MoveFlag::RookPromo, "e7e8r"),
+            (MoveFlag::QueenPromo, "e7e8q"),
+        ];
+        for &(flag, expected) in promos {
+            let mv = Move::new(Square::E7, Square::E8, flag);
+            assert_eq!(mv.to_uci(), expected, "flag={flag:?}");
+        }
+    }
+
+    #[test]
+    fn to_uci_promotion_capture_each_kind() {
+        let promos: &[(MoveFlag, &str)] = &[
+            (MoveFlag::KnightPromoCapture, "e7f8n"),
+            (MoveFlag::BishopPromoCapture, "e7f8b"),
+            (MoveFlag::RookPromoCapture, "e7f8r"),
+            (MoveFlag::QueenPromoCapture, "e7f8q"),
+        ];
+        for &(flag, expected) in promos {
+            let mv = Move::new(Square::E7, Square::F8, flag);
+            assert_eq!(mv.to_uci(), expected, "flag={flag:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // to_uci agrees with Display.
+    //
+    // Pins the structural relationship: to_uci's contract is "identical
+    // bytes to Display::fmt." Today the implementation is literally
+    // `self.to_string()`, so this assertion is a tautology — the value
+    // is catching a future refactor that splits them apart silently.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn to_uci_matches_display_for_every_curated_case() {
+        for c in CASES {
+            assert_eq!(c.mv.to_uci(), c.mv.to_string(), "case {}", c.label);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // from_uci positive anchor tests — one per disambiguation.
+    //
+    // Each test asserts both that parsing succeeds AND that the returned
+    // Move's flag is the one we expect (because flag inference is the
+    // whole point of from_uci needing &Position).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_uci_quiet_pawn_starting_position() {
+        let pos = Position::starting_position();
+        let mv = Move::from_uci("e2e3", &pos).expect("e2e3 is a legal quiet pawn push");
+        assert_eq!(mv.from_square(), Square::E2);
+        assert_eq!(mv.to_square(), Square::E3);
+        assert_eq!(mv.flag(), MoveFlag::Quiet);
+    }
+
+    #[test]
+    fn from_uci_double_push_recognized() {
+        let pos = Position::starting_position();
+        let mv = Move::from_uci("e2e4", &pos).expect("e2e4 is a legal double push");
+        assert_eq!(mv.from_square(), Square::E2);
+        assert_eq!(mv.to_square(), Square::E4);
+        assert_eq!(mv.flag(), MoveFlag::DoublePush);
+    }
+
+    #[test]
+    fn from_uci_capture_inferred() {
+        // White knight on f3 captures black pawn on e5.
+        let pos = Position::from_fen(
+            "rnbqkbnr/pppp1ppp/8/4p3/8/5N2/PPPPPPPP/RNBQKB1R w KQkq - 0 2",
+        )
+        .unwrap();
+        let mv = Move::from_uci("f3e5", &pos).expect("f3xe5 is a legal capture");
+        assert_eq!(mv.from_square(), Square::F3);
+        assert_eq!(mv.to_square(), Square::E5);
+        assert_eq!(mv.flag(), MoveFlag::Capture);
+    }
+
+    #[test]
+    fn from_uci_en_passant_inferred() {
+        // White pawn on e5, black pawn on d5, EP target d6.
+        let pos = Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1").unwrap();
+        let mv = Move::from_uci("e5d6", &pos).expect("e5xd6 e.p. is legal");
+        assert_eq!(mv.from_square(), Square::E5);
+        assert_eq!(mv.to_square(), Square::D6);
+        assert_eq!(mv.flag(), MoveFlag::EnPassant);
+    }
+
+    #[test]
+    fn from_uci_castle_kingside_white() {
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/4K2R w K - 0 1").unwrap();
+        let mv = Move::from_uci("e1g1", &pos).expect("e1g1 is castling");
+        assert_eq!(mv.from_square(), Square::E1);
+        assert_eq!(mv.to_square(), Square::G1);
+        assert_eq!(mv.flag(), MoveFlag::KingCastle);
+    }
+
+    #[test]
+    fn from_uci_castle_queenside_white() {
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w Q - 0 1").unwrap();
+        let mv = Move::from_uci("e1c1", &pos).expect("e1c1 is castling");
+        assert_eq!(mv.from_square(), Square::E1);
+        assert_eq!(mv.to_square(), Square::C1);
+        assert_eq!(mv.flag(), MoveFlag::QueenCastle);
+    }
+
+    #[test]
+    fn from_uci_castle_kingside_black() {
+        let pos = Position::from_fen("4k2r/8/8/8/8/8/8/4K3 b k - 0 1").unwrap();
+        let mv = Move::from_uci("e8g8", &pos).expect("e8g8 is castling");
+        assert_eq!(mv.from_square(), Square::E8);
+        assert_eq!(mv.to_square(), Square::G8);
+        assert_eq!(mv.flag(), MoveFlag::KingCastle);
+    }
+
+    #[test]
+    fn from_uci_promotion_each_kind() {
+        let pos = Position::from_fen("5k2/4P3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let cases: &[(&str, MoveFlag)] = &[
+            ("e7e8q", MoveFlag::QueenPromo),
+            ("e7e8r", MoveFlag::RookPromo),
+            ("e7e8b", MoveFlag::BishopPromo),
+            ("e7e8n", MoveFlag::KnightPromo),
+        ];
+        for &(uci, expected_flag) in cases {
+            let mv = Move::from_uci(uci, &pos).expect("legal promotion must parse");
+            assert_eq!(mv.from_square(), Square::E7, "uci={uci}");
+            assert_eq!(mv.to_square(), Square::E8, "uci={uci}");
+            assert_eq!(mv.flag(), expected_flag, "uci={uci}");
+        }
+    }
+
+    #[test]
+    fn from_uci_promotion_capture_inferred() {
+        // Black knight on f8; white pawn on e7 promotes by capturing.
+        let pos = Position::from_fen("4kn2/4P3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let mv = Move::from_uci("e7f8q", &pos).expect("e7xf8=Q is legal");
+        assert_eq!(mv.from_square(), Square::E7);
+        assert_eq!(mv.to_square(), Square::F8);
+        assert_eq!(mv.flag(), MoveFlag::QueenPromoCapture);
+    }
+
+    #[test]
+    fn from_uci_under_check_evasion() {
+        // Black bishop on b4 checks white king on e1 via the
+        // a5-e1 diagonal. White's only legal moves are: king moves
+        // to d1/d2/e2/f1/f2 (the bishop attack-line covers e1, so
+        // king must vacate or block). A king step out of check that
+        // doesn't fall back into the diagonal: e1f1 (f1 is not on
+        // the diagonal). Pins that flag inference correctly handles
+        // an in-check position — flag must be Quiet, not anything
+        // mistakenly inferred from a "looks like a king step" path
+        // that bypassed `generate_moves`.
+        let pos = Position::from_fen("4k3/8/8/8/1b6/8/8/4K3 w - - 0 1").unwrap();
+        let mv = Move::from_uci("e1f1", &pos).expect("e1f1 is a legal check evasion");
+        assert_eq!(mv.from_square(), Square::E1);
+        assert_eq!(mv.to_square(), Square::F1);
+        assert_eq!(mv.flag(), MoveFlag::Quiet);
+
+        // Belt-and-suspenders: e1d2 lands the king back on the b4-e1
+        // diagonal (still attacked by the bishop) — must reject.
+        // Materially the same code path as `from_uci_rejects_move_into_check`,
+        // but spelled out here so the in-check test pins both directions
+        // (legal evasion accepted, illegal "evasion" rejected) on the
+        // same position.
+        assert_eq!(
+            Move::from_uci("e1d2", &pos),
+            Err(UciMoveError::IllegalForPosition),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // from_uci negative-parse tests — table-driven.
+    //
+    // The error categorization is intrinsic to the input string's
+    // length/character classes (or the explicit `0000` literal), so the
+    // position is irrelevant for these. Use the starting position.
+    //
+    // **Categorization granularity is a project-level commitment, NOT
+    // a UCI-spec requirement.** The spec only requires "reject
+    // malformed input"; it doesn't dictate which error variant maps to
+    // which input. This table pins the granularity chosen in the M2.A
+    // plan §"Decisions §2" / §4 (parse from-square → parse to-square →
+    // parse promo letter). A correctly-spec'd alternative
+    // implementation that examined characters in a different order
+    // could conform to UCI but disagree with this table on the
+    // borderline rows. The borderline rows below use `is_err()` rather
+    // than a specific variant; the rest use the variant.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_uci_negative_parse_table() {
+        let pos = Position::starting_position();
+        let cases: &[(&str, UciMoveError)] = &[
+            // Length-based malformed inputs.
+            ("", UciMoveError::Malformed),
+            ("e", UciMoveError::Malformed),
+            ("e2e", UciMoveError::Malformed),
+            ("e2e4qq", UciMoveError::Malformed),
+            // Bad square chars.
+            ("i2e4", UciMoveError::Malformed),
+            ("e2i4", UciMoveError::Malformed),
+            ("e9e4", UciMoveError::Malformed),
+            ("e2e9", UciMoveError::Malformed),
+            ("E2E4", UciMoveError::Malformed),
+            ("a0a1", UciMoveError::Malformed),
+            // Non-ASCII rejected by the is_ascii() guard before slicing
+            // (without the guard the &s[2..4] slice would panic on a
+            // non-char-boundary index).
+            ("e2e°", UciMoveError::Malformed),
+            ("\u{265B}\u{265B}", UciMoveError::Malformed),
+            // Length-5 inputs that pass the square parse but have a
+            // semantically-illegal promo letter — categorized as
+            // IllegalPromotionPiece (no spec-borderline ambiguity).
+            ("e7e8p", UciMoveError::IllegalPromotionPiece),
+            ("e7e8k", UciMoveError::IllegalPromotionPiece),
+            ("e7e8x", UciMoveError::IllegalPromotionPiece),
+            ("e7e8Q", UciMoveError::IllegalPromotionPiece),
+            // Null move.
+            ("0000", UciMoveError::NullMove),
+        ];
+        for &(input, expected) in cases {
+            let result = Move::from_uci(input, &pos);
+            assert_eq!(
+                result,
+                Err(expected),
+                "input {input:?} should reject as {expected:?}, got {result:?}",
+            );
+        }
+
+        // Borderline rows — spec doesn't dictate the variant. Pin only
+        // that we reject. (For the record, the project's chosen
+        // ordering routes them as listed in the comments.)
+        for input in [
+            "e2 e4", // → Malformed: Square::parse_uci("e ") rejects before promo is read
+            "e2e4 ", // → IllegalPromotionPiece: squares parse, byte 4 = ' ' hits the catch-all
+            "e2e44", // → IllegalPromotionPiece: squares parse, byte 4 = '4' hits the catch-all
+        ] {
+            let result = Move::from_uci(input, &pos);
+            assert!(
+                result.is_err(),
+                "input {input:?} must reject (spec doesn't pin the variant), got {result:?}",
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // from_uci position-dependent rejection tests.
+    //
+    // The string parses cleanly; the position rejects.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_uci_rejects_no_piece_on_from() {
+        let pos = Position::starting_position();
+        // No piece on e3 in the starting position.
+        assert_eq!(
+            Move::from_uci("e3e4", &pos),
+            Err(UciMoveError::IllegalForPosition),
+        );
+    }
+
+    #[test]
+    fn from_uci_rejects_opposite_color_on_from() {
+        // White to move; e7 has a black pawn.
+        let pos = Position::starting_position();
+        assert_eq!(
+            Move::from_uci("e7e6", &pos),
+            Err(UciMoveError::IllegalForPosition),
+        );
+    }
+
+    #[test]
+    fn from_uci_rejects_blocked_pawn_push() {
+        // White pawn on e2 blocked by black pawn on e3.
+        let pos = Position::from_fen("4k3/8/8/8/8/4p3/4P3/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            Move::from_uci("e2e3", &pos),
+            Err(UciMoveError::IllegalForPosition),
+        );
+    }
+
+    #[test]
+    fn from_uci_rejects_castling_when_no_rights() {
+        // Same geometry as a legal kingside castle, but the rights field
+        // is empty — castling must reject.
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/4K2R w - - 0 1").unwrap();
+        assert_eq!(
+            Move::from_uci("e1g1", &pos),
+            Err(UciMoveError::IllegalForPosition),
+        );
+    }
+
+    #[test]
+    fn from_uci_rejects_castling_when_in_check() {
+        // Black rook on e4 attacks white king on e1 — castling is
+        // illegal when in check, even with rights present.
+        let pos = Position::from_fen("4k3/8/8/8/4r3/8/8/4K2R w K - 0 1").unwrap();
+        assert_eq!(
+            Move::from_uci("e1g1", &pos),
+            Err(UciMoveError::IllegalForPosition),
+        );
+    }
+
+    #[test]
+    fn from_uci_rejects_promo_when_not_promotion_rank() {
+        // e2-e4 is not a promotion. Specifying a promo letter here is
+        // illegal-for-position (no legal e2-e4-with-promotion exists).
+        let pos = Position::starting_position();
+        assert_eq!(
+            Move::from_uci("e2e4q", &pos),
+            Err(UciMoveError::IllegalForPosition),
+        );
+    }
+
+    #[test]
+    fn from_uci_rejects_missing_promo_when_required() {
+        // e7-e8 is a promotion-only square; a length-4 string omits the
+        // required promo letter, so no legal move matches.
+        let pos = Position::from_fen("5k2/4P3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            Move::from_uci("e7e8", &pos),
+            Err(UciMoveError::IllegalForPosition),
+        );
+    }
+
+    #[test]
+    fn from_uci_rejects_ep_when_target_not_set() {
+        // Same piece geometry as the EP-positive test, but EP target is
+        // not set — no EP move is legal, no plain capture is legal
+        // either (d6 is empty).
+        let pos = Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            Move::from_uci("e5d6", &pos),
+            Err(UciMoveError::IllegalForPosition),
+        );
+    }
+
+    #[test]
+    fn from_uci_rejects_move_into_check() {
+        // Black rook on e4 absolutely pins white knight on e2 to king
+        // on e1; any knight move leaves the e-file and exposes the
+        // king. e2-c3 is therefore illegal-for-position. Pins that
+        // from_uci defers to generate_moves's legality filter, not
+        // just pseudo-legality.
+        //
+        // (A pawn pin along the same file would NOT work — pushing
+        // e2-e3 keeps the pawn on the e-file, still blocking the rook.
+        // A knight has no "stay on line" moves, so every knight move
+        // is illegal under the pin.)
+        let pos = Position::from_fen("3k4/8/8/8/4r3/8/4N3/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            Move::from_uci("e2c3", &pos),
+            Err(UciMoveError::IllegalForPosition),
+        );
+    }
+
+    #[test]
+    fn from_uci_rejects_when_no_legal_moves_exist() {
+        // Stalemate position: black king on h8 is not in check but has
+        // no legal moves. generate_moves returns an empty list; find
+        // returns None cleanly. Pins the empty-MoveList code path so
+        // no future fast-path can panic on it. Multiple inputs assert
+        // that rejection comes from "no legal moves at all," not from
+        // "this specific from-square has no candidate."
+        let pos = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+        for input in ["h8h7", "h8g8", "h8g7", "a1a2"] {
+            assert_eq!(
+                Move::from_uci(input, &pos),
+                Err(UciMoveError::IllegalForPosition),
+                "input {input}",
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-trip tests.
+    //
+    // For every move that can arise from a legal play, to_uci then
+    // from_uci must recover the original move byte-for-byte.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn round_trip_curated_cases() {
+        for c in CASES {
+            let pos = Position::from_fen(c.before).expect("before FEN parses");
+            let uci = c.mv.to_uci();
+            let parsed = Move::from_uci(&uci, &pos).unwrap_or_else(|e| {
+                panic!("round-trip failed for {} ({uci}): {e:?}", c.label)
+            });
+            assert_eq!(
+                parsed, c.mv,
+                "round-trip mismatch for {} (uci={uci}): parsed flag {:?}, expected flag {:?}",
+                c.label,
+                parsed.flag(),
+                c.mv.flag(),
+            );
+        }
+    }
+
+    /// Seed FENs for D1 enumeration and the M2.A property tests below.
+    /// Mirrors `src/movegen.rs::SEED_FENS` (canonical 6 + edge-class
+    /// fixtures from `docs/research/m1-engine-architecture.md` §6).
+    /// Reusing the broader edge-class list — not just the canonical 6 —
+    /// raises the bar for `prop_at_most_one_legal_move_per_from_to_promo`
+    /// and `round_trip_canonical_six_d2_proptest`: bugs in EP-discovery
+    /// or EP-horizontal-pin handling are most likely to surface in those
+    /// edge positions, not in the well-trodden canonical-6 starts.
+    const UCI_SEED_FENS: &[&str] = &[
+        // Canonical 6.
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+        // Edge fixtures.
+        "3k4/8/8/K1Pp3r/8/8/8/8 w - d6 0 2", // EP horizontal pin.
+        "4r2k/8/8/8/3Pp3/8/4K3/8 b - d3 0 1", // EP-double-check parent.
+        "4k3/4Q3/3K4/8/8/8/8/8 b - - 0 1",   // Mate.
+        "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1",    // Stalemate.
+    ];
+
+    #[test]
+    fn round_trip_seed_positions_d1() {
+        for fen in UCI_SEED_FENS {
+            let pos = Position::from_fen(fen).expect("seed FEN parses");
+            let mut moves = MoveList::new();
+            generate_moves(&pos, &mut moves);
+            for mv in moves.as_slice() {
+                let uci = mv.to_uci();
+                let parsed = Move::from_uci(&uci, &pos).unwrap_or_else(|e| {
+                    panic!("D1 round-trip failed for {uci} from {fen}: {e:?}")
+                });
+                assert_eq!(
+                    parsed, *mv,
+                    "D1 round-trip mismatch from {fen}: uci={uci}, expected={mv:?}, parsed={parsed:?}",
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // M2.A property tests.
+    //
+    // Random walk from one of `UCI_SEED_FENS` (canonical 6 + edge-class
+    // fixtures: EP-horizontal-pin, EP-double-check parent, mate,
+    // stalemate), then exercise to_uci/from_uci round-trip and the
+    // (from, to, promo) uniqueness invariant on the reached position.
+    // Mirrors the M1.F `SEED_FENS` + walk pattern from `src/movegen.rs`.
+    // -----------------------------------------------------------------------
+
+    /// Tiny SplitMix64 — same constants as `src/movegen.rs::next_u64`.
+    /// Re-emitted here rather than exported to keep the random-walk
+    /// strategy local to its consumer.
+    fn uci_next_u64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Walk a Position from a seed FEN through `walk_len` legal plies.
+    /// Stops early on terminal positions.
+    fn uci_walk(seed: &str, walk_len: usize, rng_seed: u64) -> Position {
+        let mut pos = Position::from_fen(seed).expect("seed FEN must parse");
+        let mut state = rng_seed.wrapping_add(1);
+        for _ in 0..walk_len {
+            let mut ml = MoveList::new();
+            generate_moves(&pos, &mut ml);
+            if ml.is_empty() {
+                break;
+            }
+            let pick = (uci_next_u64(&mut state) as usize) % ml.len();
+            let mv = ml.as_slice()[pick];
+            pos.make_move(mv);
+        }
+        pos
+    }
+
+    fn uci_arb_position() -> impl Strategy<Value = Position> {
+        // Walk length 0..=4 plies. 0 = the seed itself (D0 coverage,
+        // important for the edge-class seeds in `UCI_SEED_FENS` that
+        // already encode the exotic positions); 4 = enough to surface
+        // mid-game positions with EP targets, mid-game castling rights,
+        // and pawn-promotion candidates from the canonical-6 seeds.
+        (0..UCI_SEED_FENS.len(), 0usize..=4, any::<u64>())
+            .prop_map(|(idx, walk_len, rng_seed)| {
+                uci_walk(UCI_SEED_FENS[idx], walk_len, rng_seed)
+            })
+    }
+
+    proptest! {
+        /// For any reachable position, every legal move round-trips
+        /// through to_uci → from_uci correctly. Subsumes
+        /// `round_trip_seed_positions_d1` for a strict superset of
+        /// positions (D0..=D4 from each seed in `UCI_SEED_FENS`).
+        #[test]
+        fn round_trip_seed_positions_d2_proptest(pos in uci_arb_position()) {
+            let mut moves = MoveList::new();
+            generate_moves(&pos, &mut moves);
+            for mv in moves.iter() {
+                let uci = mv.to_uci();
+                let parsed = Move::from_uci(&uci, &pos);
+                prop_assert_eq!(
+                    parsed,
+                    Ok(mv),
+                    "round-trip failed for uci={} (mv={:?}) from {}",
+                    uci,
+                    mv,
+                    pos.to_fen(),
+                );
+            }
+        }
+
+        /// Uniqueness of (from, to, promotion_kind) per legal move.
+        ///
+        /// `from_uci`'s generate-and-match strategy depends on this
+        /// invariant. The plan §"Decisions §2" derives it from chess
+        /// rules; this property pins it empirically against the
+        /// movegen surface across reachable positions. If a future
+        /// movegen change ever emits two legal moves with the same
+        /// triple, `from_uci` would silently pick the first — this
+        /// test catches the regression before that.
+        #[test]
+        fn prop_at_most_one_legal_move_per_from_to_promo(pos in uci_arb_position()) {
+            let mut moves = MoveList::new();
+            generate_moves(&pos, &mut moves);
+            // O(n²) pairwise check — n ≤ 218 in any chess position
+            // (Whittington's max), so ~50k comparisons worst case.
+            // Trivial.
+            let slice = moves.as_slice();
+            for (i, a) in slice.iter().enumerate() {
+                for (j_offset, b) in slice[i + 1..].iter().enumerate() {
+                    let j = i + 1 + j_offset;
+                    let same = a.from_square() == b.from_square()
+                        && a.to_square() == b.to_square()
+                        && a.promotion_kind() == b.promotion_kind();
+                    prop_assert!(
+                        !same,
+                        "uniqueness violated in {}: pair (i={}, j={}) — {:?} and {:?} share (from, to, promo)",
+                        pos.to_fen(),
+                        i,
+                        j,
+                        a,
+                        b,
+                    );
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // UciMoveError surface tests.
+    //
+    // The Display/Error impls are tiny but worth a smoke test so a
+    // future renaming or removal of a variant doesn't silently break
+    // diagnostics in M2.B/C.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn uci_move_error_display_messages() {
+        // Each variant produces non-empty human-readable output. The
+        // exact wording isn't pinned (it's diagnostic, not protocol),
+        // but each must be distinct and informative.
+        let messages: Vec<String> = [
+            UciMoveError::Malformed,
+            UciMoveError::IllegalPromotionPiece,
+            UciMoveError::NullMove,
+            UciMoveError::IllegalForPosition,
+        ]
+        .iter()
+        .map(|e| e.to_string())
+        .collect();
+        for m in &messages {
+            assert!(!m.is_empty(), "Display must produce non-empty text");
+        }
+        // Distinct messages — no two variants share text.
+        for i in 0..messages.len() {
+            for j in (i + 1)..messages.len() {
+                assert_ne!(
+                    messages[i], messages[j],
+                    "variants at indices {i} and {j} share a Display message",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uci_move_error_implements_std_error() {
+        // Compile-time check: UciMoveError satisfies the `std::error::Error`
+        // trait bound, so it's usable with `?`-propagation through
+        // `Box<dyn Error>` downstream in M2.B/C.
+        fn assert_error<E: std::error::Error>(_: &E) {}
+        assert_error(&UciMoveError::Malformed);
     }
 }
