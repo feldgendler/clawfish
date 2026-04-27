@@ -16,7 +16,7 @@ The cycle:
 2. **Synthesize findings in chat.** Tradeoffs, alternatives, gotchas. Informational; the agent does not wait.
 3. **Choose approach.** The agent picks based on the research synthesis, consistency with project decisions (ADRs and `docs/architecture.md`), and the path of least architectural surprise. If multiple defensible options exist, the agent picks one and notes the alternatives in chat for awareness.
 4. **Plan with plan-review loop.** Every implementable unit gets a written plan. The plan must identify **parallelization opportunities** — which subtasks can run on parallel coding agents. The plan goes through a blind-review loop until convergent. See "Plan mode and plan-review loop" below.
-5. **Write tests** for the entire task scope, where the layer admits TDD (see TDD scope below). Parallelizable across coding agents per the plan.
+5. **Write tests** for the entire task scope, where the layer admits TDD (see TDD scope below). This includes both ordinary unit tests and property tests (via `proptest`) where the invariant is more compact than an enumeration — written and reviewed *together*, before implementation. Property tests do not replace specific unit tests; see "Property tests vs. unit tests" below. Parallelizable across coding agents per the plan.
 6. **Test-suite review loop.** Independent reviewer checks the test suite for correctness to spec, confirmation bias, adequate checks, corner case coverage. See "Test-suite review loop" below. Implementation does not begin until the test suite passes review.
 7. **Implement.** Parallelizable across coding agents per the plan.
 8. **All tests pass.** No final review or commit until they do.
@@ -218,6 +218,16 @@ The two are **orthogonal and both apply.** A pruning decision function has a det
 - **Match outcomes / strength claims themselves.** These are inherently statistical — SPRT, not unit tests.
 
 NNUE *training* is non-deterministic; NNUE *inference* is deterministic and unit-testable.
+
+## Property tests vs. unit tests
+
+Property tests (via `proptest`) and ordinary unit tests are **complementary**, not interchangeable.
+
+- **Property tests are part of the per-feature test suite from the start.** When a unit's invariants admit a more compact property than an enumerated unit test (set algebra, round-trips, idempotence, monotonicity, etc.), the property is written *together with* the ordinary tests in step 5 of the per-feature loop and reviewed *together with* them in step 6's test-suite review. Properties are not a follow-up exercise after the code ships.
+- **Property tests do not replace specific unit tests.** Two reasons:
+  1. **Sampling, not enumeration.** Proptest samples (default 256 cases). A property whose strategy spans the same domain as a unit test guarantees the value only probabilistically; the unit test guarantees it deterministically.
+  2. **Anchor tests document intent.** Tests added to kill specific cargo-mutants survivors, or to pin a past regression, encode information beyond the assertion — *which* mutant they kill, *which* bug they prevent. A property that subsumes the assertion does not subsume the documentation. **Do not delete anchor tests** when a broader property covers the same assertion. The same applies in reverse: a property exercising a previously-excluded equivalent mutant is good news but does not justify removing the exclusion's `# explanation` comment in `.cargo/mutants.toml`.
+- **Use a property where the invariant is more compact than the enumeration.** Use a unit test where you want to anchor a specific input/output pair, document a mutant kill, or pin a regression.
 
 ## SPRT
 
