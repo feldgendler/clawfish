@@ -122,29 +122,23 @@ impl Position {
     pub const fn starting_position() -> Position {
         // White pieces.
         let white_pawns = Bitboard::RANK_2;
-        let white_rooks = Bitboard(
-            Bitboard::from_square(Square::A1).0 | Bitboard::from_square(Square::H1).0,
-        );
-        let white_knights = Bitboard(
-            Bitboard::from_square(Square::B1).0 | Bitboard::from_square(Square::G1).0,
-        );
-        let white_bishops = Bitboard(
-            Bitboard::from_square(Square::C1).0 | Bitboard::from_square(Square::F1).0,
-        );
+        let white_rooks =
+            Bitboard(Bitboard::from_square(Square::A1).0 | Bitboard::from_square(Square::H1).0);
+        let white_knights =
+            Bitboard(Bitboard::from_square(Square::B1).0 | Bitboard::from_square(Square::G1).0);
+        let white_bishops =
+            Bitboard(Bitboard::from_square(Square::C1).0 | Bitboard::from_square(Square::F1).0);
         let white_queens = Bitboard::from_square(Square::D1);
         let white_kings = Bitboard::from_square(Square::E1);
 
         // Black pieces.
         let black_pawns = Bitboard::RANK_7;
-        let black_rooks = Bitboard(
-            Bitboard::from_square(Square::A8).0 | Bitboard::from_square(Square::H8).0,
-        );
-        let black_knights = Bitboard(
-            Bitboard::from_square(Square::B8).0 | Bitboard::from_square(Square::G8).0,
-        );
-        let black_bishops = Bitboard(
-            Bitboard::from_square(Square::C8).0 | Bitboard::from_square(Square::F8).0,
-        );
+        let black_rooks =
+            Bitboard(Bitboard::from_square(Square::A8).0 | Bitboard::from_square(Square::H8).0);
+        let black_knights =
+            Bitboard(Bitboard::from_square(Square::B8).0 | Bitboard::from_square(Square::G8).0);
+        let black_bishops =
+            Bitboard(Bitboard::from_square(Square::C8).0 | Bitboard::from_square(Square::F8).0);
         let black_queens = Bitboard::from_square(Square::D8);
         let black_kings = Bitboard::from_square(Square::E8);
 
@@ -175,20 +169,13 @@ impl Position {
 
         let mailbox: [Option<Piece>; 64] = [
             // rank 1: a1..h1
-            WR, WN, WB, WQ, WK, WB, WN, WR,
-            // rank 2: a2..h2
-            WP, WP, WP, WP, WP, WP, WP, WP,
-            // rank 3
-            __, __, __, __, __, __, __, __,
-            // rank 4
-            __, __, __, __, __, __, __, __,
-            // rank 5
-            __, __, __, __, __, __, __, __,
-            // rank 6
-            __, __, __, __, __, __, __, __,
-            // rank 7
-            BP, BP, BP, BP, BP, BP, BP, BP,
-            // rank 8
+            WR, WN, WB, WQ, WK, WB, WN, WR, // rank 2: a2..h2
+            WP, WP, WP, WP, WP, WP, WP, WP, // rank 3
+            __, __, __, __, __, __, __, __, // rank 4
+            __, __, __, __, __, __, __, __, // rank 5
+            __, __, __, __, __, __, __, __, // rank 6
+            __, __, __, __, __, __, __, __, // rank 7
+            BP, BP, BP, BP, BP, BP, BP, BP, // rank 8
             BR, BN, BB, BQ, BK, BB, BN, BR,
         ];
 
@@ -289,8 +276,7 @@ impl Position {
         for bb in self.piece_bb.iter() {
             piece_union |= *bb;
         }
-        let color_union =
-            self.color_bb[Color::White.index()] | self.color_bb[Color::Black.index()];
+        let color_union = self.color_bb[Color::White.index()] | self.color_bb[Color::Black.index()];
         assert_eq!(
             piece_union, color_union,
             "piece-bitboard union must equal color-bitboard union",
@@ -405,8 +391,7 @@ impl fmt::Debug for Position {
         for rank in (0..8u8).rev() {
             write!(f, "{}", rank + 1)?;
             for file in 0..8u8 {
-                let sq = Square::from_file_rank(file, rank)
-                    .expect("file and rank are in 0..8");
+                let sq = Square::from_file_rank(file, rank).expect("file and rank are in 0..8");
                 let cell = match self.piece_at(sq) {
                     Some(piece) => piece.fen_char() as char,
                     None => '.',
@@ -493,12 +478,16 @@ mod tests {
 
     #[test]
     fn castling_has_with_without() {
-        assert!(CastlingRights::NONE
-            .with(CastlingRights::WHITE_KING)
-            .has(CastlingRights::WHITE_KING));
-        assert!(!CastlingRights::ALL
-            .without(CastlingRights::BLACK_QUEEN)
-            .has(CastlingRights::BLACK_QUEEN));
+        assert!(
+            CastlingRights::NONE
+                .with(CastlingRights::WHITE_KING)
+                .has(CastlingRights::WHITE_KING)
+        );
+        assert!(
+            !CastlingRights::ALL
+                .without(CastlingRights::BLACK_QUEEN)
+                .has(CastlingRights::BLACK_QUEEN)
+        );
         assert!(CastlingRights::ALL.has(CastlingRights::WHITE_KING));
     }
 
@@ -525,8 +514,14 @@ mod tests {
         assert_eq!(p.pieces_colored(Color::Black, PieceKind::Pawn).count(), 8);
 
         // Pawn ranks.
-        assert_eq!(p.pieces_colored(Color::White, PieceKind::Pawn), Bitboard::RANK_2);
-        assert_eq!(p.pieces_colored(Color::Black, PieceKind::Pawn), Bitboard::RANK_7);
+        assert_eq!(
+            p.pieces_colored(Color::White, PieceKind::Pawn),
+            Bitboard::RANK_2
+        );
+        assert_eq!(
+            p.pieces_colored(Color::Black, PieceKind::Pawn),
+            Bitboard::RANK_7
+        );
 
         // Back-rank piece counts.
         assert_eq!(p.pieces_colored(Color::White, PieceKind::Knight).count(), 2);
@@ -542,24 +537,30 @@ mod tests {
         assert_eq!(p.pieces_colored(Color::Black, PieceKind::King).count(), 1);
 
         // Spot-check specific squares for piece presence.
-        assert!(p
-            .pieces_colored(Color::White, PieceKind::Rook)
-            .contains(Square::A1));
-        assert!(p
-            .pieces_colored(Color::White, PieceKind::Rook)
-            .contains(Square::H1));
-        assert!(p
-            .pieces_colored(Color::Black, PieceKind::Rook)
-            .contains(Square::A8));
-        assert!(p
-            .pieces_colored(Color::Black, PieceKind::Rook)
-            .contains(Square::H8));
-        assert!(p
-            .pieces_colored(Color::White, PieceKind::Queen)
-            .contains(Square::D1));
-        assert!(p
-            .pieces_colored(Color::Black, PieceKind::Queen)
-            .contains(Square::D8));
+        assert!(
+            p.pieces_colored(Color::White, PieceKind::Rook)
+                .contains(Square::A1)
+        );
+        assert!(
+            p.pieces_colored(Color::White, PieceKind::Rook)
+                .contains(Square::H1)
+        );
+        assert!(
+            p.pieces_colored(Color::Black, PieceKind::Rook)
+                .contains(Square::A8)
+        );
+        assert!(
+            p.pieces_colored(Color::Black, PieceKind::Rook)
+                .contains(Square::H8)
+        );
+        assert!(
+            p.pieces_colored(Color::White, PieceKind::Queen)
+                .contains(Square::D1)
+        );
+        assert!(
+            p.pieces_colored(Color::Black, PieceKind::Queen)
+                .contains(Square::D8)
+        );
     }
 
     #[test]
@@ -582,7 +583,10 @@ mod tests {
         }
 
         // Color bitboards are disjoint.
-        assert_eq!(p.occupied(Color::White) & p.occupied(Color::Black), Bitboard::EMPTY);
+        assert_eq!(
+            p.occupied(Color::White) & p.occupied(Color::Black),
+            Bitboard::EMPTY
+        );
 
         // Piece-bitboard union equals color-bitboard union.
         let piece_union = kinds
@@ -606,16 +610,22 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(mailbox_piece, bb_piece, "mailbox vs bitboards diverge at {:?}", sq);
+            assert_eq!(
+                mailbox_piece, bb_piece,
+                "mailbox vs bitboards diverge at {:?}",
+                sq
+            );
         }
 
         // King cache matches the King bitboard.
-        assert!(p
-            .pieces_colored(Color::White, PieceKind::King)
-            .contains(p.king_square(Color::White)));
-        assert!(p
-            .pieces_colored(Color::Black, PieceKind::King)
-            .contains(p.king_square(Color::Black)));
+        assert!(
+            p.pieces_colored(Color::White, PieceKind::King)
+                .contains(p.king_square(Color::White))
+        );
+        assert!(
+            p.pieces_colored(Color::Black, PieceKind::King)
+                .contains(p.king_square(Color::Black))
+        );
     }
 
     #[test]
@@ -630,8 +640,14 @@ mod tests {
     #[test]
     fn occupied_partition_starting_position() {
         let p = Position::starting_position();
-        assert_eq!(p.occupied(Color::White) & p.occupied(Color::Black), Bitboard::EMPTY);
-        assert_eq!(p.occupied_all(), p.occupied(Color::White) | p.occupied(Color::Black));
+        assert_eq!(
+            p.occupied(Color::White) & p.occupied(Color::Black),
+            Bitboard::EMPTY
+        );
+        assert_eq!(
+            p.occupied_all(),
+            p.occupied(Color::White) | p.occupied(Color::Black)
+        );
         assert_eq!(p.occupied_all().count(), 32);
     }
 
@@ -682,24 +698,12 @@ mod tests {
 
         // Flipping side-to-move alone should make them unequal.
         let mut p_flipped = Position::starting_position();
-        p_flipped.set_aux_state(
-            Color::Black,
-            CastlingRights::ALL,
-            None,
-            0,
-            1,
-        );
+        p_flipped.set_aux_state(Color::Black, CastlingRights::ALL, None, 0, 1);
         assert_ne!(p1, p_flipped);
 
         // Bumping fullmove alone should make them unequal.
         let mut p_bumped = Position::starting_position();
-        p_bumped.set_aux_state(
-            Color::White,
-            CastlingRights::ALL,
-            None,
-            0,
-            2,
-        );
+        p_bumped.set_aux_state(Color::White, CastlingRights::ALL, None, 0, 2);
         assert_ne!(p1, p_bumped);
     }
 
@@ -712,8 +716,8 @@ mod tests {
     #[test]
     fn starting_position_matches_from_fen() {
         let from_const = Position::starting_position();
-        let from_parser = Position::from_fen(Position::STARTING_FEN)
-            .expect("STARTING_FEN must parse");
+        let from_parser =
+            Position::from_fen(Position::STARTING_FEN).expect("STARTING_FEN must parse");
         assert_eq!(from_const, from_parser);
     }
 
@@ -746,13 +750,7 @@ mod tests {
         p.set_piece(Square::E4, WHITE_PAWN);
         p.set_piece(Square::E8, BLACK_KING);
         p.set_piece(Square::G8, BLACK_KNIGHT);
-        p.set_aux_state(
-            Color::White,
-            CastlingRights::NONE,
-            None,
-            3,
-            17,
-        );
+        p.set_aux_state(Color::White, CastlingRights::NONE, None, 3, 17);
 
         let formatted = format!("{}", p);
         let parsed = Position::from_fen(&formatted).expect("formatted FEN must parse");
@@ -783,8 +781,7 @@ mod tests {
         p.set_aux_state(Color::Black, castling, Some(Square::D3), 0, 8);
 
         let formatted = format!("{}", p);
-        let parsed =
-            Position::from_fen(&formatted).expect("formatted castle/EP FEN must parse");
+        let parsed = Position::from_fen(&formatted).expect("formatted castle/EP FEN must parse");
         assert_eq!(parsed, p);
         // Sanity-check the formatted string actually carries the expected
         // castling and EP tokens (so the round-trip wasn't a self-cancelling
@@ -861,17 +858,22 @@ mod tests {
         // Place a white rook, then overwrite it with a white bishop.
         p.set_piece(Square::E4, WHITE_ROOK);
         // Verify rook is present before overwrite.
-        assert!(p.pieces_colored(Color::White, PieceKind::Rook).contains(Square::E4));
+        assert!(
+            p.pieces_colored(Color::White, PieceKind::Rook)
+                .contains(Square::E4)
+        );
 
         p.set_piece(Square::E4, WHITE_BISHOP);
 
         // After overwrite: bishop must be on e4, rook must not be.
         assert!(
-            p.pieces_colored(Color::White, PieceKind::Bishop).contains(Square::E4),
+            p.pieces_colored(Color::White, PieceKind::Bishop)
+                .contains(Square::E4),
             "bishop must appear on e4 after overwrite"
         );
         assert!(
-            !p.pieces_colored(Color::White, PieceKind::Rook).contains(Square::E4),
+            !p.pieces_colored(Color::White, PieceKind::Rook)
+                .contains(Square::E4),
             "rook must be removed from e4 after overwrite"
         );
         assert_eq!(

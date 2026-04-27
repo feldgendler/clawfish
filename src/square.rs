@@ -75,11 +75,7 @@ impl Square {
     pub const H8: Square = Square(63);
 
     pub const fn new(index: u8) -> Option<Self> {
-        if index < 64 {
-            Some(Self(index))
-        } else {
-            None
-        }
+        if index < 64 { Some(Self(index)) } else { None }
     }
 
     pub const fn new_unchecked(index: u8) -> Self {
@@ -164,8 +160,7 @@ mod tests {
     fn from_file_rank_round_trip() {
         for f in 0..8u8 {
             for r in 0..8u8 {
-                let sq = Square::from_file_rank(f, r)
-                    .expect("0..8 x 0..8 must be a valid square");
+                let sq = Square::from_file_rank(f, r).expect("0..8 x 0..8 must be a valid square");
                 assert_eq!(sq.file(), f);
                 assert_eq!(sq.rank(), r);
             }
@@ -216,14 +211,70 @@ mod tests {
         assert_eq!(Square::parse_uci("h8"), Some(Square::H8));
 
         let named: [Square; 64] = [
-            Square::A1, Square::B1, Square::C1, Square::D1, Square::E1, Square::F1, Square::G1, Square::H1,
-            Square::A2, Square::B2, Square::C2, Square::D2, Square::E2, Square::F2, Square::G2, Square::H2,
-            Square::A3, Square::B3, Square::C3, Square::D3, Square::E3, Square::F3, Square::G3, Square::H3,
-            Square::A4, Square::B4, Square::C4, Square::D4, Square::E4, Square::F4, Square::G4, Square::H4,
-            Square::A5, Square::B5, Square::C5, Square::D5, Square::E5, Square::F5, Square::G5, Square::H5,
-            Square::A6, Square::B6, Square::C6, Square::D6, Square::E6, Square::F6, Square::G6, Square::H6,
-            Square::A7, Square::B7, Square::C7, Square::D7, Square::E7, Square::F7, Square::G7, Square::H7,
-            Square::A8, Square::B8, Square::C8, Square::D8, Square::E8, Square::F8, Square::G8, Square::H8,
+            Square::A1,
+            Square::B1,
+            Square::C1,
+            Square::D1,
+            Square::E1,
+            Square::F1,
+            Square::G1,
+            Square::H1,
+            Square::A2,
+            Square::B2,
+            Square::C2,
+            Square::D2,
+            Square::E2,
+            Square::F2,
+            Square::G2,
+            Square::H2,
+            Square::A3,
+            Square::B3,
+            Square::C3,
+            Square::D3,
+            Square::E3,
+            Square::F3,
+            Square::G3,
+            Square::H3,
+            Square::A4,
+            Square::B4,
+            Square::C4,
+            Square::D4,
+            Square::E4,
+            Square::F4,
+            Square::G4,
+            Square::H4,
+            Square::A5,
+            Square::B5,
+            Square::C5,
+            Square::D5,
+            Square::E5,
+            Square::F5,
+            Square::G5,
+            Square::H5,
+            Square::A6,
+            Square::B6,
+            Square::C6,
+            Square::D6,
+            Square::E6,
+            Square::F6,
+            Square::G6,
+            Square::H6,
+            Square::A7,
+            Square::B7,
+            Square::C7,
+            Square::D7,
+            Square::E7,
+            Square::F7,
+            Square::G7,
+            Square::H7,
+            Square::A8,
+            Square::B8,
+            Square::C8,
+            Square::D8,
+            Square::E8,
+            Square::F8,
+            Square::G8,
+            Square::H8,
         ];
         for sq in named {
             let s = sq.to_string();

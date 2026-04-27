@@ -30,8 +30,8 @@ const CANONICAL_PERFT_FENS: &[&str] = &[
 
 #[test]
 fn starting_position_round_trip() {
-    let parsed = Position::from_fen(Position::STARTING_FEN)
-        .expect("STARTING_FEN must parse cleanly");
+    let parsed =
+        Position::from_fen(Position::STARTING_FEN).expect("STARTING_FEN must parse cleanly");
     assert_eq!(
         parsed.to_fen(),
         Position::STARTING_FEN,

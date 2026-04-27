@@ -326,8 +326,7 @@ mod tests {
 
     #[test]
     fn parse_starting_position() {
-        let p = Position::from_fen(Position::STARTING_FEN)
-            .expect("starting FEN must parse");
+        let p = Position::from_fen(Position::STARTING_FEN).expect("starting FEN must parse");
         assert_eq!(p.to_fen(), Position::STARTING_FEN);
         p.debug_assert_consistent();
     }
@@ -379,10 +378,7 @@ mod tests {
         assert_eq!(p.fullmove_number(), 39);
         assert_eq!(p.king_square(Color::White), Square::E1);
         assert_eq!(p.king_square(Color::Black), Square::E8);
-        assert_eq!(
-            p.pieces_colored(Color::White, PieceKind::Pawn).count(),
-            1
-        );
+        assert_eq!(p.pieces_colored(Color::White, PieceKind::Pawn).count(), 1);
         assert_eq!(p.to_fen(), fen);
     }
 
@@ -503,24 +499,19 @@ mod tests {
     #[test]
     fn parse_rejects_too_few_fields() {
         // 5 fields — missing fullmove.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0");
         assert!(matches!(r, Err(FenError::WrongFieldCount { found: 5 })));
         // 4 fields — missing both halfmove and fullmove. Stockfish accepts
         // this de-facto truncated form; we don't (per the strict-spec stance).
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -");
         assert!(matches!(r, Err(FenError::WrongFieldCount { found: 4 })));
     }
 
     #[test]
     fn parse_rejects_too_many_fields() {
         // 7 fields — trailing extra token.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1 extra",
-        );
+        let r =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1 extra");
         assert!(matches!(r, Err(FenError::WrongFieldCount { found: 7 })));
     }
 
@@ -559,9 +550,7 @@ mod tests {
         // Ten pawns in rank 7 — cumulative-square overflow. Rank 7 (not rank 8)
         // so the pawn-on-back-rank check does not fire first; both kings are
         // present so the king-count check is satisfied.
-        let r = Position::from_fen(
-            "4k3/pppppppppp/8/8/8/8/8/4K3 w - - 0 1",
-        );
+        let r = Position::from_fen("4k3/pppppppppp/8/8/8/8/8/4K3 w - - 0 1");
         assert!(matches!(r, Err(FenError::BadPiecePlacement(_))));
     }
 
@@ -659,27 +648,21 @@ mod tests {
     #[test]
     fn parse_rejects_bad_active_color() {
         // Uppercase W — case-sensitive per spec.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR W KQkq - 0 1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR W KQkq - 0 1");
         assert!(matches!(r, Err(FenError::BadActiveColor(_))));
     }
 
     #[test]
     fn parse_rejects_bad_active_color_long() {
         // Multi-char "white" — must be a single byte.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR white KQkq - 0 1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR white KQkq - 0 1");
         assert!(matches!(r, Err(FenError::BadActiveColor(_))));
     }
 
     #[test]
     fn parse_rejects_bad_castling_chars() {
         // 'X' is not a valid castling letter.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w XQkq - 0 1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w XQkq - 0 1");
         assert!(matches!(r, Err(FenError::BadCastlingRights(_))));
     }
 
@@ -687,18 +670,14 @@ mod tests {
     fn parse_rejects_bad_castling_order() {
         // QKkq — Q before K violates spec ordering (uppercase before lowercase,
         // kingside before queenside). See Reviewer-revision §A.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w QKkq - 0 1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w QKkq - 0 1");
         assert!(matches!(r, Err(FenError::BadCastlingRights(_))));
     }
 
     #[test]
     fn parse_rejects_duplicate_castling() {
         // KKkq — K appears twice.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KKkq - 0 1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KKkq - 0 1");
         assert!(matches!(r, Err(FenError::BadCastlingRights(_))));
     }
 
@@ -707,9 +686,7 @@ mod tests {
         // "-K" — dash followed by letters. The dash means "no castling" and
         // is mutually exclusive with letters. Pin that this is rejected
         // rather than silently accepted as either "-" or "K".
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w -K - 0 1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w -K - 0 1");
         assert!(matches!(r, Err(FenError::BadCastlingRights(_))));
     }
 
@@ -717,9 +694,7 @@ mod tests {
     fn parse_rejects_bad_ep_square() {
         // Several malformed EP squares — all must reject.
         for bad_ep in ["i9", "e0", "e9", "aa", "e", "e3x"] {
-            let fen = format!(
-                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq {bad_ep} 0 1"
-            );
+            let fen = format!("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq {bad_ep} 0 1");
             let r = Position::from_fen(&fen);
             assert!(
                 matches!(r, Err(FenError::BadEnPassant(_))),
@@ -731,9 +706,7 @@ mod tests {
     #[test]
     fn parse_rejects_ep_wrong_rank() {
         // EP on rank 4 — impossible from a legal preceding move.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq e4 0 1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq e4 0 1");
         assert!(matches!(r, Err(FenError::BadEnPassant(_))));
     }
 
@@ -741,60 +714,47 @@ mod tests {
     fn parse_rejects_ep_em_dash() {
         // EP field is the UTF-8 em-dash (U+2014, three bytes) instead of '-'.
         // Pins that the byte-oriented parser does not panic on multi-byte UTF-8.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq \u{2014} 0 1",
-        );
+        let r =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq \u{2014} 0 1");
         assert!(matches!(r, Err(FenError::BadEnPassant(_))));
     }
 
     #[test]
     fn parse_rejects_negative_halfmove() {
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - -1 1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - -1 1");
         assert!(matches!(r, Err(FenError::BadHalfmoveClock(_))));
     }
 
     #[test]
     fn parse_rejects_plus_prefixed_halfmove() {
         // Strict-decimal: leading '+' rejected.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - +1 1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - +1 1");
         assert!(matches!(r, Err(FenError::BadHalfmoveClock(_))));
     }
 
     #[test]
     fn parse_rejects_non_numeric_halfmove() {
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - x 1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - x 1");
         assert!(matches!(r, Err(FenError::BadHalfmoveClock(_))));
     }
 
     #[test]
     fn parse_rejects_zero_fullmove() {
         // Spec: fullmove is a positive integer.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 0",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 0");
         assert!(matches!(r, Err(FenError::BadFullmoveNumber(_))));
     }
 
     #[test]
     fn parse_rejects_negative_fullmove() {
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 -1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 -1");
         assert!(matches!(r, Err(FenError::BadFullmoveNumber(_))));
     }
 
     #[test]
     fn parse_rejects_plus_prefixed_fullmove() {
         // Strict-decimal: leading '+' rejected.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 +1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 +1");
         assert!(matches!(r, Err(FenError::BadFullmoveNumber(_))));
     }
 
@@ -837,18 +797,14 @@ mod tests {
     #[test]
     fn parse_rejects_halfmove_above_u8_max() {
         // 256 overflows u8.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 256 1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 256 1");
         assert!(matches!(r, Err(FenError::BadHalfmoveClock(_))));
     }
 
     #[test]
     fn parse_rejects_fullmove_above_u16_max() {
         // 70000 overflows u16 (max 65535).
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 70000",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 70000");
         assert!(matches!(r, Err(FenError::BadFullmoveNumber(_))));
     }
 
@@ -856,9 +812,7 @@ mod tests {
     fn parse_rejects_leading_whitespace() {
         // Leading space → strict split(' ') yields an empty first field.
         // Either WrongFieldCount (7 fields) or BadPiecePlacement is acceptable.
-        let r = Position::from_fen(
-            " rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        );
+        let r = Position::from_fen(" rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
         assert!(matches!(
             r,
             Err(FenError::WrongFieldCount { .. }) | Err(FenError::BadPiecePlacement(_))
@@ -868,18 +822,14 @@ mod tests {
     #[test]
     fn parse_rejects_trailing_whitespace() {
         // Trailing space → 7th empty field.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1 ",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1 ");
         assert!(matches!(r, Err(FenError::WrongFieldCount { found: 7 })));
     }
 
     #[test]
     fn parse_rejects_double_space() {
         // Two spaces between fields 2 and 3 yield a 7th phantom empty field.
-        let r = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w  KQkq - 0 1",
-        );
+        let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w  KQkq - 0 1");
         assert!(matches!(r, Err(FenError::WrongFieldCount { found: 7 })));
     }
 
@@ -897,47 +847,69 @@ mod tests {
             "FEN must have 6 fields, found 3"
         );
         // BadPiecePlacement
-        assert!(FenError::BadPiecePlacement("bad".to_string())
-            .to_string()
-            .contains("bad piece placement"));
+        assert!(
+            FenError::BadPiecePlacement("bad".to_string())
+                .to_string()
+                .contains("bad piece placement")
+        );
         // BadActiveColor
-        assert!(FenError::BadActiveColor("X".to_string())
-            .to_string()
-            .contains("bad active color"));
+        assert!(
+            FenError::BadActiveColor("X".to_string())
+                .to_string()
+                .contains("bad active color")
+        );
         // BadCastlingRights
-        assert!(FenError::BadCastlingRights("xx".to_string())
-            .to_string()
-            .contains("bad castling rights"));
+        assert!(
+            FenError::BadCastlingRights("xx".to_string())
+                .to_string()
+                .contains("bad castling rights")
+        );
         // BadEnPassant
-        assert!(FenError::BadEnPassant("e5".to_string())
-            .to_string()
-            .contains("bad en passant target"));
+        assert!(
+            FenError::BadEnPassant("e5".to_string())
+                .to_string()
+                .contains("bad en passant target")
+        );
         // BadHalfmoveClock
-        assert!(FenError::BadHalfmoveClock("x".to_string())
-            .to_string()
-            .contains("bad halfmove clock"));
+        assert!(
+            FenError::BadHalfmoveClock("x".to_string())
+                .to_string()
+                .contains("bad halfmove clock")
+        );
         // BadFullmoveNumber
-        assert!(FenError::BadFullmoveNumber("0".to_string())
-            .to_string()
-            .contains("bad fullmove number"));
+        assert!(
+            FenError::BadFullmoveNumber("0".to_string())
+                .to_string()
+                .contains("bad fullmove number")
+        );
         // MissingKing — both colors
-        assert!(FenError::MissingKing(Color::White)
-            .to_string()
-            .contains("missing"));
-        assert!(FenError::MissingKing(Color::Black)
-            .to_string()
-            .contains("missing"));
+        assert!(
+            FenError::MissingKing(Color::White)
+                .to_string()
+                .contains("missing")
+        );
+        assert!(
+            FenError::MissingKing(Color::Black)
+                .to_string()
+                .contains("missing")
+        );
         // TooManyKings — both colors
-        assert!(FenError::TooManyKings(Color::White)
-            .to_string()
-            .contains("too many"));
-        assert!(FenError::TooManyKings(Color::Black)
-            .to_string()
-            .contains("too many"));
+        assert!(
+            FenError::TooManyKings(Color::White)
+                .to_string()
+                .contains("too many")
+        );
+        assert!(
+            FenError::TooManyKings(Color::Black)
+                .to_string()
+                .contains("too many")
+        );
         // PawnOnBackRank
-        assert!(FenError::PawnOnBackRank(Square::A1)
-            .to_string()
-            .contains("pawn on back rank"));
+        assert!(
+            FenError::PawnOnBackRank(Square::A1)
+                .to_string()
+                .contains("pawn on back rank")
+        );
     }
 
     /// `FenError` implements `std::error::Error`; pin that the impl compiles
@@ -978,6 +950,4 @@ mod tests {
             "incomplete last rank must be BadPiecePlacement, got {r:?}"
         );
     }
-
 }
-

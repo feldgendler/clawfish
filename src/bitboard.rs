@@ -198,7 +198,11 @@ impl fmt::Debug for Bitboard {
             write!(f, "{}", rank + 1)?;
             for file in 0..8u8 {
                 let index = rank * 8 + file;
-                let cell = if self.0 & (1u64 << index) != 0 { 'X' } else { '.' };
+                let cell = if self.0 & (1u64 << index) != 0 {
+                    'X'
+                } else {
+                    '.'
+                };
                 write!(f, " {}", cell)?;
             }
             writeln!(f)?;
@@ -259,7 +263,11 @@ mod tests {
             let sq = Square::new(i).expect("0..64 must be a valid square");
             let bb = Bitboard::from_square(sq);
             assert_eq!(bb.count(), 1, "from_square({}) should have count 1", i);
-            assert!(bb.contains(sq), "from_square({}) should contain that square", i);
+            assert!(
+                bb.contains(sq),
+                "from_square({}) should contain that square",
+                i
+            );
         }
     }
 
@@ -334,10 +342,21 @@ mod tests {
         let bb = Bitboard::FILE_A | Bitboard::RANK_1;
         let collected: Vec<Square> = bb.iter().collect();
         let expected: Vec<Square> = vec![
-            Square::A1, Square::B1, Square::C1, Square::D1,
-            Square::E1, Square::F1, Square::G1, Square::H1,
-            Square::A2, Square::A3, Square::A4, Square::A5,
-            Square::A6, Square::A7, Square::A8,
+            Square::A1,
+            Square::B1,
+            Square::C1,
+            Square::D1,
+            Square::E1,
+            Square::F1,
+            Square::G1,
+            Square::H1,
+            Square::A2,
+            Square::A3,
+            Square::A4,
+            Square::A5,
+            Square::A6,
+            Square::A7,
+            Square::A8,
         ];
         assert_eq!(collected.len(), 15);
         let mut got = collected.clone();
@@ -447,26 +466,50 @@ mod tests {
 
     #[test]
     fn shift_north_off_top_rank() {
-        assert_eq!(Bitboard::from_square(Square::E8).shift_north(), Bitboard::EMPTY);
-        assert_eq!(Bitboard::from_square(Square::A8).shift_north(), Bitboard::EMPTY);
-        assert_eq!(Bitboard::from_square(Square::H8).shift_north(), Bitboard::EMPTY);
+        assert_eq!(
+            Bitboard::from_square(Square::E8).shift_north(),
+            Bitboard::EMPTY
+        );
+        assert_eq!(
+            Bitboard::from_square(Square::A8).shift_north(),
+            Bitboard::EMPTY
+        );
+        assert_eq!(
+            Bitboard::from_square(Square::H8).shift_north(),
+            Bitboard::EMPTY
+        );
     }
 
     #[test]
     fn shift_south_off_bottom_rank() {
-        assert_eq!(Bitboard::from_square(Square::E1).shift_south(), Bitboard::EMPTY);
-        assert_eq!(Bitboard::from_square(Square::A1).shift_south(), Bitboard::EMPTY);
-        assert_eq!(Bitboard::from_square(Square::H1).shift_south(), Bitboard::EMPTY);
+        assert_eq!(
+            Bitboard::from_square(Square::E1).shift_south(),
+            Bitboard::EMPTY
+        );
+        assert_eq!(
+            Bitboard::from_square(Square::A1).shift_south(),
+            Bitboard::EMPTY
+        );
+        assert_eq!(
+            Bitboard::from_square(Square::H1).shift_south(),
+            Bitboard::EMPTY
+        );
     }
 
     #[test]
     fn shift_e_singleton_h_file() {
-        assert_eq!(Bitboard::from_square(Square::H4).shift_east(), Bitboard::EMPTY);
+        assert_eq!(
+            Bitboard::from_square(Square::H4).shift_east(),
+            Bitboard::EMPTY
+        );
     }
 
     #[test]
     fn shift_w_singleton_a_file() {
-        assert_eq!(Bitboard::from_square(Square::A4).shift_west(), Bitboard::EMPTY);
+        assert_eq!(
+            Bitboard::from_square(Square::A4).shift_west(),
+            Bitboard::EMPTY
+        );
     }
 
     #[test]
