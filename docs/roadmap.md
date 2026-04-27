@@ -4,7 +4,41 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1 complete; M2.A landed; M2.B next — UCI command parser.**
+**M1 complete; M2.A and M2.B landed; M2.C next — Engine I/O loop + position state (binds ADR-0011 on UCI threading).**
+
+### M2.B — what landed
+
+The `uci` module — pure-function parser for UCI 2006 GUI→engine commands:
+
+- **`parse_uci_line(&str) -> Command`** — sole public entry point. Total over input: every string yields a `Command`, with `Command::Unknown` for unrecognized or malformed input.
+- **`Command` enum** + helper types: `DebugMode`, `Register` (with `Identify { name, code }` invariant variant), `PositionSpec`, `GoParams`.
+- **5 private sub-parsers** (`parse_debug`/`parse_setoption`/`parse_register`/`parse_position`/`parse_go`) — tested through the public surface, not directly.
+- **`SEARCHMOVES_TERMINATORS` const** — the 11 `go` body keywords other than `searchmoves` itself; pinned by data-invariant test against drift between source / test / plan §6.a.
+
+### M2.B — implementation highlights
+
+- **Per-command leniency model is asymmetric**, grounded in 12 empirical Stockfish 18 probes (see `docs/plans/m2.b.md` §3.1):
+  - No-arg commands ignore trailing junk (`isready xyzzybanana` → `IsReady`).
+  - `debug` is strict-exact-2-tokens (`debug on garbage` → `Unknown`).
+  - `position` is lenient-stop after the position spec (junk between `startpos` and `moves` discards the `moves` clause).
+  - `go` is lenient-skip on unknown body tokens (silently dropped, parsing continues).
+- **Strict-first-token rule chosen over the spec's literal `joho debug on → debug on` rule** — Stockfish 18 doesn't honor that rule either, and silently swallowing GUI-side typos is anti-debuggability.
+- **Move strings + FEN strings collected raw**, not parsed at this layer. M2.C parses moves via M2.A's `from_uci` and FEN via the existing FEN parser.
+- **Numeric type widths grounded in spec**: `wtime`/`btime`/`movetime` `i64` (clock can go negative); `winc`/`binc` `u64` (spec "if x > 0"); `nodes` `u64`; `depth`/`movestogo`/`mate` `u32`. Negative or out-of-range inputs fail to parse and yield `None` per §6.b.
+- **Total function — no `Result`, no panics.** All numeric parsing via `str::parse::<T>()` returning `Result`; tokenization via `split_whitespace` (panic-free); the only `unwrap` is a `peek-then-next` pattern provably safe by `Iterator` contract.
+
+### M2.B — verification (Apple M4, dev machine)
+
+| Metric | Result |
+|---|---|
+| Tests | 542 fast + 4 ignored (446 prior + 96 new M2.B). All passing. |
+| `cargo build --release` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo llvm-cov --summary-only --lib` (`uci.rs`) | 99.90% region / 100.00% line / 100.00% function. The 1 uncovered region is the `iter.next().unwrap()` panic branch in `searchmoves` collection (peek-then-next pattern; unreachable by Iterator contract). |
+| `cargo mutants --in-diff` | 55 mutants generated; **49 caught, 6 unviable** (compile failures); 0 missed. |
+| Benchmark | **Skipped** — UCI command parsing is per command (line-at-a-time, never inside a search loop). Microbenchmark would measure noise. Same precedent as M2.A. |
+
+All three review loops converged: plan after 5 reviewer passes; test suite after 3; final code+tests on first pass. Plan archived at `docs/plans/m2.b.md`. No new ADR.
 
 ### M2.A — what landed
 
@@ -215,7 +249,7 @@ Plays legal random moves through a tournament harness (fastchess; see ADR-0012 b
 | Phase | Scope | Approx size |
 |---|---|---|
 | **M2.A** ✓ — UCI move encoding | `Move::to_uci` (Display delegate) + `Move::from_uci` (generate-and-match against `generate_moves`) + `UciMoveError` (4 variants). Long algebraic per UCI spec; null move `0000` rejected; strict lowercase input. Defers legality entirely to movegen (consistent with ADR-0007). Debug-only `debug_assert!` on `(from, to, promo)` uniqueness inside `from_uci` (defense-in-depth alongside property test) | ~400–600 lines (actual: ~860 lines incl. 38 new tests) |
-| **M2.B** — UCI command parser | New `uci` module: `Command` enum + `parse_uci_line(&str) -> Command` (returns `Command::Unknown` for stuff to silently skip per spec §"unknown command or token"). Covers `uci`, `debug on/off`, `isready`, `setoption name … [value …]`, `register`, `ucinewgame`, `position [startpos\|fen …] [moves …]`, `go` (with `searchmoves`/`ponder`/`wtime`/`btime`/`winc`/`binc`/`movestogo`/`depth`/`nodes`/`mate`/`movetime`/`infinite`), `stop`, `ponderhit`, `quit`. Strict whitespace tolerance per spec §arbitrary-whitespace. Property tests for grammar coverage | ~600–900 lines |
+| **M2.B** ✓ — UCI command parser | `uci` module: `Command` enum + helper types + `parse_uci_line(&str) -> Command`. Per-command leniency rules grounded in 12 empirical Stockfish 18 probes (strict-first-token, `debug` strict-exact-2-tokens, `position` lenient-stop, `go` lenient-skip). Move strings + FEN strings collected raw — M2.C parses. Total function: no `Result`, no panics. 96 tests; 99.9% line coverage; 0 missed mutants on `--in-diff` (49 caught, 6 unviable). | ~600–900 lines (actual: ~1430 lines incl. ~700 lines of impl + ~700 lines of 96 tests) |
 | **M2.C** — Engine I/O loop + position state | `Engine` struct (current `Position`, options, RNG seed), main `run()` loop reads lines from stdin and dispatches parsed `Command`s to handlers, writes responses to stdout. Handlers: `uci` (emits `id name`/`id author`/`option …`/`uciok`), `isready` (always answers `readyok`, even mid-search), `setoption`, `ucinewgame` (resets state), `position` (parses moves via M2.A `from_uci` and applies them), `quit`. `info string …` debug logging behind `debug on`. `go` parsed but answered with placeholder until M2.D. Threading model (ADR-0011) lands here so `isready` and `stop` work concurrently with future search | ~800–1200 lines |
 | **M2.D** — Random search + `go`/`bestmove` | `Search` trait/struct with `start(pos, params, output) -> Handle` and `Handle::stop()`, preserving the eval/search interception point per ADR-0004 (NNUE + skill-dial future hooks). Random move via SplitMix64; seed from system time or a custom `Random_Seed` UCI option for reproducibility. Honors `go movetime <ms>` (sleeps then emits), `go infinite` (waits for `stop`), `stop` (cancels pending emit), `searchmoves` (filters legal-move pool). `bestmove <uci>` output. End-to-end test: drive a full game from `position startpos` through repeated `go movetime 10` until terminal | ~700–1000 lines |
 | **M2.E** — Tournament harness + fastchess | `scripts/match.sh` wrapper around `fastchess`; documentation for downloading the `mac-arm64` release and reading PGN/log output. Integration test that spawns the release binary, drives it through a complete self-game via piped stdin/stdout, asserts the game terminates legally (checkmate / stalemate / 50-move / threefold / insufficient material per FIDE) and that the PGN parses. ADR-0012 codifies the harness layout. `docs/workflow.md` gains a "running a match" runbook | ~400–700 lines |

@@ -8,6 +8,7 @@ pub mod piece;
 pub mod position;
 pub mod slow_attacks;
 pub mod square;
+pub mod uci;
 pub mod zobrist;
 
 pub use bitboard::Bitboard;
@@ -19,3 +20,4 @@ pub use perft::{PerftCounts, divide, perft, perft_bulk, perft_categorized};
 pub use piece::{Color, Piece, PieceKind};
 pub use position::Position;
 pub use square::Square;
+pub use uci::{Command, DebugMode, GoParams, PositionSpec, Register, parse_uci_line};

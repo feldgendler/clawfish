@@ -6,11 +6,42 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M2.A complete; M2.B next.** Architectural commitments settled (see `docs/decisions/`).
+**Phase: M2.B complete; M2.C next.** Architectural commitments settled (see `docs/decisions/`).
 
 - M1: complete through M1.G (perft + criterion benchmark harness; 119 Mnps bulk on starting D4).
 - M2.A: complete — `Move::to_uci` + `Move::from_uci` + `UciMoveError`. Generate-and-match parsing strategy; null move `0000` rejected as `NullMove`; strict lowercase input. No new ADR.
-- M2: B–E remain. Pre-M2 research complete: `docs/research/m2-uci-threading.md` (binds ADR-0011 on M2.C) and `docs/research/m2-tournament-harness.md` (binds ADR-0012 on M2.E).
+- M2.B: complete — `uci` module: `Command` enum + `parse_uci_line(&str) -> Command`. Pure string→AST function, no I/O, no engine state. Per-command leniency rules grounded in empirical Stockfish 18 probes (strict-first-token deviates from the spec's literal "joho debug on → debug on" rule, which Stockfish itself doesn't honor). No new ADR.
+- M2: C–E remain. Pre-M2 research complete: `docs/research/m2-uci-threading.md` (binds ADR-0011 on M2.C) and `docs/research/m2-tournament-harness.md` (binds ADR-0012 on M2.E).
+
+### What M2.B landed
+
+The `uci` module — pure-function parser for UCI 2006 GUI→engine commands:
+
+- **`src/uci.rs`** with `Command` enum + helper types (`DebugMode`, `Register`, `PositionSpec`, `GoParams`) + `parse_uci_line(&str) -> Command` + 5 private sub-parsers.
+- **Per-command leniency rules** (Stockfish-empirically grounded): strict-first-token (no leading-skip — `joho uci` → `Unknown`); `debug` strict-exact-2-tokens; `position` lenient-stop after the position spec; `go` lenient-skip on unknown body tokens.
+- **Move strings collected raw**, not parsed — `Position { … moves: Vec<String> }` and `GoParams::searchmoves: Option<Vec<String>>` stay strings; M2.C parses via M2.A's `from_uci`.
+- **FEN strings collected raw** — strict-6-token collection after `fen`, joined with single spaces; M2.C parses via FEN parser.
+- **`SEARCHMOVES_TERMINATORS`** — private const enumerating the 11 `go` body keywords other than `searchmoves` itself; pinned by data-invariant test.
+
+### M2.B — implementation highlights
+
+- **Strict-first-token rule** chosen over spec-literal "skip leading unknown tokens." User flagged the spec rule as silly ("hides GUI-side typos"). Stockfish 18 probes confirmed the de facto reference doesn't implement leading-skip either. Documented in `docs/plans/m2.b.md` §3.1 with 12 empirical probe rows.
+- **Per-command leniency asymmetry** is real (not a uniform rule): `debug` is strict-exact-2-tokens (`debug on garbage` → `Unknown`); `position` is lenient-stop (junk between `startpos` and `moves` discards the `moves` clause); `go` is lenient-skip (unknown body tokens silently dropped, parsing continues). All three confirmed empirically against Stockfish.
+- **Numeric type widths grounded in spec**: `wtime`/`btime`/`movetime` are `i64` (clock can go negative under time-trouble); `winc`/`binc` are `u64` (spec literally says "if x > 0", so non-negative); `nodes` is `u64`; `depth`/`movestogo`/`mate` are `u32`.
+- **Total function** — every input maps to a `Command`; no `Result`, no panics. No-arg commands ignore trailing junk (`isready xyzzybanana` → `IsReady`). Parser body uses no panicking primitives beyond a `peek-then-next.unwrap()` pattern that's safe by construction.
+
+### M2.B — verification (Apple M4, dev machine)
+
+| Metric | Result |
+|---|---|
+| Tests | 542 fast + 4 ignored (446 prior + 96 new M2.B; integration + doctests as before). All passing. |
+| `cargo build --release` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo llvm-cov --summary-only --lib` (`uci.rs`) | 99.90% region / 100.00% line / 100.00% function. The 1 uncovered region is the safety-net `iter.next().unwrap()` panic branch in the searchmoves collection loop (peek-then-next pattern; the panic side is unreachable by Iterator contract). |
+| `cargo mutants --in-diff` | 55 mutants generated; **49 caught, 6 unviable** (the 6 unviable are mutants that fail to compile — typically `Default::default()` substitutions on types without `Default` impls, etc.); 0 missed. |
+| Benchmark | **Skipped** — UCI command parsing is per command (line-at-a-time, never inside a search loop). A microbenchmark would measure noise. Same precedent as M2.A. |
+
+All three review loops (plan, test-suite, final code+tests) converged. Plan archived at `docs/plans/m2.b.md`. The plan went through 5 reviewer passes; the test suite through 3; the final review converged on first pass.
 
 ### What M2.A landed
 
@@ -58,13 +89,14 @@ All four loops (plan, test-suite, final code+tests, benchmark capture) converged
 
 ### What's next
 
-**M2.B — UCI command parser.** New `uci` module: `Command` enum + `parse_uci_line(&str) -> Command` covering the GUI→engine command set (`uci`, `isready`, `setoption`, `ucinewgame`, `position`, `go`, `stop`, `quit`, etc. per UCI spec). Returns `Command::Unknown` for unrecognized tokens (per spec "ignore unknown command or token"). Property tests for whitespace tolerance and grammar coverage.
+**M2.C — Engine I/O loop + position state.** `Engine` struct (current `Position`, options, RNG seed), main `run()` loop reads lines from stdin and dispatches parsed `Command`s to handlers. Handlers: `uci` (emits `id name`/`id author`/`option …`/`uciok`), `isready` (always answers `readyok`, even mid-search), `setoption`, `ucinewgame` (resets state), `position` (parses moves via M2.A's `from_uci` and applies them), `quit`. `info string …` debug logging behind `debug on`. `go` parsed but answered with placeholder until M2.D.
 
-- No ADR binds on this phase.
-- Approx size: 600–900 lines.
-- M2.A's `from_uci` is a dependency for parsing the `position … moves m1 m2 …` command's move list.
+- **Binds ADR-0011** — UCI threading model (reader thread + mpsc + per-`go` worker + `Arc<AtomicBool>` cancellation per `docs/research/m2-uci-threading.md`).
+- Approx size: 800–1200 lines.
+- M2.A's `from_uci` is a dependency for the `position … moves` and `go searchmoves` move-list application.
+- M2.B's `Command` enum + `parse_uci_line` is the sole input source.
 
-Full M2 plan and the three remaining sub-phases (M2.C–E) are in `docs/roadmap.md`. Exit criteria for M2 as a whole: complete game through `fastchess` against itself or another engine without protocol errors or illegal moves.
+Full M2 plan and the two remaining sub-phases (M2.D–E) are in `docs/roadmap.md`. Exit criteria for M2 as a whole: complete game through `fastchess` against itself or another engine without protocol errors or illegal moves.
 
 ## How to pick up a new session
 
