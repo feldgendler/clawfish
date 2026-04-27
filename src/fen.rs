@@ -950,4 +950,154 @@ mod tests {
             "incomplete last rank must be BadPiecePlacement, got {r:?}"
         );
     }
+
+    // ------------------------------------------------------------------------
+    // Property tests (proptest).
+    //
+    // The unit tests above cover canonical perft positions verbatim and a
+    // long list of malformed-input rejections. The property below randomly
+    // generates structurally valid positions (1 king/color, EP on rank 3 or
+    // 6, no pawn on back rank) and asserts the format→parse→equal round-trip
+    // — same shape as `unit_round_trip_format_then_parse` in position.rs but
+    // over an unbounded variety of placements and aux-state combinations.
+    // ------------------------------------------------------------------------
+
+    use crate::piece::Piece;
+    use proptest::prelude::*;
+
+    /// Build a CastlingRights from a 4-bit mask. Mirrors the `with`-chain that
+    /// `parse_castling` produces and matches the bit layout pinned in the
+    /// `Polyglot` doc comment on CastlingRights.
+    fn rights_from_mask(mask: u8) -> CastlingRights {
+        let mut r = CastlingRights::NONE;
+        if mask & 0b0001 != 0 {
+            r = r.with(CastlingRights::WHITE_KING);
+        }
+        if mask & 0b0010 != 0 {
+            r = r.with(CastlingRights::WHITE_QUEEN);
+        }
+        if mask & 0b0100 != 0 {
+            r = r.with(CastlingRights::BLACK_KING);
+        }
+        if mask & 0b1000 != 0 {
+            r = r.with(CastlingRights::BLACK_QUEEN);
+        }
+        r
+    }
+
+    /// Map a piece code 0..10 to a non-king (color, kind) pair. The 10
+    /// non-king piece variants are: 5 kinds × 2 colors. King is excluded so
+    /// the king-count invariant remains intact when we apply extras to a
+    /// position that already has its two kings placed.
+    fn non_king_piece(code: u8) -> Piece {
+        let (color, kind) = match code {
+            0 => (Color::White, PieceKind::Pawn),
+            1 => (Color::White, PieceKind::Knight),
+            2 => (Color::White, PieceKind::Bishop),
+            3 => (Color::White, PieceKind::Rook),
+            4 => (Color::White, PieceKind::Queen),
+            5 => (Color::Black, PieceKind::Pawn),
+            6 => (Color::Black, PieceKind::Knight),
+            7 => (Color::Black, PieceKind::Bishop),
+            8 => (Color::Black, PieceKind::Rook),
+            9 => (Color::Black, PieceKind::Queen),
+            _ => unreachable!("non_king_piece code restricted to 0..10 by the caller"),
+        };
+        Piece::new(color, kind)
+    }
+
+    proptest! {
+        /// `Position` → FEN → `Position` round-trip preserves equality, and a
+        /// second format yields the same string. Generation strategy:
+        ///
+        /// - Two distinct king squares (uniformly over `0..64`, filtered).
+        /// - Up to 16 additional (square, piece-code) entries; entries that
+        ///   collide with kings, with each other, or that would place a pawn
+        ///   on rank 1 or 8 are silently skipped. The remaining entries
+        ///   guarantee placement validity (no overwrites, no back-rank pawns).
+        /// - Side to move from `{White, Black}`.
+        /// - Castling: every 4-bit subset of the four named flags.
+        /// - EP target: None, or a square on rank 3 or rank 6.
+        /// - Halfmove: any `u8`.
+        /// - Fullmove: any non-zero `u16` (parser rejects 0).
+        ///
+        /// **Scope: positive-only.** Every position the strategy emits passes
+        /// `validate_post_parse`, so a Display-side bug that produces an
+        /// unparseable FEN — or a parse-side bug that decodes the formatted
+        /// string into a different `Position` — fails the property. The
+        /// strategy deliberately does **not** exercise the parser's rejection
+        /// paths (WrongFieldCount, BadPiecePlacement, MissingKing,
+        /// TooManyKings, PawnOnBackRank, BadActiveColor, BadCastlingRights,
+        /// BadEnPassant, BadHalfmoveClock, BadFullmoveNumber); those remain
+        /// covered by the targeted unit tests above.
+        #[test]
+        fn prop_fen_round_trip(
+            (wk_idx, bk_idx) in (0u8..64, 0u8..64).prop_filter(
+                "kings on distinct squares",
+                |t| t.0 != t.1,
+            ),
+            extras in proptest::collection::vec((0u8..64, 0u8..10), 0..16),
+            side in prop_oneof![Just(Color::White), Just(Color::Black)],
+            castling_mask in 0u8..16,
+            ep in prop_oneof![
+                Just(None),
+                (0u8..8, prop_oneof![Just(2u8), Just(5u8)])
+                    .prop_map(|(f, r)| Some(Square::from_file_rank(f, r)
+                        .expect("(0..8, 2|5) is in range"))),
+            ],
+            halfmove in any::<u8>(),
+            fullmove in 1u16..=u16::MAX,
+        ) {
+            let mut p = Position::empty();
+
+            let wk_sq = Square::new(wk_idx).expect("0..64 in range");
+            let bk_sq = Square::new(bk_idx).expect("0..64 in range");
+            p.set_piece(wk_sq, Piece::new(Color::White, PieceKind::King));
+            p.set_piece(bk_sq, Piece::new(Color::Black, PieceKind::King));
+
+            // Place extras, skipping entries that would violate the
+            // invariants the FEN parser checks (king count, no back-rank
+            // pawn) or that would overwrite an already-placed piece.
+            for (sq_idx, code) in extras {
+                if sq_idx == wk_idx || sq_idx == bk_idx {
+                    continue;
+                }
+                let sq = Square::new(sq_idx).expect("0..64 in range");
+                if p.piece_at(sq).is_some() {
+                    continue;
+                }
+                let piece = non_king_piece(code);
+                let rank = sq.rank();
+                if piece.kind == PieceKind::Pawn && (rank == 0 || rank == 7) {
+                    continue;
+                }
+                p.set_piece(sq, piece);
+            }
+
+            p.set_aux_state(
+                side,
+                rights_from_mask(castling_mask),
+                ep,
+                halfmove,
+                fullmove,
+            );
+
+            // The constructed position must satisfy the parser's
+            // post-parse invariants — if not, the strategy is broken.
+            // Anchor that here so a strategy bug is the assertion failure,
+            // not the round-trip property below.
+            p.validate_post_parse()
+                .expect("constructed position must pass validate_post_parse");
+
+            let s = p.to_fen();
+            let parsed = Position::from_fen(&s).map_err(|e| {
+                TestCaseError::fail(format!(
+                    "formatted FEN must parse: {s:?} -> {e:?}"
+                ))
+            })?;
+            prop_assert_eq!(&parsed, &p);
+            // Re-formatting the parsed position yields the same string.
+            prop_assert_eq!(parsed.to_fen(), s);
+        }
+    }
 }

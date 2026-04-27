@@ -943,4 +943,86 @@ mod tests {
             "two black kings must yield TooManyKings(Black), got {r:?}"
         );
     }
+
+    // ------------------------------------------------------------------------
+    // Property tests (proptest).
+    // ------------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// All four `CastlingRights` named flags, paired with their target bit
+    /// position. Used by the bit-packing property to cover every flag without
+    /// repeating the list.
+    const CR_FLAGS: [(CastlingRights, u8); 4] = [
+        (CastlingRights::WHITE_KING, 0b0001),
+        (CastlingRights::WHITE_QUEEN, 0b0010),
+        (CastlingRights::BLACK_KING, 0b0100),
+        (CastlingRights::BLACK_QUEEN, 0b1000),
+    ];
+
+    /// Build a CastlingRights from a 4-bit mask by `with`-ing each set flag.
+    /// Mirrors how `parse_castling` constructs rights from FEN letters.
+    fn rights_from_mask(mask: u8) -> CastlingRights {
+        let mut r = CastlingRights::NONE;
+        for (flag, bit) in CR_FLAGS {
+            if mask & bit != 0 {
+                r = r.with(flag);
+            }
+        }
+        r
+    }
+
+    proptest! {
+        /// Bit packing: a 4-bit mask routed through `with()` round-trips
+        /// through `bits()`, every per-flag `has()` answers correctly, and
+        /// `with`/`without` are idempotent on their respective set/clear
+        /// state. Pins the bit layout to `bit 0 = WK, bit 1 = WQ, bit 2 = BK,
+        /// bit 3 = BQ`, which is load-bearing for the Polyglot Zobrist
+        /// castling-key convention (per the doc comment on CastlingRights).
+        #[test]
+        fn prop_castling_rights_bit_packing(mask in 0u8..16) {
+            let r = rights_from_mask(mask);
+
+            // bits() reflects exactly the constructed mask.
+            prop_assert_eq!(r.bits(), mask);
+
+            // has() answers correctly for every single flag.
+            for (flag, bit) in CR_FLAGS {
+                prop_assert_eq!(r.has(flag), mask & bit != 0);
+            }
+
+            // The "all bits clear" query (`has(NONE)`) returns false by
+            // definition (the empty query is meaningless), regardless of mask.
+            prop_assert!(!r.has(CastlingRights::NONE));
+
+            // with(flag) sets the flag; without(flag) clears it. Both are
+            // idempotent (asserted directly on the random base `r`, which
+            // kills `|`-vs-`^` mutants on `with` and `&!`-vs-`^` on `without`
+            // regardless of whether `r` already had the flag).
+            for (flag, _) in CR_FLAGS {
+                prop_assert!(r.with(flag).has(flag));
+                prop_assert!(!r.without(flag).has(flag));
+
+                prop_assert_eq!(r.with(flag).with(flag), r.with(flag));
+                prop_assert_eq!(r.without(flag).without(flag), r.without(flag));
+
+                // with then without unconditionally clears.
+                prop_assert!(!r.with(flag).without(flag).has(flag));
+                // without then with unconditionally sets.
+                prop_assert!(r.without(flag).with(flag).has(flag));
+            }
+        }
+
+        /// Multi-flag `has` query: `has(combo)` is true iff EVERY bit of
+        /// `combo` is set in `self`. This pins the AND-not-OR semantics of
+        /// `has` against the multi-flag query that the unit tests only check
+        /// on a single hand-picked combo (`ALL.has(WK)`).
+        #[test]
+        fn prop_castling_has_multi_flag(mask in 0u8..16, combo in 0u8..16) {
+            let r = rights_from_mask(mask);
+            let combo_rights = rights_from_mask(combo);
+            let expected = combo != 0 && (mask & combo) == combo;
+            prop_assert_eq!(r.has(combo_rights), expected);
+        }
+    }
 }

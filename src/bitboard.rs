@@ -691,4 +691,137 @@ mod tests {
             "Bitboard(0xffffffffffffffff)"
         );
     }
+
+    // ------------------------------------------------------------------------
+    // Property tests (proptest).
+    //
+    // The unit tests above pin specific identities on hand-picked operands
+    // (set_op_identities, de_morgan, file_masks_partition_full, …). The
+    // properties below run those identities (and a few more) on randomly
+    // generated u64s, exercising bit patterns the unit tests don't reach
+    // (mid-range values, sparse-bit positions, sibling-bit interactions).
+    // ------------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Boolean-algebra identities on randomly generated bitboards.
+        /// Exercises commutativity, associativity, identity elements,
+        /// idempotence, self-XOR collapse, double-negation, De Morgan, and
+        /// absorption. Also checks that the assigning ops match their non-
+        /// assigning counterparts.
+        #[test]
+        fn prop_set_algebra(a in any::<u64>(), b in any::<u64>(), c in any::<u64>()) {
+            let a = Bitboard(a);
+            let b = Bitboard(b);
+            let c = Bitboard(c);
+
+            // Commutativity.
+            prop_assert_eq!(a & b, b & a);
+            prop_assert_eq!(a | b, b | a);
+            prop_assert_eq!(a ^ b, b ^ a);
+
+            // Associativity.
+            prop_assert_eq!((a & b) & c, a & (b & c));
+            prop_assert_eq!((a | b) | c, a | (b | c));
+            prop_assert_eq!((a ^ b) ^ c, a ^ (b ^ c));
+
+            // Identity / annihilator elements.
+            prop_assert_eq!(a & Bitboard::FULL, a);
+            prop_assert_eq!(a | Bitboard::EMPTY, a);
+            prop_assert_eq!(a ^ Bitboard::EMPTY, a);
+            prop_assert_eq!(a & Bitboard::EMPTY, Bitboard::EMPTY);
+            prop_assert_eq!(a | Bitboard::FULL, Bitboard::FULL);
+
+            // Idempotence and self-XOR.
+            prop_assert_eq!(a & a, a);
+            prop_assert_eq!(a | a, a);
+            prop_assert_eq!(a ^ a, Bitboard::EMPTY);
+
+            // Double-negation, De Morgan, absorption.
+            prop_assert_eq!(!!a, a);
+            prop_assert_eq!(!(a & b), !a | !b);
+            prop_assert_eq!(!(a | b), !a & !b);
+            prop_assert_eq!(a & (a | b), a);
+            prop_assert_eq!(a | (a & b), a);
+
+            // count() agrees with the underlying popcount; is_empty is the
+            // negation of any().
+            prop_assert_eq!(a.count(), a.0.count_ones());
+            prop_assert_eq!(a.is_empty(), !a.any());
+
+            // Assigning operators agree with the non-assigning forms.
+            let mut acc = a;
+            acc &= b;
+            prop_assert_eq!(acc, a & b);
+            let mut acc = a;
+            acc |= b;
+            prop_assert_eq!(acc, a | b);
+            let mut acc = a;
+            acc ^= b;
+            prop_assert_eq!(acc, a ^ b);
+        }
+
+        /// Membership invariants: with/without/contains/from_square must agree
+        /// with each other across an arbitrary base bitboard and an arbitrary
+        /// square. Drains pop_lsb to confirm count() squares come out and the
+        /// iterator is fused.
+        #[test]
+        fn prop_membership(base in any::<u64>(), i in 0u8..64) {
+            let a = Bitboard(base);
+            let sq = Square::new(i).expect("0..64 is in range");
+
+            // with sets the bit; without clears it.
+            prop_assert!(a.with(sq).contains(sq));
+            prop_assert!(!a.without(sq).contains(sq));
+
+            // from_square is a singleton bitboard.
+            let single = Bitboard::from_square(sq);
+            prop_assert_eq!(single.count(), 1);
+            prop_assert!(single.contains(sq));
+
+            // count after with(sq) is original count or original+1, depending
+            // on whether the bit was already set.
+            let new_count = a.with(sq).count();
+            if a.contains(sq) {
+                prop_assert_eq!(new_count, a.count());
+            } else {
+                prop_assert_eq!(new_count, a.count() + 1);
+            }
+
+            // pop_lsb drains exactly count() squares in strictly LSB-ascending
+            // order (each popped index strictly greater than the previous);
+            // subsequent calls return None. Pinning order on random u64s kills
+            // any "swap LSB for MSB" mutant on the underlying trailing_zeros
+            // call — the unit tests (`pop_lsb_order`, `iter_order_lsb_first`)
+            // pin this only on hand-picked operands.
+            let mut bb = a;
+            let mut popped: u32 = 0;
+            let mut prev: Option<u8> = None;
+            while let Some(sq) = bb.pop_lsb() {
+                popped += 1;
+                if let Some(p) = prev {
+                    prop_assert!(
+                        sq.index() > p,
+                        "pop_lsb must return strictly LSB-ascending squares; got {} after {}",
+                        sq.index(),
+                        p,
+                    );
+                }
+                prev = Some(sq.index());
+            }
+            prop_assert_eq!(popped, a.count());
+            prop_assert_eq!(bb.pop_lsb(), None);
+
+            // iter() yields the same sequence of squares as draining via
+            // pop_lsb. Comparing as Vecs (not multisets) pins the order too.
+            let by_iter: Vec<Square> = a.iter().collect();
+            let mut bb = a;
+            let mut by_pop: Vec<Square> = Vec::with_capacity(a.count() as usize);
+            while let Some(sq) = bb.pop_lsb() {
+                by_pop.push(sq);
+            }
+            prop_assert_eq!(by_iter, by_pop);
+        }
+    }
 }

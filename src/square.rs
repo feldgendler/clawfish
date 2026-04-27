@@ -336,4 +336,46 @@ mod tests {
     fn new_unchecked_oob_panics_in_debug() {
         let _ = Square::new_unchecked(64);
     }
+
+    // ------------------------------------------------------------------------
+    // Property tests (proptest).
+    //
+    // Subsume the per-i exhaustive tests above for the in-range case, and add
+    // shrinking-friendly coverage of the out-of-range branch and the
+    // Display↔parse_uci round-trip (which the existing tests check on the 64
+    // named constants only). The 0..64 range is fully enumerable, so these
+    // properties will exhaustively explore it on every run; the value over the
+    // existing tests is the framework wiring + reuse for future invariants.
+    // ------------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_in_range_round_trip(i in 0u8..64) {
+            let sq = Square::new(i).expect("0..64 is in range");
+            prop_assert_eq!(sq.index(), i);
+            prop_assert_eq!(sq.file(), i % 8);
+            prop_assert_eq!(sq.rank(), i / 8);
+            // file/rank decomposition recomposes to the same square.
+            prop_assert_eq!(Square::from_file_rank(sq.file(), sq.rank()), Some(sq));
+            // Display ↔ parse_uci round-trip (covers every algebraic form).
+            prop_assert_eq!(Square::parse_uci(&sq.to_string()), Some(sq));
+        }
+
+        #[test]
+        fn prop_out_of_range_rejected(i in 64u8..=255) {
+            prop_assert_eq!(Square::new(i), None);
+        }
+
+        #[test]
+        fn prop_from_file_rank_oob_rejected(f in 0u8..=255, r in 0u8..=255) {
+            // Either coordinate ≥ 8 must reject; the in-range branch is
+            // covered exhaustively by from_file_rank_round_trip above and by
+            // the in-range round-trip property.
+            if f >= 8 || r >= 8 {
+                prop_assert_eq!(Square::from_file_rank(f, r), None);
+            }
+        }
+    }
 }

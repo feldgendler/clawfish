@@ -7,6 +7,11 @@ publish = false
 
 [dependencies]
 
+[dev-dependencies]
+# Property-based testing. Used in unit tests (modules under `#[cfg(test)]`)
+# and integration tests under `tests/`. Stable-Rust only — no nightly.
+proptest = "1.11"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

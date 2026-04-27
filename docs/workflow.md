@@ -202,7 +202,7 @@ The two are **orthogonal and both apply.** A pruning decision function has a det
 | Zobrist hashing | yes — round-trip + incrementality properties | n/a |
 | Eval terms (each) | yes — constructed positions with expected term values | SPRT on whether the term improves play |
 | Eval composition | sanity tests (symmetry, color invariance, range bounds) | SPRT for tuning weights |
-| Search invariants | property tests (PV stability under re-search; fail-soft consistency) | SPRT |
+| Search invariants | property tests via `proptest` (PV stability under re-search; fail-soft consistency) | SPRT |
 | Search heuristics (LMR, NMP, futility, …) | yes — the decision function is unit-tested with constructed inputs | SPRT for *enabling* + parameter tuning |
 | TT operations (probe, store, replacement) | yes | n/a |
 | Move ordering | yes — given a move list and history/killer state, ordering is deterministic | SPRT on whether ordering changes help |
