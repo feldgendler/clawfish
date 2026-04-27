@@ -6,7 +6,44 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M1.D complete; M1.E next.** Architectural commitments settled (see `docs/decisions/`). M1.D landed the `zobrist` module with the Polyglot 781-key set vendored verbatim from `docs/reference/polyglot-book-format.md` into `src/zobrist/keys.rs`, the EP-only-when-pseudo-legal hashing rule (adjacency only, no pin/check tests), the asymmetric turn key (XORed iff WHITE-to-move), the four-key castling encoding, the `Position::zobrist` field with `pub(crate) fn refresh_zobrist()` setter, FEN-parser hookup, and the 9 published Polyglot test vectors as the gold-standard interop check (`tests/zobrist_polyglot_vectors.rs`). ADR-0009 landed in the same commit; the canonical Polyglot spec is now vendored at `docs/reference/polyglot-book-format.md`. 224 unit + 3 fen + 2 magic-consistency + 9 zobrist-vector = **238 tests pass + 1 ignored bench**; `cargo clippy --all-targets -- -D warnings` clean; release build clean; `cargo llvm-cov` >99% on new code; `cargo mutants --in-diff` zero survivors on the 1067-line diff. Throughput sanity: `from_scratch(starting_position)` ≈ 50.8 ns, `ep_file_to_hash` (no-EP) ≈ 0.72 ns. All three review loops (plan, test-suite, final) converged. Plan archived at `docs/plans/m1.d.md`. Workflow doc updated with the `git add -N` step required for `cargo mutants --in-diff` to see new files. ADR-0007 (legal-direct movegen) awaits M1.F. M1 prior-art research is in `docs/research/`, synthesized into `docs/prior-art.md`. Next: M1.E (`make_move`/`unmake_move` with all special cases — castling, EP, promotion, double-push — round-trip property tests, NNUE-readiness hook, and the debug-build Zobrist round-trip assert).
+**Phase: M1.E complete; M1.F next.** Architectural commitments settled (see `docs/decisions/`).
+
+### What M1.E landed
+
+The `mov` module — the engine's first mutating layer:
+
+- **`Move`** — 16-bit packed encoding: bits 0–5 from-square, bits 6–11 to-square, bits 12–15 flag nibble.
+- **`MoveFlag`** — 14 valid codes (codes 6 and 7 deliberately absent; no public path constructs them).
+- **`Undo`** (~16 B) — carries captured piece, prior castling/EP/halfmove, and prior zobrist.
+- **`make_move(&mut Position, Move) -> Undo`** and **`unmake_move(&mut Position, Move, Undo)`** — free functions per ADR-0004; ergonomic `Position::make_move`/`Position::unmake_move` method delegates also present.
+
+All special cases handled: quiet, double-push, capture, en passant, kingside/queenside castle, four `*Promo` and four `*PromoCapture` flags.
+
+### Implementation highlights
+
+- **Castling-rights update** via a 64-entry `CASTLING_MASK` table indexed by from/to. Handles the rook-captured-on-corner edge case (the Kiwipete depth-4 perft trap).
+- **Incremental Zobrist update** with a debug-build round-trip assert against `from_scratch`.
+- **Always-on release-build perf sentinel** (`make_move_no_from_scratch_in_release`) at 100 ns/cycle threshold — guards against accidental from-scratch reintroduction on the hot path.
+- **`Position` extensions:** `clear_square`, `refresh_zobrist_from`, ergonomic method delegates, `BitAnd` impl on `CastlingRights`.
+
+### Verification (Apple Silicon, dev machine)
+
+| Metric | Result |
+|---|---|
+| Tests | **303 passing** + 3 ignored benches (286 lib + 3 fen + 2 magic + 3 make/unmake integration + 9 zobrist-vector) |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo build --release` | clean |
+| `cargo llvm-cov` on `mov.rs` | 95.65% region / 94.71% line (gaps are const-fn evaluated at compile time + provably-unreachable `unreachable!()` arms + debug_assert formatters) |
+| `cargo mutants --in-diff` | **0 survivors** on 123 mutants (107 caught, 16 unviable) — full-suite per-milestone backstop |
+| Throughput (release, ns/cycle) | quiet 27, capture 38, EP 36, castle 42, promo 22 — all under the <50 ns/cycle target |
+
+### Process
+
+All three review loops (plan, test-suite, final) converged. Plan archived at `docs/plans/m1.e.md`.
+
+### What's next
+
+**M1.F — legal move generation.** Per-piece-type generation, pin computation, check-evasion specialization (single-check → king/capture/block; double-check → king only), legal-direct emission. ADR-0007 (legal-direct movegen) binds here. M1 prior-art research is in `docs/research/`, synthesized into `docs/prior-art.md`.
 
 ## How to pick up a new session
 

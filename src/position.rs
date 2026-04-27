@@ -62,6 +62,16 @@ impl CastlingRights {
     }
 }
 
+impl std::ops::BitAnd for CastlingRights {
+    type Output = CastlingRights;
+    /// Bitwise intersection — used by M1.E's make_move to apply the
+    /// castling-mask table: `new_castling = prior & MASK[from] & MASK[to]`.
+    #[inline]
+    fn bitand(self, rhs: CastlingRights) -> CastlingRights {
+        CastlingRights(self.0 & rhs.0)
+    }
+}
+
 impl fmt::Display for CastlingRights {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.0 == 0 {
@@ -372,6 +382,42 @@ impl Position {
         }
     }
 
+    /// Remove the piece (if any) at `sq`. Symmetric to [`set_piece`](Self::set_piece).
+    /// Used by `make_move` / `unmake_move` to vacate a square; the matching
+    /// `set_piece` call that places the moving piece on its new square
+    /// follows immediately.
+    ///
+    /// **Clearing a king square is allowed** — every king move (quiet,
+    /// capture, castling) decomposes into `clear_square(old_sq)` followed
+    /// by `set_piece(new_sq, king)`. The `set_piece` call refreshes
+    /// `king_sq[color]` to the new square, so the king-cache invariant
+    /// holds again the moment both calls have run. Callers must not
+    /// invoke [`debug_assert_consistent`](Self::debug_assert_consistent)
+    /// between the `clear_square` and the matching `set_piece` for a king
+    /// move; `make_move` / `unmake_move` invoke it only after both have
+    /// completed.
+    ///
+    /// Calling on an empty square is a no-op.
+    ///
+    /// **Does not refresh `zobrist`** — same contract as `set_piece`. M1.E's
+    /// `make_move` / `unmake_move` maintain `zobrist` via incremental XOR
+    /// updates around the bitboard mutations.
+    pub(crate) fn clear_square(&mut self, sq: Square) {
+        let prev = self.mailbox[sq.index() as usize];
+        if let Some(prev_piece) = prev {
+            self.piece_bb[prev_piece.kind.index()] =
+                self.piece_bb[prev_piece.kind.index()].without(sq);
+            self.color_bb[prev_piece.color.index()] =
+                self.color_bb[prev_piece.color.index()].without(sq);
+            self.mailbox[sq.index() as usize] = None;
+            // The king cache is intentionally NOT updated here. See the doc
+            // comment: a `clear_square` of a king square is always followed
+            // by a `set_piece` placing that king on a new square, which
+            // updates `king_sq`. Between the two calls the cache is stale,
+            // which is why `debug_assert_consistent` must not be invoked.
+        }
+    }
+
     /// Set side-to-move, castling, EP, halfmove, and fullmove fields in one go.
     ///
     /// **Does not refresh `zobrist`.** Same contract as [`set_piece`](Self::set_piece):
@@ -396,10 +442,34 @@ impl Position {
     /// position state via [`crate::zobrist::from_scratch`]. Called by
     /// `starting_position()`, by the FEN parser after `validate_post_parse`,
     /// and by tests that mutate via `set_piece` / `set_aux_state` and want
-    /// a consistent hash. M1.E's `make_move` / `unmake_move` will replace
-    /// this with incremental XOR updates.
+    /// a consistent hash. M1.E's `make_move` / `unmake_move` use the
+    /// `refresh_zobrist_from` setter below for incremental XOR updates.
     pub(crate) fn refresh_zobrist(&mut self) {
         self.zobrist = crate::zobrist::from_scratch(self);
+    }
+
+    /// Write `value` into the zobrist field directly, bypassing
+    /// [`refresh_zobrist`](Self::refresh_zobrist)'s from-scratch
+    /// recomputation. Used by `mov::make_move` to install an
+    /// incrementally-computed hash and by `mov::unmake_move` to restore
+    /// the pre-make hash from `Undo`. The caller is responsible for the
+    /// value being correct; debug assertions in `make_move` / `unmake_move`
+    /// validate against `from_scratch`.
+    pub(crate) fn refresh_zobrist_from(&mut self, value: u64) {
+        self.zobrist = value;
+    }
+
+    /// Apply `mv` to `self`, returning an [`Undo`](crate::mov::Undo) token
+    /// sufficient to reverse the change. Equivalent to
+    /// [`crate::mov::make_move(self, mv)`](crate::mov::make_move).
+    pub fn make_move(&mut self, mv: crate::mov::Move) -> crate::mov::Undo {
+        crate::mov::make_move(self, mv)
+    }
+
+    /// Reverse a previous `make_move`. Equivalent to
+    /// [`crate::mov::unmake_move(self, mv, undo)`](crate::mov::unmake_move).
+    pub fn unmake_move(&mut self, mv: crate::mov::Move, undo: crate::mov::Undo) {
+        crate::mov::unmake_move(self, mv, undo)
     }
 
     pub(crate) fn validate_post_parse(&self) -> Result<(), FenError> {
