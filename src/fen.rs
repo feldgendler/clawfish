@@ -135,15 +135,11 @@ fn parse_placement(p: &mut Position, s: &str) -> Result<(), FenError> {
                 if file != 8 {
                     return Err(FenError::BadPiecePlacement(s.to_string()));
                 }
-                // NOTE: With the pre-check above guaranteeing exactly 8
-                // slash-separated chunks (7 slashes), `rank` decrements once
-                // per slash and starts at 8, so it reaches 1 only after the
-                // 7th slash — and the input has no 8th slash. This guard is
-                // therefore unreachable via `Position::from_fen`. It exists as
-                // a defensive guard for hypothetical direct callers of
-                // `parse_placement`. Coverage backfill audit 2026-04-27.
+                // Unreachable: the pre-check guarantees exactly 7 slashes, so
+                // `rank` (8 → 1) reaches 1 only after the 7th slash; an 8th
+                // can't exist by construction.
                 if rank == 1 {
-                    return Err(FenError::BadPiecePlacement(s.to_string()));
+                    unreachable!("8th slash in piece placement after pre-check guaranteed 7");
                 }
                 rank -= 1;
                 file = 0;
@@ -201,14 +197,10 @@ fn parse_castling(s: &str) -> Result<CastlingRights, FenError> {
     if s == "-" {
         return Ok(CastlingRights::NONE);
     }
-    // NOTE: `s.is_empty()` is unreachable via `Position::from_fen` because an
-    // empty field-2 requires two consecutive spaces, which produce 7 fields and
-    // are rejected by the WrongFieldCount check before `parse_castling` is
-    // called. This guard is defensive code for direct callers — not dead code
-    // per se, but untestable through the public API without bypassing the
-    // field-count gate. Coverage backfill audit 2026-04-27.
+    // Unreachable: an empty field-2 requires double-space in the input, which
+    // produces 7 fields and trips WrongFieldCount before this is called.
     if s.is_empty() {
-        return Err(FenError::BadCastlingRights(s.to_string()));
+        unreachable!("empty castling field after WrongFieldCount gate");
     }
     // Strict spec order: K, Q, k, q. Walk the input and the spec sequence
     // in lock-step; each input letter must match the next-or-later spec
