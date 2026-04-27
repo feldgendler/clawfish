@@ -4,7 +4,7 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1.A complete; M1.B next.** Architectural commitments settled — see `docs/decisions/` and `docs/architecture.md`. Cargo package initialized at the repo root (`chess` v0.1.0, edition 2024, Rust toolchain pinned to `stable` via `rust-toolchain.toml`). M1.A landed `Square` and `Bitboard` primitives behind `lib.rs` plus the release profile per `docs/plans/m1.a.md`; 50 unit tests pass, `cargo build --release` clean, all three review loops converged. Stockfish 18 installed via Homebrew per `decisions/0006`. Next: M1.B (`Position` struct + FEN parsing).
+**M1.B complete; M1.C next.** M1.B landed the `Position` struct, FEN parse/format, `Color` / `PieceKind` / `Piece` types, and `CastlingRights` per `docs/plans/m1.b.md`; 139 unit tests + 3 integration tests pass, `cargo build --release` clean, `cargo clippy --all-targets -- -D warnings` clean, all three review loops (plan, test-suite, final) converged. M1.A primitives (`Square`, `Bitboard`) unchanged. Stockfish 18 installed via Homebrew per `decisions/0006`. Next: M1.C (sliding-piece attacks via fancy magic bitboards + `magicgen` binary; ADR-0008 binds at this phase).
 
 ## Milestones
 
@@ -38,7 +38,7 @@ Bitboards, all rules of standard chess, no search, no eval. Validated against pe
 | Phase | Scope | Approx size |
 |---|---|---|
 | **M1.A** ✓ — Skeleton + primitives | `lib.rs` split, `Cargo.toml` release profile (`lto = "thin"`, `codegen-units = 1`, `panic = "abort"`), module skeleton, `Square` type, `Bitboard` type and primitive operations, unit tests for primitives | ~500–800 lines (actual: ~720 lines, 50 tests) |
-| **M1.B** — Position + FEN | `Position` struct (6+2 bitboards + mailbox + cached king squares + auxiliary state), FEN parse/format per Edwards 1994 §16.1, position-equality tests | ~600–900 lines |
+| **M1.B** ✓ — Position + FEN | `Position` struct (6+2 bitboards + mailbox + cached king squares + auxiliary state), `Color` / `PieceKind` / `Piece` / `CastlingRights` types, FEN parse/format per Edwards 1994 §16.1 (strict syntactic + structural sanity checks), position-equality tests | ~600–900 lines (actual: ~2175 lines including ~40 negative-parse tests, 139 unit + 3 integration tests) |
 | **M1.C** — Sliding-piece attacks | Slow ray-walker as permanent `slow_attacks` oracle module, `src/bin/magicgen.rs` (search + validation + codegen), generated magic constants source file, fancy-magic attack lookups, differential tests over all ~108k (square, occupancy) pairs | ~800–1200 lines |
 | **M1.D** — Zobrist | Polyglot key table, incremental hash update on make/unmake, EP-only-when-pseudo-legal hashing rule, debug-build round-trip assert | ~250–350 lines |
 | **M1.E** — Make/unmake | `make_move`, `unmake_move`, all special cases (castling, EP, promotion, double-push), round-trip property tests, NNUE-readiness hook (function call structure only — no accumulator yet, per ADR-0004) | ~600–900 lines |

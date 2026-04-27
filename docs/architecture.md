@@ -22,6 +22,8 @@ Current architectural state. Decisions and their rationale live in `docs/decisio
 | Source-code reading | No third-party chess engine source code as research input | `decisions/0003-no-third-party-source-code-reading.md` |
 | Testing | TDD on rules layer (perft); property tests on search; SPRT on strength changes | (see `workflow.md`) |
 | Perft oracle | Stockfish (Homebrew install) is the sole external source for perft fixtures (totals + divide) | `decisions/0006-stockfish-as-perft-oracle.md` |
+| Position layout | 6 piece-kind bitboards + 2 color-occupancy bitboards + 64-entry `Option<Piece>` mailbox + cached king squares + aux state (side, castling, EP target, halfmove, fullmove). FEN-spec EP semantics (set whenever prior move was a double push); the Polyglot-pseudo-legal-only EP filter applies at Zobrist time only. | `docs/plans/m1.b.md` |
+| FEN parsing | Strict per Edwards 1994 §16.1: single-space field separator, strict-decimal integers (no `+`/`-`/whitespace prefix), spec-ordered castling letters. Parse-time structural checks: exactly one king per color, no pawns on rank 1/8, EP target on rank 3 or 6. Deeper semantic validity (own-side-not-in-check, castling-vs-rook consistency) deferred. | `docs/plans/m1.b.md` |
 
 ## Hot-path implications of Apple Silicon target
 
