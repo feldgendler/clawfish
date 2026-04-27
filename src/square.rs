@@ -303,6 +303,17 @@ mod tests {
     }
 
     #[test]
+    fn debug_format_matches_display() {
+        // Pin Debug emitting algebraic notation (delegating to Display), not
+        // the derived `Square(0)` form. Without an explicit `{:?}` test the
+        // Debug impl is unexercised — a stub returning Ok(()) would silently
+        // pass.
+        assert_eq!(format!("{:?}", Square::E4), "e4");
+        assert_eq!(format!("{:?}", Square::A1), "a1");
+        assert_eq!(format!("{:?}", Square::H8), "h8");
+    }
+
+    #[test]
     fn all_iterates_64_unique() {
         let collected: Vec<Square> = Square::all().collect();
         assert_eq!(collected.len(), 64);

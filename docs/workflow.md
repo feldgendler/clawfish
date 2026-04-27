@@ -96,6 +96,7 @@ The dimensions of final review:
 - **Correctness.** Does the code actually do what the tests claim it does? Are there situations the tests don't cover where the code would behave incorrectly?
 - **Corner cases.** Same dimension as test-suite review, now on the implementation side: are there situations not covered by tests that the code should handle? (If yes, write more tests, then re-implement to satisfy them.)
 - **Coverage.** Run `cargo llvm-cov --summary-only` (or `--html` for line-level detail) on the unit's tests. Inspect the report for newly-introduced code with uncovered lines or branches. Common cause: TDD pins the function's *contract* (defined by tests) before the implementation chooses internal paths — e.g. an implementation may introduce a separate fast path for even arguments after the tests were written, and if all tests happened to use even values, the odd path stays untested. For each meaningful gap, the agent either adds tests that exercise the path, proves the path unreachable and removes it, or documents in chat why the gap is intentional (e.g. a `panic!()` on impossible state, a debug-only assertion). No hard percentage threshold — judgment-based. Tool: `cargo-llvm-cov` (LLVM source-based instrumentation; works natively on Apple Silicon).
+- **Mutation testing.** Run `cargo mutants` on the unit's modules. Coverage answers "did the test execute this line"; mutation testing answers "would the test catch a bug here?" — it mutates `+` to `-`, `<` to `<=`, `|` to `^`, etc., and reports which mutants survive. Each survivor points at either a missing assertion, a genuinely-equivalent mutant (no input distinguishes the original from the mutated form), or a defensive branch unreachable for the actual inputs. For each survivor, the agent: (a) adds a test that catches it, (b) proves equivalence and adds an `exclude_re` rule to `.cargo/mutants.toml` with a comment explaining why, or (c) refactors the unreachable branch (e.g. via `unreachable!()`). Configuration lives in `.cargo/mutants.toml`. Tool: `cargo-mutants` (single-binary install, no nightly required). Run is slow (minutes per dozen mutants), so once per unit at the final-review step rather than per commit.
 - **Code quality.** Idiomatic Rust, error-handling style, no dead code, no premature abstractions, no commented-out blocks. **Provably-unreachable branches use `unreachable!("brief why")`** rather than silent defensive returns. The panic message documents the invariant the code relies on; if a future change breaks the invariant, the program fails loudly instead of returning a misleading error or silently miscomputing. Reserve plain `if`/`return Err(...)` for paths that *can* fire on bad input — these are validation, not defense.
 - **Readability.** Clear naming, sensible structure, comments only where the *why* is non-obvious. A future reader (including a future Claude session) should be able to follow the code without consulting the conversation that produced it.
 - **Simplicity.** Anything overengineered? Anything that could be cut, merged, or deferred without loss?
@@ -106,6 +107,10 @@ The final review's purpose is to catch what the plan didn't anticipate and the t
 ## Static analysis and dependency hygiene
 
 Standing checks that complement the review loops. The review loops catch reasoning errors; these catch mechanical drift.
+
+### Per-unit (final-review step)
+
+- **`cargo mutants`** — see "Mutation testing" under final review above. Survivors are addressed before commit.
 
 ### Continuously enforced (pre-commit hook)
 

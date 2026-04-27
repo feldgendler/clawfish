@@ -123,6 +123,46 @@ mod tests {
         bb
     }
 
+    // -------- ray_attack direct tests (pin per-axis step semantics) --------
+    //
+    // The four-direction `rook_attacks` / `bishop_attacks` callers are
+    // symmetric in {dfile, drank} sign, so a sign-flip on the step (`f0 +
+    // k*dfile` → `f0 - k*dfile`) cycles east↔west / north↔south and the
+    // overall four-direction union is identical. Pin each axis independently
+    // here so the per-axis step is verifiable in isolation.
+
+    #[test]
+    fn ray_attack_east_pins_dfile_step() {
+        // From a4 walking east on an empty board: yields b4..h4.
+        let got = ray_attack(Square::A4, Bitboard::EMPTY, 1, 0);
+        let expected = bb_of(&[
+            Square::B4,
+            Square::C4,
+            Square::D4,
+            Square::E4,
+            Square::F4,
+            Square::G4,
+            Square::H4,
+        ]);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn ray_attack_north_pins_drank_step() {
+        // From d1 walking north on an empty board: yields d2..d8.
+        let got = ray_attack(Square::D1, Bitboard::EMPTY, 0, 1);
+        let expected = bb_of(&[
+            Square::D2,
+            Square::D3,
+            Square::D4,
+            Square::D5,
+            Square::D6,
+            Square::D7,
+            Square::D8,
+        ]);
+        assert_eq!(got, expected);
+    }
+
     // -------- rook_mask --------
 
     #[test]

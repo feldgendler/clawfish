@@ -1,0 +1,93 @@
+# cargo-mutants configuration. See https://mutants.rs/.
+#
+# Mutation testing answers "would the test catch a bug here?" by mutating
+# the source (e.g. `+` → `-`, `<` → `<=`) and reporting which mutants
+# survive the test suite. Surviving mutants point at gaps in test coverage.
+#
+# Run with: cargo mutants
+
+# ---- File-level exclusions ------------------------------------------------
+exclude_globs = [
+    # Auto-generated constants. The data is verified end-to-end by the
+    # gold-standard differential test in tests/magic_consistency.rs;
+    # mutating individual hex literals would just produce noise.
+    "src/magic/constants.rs",
+
+    # The magicgen binary is a codegen tool, not engine code. It runs its
+    # own validate() pass on every invocation and is not exercised by
+    # cargo test, so every mutation here would survive trivially.
+    "src/bin/magicgen.rs",
+
+    # Stub entry point — println! only, nothing meaningful to mutate.
+    "src/main.rs",
+]
+
+# ---- Mutant-level exclusions (by name regex) ------------------------------
+#
+# Patterns key on the mutant's `replace ... in <function>` form and so are
+# robust to line moves within a function. Each block documents *why* the
+# mutant is genuinely indistinguishable from the original — i.e. the test
+# suite cannot catch it because no input differentiates the two operators
+# (an "equivalent mutant" in mutation-testing terminology).
+exclude_re = [
+    # `replace <fn> -> () with ()` — no-op for unit-returning functions.
+    "replace .* -> \\(\\) with \\(\\)",
+
+    # ---- `|` ↔ `^` between provably-disjoint operands -----------------
+    #
+    # These functions OR together bitboards (or single-bit integer values)
+    # that are disjoint by construction. For disjoint a, b: a | b == a ^ b
+    # for every input, so no test can distinguish the two operators.
+
+    # slow_attacks: each ray-combiner ORs four directional rays from one
+    # square. The rays cover distinct cardinal/diagonal squares — they
+    # never overlap (this is why a slider's attack set is the disjoint
+    # union of its rays).
+    "replace \\| with \\^ in rook_mask",
+    "replace \\| with \\^ in bishop_mask",
+    "replace \\| with \\^ in rook_attacks",
+    "replace \\| with \\^ in bishop_attacks",
+    # queen_attacks (both slow_attacks and magic) ORs rook-attacks with
+    # bishop-attacks; rook attacks file/rank squares while bishops attack
+    # diagonal squares — the two sets are always disjoint.
+    "replace \\| with \\^ in queen_attacks",
+
+    # Position::starting_position composes disjoint piece bitboards (each
+    # piece type's white set is on rank 1, black set on rank 8; pawns on
+    # rank 2/7) and disjoint rank ORs (RANK_1 | RANK_2, RANK_7 | RANK_8).
+    "replace \\| with \\^ in Position::starting_position",
+
+    # White-occupancy and black-occupancy are disjoint by definition —
+    # no piece is both colors.
+    "replace \\| with \\^ in Position::occupied_all",
+    "replace \\| with \\^ in Position::debug_assert_consistent",
+
+    # ---- ray_mask: first off-board guard `||` ↔ `&&` ------------------
+    #
+    # ray_mask exits the loop on either guard:
+    #   if !(0..8).contains(&nf) || !(0..8).contains(&nr) { return acc; }
+    #   ...
+    #   if !(0..8).contains(&beyond_f) || !(0..8).contains(&beyond_r)
+    #     { return acc; }
+    # Mutating the FIRST guard's `||` to `&&` only matters if the first
+    # guard would have fired but the second won't — which is impossible:
+    # `beyond` is always one step further along (dfile, drank), so
+    # whichever axis went off-board is more off-board on the next step,
+    # and the second `||` (unchanged) catches it before
+    # Square::from_file_rank is reached. So no input distinguishes.
+    "replace \\|\\| with && in ray_mask",
+
+    # ---- magic table-build destructive-collision check ---------------
+    #
+    # The committed magic constants produce a perfect-hash mapping for
+    # every (square, subset) pair: each subset hits a unique slot, so the
+    # `existing != 0` branch is never taken during table build with our
+    # seed (0xC0FFEE_C0FFEE). The `panic!` guards a hypothetical corrupted
+    # constants file. Since the branch is unreachable in practice, mutating
+    # `!=` → `==` produces an equivalent mutant: both forms are unreachable,
+    # and the test suite cannot distinguish them. (Keep the runtime check;
+    # it's a cheap defense against future regeneration with a non-perfect
+    # magic.)
+    "replace != with == in build_rook_table",
+    "replace != with == in build_bishop_table",
+]

@@ -258,6 +258,16 @@ mod tests {
     }
 
     #[test]
+    fn with_is_idempotent_on_set_bit() {
+        // Pins `|`-not-`^` in `with`: applying to an already-set bit must
+        // leave the bit set. Under `^`, the second call would clear it.
+        let bb = Bitboard::from_square(Square::E4);
+        let twice = bb.with(Square::E4);
+        assert!(twice.contains(Square::E4));
+        assert_eq!(bb, twice);
+    }
+
+    #[test]
     fn from_square_count() {
         for i in 0..64u8 {
             let sq = Square::new(i).expect("0..64 must be a valid square");

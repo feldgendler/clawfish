@@ -487,6 +487,17 @@ mod tests {
     }
 
     #[test]
+    fn castling_with_is_idempotent_on_set_flag() {
+        // Pins `|`-not-`^` in CastlingRights::with: re-adding a flag that's
+        // already set must leave the rights unchanged.
+        let r = CastlingRights::WHITE_KING;
+        assert_eq!(
+            r.with(CastlingRights::WHITE_KING),
+            CastlingRights::WHITE_KING
+        );
+    }
+
+    #[test]
     fn castling_has_with_without() {
         assert!(
             CastlingRights::NONE
@@ -893,6 +904,31 @@ mod tests {
         );
         // Color bitboard should still claim e4 for White.
         assert!(p.occupied(Color::White).contains(Square::E4));
+    }
+
+    /// `debug_assert_consistent` is called from many tests as a sanity gate
+    /// but its body has never been observed to panic — every existing call
+    /// site presents a consistent position. The next two tests poke private
+    /// fields directly to construct broken states and confirm the function
+    /// fires. Without them, replacing the body with `()` silently passes.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn debug_assert_consistent_panics_on_broken_king_cache() {
+        let mut p = Position::starting_position();
+        // Corrupt the cached king square without touching the king bitboard.
+        p.king_sq[Color::White.index()] = Square::A1;
+        p.debug_assert_consistent();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn debug_assert_consistent_panics_on_mailbox_bitboard_drift() {
+        let mut p = Position::starting_position();
+        // Drop the white king from the mailbox without touching bitboards.
+        p.mailbox[Square::E1.index() as usize] = None;
+        p.debug_assert_consistent();
     }
 
     /// `validate_post_parse` checks for TooManyKings for both colors, but only
