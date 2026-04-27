@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M0 complete; M1 planning.** Architectural commitments settled (see `docs/decisions/`). Cargo project initialized; `cargo run` produces a hello-world binary. Stockfish 18 installed via Homebrew per `decisions/0006`. M1 prior-art research complete (three reports in `docs/research/`, synthesized into `docs/prior-art.md`). M1 is decomposed into seven sub-phases M1.A–M1.G in `docs/roadmap.md`; each goes through plan mode with the blind-review loop per `docs/workflow.md`. ADRs 0007/0008/0009 are pre-decided (material in prior-art and research files) but written per-phase as each binds — none binds on M1.A. Next: enter plan mode for M1.A.
+**Phase: M1.A complete; M1.B next.** Architectural commitments settled (see `docs/decisions/`). M1.A landed `Square` and `Bitboard` newtype primitives with full LERF support, all eight directional shifts with wrap protection, an inline `Squares` iterator, and a byte-pinned `Debug` grid printer. 50 unit tests pass; `cargo build --release` exercises the new release profile (`lto = "thin"`, `codegen-units = 1`, `panic = "abort"`). Plan-review, test-suite review, and final review loops all converged cleanly. Plan archived at `docs/plans/m1.a.md`. M1 prior-art research is in `docs/research/`, synthesized into `docs/prior-art.md`. ADRs 0007/0008/0009 are pre-decided but written per-phase as each binds — 0009 (Polyglot Zobrist) binds at M1.D, 0008 (magic bitboards) binds at M1.C, 0007 (legal-direct movegen) binds at M1.F. Next: M1.B (`Position` struct + FEN).
 
 ## How to pick up a new session
 

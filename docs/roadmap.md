@@ -4,7 +4,7 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M0 complete; project scaffolded.** Architectural commitments settled — see `docs/decisions/` and `docs/architecture.md`. Cargo package initialized at the repo root (`chess` v0.1.0, edition 2024, Rust toolchain pinned to `stable` via `rust-toolchain.toml`); hello-world binary compiles and runs (`cargo run`). Stockfish 18 installed via Homebrew per `decisions/0006`. Next: kick off M1 with prior-art research on bitboard-based move generation.
+**M1.A complete; M1.B next.** Architectural commitments settled — see `docs/decisions/` and `docs/architecture.md`. Cargo package initialized at the repo root (`chess` v0.1.0, edition 2024, Rust toolchain pinned to `stable` via `rust-toolchain.toml`). M1.A landed `Square` and `Bitboard` primitives behind `lib.rs` plus the release profile per `docs/plans/m1.a.md`; 50 unit tests pass, `cargo build --release` clean, all three review loops converged. Stockfish 18 installed via Homebrew per `decisions/0006`. Next: M1.B (`Position` struct + FEN parsing).
 
 ## Milestones
 
@@ -37,7 +37,7 @@ Bitboards, all rules of standard chess, no search, no eval. Validated against pe
 
 | Phase | Scope | Approx size |
 |---|---|---|
-| **M1.A** — Skeleton + primitives | `lib.rs` split, `Cargo.toml` release profile (`lto = "thin"`, `codegen-units = 1`, `panic = "abort"`), module skeleton, `Square` type, `Bitboard` type and primitive operations, unit tests for primitives | ~500–800 lines |
+| **M1.A** ✓ — Skeleton + primitives | `lib.rs` split, `Cargo.toml` release profile (`lto = "thin"`, `codegen-units = 1`, `panic = "abort"`), module skeleton, `Square` type, `Bitboard` type and primitive operations, unit tests for primitives | ~500–800 lines (actual: ~720 lines, 50 tests) |
 | **M1.B** — Position + FEN | `Position` struct (6+2 bitboards + mailbox + cached king squares + auxiliary state), FEN parse/format per Edwards 1994 §16.1, position-equality tests | ~600–900 lines |
 | **M1.C** — Sliding-piece attacks | Slow ray-walker as permanent `slow_attacks` oracle module, `src/bin/magicgen.rs` (search + validation + codegen), generated magic constants source file, fancy-magic attack lookups, differential tests over all ~108k (square, occupancy) pairs | ~800–1200 lines |
 | **M1.D** — Zobrist | Polyglot key table, incremental hash update on make/unmake, EP-only-when-pseudo-legal hashing rule, debug-build round-trip assert | ~250–350 lines |

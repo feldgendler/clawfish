@@ -2,5 +2,12 @@
 name = "chess"
 version = "0.1.0"
 edition = "2024"
+description = "Standard chess engine"
 
 [dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
