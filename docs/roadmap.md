@@ -4,11 +4,57 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1.E complete; M1.F next.** M1.E landed the `mov` module — `Move` (16-bit packed: bits 0–5 from / 6–11 to / 12–15 flag), `MoveFlag` (14 valid codes; 6, 7 unused), `Undo` (~16 B carrying captured/prior-aux/prior-zobrist), and the free functions `make_move(&mut Position, Move) -> Undo` + `unmake_move(&mut Position, Move, Undo)` per ADR-0004. All special cases handled: quiet, double-push, capture, en passant, kingside/queenside castle, four `*Promo` and four `*PromoCapture` flags. Castling-rights update via 64-entry `CASTLING_MASK` table (from/to indexed) — handles the rook-captured-on-corner edge case (Kiwipete depth-4 trap). Incremental Zobrist update with debug-build round-trip assert against `from_scratch`; **always-on release-build perf sentinel** guards against accidental from-scratch reintroduction (threshold 100 ns/cycle). Position extensions: `clear_square`, `refresh_zobrist_from`, ergonomic `Position::make_move`/`Position::unmake_move` method delegates, `BitAnd` impl on `CastlingRights`. Throughput sanity (Apple Silicon, dev machine, release): quiet pawn ≈ 27 ns/cycle, capture ≈ 38 ns, EP ≈ 36 ns, castle ≈ 42 ns, promo ≈ 22 ns — well under the <50 ns/cycle target. 286 lib + 3 fen + 2 magic + 3 make/unmake integration + 9 zobrist-vector = **303 tests pass + 3 ignored benches**; `cargo build --release` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo llvm-cov` shows 95.65% region / 94.71% line coverage on `mov.rs` (gaps are const-fn evaluated at compile time + provably-unreachable arms + debug_assert formatters); `cargo mutants --in-diff` reports **0 survivors on 123 mutants** (107 caught, 16 unviable). All three review loops (plan, test-suite, final) converged. Plan archived at `docs/plans/m1.e.md`. Next: M1.F (legal move generation; ADR-0007 binds).
+**M1.E complete; M1.F next.**
+
+### M1.E — what landed
+
+The `mov` module — the engine's first mutating layer:
+
+- **`Move`** — 16-bit packed: bits 0–5 from / 6–11 to / 12–15 flag.
+- **`MoveFlag`** — 14 valid codes (6 and 7 deliberately absent).
+- **`Undo`** (~16 B) — captured piece + prior aux state + prior zobrist.
+- **`make_move(&mut Position, Move) -> Undo`** and **`unmake_move(&mut Position, Move, Undo)`** — free functions per ADR-0004; ergonomic `Position::make_move` / `Position::unmake_move` delegates.
+
+All special cases: quiet, double-push, capture, en passant, kingside/queenside castle, four `*Promo` and four `*PromoCapture`.
+
+### M1.E — implementation highlights
+
+- **Castling-rights update** via 64-entry `CASTLING_MASK` table (from/to indexed) — handles the rook-captured-on-corner Kiwipete depth-4 trap.
+- **Incremental Zobrist** with debug-build round-trip assert against `from_scratch`.
+- **Always-on release-build perf sentinel** at 100 ns/cycle threshold guards against accidental from-scratch reintroduction.
+- **`Position` extensions:** `clear_square`, `refresh_zobrist_from`, method delegates, `BitAnd` impl on `CastlingRights`.
+
+### M1.E — verification
+
+| Metric | Result |
+|---|---|
+| Tests | **303 passing** + 3 ignored benches (286 lib + 3 fen + 2 magic + 3 make/unmake integ + 9 zobrist-vector) |
+| `cargo build --release` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo llvm-cov` on `mov.rs` | 95.65% region / 94.71% line (gaps: const-fn at compile time + `unreachable!()` arms + `debug_assert` formatters) |
+| `cargo mutants --in-diff` | **0 survivors** on 123 mutants (107 caught, 16 unviable) |
+| Throughput (Apple Silicon, release) | quiet 27 ns/cycle, capture 38, EP 36, castle 42, promo 22 — under <50 ns/cycle target |
+
+All three review loops (plan, test-suite, final) converged. Plan archived at `docs/plans/m1.e.md`.
+
+### What's next
+
+**M1.F — legal move generation.** Per-piece-type generation, pin computation, check-evasion specialization, legal-direct emission. ADR-0007 binds here.
 
 ## Prior status
 
-**M1.D complete.** M1.D landed the `zobrist` module with the Polyglot 781-key set vendored verbatim from `docs/reference/polyglot-book-format.md`, the EP-only-when-pseudo-legal hashing rule, the asymmetric turn key (XORed iff WHITE-to-move), the four-key castling encoding, the `Position::zobrist` field with `refresh_zobrist()` setter, and the 9 published Polyglot test vectors as the gold-standard interop check. ADR-0009 landed in the same commit. 224 unit (lib) + 3 fen integration + 2 magic-consistency + 9 zobrist-vector = **238 tests pass + 1 ignored bench**; `cargo mutants --in-diff` shows zero survivors on M1.D's 1067-line diff. All three review loops converged. Throughput: `from_scratch(starting_position)` ≈ 50.8 ns/op; `ep_file_to_hash` ≈ 0.72 ns/op on no-EP early-exit.
+### M1.D ✓ — Polyglot Zobrist hashing
+
+- Vendored the Polyglot 781-key set verbatim from `docs/reference/polyglot-book-format.md`.
+- Implemented the EP-only-when-pseudo-legal hashing rule, asymmetric turn key (XORed iff WHITE-to-move), four-key castling encoding.
+- `Position::zobrist` field with `refresh_zobrist()` setter; 9 published Polyglot test vectors as gold-standard interop check.
+- ADR-0009 landed in the same commit.
+
+| Metric | Result |
+|---|---|
+| Tests | **238 passing** + 1 ignored bench (224 lib + 3 fen + 2 magic + 9 zobrist-vector) |
+| `cargo mutants --in-diff` | 0 survivors on 1067-line diff |
+| Throughput | `from_scratch(starting_position)` ≈ 50.8 ns/op; `ep_file_to_hash` ≈ 0.72 ns/op on no-EP early-exit |
 
 ## Milestones
 
