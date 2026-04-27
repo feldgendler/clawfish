@@ -51,6 +51,7 @@ Search via Google Scholar / arXiv for specific techniques as needed. Papers ofte
 - **Arena**, **Banksia** — alternative GUIs.
 - **samply**, Instruments — profiling on Apple Silicon.
 - **criterion** — Rust microbenchmarking.
+- **cargo-llvm-cov** — line/branch coverage via LLVM source-based instrumentation (works natively on Apple Silicon). Used by the final review loop to surface implementation paths that contract-driven TDD didn't naturally exercise. See `workflow.md` "Final review loop" → Coverage dimension.
 
 ## Per-component research notes
 
