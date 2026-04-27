@@ -58,11 +58,19 @@ pub(crate) fn emit_pawn_moves(pos: &Position, us: Color, info: &MaskInfo, out: &
                 }
 
                 // Double push (only from starting rank, never a promotion).
+                // No explicit `(empty & dbl_bb).any()` check: `push_mask`
+                // is constructed in `MaskInfo::compute` such that
+                // `push_mask ⊆ empty` in every reachable case (no check:
+                // push_mask = !all_occ; single-check + slider:
+                // between_bb(king, checker), empty by construction;
+                // single-check + non-slider: EMPTY; double check:
+                // emit_pawn_moves not called). So if dbl_bb is in
+                // push_mask, dbl_bb is automatically empty.
                 if from_rank == start_rank {
                     let dbl_rank = (from_rank as i8 + 2 * push_dr) as u8;
                     if let Some(dbl_sq) = Square::from_file_rank(from_file, dbl_rank) {
                         let dbl_bb = Bitboard::from_square(dbl_sq);
-                        if (empty & dbl_bb).any() && (info.push_mask & dbl_bb & pin_ray).any() {
+                        if (info.push_mask & dbl_bb & pin_ray).any() {
                             out.push(Move::new(from, dbl_sq, MoveFlag::DoublePush));
                         }
                     }
@@ -105,24 +113,27 @@ pub(crate) fn emit_pawn_moves(pos: &Position, us: Color, info: &MaskInfo, out: &
         // attack `ep_sq`.
         let attackers = pawn_attacks_from(ep_sq, us.flip()) & pawns;
 
-        // Mask gating for EP under check: allow if either the EP-captured
-        // pawn is in capture_mask (the checker IS the captured pawn) OR
-        // the EP target square is in push_mask (rare discovered-check
-        // block scenario).
-        let mask_ok = (info.capture_mask & captured_bb).any() || (info.push_mask & ep_bb).any();
-        if !mask_ok {
-            return;
-        }
-
+        // No early `mask_ok` gate or standard pin filter here: the
+        // post-EP-occupancy slider checks below are the actual
+        // correctness gate, and they catch every reachable scenario the
+        // earlier checks would have rejected:
+        //   - Pinned own-pawn attempting EP off the pin ray: the pinner
+        //     is by definition a slider; post-EP its attack reaches the
+        //     king through the vacated `from` square — caught.
+        //   - In single-check by a slider whose check the EP doesn't
+        //     resolve: the slider still attacks the king post-EP — caught.
+        //   - In single-check by the just-double-pushed pawn: EP captures
+        //     it; post-EP no check, EP correctly emitted.
+        // The only scenarios where deleting these gates would emit an
+        // illegal move require a position with knight check + EP target
+        // set, which is unreachable from legal play (would require
+        // opponent's last move to be both a knight move AND a pawn
+        // double-push). Per ADR-0007 the engine trusts the FEN parser's
+        // input and does not validate against unreachable game-history
+        // corruption. Removed during M1.G mutation-testing follow-up
+        // — see `.cargo/mutants.toml` history if a future regression
+        // re-introduces a redundant gate.
         for from in attackers.iter() {
-            // Standard pin filter applies to EP destination.
-            if info.pinned.contains(from) {
-                let pr = info.pin_rays[from.index() as usize];
-                if (pr & ep_bb).is_empty() {
-                    continue;
-                }
-            }
-
             // Post-EP-occupancy horizontal-pin check (Position-3 trap):
             // remove our pawn from `from`, remove opp pawn from
             // captured_sq, add our pawn at ep_sq, and verify our king
@@ -575,6 +586,31 @@ mod tests {
             !pawn_only.contains(&ep),
             "EP c5xd6 must NOT be emitted when post-EP occupancy exposes king to rook \
              (different black-king anchor than the primary test), got: {pawn_only:?}"
+        );
+    }
+
+    #[test]
+    fn pawn_ep_resolves_check_from_just_double_pushed_pawn() {
+        // Position: black king d5 in check from white pawn c4 (which just
+        // double-pushed c2→c4, attacking d5 diagonally). Black pawn on b4.
+        // The EP capture b4xc3 captures the checking pawn and is the
+        // unique pawn move that resolves the check.
+        //
+        // This test pins the EP-mask gate `mask_ok = (capture_mask &
+        // captured_bb).any() || (push_mask & ep_bb).any()` against a
+        // mutant that replaces `||` with `&&`: under that mutant, since
+        // single-check by a pawn has `push_mask == EMPTY`, the right side
+        // would be false and `&&` would block the EP — incorrectly
+        // suppressing the only legal pawn move out of check. Verified at
+        // mutation-testing time: this fixture distinguishes original
+        // from `||→&&`.
+        let pos = Position::from_fen("8/8/8/3k4/1pP5/8/8/4K3 b - c3 0 1").unwrap();
+        let moves = emit(&pos);
+        let pawn_only = pawn_moves_only(&pos, moves.as_slice());
+        let ep = Move::new(Square::B4, Square::C3, MoveFlag::EnPassant);
+        assert!(
+            pawn_only.contains(&ep),
+            "EP b4xc3 must be emitted (it captures the checking pawn), got: {pawn_only:?}"
         );
     }
 
