@@ -249,7 +249,9 @@ impl Position {
     }
 
     /// Cross-field consistency check used by tests and (in M1.E) by the
-    /// post-make-move debug assert. Panics on violation.
+    /// post-make-move debug assert. Panics on violation in debug builds.
+    /// In release builds the body compiles out — see the `cfg(not(debug_assertions))`
+    /// stub below — so callers can invoke it unconditionally.
     #[cfg(debug_assertions)]
     #[allow(dead_code)] // Called from tests only at M1.B; M1.E adds a non-test caller.
     pub(crate) fn debug_assert_consistent(&self) {
@@ -377,6 +379,14 @@ impl Position {
         }
         Ok(())
     }
+
+    /// Release-mode no-op stub for `debug_assert_consistent`. The function
+    /// exists in both modes so callers (tests, parser post-conditions) can
+    /// invoke it without `cfg`-gating each call site; the body is only
+    /// present under `cfg(debug_assertions)`.
+    #[cfg(not(debug_assertions))]
+    #[allow(dead_code)]
+    pub(crate) fn debug_assert_consistent(&self) {}
 }
 
 impl fmt::Display for Position {
