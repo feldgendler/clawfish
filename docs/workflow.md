@@ -263,3 +263,14 @@ When a session produces new decisions, update the relevant doc *before* stopping
 - Milestone progress or revision → update `docs/roadmap.md`.
 - New ground rule from user → update `CLAUDE.md`.
 - Prior-art research output → append to `docs/prior-art.md` under the relevant component section.
+
+## Documentation style
+
+Write docs as structure, not prose. Concretely:
+
+- **Don't pack multiple distinct facts into one paragraph or one bullet.** A bullet that names a topic and then runs through five comma-separated facts and parentheticals is a list disguised as prose — break it into sub-bullets, one claim per line.
+- **Prefer the cheapest structure that fits.** Table > nested bullets > short prose. Use prose only when the points are genuinely linear (narrative, derivation, an argument that builds), not when listing parallel facts.
+- **One concept per section; one claim per bullet.** Findings, conventions, phase descriptions, ADR rationales — never a wall of paragraph the reader has to parse manually.
+- **Citations and parentheticals are not exempt.** "(per X, because Y, see also Z)" inside a bullet is itself an infodump — split it.
+
+Applies everywhere: `roadmap.md` phase entries and ADR stubs, written ADRs, research reports, status sections in `CLAUDE.md`/`roadmap.md`, plan documents, commit bodies.

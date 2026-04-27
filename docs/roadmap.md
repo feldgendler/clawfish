@@ -166,8 +166,17 @@ Plays legal random moves through Cute Chess. No search depth. Establishes the UC
 
 **ADRs to write per-phase, as each binds.**
 
-- **ADR-0011** — UCI I/O threading model. UCI requires the engine to read stdin while "thinking" (`isready` → `readyok` mid-search; `stop` to abort `go infinite`). Choice: dedicated reader thread + cooperative-cancellation channel to a search worker, vs. a single thread that polls stdin between search iterations. **Binds on M2.C.**
-- **ADR-0012** — Tournament-harness conventions: Cute Chess as the runner, `engines.json` template lives in `scripts/`, where match logs and PGNs land, what counts as a "passing" self-play smoke. SPRT (per-change strength gating) is deferred to M3. **Binds on M2.E.**
+- **ADR-0011** — UCI I/O threading model. **Binds on M2.C.**
+  - Constraint: UCI mandates stdin readable during search (`isready` → `readyok` mid-search; `stop` aborts `go infinite`).
+  - Choice space: dedicated reader thread + cancellation channel to a search worker, vs. single thread polling stdin between search iterations.
+  - Research: `research/m2-uci-threading.md` recommends reader thread + mpsc + per-`go` worker + `Arc<AtomicBool>` cancellation.
+- **ADR-0012** — Tournament-harness conventions. **Binds on M2.E.**
+  - Runner: `fastchess` (Cute Chess 1.4.0 ships zero macOS assets; fastchess ships pre-built `mac-arm64` binaries and is what Stockfish/Fishtest migrated to in 2024).
+  - Engine config: `scripts/match.sh` wrapper. fastchess has no `engines.json` registry.
+  - Output layout: raw PGN/log → `target/matches/` (gitignored). Milestone summaries → `bench/m2.md` per ADR-0010.
+  - Smoke contract: 4 self-play + 4 vs Stockfish at `tc=10+0.1`, all legally terminated, no protocol errors, fastchess UCI-compliance checker silent.
+  - SPRT (per-change strength gating): deferred to M3.
+  - Research: `research/m2-tournament-harness.md`.
 
 **Sub-phases.** M2 is decomposed into five plan-and-execute cycles. Each phase gets its own plan-mode pass with the self-review loop (see `workflow.md`), executes independently, lands its own commit(s), runs its own tests before we move to the next phase.
 
@@ -177,7 +186,7 @@ Plays legal random moves through Cute Chess. No search depth. Establishes the UC
 | **M2.B** — UCI command parser | New `uci` module: `Command` enum + `parse_uci_line(&str) -> Command` (returns `Command::Unknown` for stuff to silently skip per spec §"unknown command or token"). Covers `uci`, `debug on/off`, `isready`, `setoption name … [value …]`, `register`, `ucinewgame`, `position [startpos\|fen …] [moves …]`, `go` (with `searchmoves`/`ponder`/`wtime`/`btime`/`winc`/`binc`/`movestogo`/`depth`/`nodes`/`mate`/`movetime`/`infinite`), `stop`, `ponderhit`, `quit`. Strict whitespace tolerance per spec §arbitrary-whitespace. Property tests for grammar coverage | ~600–900 lines |
 | **M2.C** — Engine I/O loop + position state | `Engine` struct (current `Position`, options, RNG seed), main `run()` loop reads lines from stdin and dispatches parsed `Command`s to handlers, writes responses to stdout. Handlers: `uci` (emits `id name`/`id author`/`option …`/`uciok`), `isready` (always answers `readyok`, even mid-search), `setoption`, `ucinewgame` (resets state), `position` (parses moves via M2.A `from_uci` and applies them), `quit`. `info string …` debug logging behind `debug on`. `go` parsed but answered with placeholder until M2.D. Threading model (ADR-0011) lands here so `isready` and `stop` work concurrently with future search | ~800–1200 lines |
 | **M2.D** — Random search + `go`/`bestmove` | `Search` trait/struct with `start(pos, params, output) -> Handle` and `Handle::stop()`, preserving the eval/search interception point per ADR-0004 (NNUE + skill-dial future hooks). Random move via SplitMix64; seed from system time or a custom `Random_Seed` UCI option for reproducibility. Honors `go movetime <ms>` (sleeps then emits), `go infinite` (waits for `stop`), `stop` (cancels pending emit), `searchmoves` (filters legal-move pool). `bestmove <uci>` output. End-to-end test: drive a full game from `position startpos` through repeated `go movetime 10` until terminal | ~700–1000 lines |
-| **M2.E** — Tournament harness + Cute Chess | `scripts/run-selfplay.sh` invoking `cutechess-cli` with an `engines.json` template; documentation for installing Cute Chess and reading the resulting PGN/log output. Integration test that spawns the release binary, drives it through a complete self-game via piped stdin/stdout, asserts the game terminates legally (checkmate / stalemate / 50-move / threefold / insufficient material per FIDE) and that the PGN parses. ADR-0012 codifies the harness layout. `docs/workflow.md` updated with "running a match" runbook | ~400–700 lines |
+| **M2.E** — Tournament harness + fastchess | `scripts/match.sh` wrapper around `fastchess`; documentation for downloading the `mac-arm64` release and reading PGN/log output. Integration test that spawns the release binary, drives it through a complete self-game via piped stdin/stdout, asserts the game terminates legally (checkmate / stalemate / 50-move / threefold / insufficient material per FIDE) and that the PGN parses. ADR-0012 codifies the harness layout. `docs/workflow.md` gains a "running a match" runbook | ~400–700 lines |
 
 Phases A → D are foundational and largely sequential; A and B are independent of each other and could be planned in either order, but C depends on both. E is the validation layer (analogous to M1.G).
 
