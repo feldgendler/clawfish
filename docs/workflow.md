@@ -96,7 +96,7 @@ The dimensions of final review:
 - **Correctness.** Does the code actually do what the tests claim it does? Are there situations the tests don't cover where the code would behave incorrectly?
 - **Corner cases.** Same dimension as test-suite review, now on the implementation side: are there situations not covered by tests that the code should handle? (If yes, write more tests, then re-implement to satisfy them.)
 - **Coverage.** Run `cargo llvm-cov --summary-only` (or `--html` for line-level detail) on the unit's tests. Inspect the report for newly-introduced code with uncovered lines or branches. Common cause: TDD pins the function's *contract* (defined by tests) before the implementation chooses internal paths — e.g. an implementation may introduce a separate fast path for even arguments after the tests were written, and if all tests happened to use even values, the odd path stays untested. For each meaningful gap, the agent either adds tests that exercise the path, proves the path unreachable and removes it, or documents in chat why the gap is intentional (e.g. a `panic!()` on impossible state, a debug-only assertion). No hard percentage threshold — judgment-based. Tool: `cargo-llvm-cov` (LLVM source-based instrumentation; works natively on Apple Silicon).
-- **Mutation testing.** Run `cargo mutants` on the unit's modules. Coverage answers "did the test execute this line"; mutation testing answers "would the test catch a bug here?" — it mutates `+` to `-`, `<` to `<=`, `|` to `^`, etc., and reports which mutants survive. Each survivor points at either a missing assertion, a genuinely-equivalent mutant (no input distinguishes the original from the mutated form), or a defensive branch unreachable for the actual inputs. For each survivor, the agent: (a) adds a test that catches it, (b) proves equivalence and adds an `exclude_re` rule to `.cargo/mutants.toml` with a comment explaining why, or (c) refactors the unreachable branch (e.g. via `unreachable!()`). Configuration lives in `.cargo/mutants.toml`. Tool: `cargo-mutants` (single-binary install, no nightly required). Run is slow (minutes per dozen mutants), so once per unit at the final-review step rather than per commit.
+- **Mutation testing.** Run `cargo mutants` on the unit's modules. Coverage answers "did the test execute this line"; mutation testing answers "would the test catch a bug here?" — it mutates `+` to `-`, `<` to `<=`, `|` to `^`, etc., and reports which mutants survive. Each survivor points at either a missing assertion, a genuinely-equivalent mutant (no input distinguishes the original from the mutated form), or a defensive branch unreachable for the actual inputs. For each survivor, the agent: (a) adds a test that catches it, (b) proves equivalence and adds an `exclude_re` rule to `.cargo/mutants.toml` with a comment explaining why, or (c) refactors the unreachable branch (e.g. via `unreachable!()`). Configuration lives in `.cargo/mutants.toml`. Tool: `cargo-mutants` (single-binary install, no nightly required). See "Mutation-testing scope" below for the per-unit `--in-diff` workflow.
 - **Code quality.** Idiomatic Rust, error-handling style, no dead code, no premature abstractions, no commented-out blocks. **Provably-unreachable branches use `unreachable!("brief why")`** rather than silent defensive returns. The panic message documents the invariant the code relies on; if a future change breaks the invariant, the program fails loudly instead of returning a misleading error or silently miscomputing. Reserve plain `if`/`return Err(...)` for paths that *can* fire on bad input — these are validation, not defense.
 - **Readability.** Clear naming, sensible structure, comments only where the *why* is non-obvious. A future reader (including a future Claude session) should be able to follow the code without consulting the conversation that produced it.
 - **Simplicity.** Anything overengineered? Anything that could be cut, merged, or deferred without loss?
@@ -110,7 +110,42 @@ Standing checks that complement the review loops. The review loops catch reasoni
 
 ### Per-unit (final-review step)
 
-- **`cargo mutants`** — see "Mutation testing" under final review above. Survivors are addressed before commit.
+- **`cargo mutants`** — see "Mutation testing" under final review above, and "Mutation-testing scope" below for the `--in-diff` workflow that keeps the run bounded.
+
+## Mutation-testing scope
+
+Mutation testing runtime grows roughly linearly with codebase size. A full-repo run is acceptable while the project is small, but doesn't scale — by the time the search layer lands, a full pass would take an hour-plus. Two scoping mechanisms keep the per-unit cost bounded; combine them as needed.
+
+### Default per-unit run: `--in-diff`
+
+`cargo mutants --in-diff <FILE>` accepts a unified diff and only generates mutants on lines the diff touches. At the final-review step, the unit's work is in the working tree (uncommitted — the commit lands at step 11), so the invocation is:
+
+```sh
+git diff HEAD -- 'src/**/*.rs' > /tmp/<unit>.diff
+cargo mutants --in-diff /tmp/<unit>.diff
+```
+
+The runtime is proportional to the *new* surface area, not the cumulative codebase. Lines that haven't changed since the previous unit are not mutated.
+
+This is the default cargo-mutants invocation at the final-review step.
+
+When in-flight work from a parallel agent is sitting in the same working tree, scope the diff to the unit's files explicitly with extra pathspec args, e.g. `git diff HEAD -- src/zobrist.rs src/position.rs > /tmp/m1.d.diff`, so unrelated unstaged work doesn't broaden the mutant set.
+
+### Iterating: `--iterate`
+
+When working through survivors and re-running cargo-mutants, `--iterate` reads the previous run's `mutants.out/` and skips mutants that were already caught. Combine with `--in-diff` so that fixing a survivor re-tests only the unaddressed mutants in the unit's surface area:
+
+```sh
+cargo mutants --in-diff /tmp/<unit>.diff --iterate
+```
+
+### Periodic full-suite backstop
+
+The `--in-diff` runs do not exercise mutants on lines that haven't changed since the previous unit. Test additions in the unit might reveal mutants in pre-existing untouched code that the previous run missed; conversely, a refactor elsewhere could move a previously-caught line out of test coverage. To catch this drift, run the **full suite** (`cargo mutants` with no `--in-diff`) once per major milestone (M1, M2, M3, …) — at the milestone's final unit's commit, after that unit's per-unit pass converges. Frequency tradeoff: more often means more confidence and slower commits; the milestone cadence is the balance for now and can be revisited if drift becomes a recurring source of late-discovered survivors.
+
+### File-glob fallback: `--file`
+
+`-f <GLOB>` limits to a fixed file set, ignoring git history. Useful when the relevant scope is known but a diff isn't (e.g. mutation-testing a single module while debugging it). Not part of the standard per-unit workflow, but available.
 
 ### Continuously enforced (pre-commit hook)
 
