@@ -1,70 +1,100 @@
+//! Bitboard type and bit-manipulation operations. A bitboard is a `u64`
+//! with one bit per board square (LSB = a1, MSB = h8 — LERF layout).
+
 use crate::square::Square;
 use std::fmt;
 use std::ops;
 
+/// A set of up to 64 squares, stored as a `u64` bitmask (LSB = a1, MSB = h8).
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Bitboard(pub u64);
 
 impl Bitboard {
+    /// Bitboard with no bits set (the empty set).
     pub const EMPTY: Bitboard = Bitboard(0);
+    /// Bitboard with all 64 bits set.
     pub const FULL: Bitboard = Bitboard(!0);
 
+    /// All 8 squares on the a-file.
     pub const FILE_A: Bitboard = Bitboard(0x0101_0101_0101_0101);
+    /// All 8 squares on the b-file.
     pub const FILE_B: Bitboard = Bitboard(0x0202_0202_0202_0202);
+    /// All 8 squares on the c-file.
     pub const FILE_C: Bitboard = Bitboard(0x0404_0404_0404_0404);
+    /// All 8 squares on the d-file.
     pub const FILE_D: Bitboard = Bitboard(0x0808_0808_0808_0808);
+    /// All 8 squares on the e-file.
     pub const FILE_E: Bitboard = Bitboard(0x1010_1010_1010_1010);
+    /// All 8 squares on the f-file.
     pub const FILE_F: Bitboard = Bitboard(0x2020_2020_2020_2020);
+    /// All 8 squares on the g-file.
     pub const FILE_G: Bitboard = Bitboard(0x4040_4040_4040_4040);
+    /// All 8 squares on the h-file.
     pub const FILE_H: Bitboard = Bitboard(0x8080_8080_8080_8080);
 
+    /// All 8 squares on rank 1 (White's back rank).
     pub const RANK_1: Bitboard = Bitboard(0x0000_0000_0000_00FF);
+    /// All 8 squares on rank 2 (White's pawn starting rank).
     pub const RANK_2: Bitboard = Bitboard(0x0000_0000_0000_FF00);
+    /// All 8 squares on rank 3.
     pub const RANK_3: Bitboard = Bitboard(0x0000_0000_00FF_0000);
+    /// All 8 squares on rank 4.
     pub const RANK_4: Bitboard = Bitboard(0x0000_0000_FF00_0000);
+    /// All 8 squares on rank 5.
     pub const RANK_5: Bitboard = Bitboard(0x0000_00FF_0000_0000);
+    /// All 8 squares on rank 6.
     pub const RANK_6: Bitboard = Bitboard(0x0000_FF00_0000_0000);
+    /// All 8 squares on rank 7 (Black's pawn starting rank).
     pub const RANK_7: Bitboard = Bitboard(0x00FF_0000_0000_0000);
+    /// All 8 squares on rank 8 (Black's back rank).
     pub const RANK_8: Bitboard = Bitboard(0xFF00_0000_0000_0000);
 
+    /// Return a bitboard with only `sq` set.
     #[must_use]
     #[inline]
     pub const fn from_square(sq: Square) -> Bitboard {
         Bitboard(1u64 << sq.index())
     }
 
+    /// Return `true` if `sq` is a member of this bitboard.
     #[inline]
     pub const fn contains(self, sq: Square) -> bool {
         (self.0 >> sq.index()) & 1 == 1
     }
 
+    /// Return this bitboard with `sq` added (no change if already set).
     #[must_use]
     #[inline]
     pub const fn with(self, sq: Square) -> Bitboard {
         Bitboard(self.0 | (1u64 << sq.index()))
     }
 
+    /// Return this bitboard with `sq` removed (no change if already clear).
     #[must_use]
     #[inline]
     pub const fn without(self, sq: Square) -> Bitboard {
         Bitboard(self.0 & !(1u64 << sq.index()))
     }
 
+    /// Return the number of squares in this bitboard.
     #[inline]
     pub const fn count(self) -> u32 {
         self.0.count_ones()
     }
 
+    /// Return `true` if the bitboard contains no squares.
     #[inline]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
+    /// Return `true` if the bitboard contains at least one square.
     #[inline]
     pub const fn any(self) -> bool {
         self.0 != 0
     }
 
+    /// Return the least-significant set square without modifying the bitboard, or `None` if empty.
     #[inline]
     pub const fn lsb(self) -> Option<Square> {
         if self.0 == 0 {
@@ -74,6 +104,7 @@ impl Bitboard {
         }
     }
 
+    /// Remove and return the least-significant set square, or `None` if empty.
     #[inline]
     pub fn pop_lsb(&mut self) -> Option<Square> {
         match self.lsb() {
@@ -85,53 +116,62 @@ impl Bitboard {
         }
     }
 
+    /// Return an iterator over the set squares in LSB-to-MSB (a1-to-h8) order.
     #[inline]
     pub fn iter(self) -> Squares {
         Squares(self)
     }
 
+    /// Shift all squares one rank toward rank 8; squares on rank 8 are lost.
     #[must_use]
     #[inline]
     pub const fn shift_north(self) -> Bitboard {
         Bitboard(self.0 << 8)
     }
 
+    /// Shift all squares one rank toward rank 1; squares on rank 1 are lost.
     #[must_use]
     #[inline]
     pub const fn shift_south(self) -> Bitboard {
         Bitboard(self.0 >> 8)
     }
 
+    /// Shift all squares one file toward the h-file; squares on the h-file are lost.
     #[must_use]
     #[inline]
     pub const fn shift_east(self) -> Bitboard {
         Bitboard((self.0 & !Self::FILE_H.0) << 1)
     }
 
+    /// Shift all squares one file toward the a-file; squares on the a-file are lost.
     #[must_use]
     #[inline]
     pub const fn shift_west(self) -> Bitboard {
         Bitboard((self.0 & !Self::FILE_A.0) >> 1)
     }
 
+    /// Shift all squares one step toward rank 8 and the h-file; edge squares are lost.
     #[must_use]
     #[inline]
     pub const fn shift_north_east(self) -> Bitboard {
         Bitboard((self.0 & !Self::FILE_H.0) << 9)
     }
 
+    /// Shift all squares one step toward rank 8 and the a-file; edge squares are lost.
     #[must_use]
     #[inline]
     pub const fn shift_north_west(self) -> Bitboard {
         Bitboard((self.0 & !Self::FILE_A.0) << 7)
     }
 
+    /// Shift all squares one step toward rank 1 and the h-file; edge squares are lost.
     #[must_use]
     #[inline]
     pub const fn shift_south_east(self) -> Bitboard {
         Bitboard((self.0 & !Self::FILE_H.0) >> 7)
     }
 
+    /// Shift all squares one step toward rank 1 and the a-file; edge squares are lost.
     #[must_use]
     #[inline]
     pub const fn shift_south_west(self) -> Bitboard {
@@ -218,6 +258,7 @@ impl fmt::Display for Bitboard {
     }
 }
 
+/// Iterator over the squares of a [`Bitboard`], yielded in LSB-to-MSB order.
 #[derive(Clone)]
 pub struct Squares(Bitboard);
 

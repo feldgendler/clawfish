@@ -83,20 +83,34 @@ const _: () = {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum MoveFlag {
+    /// Non-capturing, non-special pawn or piece move.
     Quiet = 0,
+    /// Pawn advances two squares from its starting rank; sets the EP target square.
     DoublePush = 1,
+    /// King-side castling (king e1→g1 or e8→g8; rook moves implicitly).
     KingCastle = 2,
+    /// Queen-side castling (king e1→c1 or e8→c8; rook moves implicitly).
     QueenCastle = 3,
+    /// Ordinary capture: opponent piece on the destination square.
     Capture = 4,
+    /// En passant capture; the captured pawn is one rank behind the destination.
     EnPassant = 5,
     // Codes 6 and 7 deliberately absent.
+    /// Pawn promotion to knight (no capture).
     KnightPromo = 8,
+    /// Pawn promotion to bishop (no capture).
     BishopPromo = 9,
+    /// Pawn promotion to rook (no capture).
     RookPromo = 10,
+    /// Pawn promotion to queen (no capture).
     QueenPromo = 11,
+    /// Pawn promotion to knight with simultaneous capture.
     KnightPromoCapture = 12,
+    /// Pawn promotion to bishop with simultaneous capture.
     BishopPromoCapture = 13,
+    /// Pawn promotion to rook with simultaneous capture.
     RookPromoCapture = 14,
+    /// Pawn promotion to queen with simultaneous capture.
     QueenPromoCapture = 15,
 }
 
@@ -157,17 +171,20 @@ impl Move {
         Move::new(from, to, MoveFlag::Capture)
     }
 
+    /// Decode the from-square (bits 0–5).
     #[inline]
     pub const fn from_square(self) -> Square {
         // Square::new_unchecked is OK because the bottom 6 bits are always in 0..64.
         Square::new_unchecked((self.0 & 0x3F) as u8)
     }
 
+    /// Decode the to-square (bits 6–11).
     #[inline]
     pub const fn to_square(self) -> Square {
         Square::new_unchecked(((self.0 >> 6) & 0x3F) as u8)
     }
 
+    /// Decode the 4-bit flag nibble (bits 12–15).
     #[inline]
     pub const fn flag(self) -> MoveFlag {
         let bits = ((self.0 >> 12) & 0xF) as u8;
@@ -411,9 +428,14 @@ pub struct Undo {
     /// (recoverable from `mv` alone via the captured-square arithmetic in
     /// `make_move`).
     pub captured: Option<Piece>,
+    /// Castling rights before this move; restored verbatim by `unmake_move`.
     pub prior_castling: CastlingRights,
+    /// En passant target square before this move, or `None` if EP was unavailable.
     pub prior_ep: Option<Square>,
+    /// Half-move clock value captured before `make_move` ran, so `unmake_move`
+    /// can restore it after `make_move`'s reset/increment.
     pub prior_halfmove: u8,
+    /// Polyglot Zobrist hash of the position before this move.
     pub prior_zobrist: u64,
     /// Combined material + PST score from White's perspective, before `make_move`
     /// applied its delta. Restored by `unmake_move` via `refresh_static_eval_from`.

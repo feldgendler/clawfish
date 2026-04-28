@@ -7,16 +7,21 @@
 //! of the Polyglot Zobrist piece enumeration so M1.D's hash table doesn't
 //! need a kind-axis remap.
 
+/// Which side owns a piece: White (moves first) or Black.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum Color {
+    /// The side that moves first; discriminant 0 so color-indexed arrays use `White = index 0`.
     White = 0,
+    /// The opposing side; discriminant 1.
     Black = 1,
 }
 
 impl Color {
+    /// Number of colors; bounds color-indexed arrays of length 2.
     pub const COUNT: usize = 2;
 
+    /// Return the opposite color. White flips to Black and vice-versa.
     #[must_use]
     #[inline]
     pub const fn flip(self) -> Color {
@@ -26,11 +31,13 @@ impl Color {
         }
     }
 
+    /// Discriminant cast to `usize` (in `0..Color::COUNT`).
     #[inline]
     pub const fn index(self) -> usize {
         self as usize
     }
 
+    /// Parse `'w'` → `White`, `'b'` → `Black` (case-sensitive per FEN §16.1.3.2); all other bytes → `None`.
     #[inline]
     pub const fn from_fen_char(c: u8) -> Option<Color> {
         match c {
@@ -40,6 +47,7 @@ impl Color {
         }
     }
 
+    /// FEN active-color byte: `b'w'` for White, `b'b'` for Black.
     #[inline]
     pub const fn fen_char(self) -> u8 {
         match self {
@@ -49,20 +57,29 @@ impl Color {
     }
 }
 
+/// The six standard chess piece types, ordered P-N-B-R-Q-K to match the Polyglot Zobrist kind axis.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum PieceKind {
+    /// Pawn; discriminant 0.
     Pawn = 0,
+    /// Knight; discriminant 1.
     Knight = 1,
+    /// Bishop; discriminant 2.
     Bishop = 2,
+    /// Rook; discriminant 3.
     Rook = 3,
+    /// Queen; discriminant 4.
     Queen = 4,
+    /// King; discriminant 5.
     King = 5,
 }
 
 impl PieceKind {
+    /// Number of piece kinds; bounds kind-indexed arrays of length 6.
     pub const COUNT: usize = 6;
 
+    /// All six kinds in Polyglot order (P=0 … K=5), suitable for iteration.
     pub const ALL: [PieceKind; 6] = [
         PieceKind::Pawn,
         PieceKind::Knight,
@@ -72,11 +89,13 @@ impl PieceKind {
         PieceKind::King,
     ];
 
+    /// Discriminant cast to `usize` (in `0..PieceKind::COUNT`).
     #[inline]
     pub const fn index(self) -> usize {
         self as usize
     }
 
+    /// Lowercase SAN/FEN letter for this piece kind: `p n b r q k`.
     #[inline]
     pub const fn san_letter(self) -> u8 {
         match self {
@@ -89,6 +108,7 @@ impl PieceKind {
         }
     }
 
+    /// Parse a SAN/FEN piece letter (case-insensitive `p n b r q k P N B R Q K`) to a `PieceKind`; all other bytes → `None`.
     #[inline]
     pub const fn from_san_letter(c: u8) -> Option<PieceKind> {
         match c {
@@ -103,17 +123,22 @@ impl PieceKind {
     }
 }
 
+/// A colored chess piece: a `Color` plus a `PieceKind`.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Piece {
+    /// Which side owns this piece.
     pub color: Color,
+    /// What type of piece it is.
     pub kind: PieceKind,
 }
 
 impl Piece {
+    /// Construct a `Piece` from a color and kind.
     pub const fn new(color: Color, kind: PieceKind) -> Piece {
         Piece { color, kind }
     }
 
+    /// FEN piece letter: uppercase for White (`PNBRQK`), lowercase for Black (`pnbrqk`).
     #[inline]
     pub const fn fen_char(self) -> u8 {
         // FEN: uppercase for White, lowercase for Black. san_letter() returns
@@ -125,6 +150,8 @@ impl Piece {
         }
     }
 
+    /// Parse a FEN piece letter to a `Piece`; uppercase → White, lowercase → Black.
+    /// Returns `None` for any byte that isn't one of `pnbrqkPNBRQK`.
     #[inline]
     pub const fn from_fen_char(c: u8) -> Option<Piece> {
         let color = match c {

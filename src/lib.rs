@@ -1,3 +1,10 @@
+#![deny(missing_docs)]
+//! clawfish — a Rust chess engine, written from scratch and grown
+//! incrementally toward GM-level standard-chess strength.
+//!
+//! See `docs/architecture.md` and `docs/roadmap.md` for the project's
+//! current architectural state and milestone plan.
+
 pub mod bitboard;
 pub mod engine;
 pub mod eval;

@@ -32,11 +32,17 @@ use crate::square::Square;
 pub struct CastlingRights(u8);
 
 impl CastlingRights {
+    /// No castling rights remaining.
     pub const NONE: CastlingRights = CastlingRights(0);
+    /// White may castle kingside (bit 0; h1-rook present, e1-king present).
     pub const WHITE_KING: CastlingRights = CastlingRights(0b0001);
+    /// White may castle queenside (bit 1; a1-rook present, e1-king present).
     pub const WHITE_QUEEN: CastlingRights = CastlingRights(0b0010);
+    /// Black may castle kingside (bit 2; h8-rook present, e8-king present).
     pub const BLACK_KING: CastlingRights = CastlingRights(0b0100);
+    /// Black may castle queenside (bit 3; a8-rook present, e8-king present).
     pub const BLACK_QUEEN: CastlingRights = CastlingRights(0b1000);
+    /// All four castling rights set.
     pub const ALL: CastlingRights = CastlingRights(0b1111);
 
     /// Test whether all bits of `flag` are set in `self`. Returns `false`
@@ -47,16 +53,19 @@ impl CastlingRights {
         (self.0 & flag.0) == flag.0 && flag.0 != 0
     }
 
+    /// Return `self` with all bits of `flag` set (union).
     #[must_use]
     pub const fn with(self, flag: CastlingRights) -> CastlingRights {
         CastlingRights(self.0 | flag.0)
     }
 
+    /// Return `self` with all bits of `flag` cleared (difference).
     #[must_use]
     pub const fn without(self, flag: CastlingRights) -> CastlingRights {
         CastlingRights(self.0 & !flag.0)
     }
 
+    /// Raw 4-bit representation; bit layout matches the Polyglot Zobrist castling-key convention.
     pub const fn bits(self) -> u8 {
         self.0
     }
@@ -93,6 +102,10 @@ impl fmt::Display for CastlingRights {
     }
 }
 
+/// The complete state of a chess position: bitboards, mailbox, king cache, and auxiliary fields.
+///
+/// Invariants are enforced at parse/construction time and verified by
+/// [`debug_assert_consistent`](Self::debug_assert_consistent) in debug builds.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct Position {
     piece_bb: [Bitboard; PieceKind::COUNT],
@@ -117,6 +130,7 @@ pub struct Position {
 }
 
 impl Position {
+    /// FEN string of the standard starting position.
     pub const STARTING_FEN: &'static str =
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
@@ -141,6 +155,7 @@ impl Position {
         }
     }
 
+    /// Construct the standard starting position with all pieces on their initial squares.
     pub fn starting_position() -> Position {
         // White pieces.
         let white_pawns = Bitboard::RANK_2;
@@ -223,30 +238,40 @@ impl Position {
         p
     }
 
+    /// Parse a FEN string into a `Position`. Returns `Err(FenError)` on any malformed or invalid input.
     pub fn from_fen(s: &str) -> Result<Position, FenError> {
         crate::fen::parse(s)
     }
 
+    /// Serialize the position to a FEN string (equivalent to `format!("{}", self)`).
     pub fn to_fen(&self) -> String {
         format!("{}", self)
     }
 
+    /// The color whose turn it is to move.
     pub const fn side_to_move(&self) -> Color {
         self.side_to_move
     }
 
+    /// Current castling availability as a 4-bit flags value.
     pub const fn castling_rights(&self) -> CastlingRights {
         self.castling
     }
 
+    /// En-passant target square, set iff a pseudo-legal en-passant capture
+    /// exists in this position (Stockfish-compatible phantom-EP sanitization).
+    /// Both the FEN parser and `make_move` apply this filter — see
+    /// `docs/architecture.md` "FEN parsing" and `docs/decisions/`.
     pub const fn ep_target(&self) -> Option<Square> {
         self.ep_target
     }
 
+    /// Half-move clock for the fifty-move rule; reset on pawn moves and captures.
     pub const fn halfmove_clock(&self) -> u8 {
         self.halfmove_clock
     }
 
+    /// Full-move counter, starting at 1 and incrementing after Black's move.
     pub const fn fullmove_number(&self) -> u16 {
         self.fullmove_number
     }
@@ -259,26 +284,32 @@ impl Position {
         self.zobrist
     }
 
+    /// Piece on `sq` per the mailbox, or `None` if the square is empty.
     pub const fn piece_at(&self, sq: Square) -> Option<Piece> {
         self.mailbox[sq.index() as usize]
     }
 
+    /// Bitboard of all pieces of the given kind, regardless of color.
     pub const fn pieces(&self, kind: PieceKind) -> Bitboard {
         self.piece_bb[kind.index()]
     }
 
+    /// Bitboard of pieces of the given color and kind (intersection of kind and color bitboards).
     pub const fn pieces_colored(&self, color: Color, kind: PieceKind) -> Bitboard {
         Bitboard(self.piece_bb[kind.index()].0 & self.color_bb[color.index()].0)
     }
 
+    /// Bitboard of all squares occupied by the given color.
     pub const fn occupied(&self, color: Color) -> Bitboard {
         self.color_bb[color.index()]
     }
 
+    /// Bitboard of all occupied squares (union of both color bitboards).
     pub const fn occupied_all(&self) -> Bitboard {
         Bitboard(self.color_bb[0].0 | self.color_bb[1].0)
     }
 
+    /// Cached square of `color`'s king. Always consistent with the king bitboard after `set_piece`.
     pub const fn king_square(&self, color: Color) -> Square {
         self.king_sq[color.index()]
     }
