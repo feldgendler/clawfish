@@ -4,7 +4,7 @@
 # Subcommands:
 #   self-play    2-game self-play (GreedyMover seed=1 vs seed=2)
 #   vs-stockfish 2-game match against Stockfish 18 capped at UCI_Elo=1320
-#   compliance   fastchess --compliance UCI shake-out on target/release/chess
+#   compliance   fastchess --compliance UCI shake-out on target/release/clawfish
 #
 # Usage: scripts/match.sh <subcommand>
 #        MATCH_DEBUG=1 scripts/match.sh <subcommand>   (enables set -x)
@@ -39,7 +39,7 @@ usage() {
     echo "Subcommands:"
     echo "  self-play      2-game self-play, GreedyMover seed=1 vs seed=2"
     echo "  vs-stockfish   2-game vs Stockfish 18 capped at UCI_Elo=1320"
-    echo "  compliance     fastchess --compliance UCI check on target/release/chess"
+    echo "  compliance     fastchess --compliance UCI check on target/release/clawfish"
 }
 
 if [[ $# -eq 0 ]] || [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
@@ -79,7 +79,7 @@ echo "fastchess resolved: $FASTCHESS"
 # -------------------------------------------------------------------------
 echo "Building engine..."
 cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" --quiet
-ENGINE="$REPO_ROOT/target/release/chess"
+ENGINE="$REPO_ROOT/target/release/clawfish"
 
 # -------------------------------------------------------------------------
 # Adjudication flags shared by self-play and vs-stockfish.
@@ -110,8 +110,8 @@ case "$SUBCMD" in
         echo "# Output: $PGN"
         echo "# Log:    $LOG"
         "$FASTCHESS" \
-            -engine cmd="$ENGINE" name=chess-W option.Random_Seed=1 \
-            -engine cmd="$ENGINE" name=chess-B option.Random_Seed=2 \
+            -engine cmd="$ENGINE" name=clawfish-W option.Random_Seed=1 \
+            -engine cmd="$ENGINE" name=clawfish-B option.Random_Seed=2 \
             -each proto=uci tc=10+0.1 \
             -rounds 1 -repeat \
             "${ADJUDICATION[@]}" \
@@ -135,7 +135,7 @@ case "$SUBCMD" in
         echo "# Output: $PGN"
         echo "# Log:    $LOG"
         "$FASTCHESS" \
-            -engine cmd="$ENGINE" name=chess option.Random_Seed=1 \
+            -engine cmd="$ENGINE" name=clawfish option.Random_Seed=1 \
             -engine cmd="$STOCKFISH" name=sf18 option.UCI_LimitStrength=true option.UCI_Elo=1320 \
             -each proto=uci tc=10+0.1 \
             -rounds 1 -repeat \

@@ -3,5 +3,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|s: String| {
-    let _ = chess::parse_uci_line(&s);
+    let _ = clawfish::parse_uci_line(&s);
 });

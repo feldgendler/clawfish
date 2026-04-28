@@ -110,7 +110,7 @@ Run `cargo fuzz add <name>` to add each additional target; updates `fuzz/Cargo.t
 
 ```toml
 [package]
-name = "chess-fuzz"
+name = "clawfish-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -176,7 +176,7 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(s) = std::str::from_utf8(data) {
-        let _ = chess::Position::from_fen(s);
+        let _ = clawfish::Position::from_fen(s);
     }
 });
 ```
@@ -193,7 +193,7 @@ use libfuzzer_sys::fuzz_target;
 use libfuzzer_sys::arbitrary::Arbitrary;
 
 fuzz_target!(|s: String| {
-    let _ = chess::Position::from_fen(&s);
+    let _ = clawfish::Position::from_fen(&s);
 });
 ```
 
@@ -227,7 +227,7 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|s: String| {
     // Should never panic — only return Ok or Err
-    let _ = chess::Position::from_fen(&s);
+    let _ = clawfish::Position::from_fen(&s);
 });
 ```
 
@@ -239,7 +239,7 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|s: String| {
     // Total function — every input must produce a Command, never panic
-    let _cmd = chess::parse_uci_line(&s);
+    let _cmd = clawfish::parse_uci_line(&s);
 });
 ```
 

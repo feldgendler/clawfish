@@ -1,6 +1,6 @@
 //! Gold-standard differential between the magic-bitboard sliding-piece attack
-//! lookup (`chess::magic`) and the slow ray-walker oracle
-//! (`chess::slow_attacks`).
+//! lookup (`clawfish::magic`) and the slow ray-walker oracle
+//! (`clawfish::slow_attacks`).
 //!
 //! Why `occ ⊆ mask` is exhaustive: the magic lookup begins by computing
 //! `(occ & m.mask)` — any bits in `occ` outside of `m.mask` are masked off and
@@ -19,7 +19,7 @@
 //! step end-to-end. The differential and the spot tests together cover the
 //! full lookup contract.
 
-use chess::{Bitboard, Square, magic, slow_attacks};
+use clawfish::{Bitboard, Square, magic, slow_attacks};
 
 #[test]
 fn rook_magic_matches_slow_for_every_subset() {

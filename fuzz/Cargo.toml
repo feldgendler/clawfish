@@ -1,5 +1,5 @@
 [package]
-name = "chess-fuzz"
+name = "clawfish-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -15,7 +15,7 @@ cargo-fuzz = true
 # current harnesses don't use. Re-enable when a future fuzz target adds
 # a custom-derive type.
 libfuzzer-sys = "0.4"
-chess = { path = ".." }
+clawfish = { path = ".." }
 
 # `cargo-fuzz` requires a separate workspace from the parent crate so that
 # `libfuzzer-sys` and its transitives stay out of the root `Cargo.lock` and

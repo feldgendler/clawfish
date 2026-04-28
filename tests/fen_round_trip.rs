@@ -1,6 +1,6 @@
 //! Integration tests for FEN round-tripping through the public `Position` API.
 //!
-//! These tests deliberately use only the public surface of the `chess` crate
+//! These tests deliberately use only the public surface of the `clawfish` crate
 //! (`Position::from_fen`, `Position::to_fen`, `Position::STARTING_FEN`,
 //! `PartialEq`). They prove that a downstream consumer can:
 //!
@@ -14,7 +14,7 @@
 //!    that nevertheless decodes to the same position; the second parse is
 //!    the witness.
 
-use chess::Position;
+use clawfish::Position;
 
 /// Canonical perft positions referenced throughout M1. Pinned here as a
 /// literal array so the test file is self-contained and an accidental edit

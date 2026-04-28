@@ -86,7 +86,7 @@ Three parallel research passes covered M1's design space:
   - No `engines.json` (fastchess has no registry); use `scripts/match.sh` wrapper.
   - Output layout: raw PGN/log → `target/matches/` (gitignored); milestone summaries → `bench/m2.md` per ADR-0010.
   - M2 smoke contract: 4 self-play + 4 vs Stockfish at `tc=10+0.1`, all legally terminated, no protocol errors, fastchess UCI-compliance checker silent.
-  - Integration test pattern (~30 lines `tests/uci_smoke.rs`): `env!("CARGO_BIN_EXE_chess")` + reader thread + `recv_timeout` to convert hangs into failures.
+  - Integration test pattern (~30 lines `tests/uci_smoke.rs`): `env!("CARGO_BIN_EXE_clawfish")` + reader thread + `recv_timeout` to convert hangs into failures.
   - Cute Chess GUI on macOS: skip; suggest `chessx` cask or Lichess paste-import for PGN replay.
   - Binds **ADR-0012** on M2.E.
 

@@ -1,7 +1,7 @@
 //! Integration tests for legal move generation (M1.F).
 //!
 //! Per `docs/plans/m1.f.md` §"Integration tests" and §"Property tests".
-//! These tests cover the public crate-root API only (`chess::*`):
+//! These tests cover the public crate-root API only (`clawfish::*`):
 //! - depth-1 perft equivalents on the canonical six positions,
 //! - checkmate / stalemate detection,
 //! - the EP horizontal-pin trap,
@@ -24,7 +24,7 @@
 //! Implementation is stubbed at the time of writing; these tests are red
 //! until the M1.F impl pass lands.
 
-use chess::{
+use clawfish::{
     Color, Move, MoveFlag, MoveList, Position, Square, generate_moves, in_check,
     mov::{make_move, unmake_move},
 };

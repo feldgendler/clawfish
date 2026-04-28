@@ -3,7 +3,7 @@
 //! ## Public API
 //!
 //! ```ignore
-//! use chess::{Position, perft, perft_bulk, divide, perft_categorized};
+//! use clawfish::{Position, perft, perft_bulk, divide, perft_categorized};
 //!
 //! let pos = Position::starting_position();
 //! assert_eq!(perft(&pos, 4), 197_281);

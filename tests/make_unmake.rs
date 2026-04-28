@@ -8,7 +8,7 @@
 //!
 //! Uses only the public crate-root API.
 
-use chess::{
+use clawfish::{
     Color, Move, MoveFlag, Piece, PieceKind, Position, Square,
     mov::{make_move, unmake_move},
     zobrist::from_scratch,
@@ -52,7 +52,7 @@ fn play_and_unwind_special_case_sequence() {
     ];
 
     let mut pos = original;
-    let mut undos: Vec<chess::Undo> = Vec::with_capacity(sequence.len());
+    let mut undos: Vec<clawfish::Undo> = Vec::with_capacity(sequence.len());
 
     for (i, &mv) in sequence.iter().enumerate() {
         let undo = make_move(&mut pos, mv);

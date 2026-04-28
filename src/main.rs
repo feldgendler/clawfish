@@ -1,3 +1,3 @@
 fn main() {
-    chess::run_stdio();
+    clawfish::run_stdio();
 }

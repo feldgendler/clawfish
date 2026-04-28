@@ -71,8 +71,8 @@ Since `fastchess` has no `engines.json` registry, the canonical pattern is to en
 
 ```bash
 fastchess \
-  -engine cmd=./target/release/chess name=chess-W \
-  -engine cmd=./target/release/chess name=chess-B \
+  -engine cmd=./target/release/clawfish name=clawfish-W \
+  -engine cmd=./target/release/clawfish name=clawfish-B \
   -each proto=uci tc=10+0.1 \
   -rounds 2 -repeat \
   -pgnout file=bench/matches/m2-smoke.pgn notation=san \
@@ -85,7 +85,7 @@ fastchess \
 
 ```bash
 fastchess \
-  -engine cmd=./target/release/chess name=chess option.Hash=64 \
+  -engine cmd=./target/release/clawfish name=clawfish option.Hash=64 \
   -engine cmd=stockfish name=sf18 option.Hash=64 option.Threads=1 \
   -each proto=uci tc=10+0.1 \
   -openings file=resources/openings/8moves_v3.pgn format=pgn order=random \
@@ -103,10 +103,10 @@ For comparison, here's the equivalent **cutechess-cli `engines.json` entry**, wh
 ```json
 [
   {
-    "name": "chess",
-    "command": "./target/release/chess",
+    "name": "clawfish",
+    "command": "./target/release/clawfish",
     "protocol": "uci",
-    "workingDirectory": "/Users/alex/chess",
+    "workingDirectory": "/path/to/clawfish",
     "options": [{"name": "Hash", "value": "64"}]
   },
   {
@@ -202,7 +202,7 @@ use std::thread;
 use std::time::Duration;
 
 fn spawn_engine() -> (std::process::Child, std::process::ChildStdin, Receiver<String>) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_chess"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_clawfish"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -250,7 +250,7 @@ fn uci_handshake_and_one_move() {
 
 Key features of this skeleton:
 
-- `env!("CARGO_BIN_EXE_chess")` resolves to the path of the release binary as built by Cargo. This is the [documented integration-test convention](https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-crates) and is preferred over hardcoding `target/release/chess`.
+- `env!("CARGO_BIN_EXE_clawfish")` resolves to the path of the release binary as built by Cargo. This is the [documented integration-test convention](https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-crates) and is preferred over hardcoding `target/release/clawfish`.
 - `stderr(Stdio::inherit())` lets `eprintln!` from the engine surface in `cargo test` output for debugging. If the engine is verbose, switch to `Stdio::null()`.
 - The reader thread + `Receiver<String>` pattern avoids both the pipe-fill deadlock (always reading) and the `bestmove` race (each command's response can be drained explicitly via `recv_until`).
 - `recv_timeout(5s)` turns "engine hangs" into a test failure rather than a CI hang.
@@ -314,8 +314,8 @@ set -euo pipefail
 cargo build --release
 mkdir -p target/matches/smoke
 fastchess \
-  -engine cmd="$PWD/target/release/chess" name=chess-W \
-  -engine cmd="$PWD/target/release/chess" name=chess-B \
+  -engine cmd="$PWD/target/release/clawfish" name=clawfish-W \
+  -engine cmd="$PWD/target/release/clawfish" name=clawfish-B \
   -each proto=uci tc=10+0.1 \
   -rounds 2 -repeat \
   -pgnout file=target/matches/smoke/m2-smoke.pgn notation=san \
@@ -340,7 +340,7 @@ fastchess \
 
 ### Integration-test pattern
 
-In-tree, in `tests/uci_smoke.rs`, the ~30-line skeleton from §5: spawn release binary via `env!("CARGO_BIN_EXE_chess")`, drive `uci → uciok → isready → readyok → position startpos → go movetime 100 → bestmove`, then `quit` and `wait`. Reader thread owns stdout to avoid pipe-fill deadlock; `recv_timeout` to convert hangs into test failures. Run as part of `cargo test`. Game-completion testing stays in fastchess, not in-tree.
+In-tree, in `tests/uci_smoke.rs`, the ~30-line skeleton from §5: spawn release binary via `env!("CARGO_BIN_EXE_clawfish")`, drive `uci → uciok → isready → readyok → position startpos → go movetime 100 → bestmove`, then `quit` and `wait`. Reader thread owns stdout to avoid pipe-fill deadlock; `recv_timeout` to convert hangs into test failures. Run as part of `cargo test`. Game-completion testing stays in fastchess, not in-tree.
 
 ### Cute Chess GUI install
 

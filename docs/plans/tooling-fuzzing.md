@@ -68,7 +68,7 @@ Mark backlog #1 done.
 
 ```toml
 [package]
-name = "chess-fuzz"
+name = "clawfish-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -78,7 +78,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-chess = { path = ".." }
+clawfish = { path = ".." }
 
 [[bin]]
 name = "fuzz_fen"
@@ -103,7 +103,7 @@ bench = false
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|s: String| {
-    let _ = chess::Position::from_fen(&s);
+    let _ = clawfish::Position::from_fen(&s);
 });
 ```
 
@@ -113,7 +113,7 @@ fuzz_target!(|s: String| {
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|s: String| {
-    let _ = chess::parse_uci_line(&s);
+    let _ = clawfish::parse_uci_line(&s);
 });
 ```
 

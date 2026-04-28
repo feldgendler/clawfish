@@ -11,7 +11,7 @@
 
 use std::hint::black_box;
 
-use chess::{MoveList, Position, generate_moves};
+use clawfish::{MoveList, Position, generate_moves};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 const CANONICAL_6: &[(&str, &str)] = &[
