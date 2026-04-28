@@ -12,7 +12,7 @@
 use clawfish::{Move, MoveList, Position, generate_moves};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command as ProcCommand, Stdio};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -235,8 +235,13 @@ fn expect_bestmove(
                     .to_string();
             }
             Ok(_) => {} // info lines, etc. — keep waiting
-            Err(_) => {
-                // timeout or disconnect
+            Err(RecvTimeoutError::Timeout) => {
+                // 50ms inner tick expired with no output. The engine may still
+                // be searching — defer to the outer deadline check next iter.
+                // (Slow Linux CI runners can take > 50ms to emit the first
+                // info+bestmove on a cold cache.)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
                 panic!(
                     "engine stdout disconnected while waiting for bestmove; last moves: {:?}",
                     last_moves.iter().rev().take(10).rev().collect::<Vec<_>>()
