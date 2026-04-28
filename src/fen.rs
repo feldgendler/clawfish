@@ -238,10 +238,11 @@ fn parse_castling(s: &str) -> Result<CastlingRights, FenError> {
     if s == "-" {
         return Ok(CastlingRights::NONE);
     }
-    // Unreachable: an empty field-2 requires double-space in the input, which
-    // produces 7 fields and trips WrongFieldCount before this is called.
+    // Empty field reachable via double-space in the source string: e.g.
+    // `… b  k- 0 1` splits on single ' ' to 6 tokens with one empty middle
+    // token, so the WrongFieldCount gate doesn't fire. Reject explicitly.
     if s.is_empty() {
-        unreachable!("empty castling field after WrongFieldCount gate");
+        return Err(FenError::BadCastlingRights(s.to_string()));
     }
     // Strict spec order: K, Q, k, q. Walk the input and the spec sequence
     // in lock-step; each input letter must match the next-or-later spec
@@ -874,6 +875,18 @@ mod tests {
     fn parse_rejects_bad_castling_chars() {
         // 'X' is not a valid castling letter.
         let r = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w XQkq - 0 1");
+        assert!(matches!(r, Err(FenError::BadCastlingRights(_))));
+    }
+
+    #[test]
+    fn parse_rejects_empty_castling_field_via_double_space() {
+        // Regression: fuzz_fen smoke run found this on the first 10000-iter
+        // campaign. Input has a double space after `b` (the active-color
+        // field), which `s.split(' ')` produces as an empty third token —
+        // 6 fields total, so WrongFieldCount does not fire. Previously this
+        // hit `unreachable!("empty castling field after WrongFieldCount
+        // gate")`. Should return BadCastlingRights instead.
+        let r = Position::from_fen("4k2r/8/8/8/8/8/8/4K3 b  k- 0 1");
         assert!(matches!(r, Err(FenError::BadCastlingRights(_))));
     }
 
