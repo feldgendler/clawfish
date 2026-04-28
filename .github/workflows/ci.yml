@@ -21,12 +21,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Apple Silicon is the primary target; Linux is an informational
-        # portability check only (per CLAUDE.md "Architectural commitments").
+        # Apple Silicon is the primary target; Linux runs as a portability
+        # check (per CLAUDE.md "Architectural commitments").
         os: [macos-14, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    # Don't block on Linux failures — informational signal, not a release gate.
-    continue-on-error: ${{ matrix.os != 'macos-14' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
