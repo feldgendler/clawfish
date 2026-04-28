@@ -5,6 +5,7 @@
 mutants.out
 mutants.out.old
 .claude/scheduled_tasks.lock
+.claude/worktrees/
 # fastchess auto-writes config.json to its cwd on every run; the runbook
 # convention is to invoke scripts/match.sh from REPO_ROOT, so the file lands
 # at REPO_ROOT/config.json. (Other cwds either fall under /target or land
