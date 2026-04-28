@@ -2,13 +2,7 @@
 
 Industry-best-practice items surfaced during the 2026-04-27 workflow review but not yet adopted. **Listed in recommended implementation order** — pick from the top when the next slot opens for tooling work.
 
-## 1. CI (GitHub Actions)
-
-**Why last in the active queue.** Blocked: the project is not on GitHub yet. When it moves, this consolidates everything above (fmt, clippy, test, coverage, audit, deny, plus any of the items implemented by then). Especially valuable since the user doesn't read code and depends on external green/red signals.
-
-**Effort.** One workflow YAML, ~30 minutes once the repo exists on GitHub.
-
-**Integration.** On push/PR: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo llvm-cov --summary-only`, `cargo audit`, `cargo deny check`. Optional matrix across Linux/Windows (Apple Silicon is primary, but a cheap signal that we haven't accidentally broken portability).
+*Active queue is currently empty — all items prioritized in the 2026-04-27 review have landed. New items append here.*
 
 ---
 
@@ -25,6 +19,7 @@ Industry-best-practice items surfaced during the 2026-04-27 workflow review but 
 
 ## Done since the 2026-04-27 review
 
+- **CI (GitHub Actions)** — completed 2026-04-28. `.github/workflows/ci.yml` runs on push to `main`, on PRs, and on manual dispatch. Jobs: `test` matrix on `macos-14` (primary, Apple Silicon) + `ubuntu-latest` (portability) running `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings` + `cargo test --all-targets` + `cargo test --doc`; `fuzz-check` on the separate fuzz workspace; `cargo deny` via the EmbarkStudios action (covers RustSec advisories + license + source-allowlist policy from `deny.toml` — `cargo audit` skipped as redundant); `coverage` via `cargo-llvm-cov --summary-only` (informational; no enforced threshold). All jobs cached via `Swatinem/rust-cache@v2`. Closes backlog item #1.
 - **Fuzzing (`cargo-fuzz`)** — completed 2026-04-28 per ADR-0013 (`docs/decisions/0013-fuzzing-strategy.md`). `fuzz/` workspace (independent — `libfuzzer-sys` stays out of root `cargo audit` / `cargo deny` scope). Two `Arbitrary<String>` harnesses: `fuzz_fen` and `fuzz_uci`. Hand-curated seed corpora (35 fen, 30 uci) under `fuzz/corpus/<target>/`. `--sanitizer none` (no fuzzed parser path reaches `unsafe`). Cadence + commands documented under `docs/workflow.md` "Fuzzing". The first 2-hour campaigns per target are deferred to a later session — operator runs `cd fuzz && cargo fuzz run --sanitizer none <target> -- -max_len=200 -max_total_time=7200` once nightly is installed; campaign-result tables go to `docs/research/tooling-fuzzing-results.md`.
 
 ## Done in the 2026-04-27 review
