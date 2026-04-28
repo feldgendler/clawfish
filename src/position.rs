@@ -999,7 +999,9 @@ mod tests {
         // Setup (chess-coherent: white just played a d2-d4 double-push, leaving
         // black to move with rank-3 EP):
         //   White: King e1, Rook a1, Rook h1, Pawn d4
-        //   Black: King e8, Rook a8
+        //   Black: King e8, Rook a8, Pawn c4 (the EP capturer — without
+        //   it, the FEN parser's phantom-EP sanitization would clear ep=d3
+        //   on round-trip and the structural equality below would fail)
         // Black to move, white-king-side + black-queen-side castling only,
         // EP target d3, halfmove 0, fullmove 8.
         let mut p = Position::empty();
@@ -1009,6 +1011,7 @@ mod tests {
         p.set_piece(Square::E8, BLACK_KING);
         p.set_piece(Square::A8, BLACK_ROOK);
         p.set_piece(Square::D4, WHITE_PAWN);
+        p.set_piece(Square::C4, BLACK_PAWN);
         let castling = CastlingRights::WHITE_KING.with(CastlingRights::BLACK_QUEEN);
         p.set_aux_state(Color::Black, castling, Some(Square::D3), 0, 8);
         // set_piece/set_aux_state don't refresh the Zobrist field; do it once

@@ -645,11 +645,27 @@ mod tests {
 
     #[test]
     fn pawn_ep_target_set_but_no_capturer() {
-        // EP target d6 is set in the FEN but the only white pawn is on
-        // e5 → wait, that *is* a capturer. Use a pawn that is NOT
-        // adjacent: white pawn on a5 only. d6 EP target is meaningless
-        // since no white pawn is on c5 or e5.
-        let pos = Position::from_fen("4k3/8/8/P7/8/8/8/4K3 w - d6 0 1").unwrap();
+        // EP target d6 set, only white pawn on a5 (not adjacent to d-file).
+        // Movegen's `attackers = pawn_attacks_from(ep_sq, us.flip()) & pawns`
+        // must produce an empty bitboard, suppressing EP move emission.
+        //
+        // The FEN parser would phantom-EP-sanitize this (no friendly
+        // capturer ⇒ ep_target cleared to None), short-circuiting movegen's
+        // `if let Some(ep_sq) = pos.ep_target()` before the empty-attackers
+        // branch is reached. Construct via set_piece + set_aux_state to
+        // genuinely exercise the empty-attackers code path.
+        use crate::piece::Color;
+        use crate::position::CastlingRights;
+        let mut pos = Position::empty();
+        pos.set_piece(Square::E1, Piece::new(Color::White, PieceKind::King));
+        pos.set_piece(Square::E8, Piece::new(Color::Black, PieceKind::King));
+        pos.set_piece(Square::A5, Piece::new(Color::White, PieceKind::Pawn));
+        pos.set_piece(Square::D5, Piece::new(Color::Black, PieceKind::Pawn));
+        pos.set_aux_state(Color::White, CastlingRights::NONE, Some(Square::D6), 0, 1);
+        pos.refresh_zobrist();
+        pos.refresh_static_eval();
+        assert_eq!(pos.ep_target(), Some(Square::D6), "test setup precondition");
+
         let moves = emit(&pos);
         let pawn_only = pawn_moves_only(&pos, moves.as_slice());
         for mv in &pawn_only {

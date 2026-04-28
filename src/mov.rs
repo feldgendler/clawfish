@@ -587,7 +587,19 @@ pub fn make_move(pos: &mut Position, mv: Move) -> Undo {
             Color::White => from.rank() + 1,
             Color::Black => from.rank() - 1,
         };
-        Some(Square::from_file_rank(from.file(), rank).expect("double-push skip square in range"))
+        let ep_sq =
+            Square::from_file_rank(from.file(), rank).expect("double-push skip square in range");
+        // Stockfish-compatible phantom-EP sanitization (see `fen` module
+        // docstring): only set the EP target when an opposing pawn capturer
+        // is geometrically present. The capturer would sit on `to`'s rank
+        // (= the rank of our just-pushed pawn), file ±1. Without this, the
+        // `ep_target` field could disagree with the round-trip FEN parse,
+        // and two physically equivalent positions could compare unequal.
+        if crate::fen::ep_capturer_exists(pos, them, from.file(), to.rank()) {
+            Some(ep_sq)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -1027,15 +1039,13 @@ mod tests {
             label: "quiet_h8_rook_clears_black_king",
         },
         // ---------- Double pushes ----------
-        // The first two cases use positions WITH a capturer present so
-        // Stockfish (X-FEN: drop EP if no capturer) and our engine (FEN-spec
-        // literal: always set EP after a double-push) produce identical
-        // expected FENs — these are Stockfish-verifiable on `after`. The
-        // `double_push_no_capturer` case below intentionally diverges from
-        // Stockfish on the EP-target field; that's the deliberate
-        // architecture commitment from `docs/architecture.md` (EP target
-        // stored on every double-push; Polyglot pseudo-legal filter applies
-        // only at zobrist-XOR time per ADR-0009).
+        // All three cases below run the same phantom-EP sanitization rule
+        // (matches Stockfish): the EP target is set iff an opposing pawn
+        // capturer is geometrically adjacent to the just-pushed pawn. The
+        // first two cases have a capturer present, so EP is set; the third
+        // (`double_push_no_capturer`) has none, so the EP field stays `-`.
+        // The Zobrist EP key is XORed in lockstep — `Position::ep_target`
+        // and `zobrist::ep_file_to_hash` agree on every double-push.
         Case {
             before: "4k3/8/8/8/5p2/8/4P3/4K3 w - - 0 1",
             mv: Move::new(Square::E2, Square::E4, MoveFlag::DoublePush),
@@ -1048,17 +1058,13 @@ mod tests {
             after: "4k3/8/8/4pP2/8/8/8/4K3 w - e6 0 2",
             label: "double_push_black_sets_ep_e6",
         },
-        // White double-push with NO black capturer adjacent — Polyglot
-        // pseudo-legal rule means the EP key is NOT XORed in zobrist.
-        // Our engine still sets the EP target in the position state per
-        // FEN spec; only the zobrist XOR is suppressed. NOT Stockfish-
-        // verifiable on `after`: Stockfish strips the `e3` field. The
-        // round-trip test asserts equality against our parser's reading
-        // of this expected FEN, which is consistent with our spec stance.
+        // White double-push with NO black capturer adjacent — phantom-EP
+        // sanitization drops the EP target. Stockfish-verifiable on `after`:
+        // Stockfish would also emit `-` here.
         Case {
             before: "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1",
             mv: Move::new(Square::E2, Square::E4, MoveFlag::DoublePush),
-            after: "4k3/8/8/8/4P3/8/8/4K3 b - e3 0 1",
+            after: "4k3/8/8/8/4P3/8/8/4K3 b - - 0 1",
             label: "double_push_no_capturer",
         },
         // White double-push with a black pawn ON RANK 4 adjacent — capturer
