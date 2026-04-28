@@ -66,6 +66,10 @@ pub struct SearchContext {
     pub start: Instant,
     /// Parsed `go` parameters for this search invocation.
     pub limits: SearchLimits,
+    /// Zobrist trajectory from the start of the game through the current
+    /// position. Cloned from `Engine::game_history` at `go`-start.
+    /// M3.C negamax will push/pop entries on make/unmake during recursion.
+    pub history: Vec<u64>,
 }
 
 impl SearchContext {
@@ -267,6 +271,54 @@ impl Search for GreedyMover {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Draw-detection helpers (M3.B). Consumed by M3.C alpha-beta.
+// ---------------------------------------------------------------------------
+
+/// Single-occurrence-in-search repetition test.
+///
+/// `history` is the full Zobrist trajectory ending with the current
+/// position (i.e. `history.last()` is the position to test). Returns
+/// `true` if any earlier entry equals `history.last()`, walking back at
+/// most `min(halfmove_clock, history.len() - 1)` plies in 2-ply steps.
+///
+/// Per CPW "Repetitions": a single match inside the search counts as a
+/// draw. The FIDE 9.2 three-fold-claim rule is enforced by the GUI /
+/// tournament adjudicator, not the engine. The 2-ply step exploits the
+/// fact that only same-side-to-move positions can repeat (the Zobrist
+/// turn key flips on every ply). The `halfmove_clock` cap is the
+/// irreversible-move stop: any pawn move or capture zeros the clock and
+/// severs the repetition chain. The `history.len() - 1` cap is the
+/// safety bound — `halfmove_clock` is loaded from FEN and may exceed
+/// the history depth the engine has actually observed.
+#[allow(dead_code)] // consumed by M3.C alpha-beta
+pub(crate) fn is_repetition(history: &[u64], halfmove_clock: u8) -> bool {
+    let Some((&current, prior)) = history.split_last() else {
+        return false;
+    };
+    let max_back = (halfmove_clock as usize).min(prior.len());
+    for i in (2..=max_back).step_by(2) {
+        if prior[prior.len() - i] == current {
+            return true;
+        }
+    }
+    false
+}
+
+/// 50-move rule: returns true at `halfmove_clock >= 100`.
+///
+/// 100 plies = 50 full moves without a pawn move or capture; this is the
+/// FIDE 9.3 "claimable" threshold. The engine treats a claimable draw as
+/// drawn for search reasoning — strictly speaking, a tournament arbiter
+/// only adjudicates after a claim, but a side that wants the draw can
+/// always claim it, so the position is effectively a draw at the search
+/// horizon. The 75-move auto-draw (FIDE 9.6.2, 150 plies) is not
+/// separately handled; we cross the claim threshold first.
+#[allow(dead_code)] // consumed by M3.C alpha-beta
+pub(crate) fn is_fifty_move_draw(halfmove_clock: u8) -> bool {
+    halfmove_clock >= 100
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +335,7 @@ mod tests {
             deadline: None,
             start: Instant::now(),
             limits: SearchLimits::default(),
+            history: Vec::new(),
         };
         (ctx, stop)
     }
@@ -297,6 +350,7 @@ mod tests {
                 searchmoves: Some(moves),
                 ..SearchLimits::default()
             },
+            history: Vec::new(),
         };
         (ctx, stop)
     }
@@ -353,6 +407,7 @@ mod tests {
                 deadline: None,
                 start: Instant::now(),
                 limits: SearchLimits::default(),
+                history: Vec::new(),
             };
             assert!(!ctx.should_abort(0), "should not abort before stop is set");
             stop.store(true, Ordering::Relaxed);
@@ -368,6 +423,7 @@ mod tests {
                 deadline: Some(expired),
                 start: Instant::now(),
                 limits: SearchLimits::default(),
+                history: Vec::new(),
             };
             assert!(
                 ctx.should_abort(0),
@@ -386,6 +442,7 @@ mod tests {
                     nodes: Some(500),
                     ..SearchLimits::default()
                 },
+                history: Vec::new(),
             };
             assert!(
                 ctx.should_abort(1_000),
@@ -478,6 +535,7 @@ mod tests {
             deadline: None,
             start: Instant::now(),
             limits: SearchLimits::default(), // no infinite/movetime/ponder
+            history: Vec::new(),
         };
 
         let result = GreedyMover::new(0).go(&pos, &ctx, &|_| {});
@@ -503,6 +561,7 @@ mod tests {
                 infinite: true,
                 ..SearchLimits::default()
             },
+            history: Vec::new(),
         };
 
         let stop_clone = Arc::clone(&stop);
@@ -811,6 +870,7 @@ mod tests {
                         deadline: None,
                         start: std::time::Instant::now(),
                         limits: SearchLimits::default(),
+                        history: Vec::new(),
                     };
                     (ctx, stop)
                 };
@@ -832,5 +892,189 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // M3.B — draw-detection helper unit tests. Consumed by M3.C alpha-beta.
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // is_fifty_move_draw — threshold at 100 plies.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_fifty_move_draw_threshold_at_100() {
+        // False below the threshold: catches ">= 99" or "<= 100" mutants.
+        assert!(!is_fifty_move_draw(0), "halfmove 0 must be false");
+        assert!(!is_fifty_move_draw(1), "halfmove 1 must be false");
+        assert!(!is_fifty_move_draw(50), "halfmove 50 must be false");
+        assert!(!is_fifty_move_draw(99), "halfmove 99 must be false");
+        // True at and above: catches "> 100" mutant (misses exact boundary).
+        assert!(is_fifty_move_draw(100), "halfmove 100 must be true");
+        assert!(is_fifty_move_draw(101), "halfmove 101 must be true");
+        assert!(is_fifty_move_draw(200), "halfmove 200 must be true");
+        assert!(is_fifty_move_draw(255), "halfmove 255 must be true");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_repetition — empty / minimal history.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_repetition_empty_history_returns_false() {
+        assert!(
+            !is_repetition(&[], 0),
+            "empty history, halfmove=0 must be false"
+        );
+        assert!(
+            !is_repetition(&[], 50),
+            "empty history, halfmove=50 must be false"
+        );
+    }
+
+    #[test]
+    fn is_repetition_single_entry_returns_false() {
+        // No prior to compare against.
+        assert!(!is_repetition(&[0xABC], 50), "single entry must be false");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_repetition — no match.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_repetition_no_match_within_window_returns_false() {
+        // [0x1, 0x2, 0x3, 0x4] — current is 0x4, none of the priors match.
+        assert!(
+            !is_repetition(&[0x1, 0x2, 0x3, 0x4], 4),
+            "no matching entry within window must return false"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_repetition — basic match cases.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_repetition_match_at_2_ply_returns_true() {
+        // History [X, Y, X]: current X at index 2, prior X at index 0 (distance 2).
+        // halfmove=2 allows looking back 2 plies. Must return true.
+        // Catches "(0..=) instead of (2..=)" start mutant: at i=0 the loop would
+        // compare current against itself (out-of-bounds or self-match) — either
+        // panics or returns the wrong result.
+        // Also catches "(1..=2).step_by(2)" start mutant (cargo-mutants commonly
+        // perturbs 2 → 1): at i=1, prior[2-1] = prior[1] = Y ≠ X → returns false
+        // → test expects true → caught.
+        const X: u64 = 0xDEAD_BEEF;
+        const Y: u64 = 0xCAFE_BABE;
+        assert!(
+            is_repetition(&[X, Y, X], 2),
+            "match at 2-ply distance must return true"
+        );
+    }
+
+    #[test]
+    fn is_repetition_match_at_4_ply_returns_true() {
+        // History [X, Y, Z, W, X]: current X at index 4, prior X at index 0.
+        // halfmove=4 allows looking back 4 plies. Pins the second loop iteration.
+        const X: u64 = 0xDEAD_BEEF;
+        assert!(
+            is_repetition(&[X, 0x1, 0x2, 0x3, X], 4),
+            "match at 4-ply distance must return true"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_repetition — even/odd distance (pins step_by(2)).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_repetition_even_distance_match_returns_true() {
+        // History [X, A, B, C, D, E, X]: current X at index 6, prior X at index 0.
+        // Distance = 6 (even). halfmove=6. Must return true.
+        // A distinct fixture from is_repetition_match_at_4_ply_returns_true (which
+        // uses distance 4); this one exercises the third loop iteration (i=6) and
+        // serves as the companion to the odd-distance-3 fixture in the next test.
+        const X: u64 = 0xAAAA;
+        assert!(
+            is_repetition(&[X, 0x1, 0x2, 0x3, 0x4, 0x5, X], 6),
+            "even-distance (6-ply) match must return true"
+        );
+    }
+
+    #[test]
+    fn is_repetition_odd_distance_match_returns_false() {
+        // History [Y, X, A, B, X]: current X at index 4, prior X at index 1.
+        // Distance from current to prior = 4 - 1 = 3 (odd). halfmove=3 (allows
+        // looking back 3 plies, but step_by(2) only checks i=2; index 1 at i=3 is
+        // never reached — the 2-ply step skips odd-distance entries because
+        // same-side-to-move positions are always at even distance).
+        // A step_by(1) mutant or (1..=) start mutant would check i=3 and return true.
+        const X: u64 = 0xBBBB;
+        assert!(
+            !is_repetition(&[0x9999, X, 0x1, 0x2, X], 3),
+            "odd-distance match must return false (2-ply step skips it)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_repetition — halfmove_clock cap.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_repetition_capped_by_halfmove_clock() {
+        // History [X, Y, Z, W, X] (5 entries): current X at index 4, prior X at
+        // index 0 (distance 4). halfmove=2 caps the search at 2 plies — the X at
+        // distance 4 must be invisible.
+        // A "max_back = prior.len()" mutant (dropping the halfmove cap) would set
+        // max_back=4, reach i=4, find the match, and return true — test expects false.
+        const X: u64 = 0xCCCC;
+        assert!(
+            !is_repetition(&[X, 0x1, 0x2, 0x3, X], 2),
+            "halfmove=2 must cap lookback to 2 plies; X at distance 4 must be invisible"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_repetition — safety bound: halfmove_clock may exceed history depth.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_repetition_no_panic_when_halfmove_exceeds_history_match() {
+        // History [X, Y, X] (prior.len()=2), halfmove=200.
+        // Without the min(halfmove, prior.len()) cap the loop would try i=4,
+        // computing prior[2-4] which underflows (panics in debug, UB in release).
+        // With the cap, max_back=2, only i=2 runs, finds the match, returns true.
+        const X: u64 = 0xDDDD;
+        assert!(
+            is_repetition(&[X, 0x1, X], 200),
+            "halfmove exceeds history but match at i=2 must still return true"
+        );
+    }
+
+    #[test]
+    fn is_repetition_no_panic_when_halfmove_exceeds_history_no_match() {
+        // History [X, Y, Z] (prior.len()=2), halfmove=200, no match.
+        // Companion to the previous test: a buggy max_back = halfmove as usize
+        // (no cap-by-length) would let i=4 run and panic (prior[2-4] underflows).
+        assert!(
+            !is_repetition(&[0x1, 0x2, 0x3], 200),
+            "halfmove exceeds history, no match — must return false without panic"
+        );
+    }
+
+    #[test]
+    fn is_repetition_halfmove_zero_returns_false() {
+        // History [X, Y, X], halfmove=0.
+        // An irreversible move (pawn move or capture) zeros the clock; after such
+        // a move no repetition is possible. max_back=min(0, 2)=0, the loop body
+        // never runs (range 2..=0 is empty), returns false.
+        // Catches an off-by-one where halfmove=0 might be treated as "go forever"
+        // due to integer underflow in a buggy max_back computation.
+        const X: u64 = 0xEEEE;
+        assert!(
+            !is_repetition(&[X, 0x1, X], 0),
+            "halfmove=0 (irreversible move) must return false"
+        );
     }
 }

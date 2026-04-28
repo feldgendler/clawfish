@@ -31,6 +31,9 @@ const MAX_RANDOM_SEED: u32 = 2_147_483_647;
 /// per-command handlers, drives the search worker thread.
 pub struct Engine<W: Write + Send + 'static, S: Search + Send + 'static> {
     position: Position,
+    /// Zobrist trajectory from start-of-game through the current position.
+    /// Invariant: `game_history.last() == Some(&position.zobrist())`.
+    game_history: Vec<u64>,
     debug: bool,
     stop: Arc<AtomicBool>,
     stdout: Arc<Mutex<W>>,
@@ -42,8 +45,10 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
     /// Build an engine. Position starts at `Position::starting_position()`,
     /// `debug` off, no search in flight.
     pub fn new(stdout: W, search: S) -> Self {
+        let position = Position::starting_position();
         Self {
-            position: Position::starting_position(),
+            game_history: vec![position.zobrist()],
+            position,
             debug: false,
             stop: Arc::new(AtomicBool::new(false)),
             stdout: Arc::new(Mutex::new(stdout)),
@@ -87,6 +92,12 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         &self.position
     }
 
+    /// Test-only access to the engine's game-history Zobrist trajectory.
+    #[cfg(test)]
+    pub(crate) fn game_history(&self) -> &[u64] {
+        &self.game_history
+    }
+
     fn handle_uci(&mut self) {
         self.write_line(&format!("id name clawfish {}", env!("CARGO_PKG_VERSION")));
         self.write_line("id author Alex Feldgendler");
@@ -106,6 +117,7 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         // ever processing the inevitable `stop`. ADR-0011 v3.
         self.join_in_flight_worker();
         self.position = Position::starting_position();
+        self.game_history = vec![self.position.zobrist()];
         self.search.lock().unwrap().reset();
     }
 
@@ -116,27 +128,32 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
                 Ok(p) => p,
                 Err(e) => {
                     self.info_string_always(&format!("position rejected: invalid FEN: {e}"));
+                    // Leave both self.position and self.game_history untouched.
                     return;
                 }
             },
         };
 
         let mut pos = base;
+        let mut hist = vec![base.zobrist()];
         for mv_str in &moves {
             match Move::from_uci(mv_str, &pos) {
                 Ok(mv) => {
                     pos.make_move(mv);
+                    hist.push(pos.zobrist());
                 }
                 Err(e) => {
                     self.info_string_always(&format!(
                         "position rejected: move {mv_str} failed: {e}"
                     ));
                     self.position = base;
+                    self.game_history = vec![base.zobrist()];
                     return;
                 }
             }
         }
         self.position = pos;
+        self.game_history = hist;
     }
 
     fn handle_go(&mut self, params: GoParams) {
@@ -192,6 +209,7 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
             deadline,
             start: Instant::now(),
             limits,
+            history: self.game_history.clone(),
         };
 
         let handle = std::thread::spawn(move || {
@@ -2144,5 +2162,409 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Group D — game-history invariant + handle_go clone semantics (M3.B)
+    //
+    // All tests in this group will FAIL until:
+    //   - Engine::new() initializes game_history = vec![starting_position().zobrist()]
+    //   - handle_ucinewgame resets game_history
+    //   - handle_position populates game_history
+    //   - handle_go clones game_history into SearchContext::history
+    // -----------------------------------------------------------------------
+
+    /// Test fake: captures `ctx.history` from inside `Search::go` into a
+    /// shared buffer. Used by `handle_go_clones_history_into_search_context`.
+    struct HistoryCapturingFake {
+        captured: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl Search for HistoryCapturingFake {
+        fn go(
+            &mut self,
+            _pos: &Position,
+            ctx: &SearchContext,
+            _info_sink: &dyn Fn(&str),
+        ) -> SearchResult {
+            *self.captured.lock().unwrap() = ctx.history.clone();
+            SearchResult::default()
+        }
+    }
+
+    /// Like `drive`, but returns `(stdout, position, game_history)` for
+    /// history invariant checks. Uses `GreedyMover` so it's location-agnostic.
+    fn drive_with_history(commands: &[&str]) -> (String, Position, Vec<u64>) {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let mut engine = Engine::new(writer, GreedyMover::new(0));
+
+        let (tx, rx) = mpsc::channel::<Command>();
+        for line in commands {
+            tx.send(parse_uci_line(line)).unwrap();
+        }
+        tx.send(Command::Quit).unwrap();
+        engine.run(rx);
+
+        let bytes = buf.lock().unwrap().clone();
+        let stdout = String::from_utf8(bytes).expect("engine output must be valid UTF-8");
+        let pos = *engine.position();
+        let hist = engine.game_history().to_vec();
+        (stdout, pos, hist)
+    }
+
+    // -----------------------------------------------------------------------
+    // D.1 — Engine::new initializes game_history.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn engine_new_history_contains_starting_position_zobrist() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let engine = Engine::new(CapturedWriter(Arc::clone(&buf)), GreedyMover::new(0));
+        assert_eq!(
+            engine.game_history(),
+            &[Position::starting_position().zobrist()],
+            "Engine::new must initialize game_history to [startpos zobrist]"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D.2 — handle_ucinewgame resets history.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_ucinewgame_resets_history_to_startpos_zobrist() {
+        let (_, _, hist) = drive_with_history(&["position startpos moves e2e4 e7e5", "ucinewgame"]);
+        assert_eq!(
+            hist,
+            vec![Position::starting_position().zobrist()],
+            "ucinewgame must reset game_history to [startpos zobrist], length 1"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D.3 — handle_position happy-path history shapes.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_position_startpos_no_moves_history_is_single_startpos_zobrist() {
+        let (_, _, hist) = drive_with_history(&["position startpos"]);
+        assert_eq!(
+            hist,
+            vec![Position::starting_position().zobrist()],
+            "position startpos (no moves) must leave history = [startpos zobrist]"
+        );
+    }
+
+    #[test]
+    fn handle_position_startpos_with_moves_history_pushes_each_post_make_zobrist() {
+        let (_, _, hist) = drive_with_history(&["position startpos moves e2e4 e7e5"]);
+
+        // Compute expected trajectory manually.
+        let mut pos = Position::starting_position();
+        let z0 = pos.zobrist();
+        let mv1 = Move::from_uci("e2e4", &pos).expect("e2e4 legal from startpos");
+        pos.make_move(mv1);
+        let z1 = pos.zobrist();
+        let mv2 = Move::from_uci("e7e5", &pos).expect("e7e5 legal after e2e4");
+        pos.make_move(mv2);
+        let z2 = pos.zobrist();
+
+        assert_eq!(
+            hist.len(),
+            3,
+            "two moves from startpos must produce history length 3"
+        );
+        assert_eq!(hist[0], z0, "history[0] must be startpos zobrist");
+        assert_eq!(hist[1], z1, "history[1] must be post-e2e4 zobrist");
+        assert_eq!(
+            hist[2], z2,
+            "history[2] must be post-e7e5 zobrist (= current)"
+        );
+    }
+
+    #[test]
+    fn handle_position_fen_no_moves_history_is_single_base_zobrist() {
+        let kiwipete_fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+        let (_, _, hist) = drive_with_history(&[&format!("position fen {kiwipete_fen}")]);
+        let expected_z = Position::from_fen(kiwipete_fen)
+            .expect("kiwipete FEN valid")
+            .zobrist();
+        assert_eq!(
+            hist,
+            vec![expected_z],
+            "position fen (no moves) must leave history = [base zobrist]"
+        );
+    }
+
+    #[test]
+    fn handle_position_fen_with_moves_history_starts_at_base_then_pushes() {
+        let kiwipete_fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+        let (_, _, hist) =
+            drive_with_history(&[&format!("position fen {kiwipete_fen} moves e2a6")]);
+
+        let mut kiwipete = Position::from_fen(kiwipete_fen).expect("kiwipete FEN valid");
+        let z_base = kiwipete.zobrist();
+        let mv = Move::from_uci("e2a6", &kiwipete).expect("e2a6 legal from kiwipete");
+        kiwipete.make_move(mv);
+        let z_after = kiwipete.zobrist();
+
+        assert_eq!(
+            hist.len(),
+            2,
+            "one move from FEN must produce history length 2"
+        );
+        assert_eq!(hist[0], z_base, "history[0] must be kiwipete base zobrist");
+        assert_eq!(hist[1], z_after, "history[1] must be post-e2a6 zobrist");
+    }
+
+    // -----------------------------------------------------------------------
+    // D.4 — handle_position error-path history shapes.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_position_invalid_fen_keeps_prior_history() {
+        // Pre-load e2e4 so history is length 2, then send bad FEN.
+        // Engine must keep history unchanged (FEN error returns before touching history).
+        let (_, pos, hist) = drive_with_history(&[
+            "position startpos moves e2e4",
+            "position fen not a valid fen here now",
+        ]);
+
+        let mut expected_pos = Position::starting_position();
+        let z0 = expected_pos.zobrist();
+        let mv = Move::from_uci("e2e4", &expected_pos).expect("e2e4 legal");
+        expected_pos.make_move(mv);
+        let z1 = expected_pos.zobrist();
+
+        assert_eq!(
+            hist.len(),
+            2,
+            "invalid FEN must keep prior history (length 2); got length {}",
+            hist.len()
+        );
+        assert_eq!(
+            hist,
+            vec![z0, z1],
+            "invalid FEN must leave history = [startpos, post-e2e4]"
+        );
+        assert_eq!(
+            hist.last().copied(),
+            Some(pos.zobrist()),
+            "invariant: hist.last() == position.zobrist() must hold even on FEN error path"
+        );
+    }
+
+    #[test]
+    fn handle_position_malformed_move_resets_history_to_base() {
+        // Drive startpos+moves first, then send kiwipete with a malformed move.
+        // After error: history must be [kiwipete_zobrist] (the new base), not the
+        // prior history, not the partial prefix.
+        let kiwipete_fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+        let (_, pos, hist) = drive_with_history(&[
+            "position startpos moves e2e4 e7e5",
+            &format!("position fen {kiwipete_fen} moves zzzz"),
+        ]);
+
+        let kiwipete_z = Position::from_fen(kiwipete_fen)
+            .expect("kiwipete FEN valid")
+            .zobrist();
+        assert_eq!(
+            hist,
+            vec![kiwipete_z],
+            "malformed move must reset history to [kiwipete zobrist] (the new base)"
+        );
+        assert_eq!(
+            hist.last().copied(),
+            Some(pos.zobrist()),
+            "invariant: hist.last() == position.zobrist() must hold even on move error path"
+        );
+    }
+
+    #[test]
+    fn handle_position_partial_success_then_fail_resets_history_to_base() {
+        // e2e4 succeeds, e7e9 fails. History must be reset to [startpos zobrist]
+        // (the base), not [startpos, post-e2e4].
+        let (_, pos, hist) = drive_with_history(&["position startpos moves e2e4 e7e9"]);
+        assert_eq!(
+            hist,
+            vec![Position::starting_position().zobrist()],
+            "partial-success-then-fail must reset history to [startpos zobrist], not keep partial prefix"
+        );
+        assert_eq!(
+            hist.last().copied(),
+            Some(pos.zobrist()),
+            "invariant: hist.last() == position.zobrist() must hold even on move error path"
+        );
+    }
+
+    #[test]
+    fn handle_position_second_command_move_error_resets_to_new_base_history() {
+        // Drive startpos+two moves (history len 3), then send kiwipete+legal+bad.
+        // e2a6 is legal from kiwipete; zzzz is malformed.
+        // After error: history must be [kiwipete_zobrist], NOT the prior history
+        // spliced with kiwipete and NOT the partial [kiwipete, post_e2a6].
+        let kiwipete_fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+        let (_, pos, hist) = drive_with_history(&[
+            "position startpos moves e2e4 e7e5",
+            &format!("position fen {kiwipete_fen} moves e2a6 zzzz"),
+        ]);
+
+        let kiwipete_z = Position::from_fen(kiwipete_fen)
+            .expect("kiwipete FEN valid")
+            .zobrist();
+        assert_eq!(
+            hist,
+            vec![kiwipete_z],
+            "move error must reset history to [new base zobrist], not splice or partially extend"
+        );
+        assert_eq!(
+            hist.last().copied(),
+            Some(pos.zobrist()),
+            "invariant: hist.last() == position.zobrist() must hold even on move error path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D.5 — invariant property: history.last() == position.zobrist() always.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_position_history_invariant_holds_after_every_handler() {
+        // Each sub-sequence ends on a different kind of handler so the invariant
+        // game_history.last() == position.zobrist() is checked under that
+        // handler's post-state. Each sub-sequence builds a fresh engine via
+        // drive_with_history, so prior corruption cannot be repaired by a later
+        // command in the same sequence.
+
+        // Sub-sequence 1: terminal happy-path command (position startpos moves).
+        {
+            let (_, pos, hist) = drive_with_history(&["position startpos moves e2e4 e7e5"]);
+            assert_eq!(
+                hist.last().copied(),
+                Some(pos.zobrist()),
+                "invariant after position-with-moves: hist.last() == position.zobrist()"
+            );
+        }
+
+        // Sub-sequence 2: terminal FEN-error command. Prior state is built up so
+        // the FEN error has something to "preserve" — a handler that zeroes history
+        // on FEN error would leave hist empty while position stays post-e2e4.
+        {
+            let (_, pos, hist) = drive_with_history(&[
+                "position startpos moves e2e4",
+                "position fen garbage", // terminal: FEN-parse error
+            ]);
+            assert_eq!(
+                hist.last().copied(),
+                Some(pos.zobrist()),
+                "invariant after FEN-parse-error path: hist.last() == position.zobrist()"
+            );
+        }
+
+        // Sub-sequence 3: terminal move-error command from a FEN base. A handler
+        // that resets history to vec![] (instead of vec![base.zobrist()]) would
+        // leave hist empty while position becomes the FEN base.
+        {
+            let kiwipete_fen =
+                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+            let (_, pos, hist) = drive_with_history(&[
+                "position startpos moves e2e4 e7e5",
+                &format!("position fen {kiwipete_fen} moves zzzz"), // terminal: move error
+            ]);
+            assert_eq!(
+                hist.last().copied(),
+                Some(pos.zobrist()),
+                "invariant after move-error path on FEN base: hist.last() == position.zobrist()"
+            );
+        }
+
+        // Sub-sequence 4: terminal ucinewgame.
+        {
+            let (_, pos, hist) = drive_with_history(&[
+                "position fen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1 moves e2e4",
+                "ucinewgame", // terminal
+            ]);
+            assert_eq!(
+                hist.last().copied(),
+                Some(pos.zobrist()),
+                "invariant after ucinewgame: hist.last() == position.zobrist()"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // D.6 — handle_go clone semantics.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_go_clones_history_into_search_context() {
+        // Use HistoryCapturingFake to read ctx.history from inside go.
+        // After "position startpos moves e2e4 e7e5" + "go depth 1", the
+        // captured history must equal the engine's game_history at that point.
+        let captured = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let fake = HistoryCapturingFake {
+            captured: Arc::clone(&captured),
+        };
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let mut engine = Engine::new(writer, fake);
+
+        let (tx, rx) = mpsc::channel::<Command>();
+        tx.send(parse_uci_line("position startpos moves e2e4 e7e5"))
+            .unwrap();
+        tx.send(parse_uci_line("go depth 1")).unwrap();
+        tx.send(Command::Quit).unwrap();
+        engine.run(rx);
+
+        // Compute expected history.
+        let mut pos = Position::starting_position();
+        let z0 = pos.zobrist();
+        let mv1 = Move::from_uci("e2e4", &pos).expect("e2e4 legal");
+        pos.make_move(mv1);
+        let z1 = pos.zobrist();
+        let mv2 = Move::from_uci("e7e5", &pos).expect("e7e5 legal");
+        pos.make_move(mv2);
+        let z2 = pos.zobrist();
+        let expected = vec![z0, z1, z2];
+
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(
+            got.len(),
+            3,
+            "ctx.history must have length 3 after e2e4 e7e5; got length {}",
+            got.len()
+        );
+        assert_eq!(
+            got, expected,
+            "ctx.history must equal engine's game_history at the time of go"
+        );
+    }
+
+    #[test]
+    fn handle_go_does_not_consume_engine_history() {
+        // Verify handle_go clones (does not drain) engine.game_history.
+        // After go completes, engine.game_history must equal the trajectory
+        // before go was called. A regression where handle_go does
+        // std::mem::take(&mut self.game_history) would drain the field to
+        // Vec::new() and fail this assertion.
+        let (_, _, hist) = drive_with_history(&["position startpos moves e2e4 e7e5", "go depth 1"]);
+
+        // Compute expected trajectory.
+        let mut pos = Position::starting_position();
+        let z0 = pos.zobrist();
+        let mv1 = Move::from_uci("e2e4", &pos).expect("e2e4 legal");
+        pos.make_move(mv1);
+        let z1 = pos.zobrist();
+        let mv2 = Move::from_uci("e7e5", &pos).expect("e7e5 legal");
+        pos.make_move(mv2);
+        let z2 = pos.zobrist();
+        let expected = vec![z0, z1, z2];
+
+        assert_eq!(
+            hist, expected,
+            "engine.game_history must be unchanged after handle_go (clone, not take)"
+        );
     }
 }

@@ -42,6 +42,8 @@ Current architectural state. Decisions and their rationale live in `docs/decisio
 | Evaluation v1 | `evaluate(&Position) -> i32` in `src/eval.rs` returns side-to-move-relative centipawn score. Two terms folded into a precomputed `PSQT[color][kind][square]` const table: PeSTO MG material (`P=82, N=337, B=365, R=477, Q=1025, K=0`) + PeSTO MG piece-square tables (vendored verbatim into `src/eval/data.rs`; file-level `cargo mutants` exclusion mirrors `src/magic/constants.rs`). White lookup `+(MATERIAL[k] + MG_PST[k][s ^ 56])`; Black `-(MATERIAL[k] + MG_PST[k][s])` — the `s ^ 56` flip converts our LERF index (a1=0) to PeSTO's a8-origin layout. Insufficient-material override returns 0 for KvK / KvN / KvB (KBvKB same-color deferred to M6). King-MG-PST included despite king material = 0 — the PST captures middlegame king-safety preferences. Single-phase MG-only; tapering, bishop pair, mobility, king safety, pawn structure all deferred to M6. | `decisions/0014-eval-material-pst.md`, `docs/plans/m3.a.md`, `docs/research/m3-eval-material-pst.md` |
 | Eval state | `Position::static_eval_white: i32` field — combined material + PST score from White's perspective, maintained incrementally by `make_move` / `unmake_move`. `Undo::prior_static_eval` captures the pre-make value; `unmake_move` restores via `refresh_static_eval_from`. Six flag-arm deltas in `update_static_eval_after_make` (private helper in `src/mov.rs`); uses the `mover.color` parameter for order-agnostic invocation. Debug builds round-trip-assert `pos.static_eval_white() == eval::eval_white_from_scratch(pos)` after both `make_move` and `unmake_move`; release builds trust the delta. Always-on `make_move_no_from_scratch_in_release` perf sentinel covers BOTH zobrist and eval from-scratch reintroductions at the 100 ns/cycle threshold. Same NNUE-hook discipline as ADR-0004: when NNUE arrives, the PSQT-based delta slots out for the accumulator delta with no signature change. | `decisions/0014-eval-material-pst.md`, `decisions/0004-nnue-hooks-from-day-one.md`, `docs/plans/m3.a.md` |
 | Production search | `GreedyMover` Search impl in `src/search.rs` — depth-1 best-eval with reservoir-sampled tie-break (one SplitMix64 step per tied move; uniform over the tied set). Single `pos_clone` mutated in place via make/unmake (not 30 separate clones). Honors `infinite` / `movetime` / `ponder` via 1 ms-cadence wait loop. Inherits `set_seed` / `reset` lifecycle from M2.D's `Search` trait. `info depth 1 score cp X nodes N time T pv MV` emitted BEFORE the wait loop (real depth-1 score, not M2.D's placeholder 0); empty searchmoves filter / mate / stalemate emit `info depth 0 score cp 0 nodes 0 ... pv 0000` and return `bestmove 0000`. M3.C will replace this with negamax alpha-beta. | `docs/plans/m3.a.md`, `decisions/0014-eval-material-pst.md` |
+| Game history | `Engine::game_history: Vec<u64>` carries the full Polyglot Zobrist trajectory **including the current position** under invariant `history.last() == position.zobrist()`. `Engine::new()` initializes to `vec![startpos.zobrist()]`; `handle_ucinewgame` resets to `vec![startpos.zobrist()]`; `handle_position` rebuilds from the new base on each successful command (FEN parse error preserves prior; move-clause error resets to `vec![base.zobrist()]` from the new base). `SearchContext::history: Vec<u64>` is owned and cloned from `Engine::game_history` at `go`-spawn time; the per-`go` worker holds its own copy so subsequent `go` invocations see a pristine engine state. M3.C's negamax will mutate the worker's copy via push/pop on make/unmake. | `docs/plans/m3.b.md`, `docs/milestones/m3.b.md` |
+| Draw-detection helpers | `pub(crate) fn is_repetition(history: &[u64], halfmove_clock: u8) -> bool` and `pub(crate) fn is_fifty_move_draw(halfmove_clock: u8) -> bool` in `src/search.rs`. `is_repetition` walks priors backward in 2-ply steps (only same-side-to-move positions can match), capped at `min(halfmove_clock, history.len()-1)`; first match returns true (per CPW single-occurrence-in-search rule; FIDE 9.2 three-fold-claim is the GUI/adjudicator's job). `is_fifty_move_draw` returns true at `>= 100` plies (FIDE 9.3 claimable threshold). Plumbed at M3.B; consumed by M3.C alpha-beta. | `docs/plans/m3.b.md`, `docs/research/m3-search-basics.md` §8–§9 |
 
 ## Sliding-piece attack lookup
 
@@ -123,6 +125,40 @@ See `decisions/0014-eval-material-pst.md` and `docs/research/m3-eval-material-ps
 **Why depth-1.** First version that *evaluates*. M3.C will replace `GreedyMover` with negamax alpha-beta + iterative deepening; the trait surface stays unchanged.
 
 See `docs/plans/m3.a.md` §10.
+
+## Game history and draw-detection helpers
+
+**Public surface (within crate).** `src/search.rs` exposes:
+
+- `pub(crate) fn is_repetition(history: &[u64], halfmove_clock: u8) -> bool` — single-occurrence-in-search repetition test.
+- `pub(crate) fn is_fifty_move_draw(halfmove_clock: u8) -> bool` — true at `halfmove_clock >= 100`.
+
+**Engine state.** `Engine::game_history: Vec<u64>` holds the full Polyglot Zobrist trajectory of the current game, **including the current position**. The invariant is `engine.game_history.last() == Some(&engine.position.zobrist())` after every command handler returns.
+
+**Lifecycle.**
+
+- `Engine::new()` initializes `game_history = vec![Position::starting_position().zobrist()]`.
+- `handle_ucinewgame` resets both `position` and `game_history` to startpos / `vec![startpos.zobrist()]`.
+- `handle_position` rebuilds `game_history` per command. FEN parse error returns *before* touching either field (preserves both prior). Move-clause error sets `position = base` and `game_history = vec![base.zobrist()]` (single entry, the *new* base — not `vec![]`, not the prior history, not the partially-built one). On full success commits both atomically: `position = pos; game_history = hist`.
+
+**`SearchContext::history`.** Owned `Vec<u64>`, cloned from `Engine::game_history` at `go`-spawn time in `handle_go`. The clone is intentional — the per-`go` worker thread holds its own copy so subsequent `go` invocations see a pristine engine state (and so M3.C's negamax can push/pop in place during recursion without affecting the engine).
+
+**Algorithm — `is_repetition`.**
+
+- Empty history returns `false` (no current position to compare).
+- Walks priors backward in 2-ply steps `i = 2, 4, 6, …` capped at `min(halfmove_clock, history.len() - 1)`.
+- First match (current's Zobrist == prior's Zobrist) returns `true`.
+- Per CPW "Repetitions": a single match counts inside the search; FIDE 9.2 three-fold-claim is the GUI/adjudicator's responsibility.
+
+**Why 2-ply step.** Only same-side-to-move positions can repeat — the Polyglot Zobrist turn key (`turn_key`) flips on every ply, so opposite-color positions can never share a hash.
+
+**Why two caps on `max_back`.** `halfmove_clock` is the irreversible-move stop (any pawn move or capture severs the chain); `history.len() - 1` is the safety bound (FEN-loaded clocks may exceed observed history depth).
+
+**Algorithm — `is_fifty_move_draw`.** Returns `true` at `halfmove_clock >= 100`. 100 plies = 50 moves by each player without pawn move or capture, the FIDE 9.3 claimable threshold. The 75-move auto-draw at 150 plies (FIDE 9.6.2) is not separately handled — once claimable, treated as drawn for engine reasoning.
+
+**Consumer.** None at M3.B. M3.C's negamax is the first consumer; the helpers' signatures are intentionally `&[u64]` / `u8` so the data's exact storage location (inside `SearchContext`, in a `Cell`, or as a separate `&mut Vec<u64>` parameter) is a deferred M3.C decision.
+
+See `docs/plans/m3.b.md` and `docs/research/m3-search-basics.md` §8–§9.
 
 ## Make / unmake
 
