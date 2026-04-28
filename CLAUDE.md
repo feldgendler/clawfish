@@ -15,6 +15,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 - M2.D: complete — `RandomMover` SplitMix64 random-mover + `Random_Seed` UCI option.
 - M2.E: complete — fastchess harness + `--compliance` 40/40 + 4 smoke games. M2 exit criterion met.
 - M3.A: complete — `eval` module + `GreedyMover` (depth-1 production search). PeSTO MG values, incremental `static_eval_white` per **ADR-0014**. Real `score cp` (e.g. `cp 36` from startpos).
+- Tooling/fuzzing: complete — `fuzz/` independent workspace + two `Arbitrary<String>` harnesses (`fuzz_fen`, `fuzz_uci`) + 35 fen + 30 uci hand-curated seed files + **ADR-0013**. Closes `docs/tooling-backlog.md` item #1. Saturation campaigns clean (2.28B + 0.89B execs, 0 unaddressed crashes). One real parser bug caught + fixed: `unreachable!()` in `parse_castling` for double-space inputs.
 
 For per-phase retrospectives ("what landed", implementation highlights, verification numbers), see `docs/milestones/`. The forward-looking milestone plan lives in `docs/roadmap.md`.
 
