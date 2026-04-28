@@ -1,2 +1,13 @@
 target/
 artifacts/
+
+# libFuzzer appends coverage-expanding discoveries to the corpus directories
+# during a campaign. Only hand-curated seed files (named `fen-NNN-…` /
+# `uci-NNN-…`) are tracked; everything else under `corpus/<target>/` is a
+# transient runtime artifact. Plan `docs/plans/tooling-fuzzing.md` §6
+# Phase 3 step 6 ("commit only the seed-only corpus") and ADR-0013 §8.
+corpus/fuzz_fen/*
+!corpus/fuzz_fen/fen-*
+corpus/fuzz_uci/*
+!corpus/fuzz_uci/uci-*
+
