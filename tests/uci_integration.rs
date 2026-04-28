@@ -20,12 +20,15 @@ use std::time::{Duration, Instant};
 // Helpers shared by all three tests.
 // ---------------------------------------------------------------------------
 
-/// Spawn the clawfish binary with piped stdin/stdout and stderr discarded.
+/// Spawn the clawfish binary with piped stdin/stdout. Stderr is inherited
+/// so any engine panic / debug output shows up in cargo test's per-test
+/// capture buffer when a test fails — diagnostic value when the engine
+/// subprocess dies unexpectedly (e.g. Linux CI flake investigation).
 fn spawn_engine() -> std::process::Child {
     ProcCommand::new(env!("CARGO_BIN_EXE_clawfish"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn clawfish binary")
 }
