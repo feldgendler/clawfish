@@ -6,8 +6,8 @@
 //! polled by the orchestrator's worker thread and must obey `should_abort`
 //! (per ADR-0011 and `docs/plans/m2.c.md` §3).
 //!
-//! M2.D ships the [`RandomMover`] implementation: a SplitMix64-seeded uniform
-//! random pick from the legal move list. See plan §5.
+//! M3.A ships the [`GreedyMover`] implementation: a depth-1 best-eval mover
+//! with reservoir-sampled tie-break PRNG. See plan §10.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +24,7 @@ pub struct SearchLimits {
     pub nodes: Option<u64>,
     /// `go movetime <ms>`. Signed to mirror `wtime`/`btime` (the UCI clock
     /// can go negative under time-trouble overshoot); negative `movetime`
-    /// in practice means "search briefly" — RandomMover treats `Some(<= 0)`
+    /// in practice means "search briefly" — GreedyMover treats `Some(<= 0)`
     /// the same as `Some(0)`.
     pub movetime: Option<i64>,
     pub mate: Option<u32>,
@@ -113,7 +113,7 @@ pub trait Search: Send {
     fn set_seed(&mut self, _seed: u64) {}
 
     /// Notify the search that a new game has started (`ucinewgame`). Default:
-    /// no-op. RandomMover resets `state` to `seed` here. M3+ alpha-beta
+    /// no-op. GreedyMover resets `state` to `seed` here. M3+ alpha-beta
     /// will eventually clear killer/history/TT here.
     fn reset(&mut self) {}
 }
@@ -130,44 +130,36 @@ pub(crate) fn splitmix64_next(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// SplitMix64-seeded uniform random-mover. Replaces `Stub` in M2.D.
-///
-/// Behavior (per plan §5):
-/// - Generates legal moves; filters by `ctx.limits.searchmoves` if `Some`.
-/// - Picks one move uniformly at random via one SplitMix64 step.
-/// - `splitmix64_next` is called only when the (post-filter) move list is
-///   non-empty, so empty filters do not consume PRNG state.
-/// - If `infinite` / `movetime` / `ponder` is set: spins on `should_abort`
-///   with a 1 ms sleep cadence until cancelled / deadline expires.
-/// - Candidate is always computed before the cancellation wait — race-free
-///   under quit-immediately-after-go (M2.C precedent, plan §8).
-pub(crate) struct RandomMover {
-    /// The seed configured via `Random_Seed` (or the default, 0). Reset
-    /// target for `reset()`.
+// ---------------------------------------------------------------------------
+// GreedyMover — depth-1 best-eval with reservoir-sampled tie-break (M3.A).
+// ---------------------------------------------------------------------------
+
+/// Depth-1 best-eval mover. Evaluates every legal move at depth 1 via
+/// `-evaluate(post_make)`, picks the move with the highest score, and
+/// breaks ties with SplitMix64 reservoir sampling (one PRNG step per tied
+/// move). Production `Search` impl introduced in M3.A.
+pub(crate) struct GreedyMover {
+    /// The seed configured via `Random_Seed` (or the default, 0).
     seed: u64,
-    /// PRNG state. Initially equal to `seed`; advances by one SplitMix64
-    /// step per `go` call (when moves are non-empty).
+    /// PRNG state. Advances by one SplitMix64 step per tied move encountered.
     state: u64,
 }
 
-impl RandomMover {
+impl GreedyMover {
     pub(crate) fn new(seed: u64) -> Self {
         Self { seed, state: seed }
     }
 }
 
-impl Search for RandomMover {
+impl Search for GreedyMover {
     fn go(
         &mut self,
         position: &Position,
         ctx: &SearchContext,
         info_sink: &dyn Fn(&str),
     ) -> SearchResult {
-        // Always compute the candidate before checking cancellation. The
-        // alternative (early-exit on pre-set stop) creates a race against
-        // `handle_quit` — if `quit` flips the flag before this thread is
-        // scheduled, the worker would emit `bestmove 0000` instead of a
-        // legitimate move. See plan §8.
+        use crate::eval::evaluate;
+
         let mut moves = {
             let mut ml = crate::movegen::MoveList::new();
             crate::movegen::generate_moves(position, &mut ml);
@@ -178,16 +170,62 @@ impl Search for RandomMover {
             moves.retain(|mv| filter.contains(mv));
         }
 
-        let candidate = if moves.is_empty() {
-            None
-        } else {
-            let r = splitmix64_next(&mut self.state);
-            // Modulo bias for N ≤ 218 (legal-move max) is < 4×10⁻¹⁸
-            // (plan §3.1) — no rejection sampling needed.
-            let idx = (r as usize) % moves.len();
-            Some(moves[idx])
-        };
+        if moves.is_empty() {
+            let elapsed_ms = ctx.start.elapsed().as_millis();
+            info_sink(&format!(
+                "info depth 0 score cp 0 nodes 0 time {elapsed_ms} pv 0000"
+            ));
+            return SearchResult {
+                bestmove: None,
+                depth: 0,
+                score_cp: Some(0),
+                nodes: 0,
+                ponder: None,
+            };
+        }
 
+        // Reservoir-sampled best-eval scan. One pos_clone mutated in place via
+        // make/unmake — not N separate clones. Required to keep the debug-build
+        // round-trip assert hot loop sane.
+        let mut pos_clone = *position;
+
+        let undo0 = pos_clone.make_move(moves[0]);
+        // Negate: post-make perspective is the opponent; we want our perspective.
+        let mut best_score = -evaluate(&pos_clone);
+        pos_clone.unmake_move(moves[0], undo0);
+        let mut best_mv = moves[0];
+        let mut tie_count: u32 = 1;
+
+        for &mv in &moves[1..] {
+            let undo = pos_clone.make_move(mv);
+            let score = -evaluate(&pos_clone);
+            pos_clone.unmake_move(mv, undo);
+
+            if score > best_score {
+                best_score = score;
+                best_mv = mv;
+                tie_count = 1;
+            } else if score == best_score {
+                tie_count += 1;
+                let r = splitmix64_next(&mut self.state);
+                // Modulo bias for tie_count ≤ 218 is < 4×10⁻¹⁸ — no rejection needed.
+                if (r as usize).is_multiple_of(tie_count as usize) {
+                    best_mv = mv;
+                }
+            }
+        }
+
+        let n = moves.len() as u64;
+
+        // Emit the info line BEFORE the wait loop — the score is real and
+        // a GUI watching `info score cp` should see it immediately.
+        let elapsed_ms = ctx.start.elapsed().as_millis();
+        info_sink(&format!(
+            "info depth 1 score cp {best_score} nodes {n} time {elapsed_ms} pv {}",
+            best_mv.to_uci()
+        ));
+
+        // Wait loop: honor infinite / movetime / ponder.
         let wait = ctx.limits.infinite || ctx.limits.movetime.is_some() || ctx.limits.ponder;
         if wait {
             while !ctx.should_abort(0) {
@@ -195,19 +233,12 @@ impl Search for RandomMover {
             }
         }
 
-        // Post-wait: time reflects the full wall-clock spent in this go, symmetric
-        // with how M3+ iterative-deepening will report info time on its final iteration.
-        let elapsed_ms = ctx.start.elapsed().as_millis();
-        let pv_token = candidate
-            .map(|m| m.to_uci())
-            .unwrap_or_else(|| "0000".to_string());
-        info_sink(&format!(
-            "info depth 0 score cp 0 nodes 1 time {elapsed_ms} pv {pv_token}"
-        ));
-
         SearchResult {
-            bestmove: candidate,
-            ..Default::default()
+            bestmove: Some(best_mv),
+            depth: 1,
+            score_cp: Some(best_score),
+            nodes: n,
+            ponder: None,
         }
     }
 
@@ -255,17 +286,13 @@ mod tests {
         (ctx, stop)
     }
 
-    fn go_no_sink(rm: &mut RandomMover, pos: &Position, ctx: &SearchContext) -> Option<Move> {
-        rm.go(pos, ctx, &|_| {}).bestmove
-    }
-
     // -----------------------------------------------------------------------
     // D1 — SplitMix64 reference-output anchor.
     // -----------------------------------------------------------------------
 
     /// Pin the first 8 outputs of `splitmix64_next` from `state = 0` against
     /// hand-computed reference values. Catches any constant-typo regression in
-    /// the PRNG without needing the full `RandomMover` machinery.
+    /// the PRNG without needing the full `GreedyMover` machinery.
     ///
     /// Reference computed offline by running the same algorithm in a standalone
     /// Rust binary; values verified stable across two independent runs.
@@ -292,275 +319,6 @@ mod tests {
             assert_eq!(
                 got, want,
                 "splitmix64_next output mismatch at step {i}: got 0x{got:016X}, want 0x{want:016X}"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // D2 — RandomMover picks a legal move from startpos.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn random_mover_picks_a_legal_move_from_startpos() {
-        let pos = Position::starting_position();
-        let (ctx, _stop) = non_aborting_ctx();
-        let mut rm = RandomMover::new(0);
-        let result = rm.go(&pos, &ctx, &|_| {});
-
-        let mv = result
-            .bestmove
-            .expect("startpos has 20 legal moves — bestmove must be Some");
-
-        let mut ml = MoveList::new();
-        generate_moves(&pos, &mut ml);
-        assert!(
-            ml.iter().any(|legal| legal == mv),
-            "bestmove {mv} is not in generate_moves output for startpos",
-            mv = mv.to_uci()
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D3 — RandomMover emits None in checkmate.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn random_mover_emits_none_in_checkmate() {
-        // Fool's mate — white is in checkmate (no legal moves).
-        let fen = "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3";
-        let pos = Position::from_fen(fen).expect("Fool's-mate FEN must parse");
-
-        let (ctx, _stop) = non_aborting_ctx();
-        let result = RandomMover::new(0).go(&pos, &ctx, &|_| {});
-
-        assert_eq!(
-            result.bestmove, None,
-            "bestmove must be None in a checkmate position"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D4 — Candidate computed even with pre-set cancellation.
-    // -----------------------------------------------------------------------
-
-    /// Pins the "always compute candidate first" invariant (plan §5 / M2.C
-    /// precedent). With no infinite/movetime/ponder, the wait loop is skipped
-    /// entirely, so a pre-set stop flag must not suppress the bestmove.
-    #[test]
-    fn random_mover_returns_candidate_even_with_pre_set_cancellation() {
-        let pos = Position::starting_position();
-        let stop = Arc::new(AtomicBool::new(true)); // pre-set
-        let ctx = SearchContext {
-            stop: Arc::clone(&stop),
-            deadline: None,
-            start: Instant::now(),
-            limits: SearchLimits::default(), // no infinite/movetime/ponder
-        };
-
-        let result = RandomMover::new(0).go(&pos, &ctx, &|_| {});
-        assert!(
-            result.bestmove.is_some(),
-            "bestmove must be Some even when the stop flag is pre-set (no wait loop)"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D5 — RandomMover honors `infinite` until cancelled.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn random_mover_honors_infinite_until_cancelled() {
-        let pos = Position::starting_position();
-        let stop = Arc::new(AtomicBool::new(false));
-        let ctx = SearchContext {
-            stop: Arc::clone(&stop),
-            deadline: None,
-            start: Instant::now(),
-            limits: SearchLimits {
-                infinite: true,
-                ..SearchLimits::default()
-            },
-        };
-
-        let stop_clone = Arc::clone(&stop);
-        let spawn_time = Instant::now();
-        let handle =
-            std::thread::spawn(move || RandomMover::new(0).go(&pos, &ctx, &|_| {}).bestmove);
-
-        std::thread::sleep(Duration::from_millis(20));
-        stop_clone.store(true, Ordering::Relaxed);
-
-        // Must return within 100 ms after cancellation (1 ms sleep cadence).
-        let result = handle.join().expect("worker thread must not panic");
-        assert!(
-            result.is_some(),
-            "bestmove must be Some even after cancellation from infinite mode"
-        );
-
-        // The worker must have been in the polling loop for at least 15 ms —
-        // catches a RandomMover::go that ignores `infinite=true` and returns
-        // immediately instead of waiting. We sleep 20 ms before cancelling, so
-        // the elapsed time must be at least ~18 ms; 15 ms absorbs scheduling
-        // jitter.
-        let elapsed = spawn_time.elapsed();
-        assert!(
-            elapsed >= Duration::from_millis(15),
-            "infinite go must block until cancelled (elapsed {elapsed:?} < 15 ms — \
-            worker likely returned immediately without polling should_abort)"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D6 — seed 42 is deterministic across two independent instances.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn random_mover_seed_42_is_deterministic() {
-        // Use a varied sequence of positions so different PRNG branches are
-        // exercised. Two instances with the same seed must produce identical
-        // bestmoves on the same sequence.
-        let positions: Vec<Position> = [
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
-            "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",
-            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
-            "r2q1rk1/pP1p2pp/Q4n2/bbp1p3/Np6/1B3NBn/pPPP1PPP/R3K2R b KQ - 0 1",
-            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
-            "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
-            "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2",
-            "5k2/8/8/8/8/8/8/4K2R w K - 0 1",
-        ]
-        .iter()
-        .map(|fen| {
-            Position::from_fen(fen).unwrap_or_else(|e| panic!("FEN must parse: {fen} ({e:?})"))
-        })
-        .collect();
-
-        let mut rm_a = RandomMover::new(42);
-        let mut rm_b = RandomMover::new(42);
-        let (ctx, _stop) = non_aborting_ctx();
-
-        for (i, pos) in positions.iter().enumerate() {
-            let mv_a = go_no_sink(&mut rm_a, pos, &ctx);
-            let mv_b = go_no_sink(&mut rm_b, pos, &ctx);
-            assert_eq!(
-                mv_a, mv_b,
-                "determinism violated at position {i}: rm_a={mv_a:?}, rm_b={mv_b:?}"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // D7 — set_seed resets PRNG state.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn random_mover_set_seed_resets_state() {
-        let seed = 7u64;
-        let pos = Position::starting_position();
-        let (ctx, _stop) = non_aborting_ctx();
-
-        // Capture the bestmove produced by a fresh instance at seed 7.
-        let first_mv_fresh = go_no_sink(&mut RandomMover::new(seed), &pos, &ctx);
-
-        // Advance the tested instance 5 times, then reset via set_seed.
-        let mut rm = RandomMover::new(seed);
-        for _ in 0..5 {
-            go_no_sink(&mut rm, &pos, &ctx);
-        }
-        rm.set_seed(seed);
-
-        // The next go must reproduce the first move of a fresh seed-7 instance.
-        let mv_after_set_seed = go_no_sink(&mut rm, &pos, &ctx);
-        assert_eq!(
-            mv_after_set_seed, first_mv_fresh,
-            "set_seed must reset state: expected {first_mv_fresh:?}, got {mv_after_set_seed:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D8 — reset() returns to seed.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn random_mover_reset_returns_to_seed() {
-        let seed = 7u64;
-        let pos = Position::starting_position();
-        let (ctx, _stop) = non_aborting_ctx();
-
-        // Capture the bestmove produced by a fresh instance at seed 7.
-        let first_mv_fresh = go_no_sink(&mut RandomMover::new(seed), &pos, &ctx);
-
-        // Advance the tested instance 5 times, then reset.
-        let mut rm = RandomMover::new(seed);
-        for _ in 0..5 {
-            go_no_sink(&mut rm, &pos, &ctx);
-        }
-        rm.reset();
-
-        let mv_after_reset = go_no_sink(&mut rm, &pos, &ctx);
-        assert_eq!(
-            mv_after_reset, first_mv_fresh,
-            "reset must restore state to seed: expected {first_mv_fresh:?}, got {mv_after_reset:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D9 — empty searchmoves yields None and does not advance PRNG state.
-    // -----------------------------------------------------------------------
-
-    /// Pins that `splitmix64_next` is only called when the post-filter move
-    /// list is non-empty. An empty `searchmoves` filter must not consume any
-    /// PRNG state, so the subsequent unrestricted `go` must produce the same
-    /// bestmove as if the empty-filter call had never happened.
-    #[test]
-    fn random_mover_empty_searchmoves_yields_none_and_does_not_advance_state() {
-        let pos = Position::starting_position();
-        let (ctx_no_filter, _stop_nf) = non_aborting_ctx();
-        let (ctx_empty_filter, _stop_ef) = ctx_with_searchmoves(vec![]);
-
-        let mut tested = RandomMover::new(7);
-        let mut reference = RandomMover::new(7);
-
-        // Step 1: empty-filter call must return None.
-        let empty_result = go_no_sink(&mut tested, &pos, &ctx_empty_filter);
-        assert_eq!(
-            empty_result, None,
-            "empty searchmoves must yield bestmove None"
-        );
-
-        // Steps 2 & 3: subsequent unrestricted calls must agree (proving no
-        // PRNG state was consumed in step 1).
-        let m1 = go_no_sink(&mut tested, &pos, &ctx_no_filter);
-        let m2 = go_no_sink(&mut reference, &pos, &ctx_no_filter);
-        assert_eq!(
-            m1, m2,
-            "PRNG state must not advance on empty-filter go: tested={m1:?}, reference={m2:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D10 — searchmoves filter restricts candidates to the specified subset.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn random_mover_filter_restricts_to_searchmoves_subset() {
-        let pos = Position::starting_position();
-        let a2a4 = Move::from_uci("a2a4", &pos).expect("a2a4 must be a legal startpos move");
-        let b2b4 = Move::from_uci("b2b4", &pos).expect("b2b4 must be a legal startpos move");
-
-        // Build once; reuse across all seeds (avoids repeated parsing).
-        let filter = vec![a2a4, b2b4];
-
-        for seed in 0u64..100 {
-            let (ctx, _stop) = ctx_with_searchmoves(filter.clone());
-            let mv = go_no_sink(&mut RandomMover::new(seed), &pos, &ctx)
-                .unwrap_or_else(|| panic!("seed {seed}: searchmoves [a2a4,b2b4] must yield Some"));
-            assert!(
-                mv == a2a4 || mv == b2b4,
-                "seed {seed}: bestmove {uci} not in {{a2a4, b2b4}}",
-                uci = mv.to_uci()
             );
         }
     }
@@ -625,26 +383,447 @@ mod tests {
         }
     }
 
+    // ===========================================================================
+    // M3.A — GreedyMover tests (D13–D22, E1, F1).
+    //
+    // All tests in this section will fail until the GreedyMover::go impl ships
+    // (Slice 3), because the stub returns SearchResult::default() (bestmove=None).
+    // ===========================================================================
+
+    fn go_greedy_no_sink(
+        gm: &mut GreedyMover,
+        pos: &Position,
+        ctx: &SearchContext,
+    ) -> SearchResult {
+        gm.go(pos, ctx, &|_| {})
+    }
+
     // -----------------------------------------------------------------------
-    // D12 — chi-square uniformity proptest.
+    // D13 — GreedyMover picks a legal move from startpos.
     // -----------------------------------------------------------------------
 
-    /// Verify that `RandomMover` picks legal moves with an approximately
-    /// uniform distribution. Uses startpos (K = 20 legal moves). Draws M =
-    /// 2000 samples per seed, computes chi-square, asserts χ² < 43.82.
-    ///
-    /// Critical value at α = 0.001, df = K−1 = 19: **43.82** (from standard
-    /// chi-square tables, e.g. NIST Handbook §1.3.6.7.4).
-    ///
-    /// The bound is intentionally loose (α = 0.001, not 0.05) to keep
-    /// per-seed false-fail probability below ~1/1000, and proptest is capped
-    /// at 8 cases to keep wallclock low (8 seeds × 2000 picks ≈ 16k PRNG
-    /// steps, negligible).
-    ///
-    /// Each sample reuses the same `RandomMover` instance (state advances
-    /// sample-to-sample) to measure genuine PRNG dispersion, not restarts.
-    #[cfg(test)]
-    mod proptest_d12 {
+    #[test]
+    fn greedy_picks_a_legal_move_from_startpos() {
+        let pos = Position::starting_position();
+        let (ctx, _stop) = non_aborting_ctx();
+        let mut gm = GreedyMover::new(0);
+        let result = go_greedy_no_sink(&mut gm, &pos, &ctx);
+
+        let mv = result
+            .bestmove
+            .expect("startpos has 20 legal moves — bestmove must be Some");
+
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        assert!(
+            ml.iter().any(|legal| legal == mv),
+            "greedy bestmove {} is not in generate_moves output for startpos",
+            mv.to_uci()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D14 — GreedyMover emits None in checkmate.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn greedy_emits_none_in_checkmate() {
+        // Fool's mate — white is in checkmate (no legal moves).
+        let fen = "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3";
+        let pos = Position::from_fen(fen).expect("Fool's-mate FEN must parse");
+
+        let (ctx, _stop) = non_aborting_ctx();
+        let result = GreedyMover::new(0).go(&pos, &ctx, &|_| {});
+
+        assert_eq!(
+            result.bestmove, None,
+            "bestmove must be None in a checkmate position"
+        );
+        assert_eq!(
+            result.score_cp,
+            Some(0),
+            "score_cp must be Some(0) in a checkmate position (empty move list)"
+        );
+        assert_eq!(
+            result.nodes, 0,
+            "nodes must be 0 when no moves are evaluated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D15 — GreedyMover returns candidate even with pre-set cancellation.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn greedy_returns_candidate_even_with_pre_set_cancellation() {
+        let pos = Position::starting_position();
+        let stop = Arc::new(AtomicBool::new(true)); // pre-set
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            deadline: None,
+            start: Instant::now(),
+            limits: SearchLimits::default(), // no infinite/movetime/ponder
+        };
+
+        let result = GreedyMover::new(0).go(&pos, &ctx, &|_| {});
+        assert!(
+            result.bestmove.is_some(),
+            "bestmove must be Some even when the stop flag is pre-set (no wait loop)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D16 — GreedyMover honors `infinite` until cancelled.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn greedy_honors_infinite_until_cancelled() {
+        let pos = Position::starting_position();
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            deadline: None,
+            start: Instant::now(),
+            limits: SearchLimits {
+                infinite: true,
+                ..SearchLimits::default()
+            },
+        };
+
+        let stop_clone = Arc::clone(&stop);
+        let spawn_time = Instant::now();
+        let handle =
+            std::thread::spawn(move || GreedyMover::new(0).go(&pos, &ctx, &|_| {}).bestmove);
+
+        std::thread::sleep(Duration::from_millis(20));
+        stop_clone.store(true, Ordering::Relaxed);
+
+        let result = handle.join().expect("worker thread must not panic");
+        assert!(
+            result.is_some(),
+            "bestmove must be Some even after cancellation from infinite mode"
+        );
+
+        let elapsed = spawn_time.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(15),
+            "infinite go must block until cancelled (elapsed {elapsed:?} < 15 ms — \
+            worker likely returned immediately without polling should_abort)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D17 — GreedyMover seed is deterministic for tied positions.
+    // -----------------------------------------------------------------------
+
+    /// Uses KvK with white king on e4. All 8 white-king moves leave a KvK
+    /// position with kings symmetrically placed → all 8 candidate scores are
+    /// equal. Two same-seed instances must produce identical bestmove
+    /// sequences across 5 calls. Pins reservoir-sampling determinism. (The
+    /// "evaluates to 0" insufficient-material claim is pinned by A4, not here;
+    /// D17 only requires that the 8 scores tie, which holds whether `evaluate`
+    /// returns 0 or some non-zero color-symmetric value.)
+    #[test]
+    fn greedy_seed_is_deterministic_for_tied_positions() {
+        // KvK: white king on e4, black king on e1. All white king moves tie.
+        let pos =
+            Position::from_fen("8/8/8/8/4K3/8/8/4k3 w - - 0 1").expect("KvK (ties) FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx();
+
+        let mut gm_a = GreedyMover::new(42);
+        let mut gm_b = GreedyMover::new(42);
+
+        for call in 0..5 {
+            let mv_a = go_greedy_no_sink(&mut gm_a, &pos, &ctx).bestmove;
+            let mv_b = go_greedy_no_sink(&mut gm_b, &pos, &ctx).bestmove;
+            assert_eq!(
+                mv_a, mv_b,
+                "D17: determinism violated at call {call}: gm_a={mv_a:?}, gm_b={mv_b:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // D18 — GreedyMover takes a hanging queen.
+    // -----------------------------------------------------------------------
+
+    /// White knight on c4, black queen on e5, white to move. The knight can
+    /// capture the queen with Nxe5 (c4e5) — a gain of +1025 material (queen
+    /// value) at depth 1. All other legal moves (king moves) leave the queen
+    /// alive. Nxe5 is therefore clearly the depth-1 best move. Assert
+    /// bestmove == c4e5 (knight captures the queen), which proves GreedyMover
+    /// actually evaluates positions rather than picking at random.
+    #[test]
+    fn greedy_takes_hanging_queen() {
+        let pos = Position::from_fen("4k3/8/8/4q3/2N5/8/8/4K3 w - - 0 1")
+            .expect("FEN with hanging queen must parse");
+        let (ctx, _stop) = non_aborting_ctx();
+        let mut gm = GreedyMover::new(0);
+        let result = go_greedy_no_sink(&mut gm, &pos, &ctx);
+
+        let mv = result
+            .bestmove
+            .expect("position has legal moves — bestmove must be Some");
+        let expected = crate::mov::Move::from_uci("c4e5", &pos).expect("c4e5 must be legal (Nxe5)");
+        assert_eq!(
+            mv,
+            expected,
+            "D18: greedy must take the hanging queen (c4e5 = Nxe5); got {}",
+            mv.to_uci()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D19 — empty searchmoves yields None, no PRNG advance.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn greedy_searchmoves_empty_yields_none_no_prng_advance() {
+        let pos = Position::starting_position();
+        let (ctx_no_filter, _stop_nf) = non_aborting_ctx();
+        let (ctx_empty_filter, _stop_ef) = ctx_with_searchmoves(vec![]);
+
+        let mut tested = GreedyMover::new(7);
+        let mut reference = GreedyMover::new(7);
+
+        // Empty filter must return None.
+        let empty_result = go_greedy_no_sink(&mut tested, &pos, &ctx_empty_filter).bestmove;
+        assert_eq!(
+            empty_result, None,
+            "D19: empty searchmoves must yield bestmove None"
+        );
+
+        // Subsequent unrestricted calls must agree (no PRNG state advanced).
+        let m1 = go_greedy_no_sink(&mut tested, &pos, &ctx_no_filter).bestmove;
+        let m2 = go_greedy_no_sink(&mut reference, &pos, &ctx_no_filter).bestmove;
+        assert_eq!(
+            m1, m2,
+            "D19: PRNG state must not advance on empty-filter go: tested={m1:?}, reference={m2:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D20 — GreedyMover emits an info depth 1 line with score cp.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn greedy_emits_info_depth_1_with_score_cp() {
+        use crate::eval::evaluate;
+        use crate::movegen::{MoveList, generate_moves};
+
+        let pos = Position::starting_position();
+        let (ctx, _stop) = non_aborting_ctx();
+        let mut gm = GreedyMover::new(0);
+
+        let info_lines: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        gm.go(&pos, &ctx, &|line| {
+            info_lines.borrow_mut().push(line.to_string())
+        });
+        let info_lines = info_lines.into_inner();
+
+        assert_eq!(
+            info_lines.len(),
+            1,
+            "D20: exactly one info line must be emitted; got: {info_lines:?}"
+        );
+        let line = &info_lines[0];
+        assert!(
+            line.starts_with("info depth 1 score cp "),
+            "D20: info line must start with 'info depth 1 score cp '; got: {line:?}"
+        );
+        assert!(
+            line.contains("nodes"),
+            "D20: info line must contain 'nodes'; got: {line:?}"
+        );
+        assert!(
+            line.contains("time"),
+            "D20: info line must contain 'time'; got: {line:?}"
+        );
+        assert!(
+            line.contains("pv"),
+            "D20: info line must contain 'pv'; got: {line:?}"
+        );
+
+        // Extract the score integer and verify it matches the independently-computed
+        // depth-1 best score. An impl that always emits `score cp 0` (the M2.D
+        // placeholder pattern) would fail this check for startpos.
+        let score_str = line
+            .strip_prefix("info depth 1 score cp ")
+            .expect("already checked prefix above");
+        let score_in_line: i32 = score_str
+            .split_whitespace()
+            .next()
+            .expect("token after 'score cp' must exist")
+            .parse()
+            .expect("score must be an integer");
+
+        // Independently compute the depth-1 best score: for each legal move,
+        // score = -evaluate(after make_move). The max over all legal moves is
+        // the expected value.
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let mut pos_clone = pos;
+        let mut best = i32::MIN;
+        for mv in ml.iter() {
+            let undo = pos_clone.make_move(mv);
+            let s = -evaluate(&pos_clone);
+            pos_clone.unmake_move(mv, undo);
+            if s > best {
+                best = s;
+            }
+        }
+
+        assert_eq!(
+            score_in_line, best,
+            "D20: score cp in info line ({score_in_line}) must match \
+            independently-computed depth-1 best score ({best})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D21 — set_seed resets PRNG state.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn greedy_set_seed_resets_state() {
+        const SEED: u64 = 42;
+        // KvK tied position for reliable determinism across seeds.
+        let pos = Position::from_fen("8/8/8/8/4K3/8/8/4k3 w - - 0 1").expect("KvK FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx();
+
+        // Capture the bestmove from a fresh instance.
+        let first_mv_fresh = go_greedy_no_sink(&mut GreedyMover::new(SEED), &pos, &ctx).bestmove;
+
+        // Advance a second instance 5 times, then call set_seed.
+        let mut gm = GreedyMover::new(SEED);
+        for _ in 0..5 {
+            go_greedy_no_sink(&mut gm, &pos, &ctx);
+        }
+        gm.set_seed(SEED);
+
+        let mv_after_set_seed = go_greedy_no_sink(&mut gm, &pos, &ctx).bestmove;
+        assert_eq!(
+            mv_after_set_seed, first_mv_fresh,
+            "D21: set_seed must reset state: expected {first_mv_fresh:?}, got {mv_after_set_seed:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D22 — reset() returns to seed.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn greedy_reset_returns_to_seed() {
+        const SEED: u64 = 42;
+        let pos = Position::from_fen("8/8/8/8/4K3/8/8/4k3 w - - 0 1").expect("KvK FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx();
+
+        let first_mv_fresh = go_greedy_no_sink(&mut GreedyMover::new(SEED), &pos, &ctx).bestmove;
+
+        let mut gm = GreedyMover::new(SEED);
+        for _ in 0..5 {
+            go_greedy_no_sink(&mut gm, &pos, &ctx);
+        }
+        gm.reset();
+
+        let mv_after_reset = go_greedy_no_sink(&mut gm, &pos, &ctx).bestmove;
+        assert_eq!(
+            mv_after_reset, first_mv_fresh,
+            "D22: reset must restore state to seed: expected {first_mv_fresh:?}, got {mv_after_reset:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // E1 — proptest: GreedyMover picks the move with max -evaluate(post_make).
+    // -----------------------------------------------------------------------
+
+    mod proptest_e1 {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 256,
+                ..ProptestConfig::default()
+            })]
+            /// For any reachable position with ≥1 legal move, the bestmove
+            /// GreedyMover returns must have `-evaluate(post_make)` equal to
+            /// `max(-evaluate(post_make_for_each_legal))`. Pins the depth-1
+            /// best-eval contract.
+            #[test]
+            fn prop_greedy_picks_max_score_among_legal_moves(
+                seed in 0u64..u64::MAX,
+            ) {
+                use crate::eval::evaluate;
+                use crate::movegen::{MoveList, generate_moves};
+
+                const FENS: &[&str] = &[
+                    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+                    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+                    "r2q1rk1/pP1p2pp/Q4n2/bbp1p3/Np6/1B3NBn/pPPP1PPP/R3K2R b KQ - 0 1",
+                    "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+                    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+                ];
+
+                let fen = FENS[(seed as usize) % FENS.len()];
+                let pos = Position::from_fen(fen).unwrap();
+
+                let mut ml = MoveList::new();
+                generate_moves(&pos, &mut ml);
+                prop_assume!(!ml.is_empty());
+
+                // Compute the max score across all legal moves.
+                let mut pos_clone = pos;
+                let max_score = {
+                    let mut best = i32::MIN;
+                    for mv in ml.iter() {
+                        let undo = pos_clone.make_move(mv);
+                        let score = -evaluate(&pos_clone);
+                        pos_clone.unmake_move(mv, undo);
+                        if score > best {
+                            best = score;
+                        }
+                    }
+                    best
+                };
+
+                // Ask GreedyMover for its choice.
+                let (ctx, _stop) = {
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let ctx = SearchContext {
+                        stop: Arc::clone(&stop),
+                        deadline: None,
+                        start: std::time::Instant::now(),
+                        limits: SearchLimits::default(),
+                    };
+                    (ctx, stop)
+                };
+                let result = GreedyMover::new(seed).go(&pos, &ctx, &|_| {});
+                let chosen = result.bestmove.expect("position has legal moves");
+
+                // Verify the chosen move achieves the max score.
+                let undo = pos_clone.make_move(chosen);
+                let chosen_score = -evaluate(&pos_clone);
+                pos_clone.unmake_move(chosen, undo);
+
+                prop_assert_eq!(
+                    chosen_score,
+                    max_score,
+                    "E1: greedy chose move {} with score {} but max available is {}",
+                    chosen.to_uci(),
+                    chosen_score,
+                    max_score
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // F1 — proptest: reservoir tie-break is approximately uniform.
+    // -----------------------------------------------------------------------
+
+    mod proptest_f1 {
         use super::*;
         use proptest::prelude::*;
 
@@ -653,16 +832,34 @@ mod tests {
                 cases: 8,
                 ..ProptestConfig::default()
             })]
+            /// KvK position with white king on e4: all 8 legal king moves tie
+            /// at score 0 (insufficient material). Each proptest case picks a
+            /// fresh seed and reuses one GreedyMover across M=2000 calls
+            /// (state advances sample-to-sample). Chi-square must be < 24.32
+            /// (α=0.001, df=7, 8 moves).
             #[test]
-            fn prop_random_mover_chi_square_within_tolerance_for_uniform_pick(
-                seed in any::<u64>(),
-            ) {
-                const K: usize = 20;     // legal moves from startpos
-                const M: usize = 2000;   // samples
-                // Critical value at α = 0.001, df = K−1 = 19 (NIST table).
-                const CHI2_CRIT: f64 = 43.82;
+            fn prop_reservoir_tie_break_uniform(seed in any::<u64>()) {
+                use crate::movegen::{MoveList, generate_moves};
 
-                let pos = Position::starting_position();
+                // K=8 tied moves; chi-square critical at α=0.001, df=7.
+                const K: usize = 8;
+                const M: usize = 2000;
+                const CHI2_CRIT_K8: f64 = 24.32;
+
+                let pos = Position::from_fen("8/8/8/8/4K3/8/8/4k3 w - - 0 1")
+                    .expect("KvK FEN must parse");
+
+                // Verify the position really has K legal moves.
+                let mut ml = MoveList::new();
+                generate_moves(&pos, &mut ml);
+                prop_assert_eq!(
+                    ml.len(),
+                    K,
+                    "KvK e4 must have exactly 8 king moves (got {})",
+                    ml.len()
+                );
+                let move_list: Vec<Move> = ml.iter().collect();
+
                 let (ctx, _stop) = {
                     let stop = Arc::new(AtomicBool::new(false));
                     let ctx = SearchContext {
@@ -674,136 +871,35 @@ mod tests {
                     (ctx, stop)
                 };
 
-                // Build a stable move-index map using MoveList order.
-                let mut ml = MoveList::new();
-                generate_moves(&pos, &mut ml);
-                prop_assert_eq!(
-                    ml.len(),
-                    K,
-                    "startpos must have exactly 20 legal moves (got {})",
-                    ml.len()
-                );
-                let move_list: Vec<Move> = ml.iter().collect();
-
                 let mut counts = vec![0u64; K];
-                let mut rm = RandomMover::new(seed);
+                let mut gm = GreedyMover::new(seed);
 
                 for _ in 0..M {
-                    let mv = rm.go(&pos, &ctx, &|_| {})
+                    let mv = gm.go(&pos, &ctx, &|_| {})
                         .bestmove
-                        .expect("startpos always has legal moves");
+                        .expect("KvK always has moves");
                     let idx = move_list
                         .iter()
                         .position(|&m| m == mv)
-                        .expect("bestmove must be in the MoveList");
+                        .expect("bestmove must be in the move list");
                     counts[idx] += 1;
                 }
 
                 let expected = M as f64 / K as f64;
-                let chi2: f64 = counts.iter().map(|&c| {
-                    let diff = c as f64 - expected;
-                    diff * diff / expected
-                }).sum();
+                let chi2: f64 = counts
+                    .iter()
+                    .map(|&c| {
+                        let diff = c as f64 - expected;
+                        diff * diff / expected
+                    })
+                    .sum();
 
                 prop_assert!(
-                    chi2 < CHI2_CRIT,
-                    "seed {seed}: chi-square {chi2:.2} >= {CHI2_CRIT} (α=0.001, df=19); counts={counts:?}"
+                    chi2 < CHI2_CRIT_K8,
+                    "F1: seed {seed}: chi-square {chi2:.2} >= {CHI2_CRIT_K8} (α=0.001, df=7); \
+                    counts={counts:?}"
                 );
             }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Seed-pair finder (documentation / one-off helper).
-    // -----------------------------------------------------------------------
-
-    /// Helper: run RandomMover::go from startpos with the given seed and no
-    /// restrictions, returning the bestmove UCI string.
-    fn bestmove_from_startpos(seed: u64) -> Option<String> {
-        let pos = Position::starting_position();
-        let (ctx, _stop) = non_aborting_ctx();
-        let result = RandomMover::new(seed).go(&pos, &ctx, &|_| {});
-        result.bestmove.map(|m| m.to_uci())
-    }
-
-    /// Find the first seed that terminates (reaches checkmate or stalemate)
-    /// within 500 ply of startpos self-play. Used for E36 anchor calibration.
-    /// Gated #[ignore] — run manually; leave in place as documentation.
-    #[test]
-    #[ignore]
-    fn find_terminating_seed_for_e36() {
-        use crate::movegen::{MoveList, generate_moves};
-        let max_ply = 500usize;
-
-        for seed in 0u64..200 {
-            let mut rm = RandomMover::new(seed);
-            let mut pos = Position::starting_position();
-            let stop = Arc::new(AtomicBool::new(false));
-
-            let mut terminated = false;
-            let mut final_ply = 0usize;
-            let mut final_mv = String::new();
-
-            for ply in 0..max_ply {
-                let mut ml = MoveList::new();
-                generate_moves(&pos, &mut ml);
-                if ml.is_empty() {
-                    final_ply = ply;
-                    terminated = true;
-                    break;
-                }
-                let ctx = SearchContext {
-                    stop: Arc::clone(&stop),
-                    deadline: None,
-                    start: std::time::Instant::now(),
-                    limits: SearchLimits::default(),
-                };
-                let result = rm.go(&pos, &ctx, &|_| {});
-                let mv = result.bestmove.expect("must have bestmove");
-                final_mv = mv.to_uci();
-                pos.make_move(mv);
-            }
-
-            if terminated {
-                println!("FOUND: seed={seed} final_ply={final_ply} last_bestmove={final_mv:?}");
-                return;
-            } else {
-                println!("seed={seed}: cycled at {max_ply} ply");
-            }
-        }
-        println!("No terminating seed found in 0..200");
-    }
-
-    /// One-off seed-pair finder for plan §B.2.e. Gated #[ignore] — run
-    /// manually during Phase 1 to capture SEED_A / SEED_B, then leave in
-    /// place as documentation.
-    #[test]
-    #[ignore]
-    fn find_seed_pair_for_b2e() {
-        let mut found: Option<(u64, u64, String, String)> = None;
-        let mut cache: Vec<String> = Vec::new();
-        for s in 0u64..1000 {
-            let mv = bestmove_from_startpos(s).expect("startpos always has legal moves");
-            cache.push(mv);
-        }
-        'outer: for s_a in 0u64..1000 {
-            for s_b in (s_a + 1)..1000 {
-                if cache[s_a as usize] != cache[s_b as usize] {
-                    found = Some((
-                        s_a,
-                        s_b,
-                        cache[s_a as usize].clone(),
-                        cache[s_b as usize].clone(),
-                    ));
-                    break 'outer;
-                }
-            }
-        }
-        match found {
-            Some((a, b, mv_a, mv_b)) => {
-                println!("SEED_A={a} bestmove={mv_a}  SEED_B={b} bestmove={mv_b}");
-            }
-            None => println!("No differing pair found in 0..1000"),
         }
     }
 }

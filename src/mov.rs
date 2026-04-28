@@ -402,7 +402,8 @@ impl fmt::Debug for Move {
 // ---------------------------------------------------------------------------
 
 /// Reversal token for a previous `make_move` call. Carries the minimum
-/// state to undo the change byte-for-byte. ~16 bytes after alignment.
+/// state to undo the change byte-for-byte. ~24 bytes after alignment
+/// (adding `prior_static_eval: i32` to the M1.E ~16 B layout).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Undo {
     /// Piece removed from the board, or `None` for non-captures. For en
@@ -414,6 +415,9 @@ pub struct Undo {
     pub prior_ep: Option<Square>,
     pub prior_halfmove: u8,
     pub prior_zobrist: u64,
+    /// Combined material + PST score from White's perspective, before `make_move`
+    /// applied its delta. Restored by `unmake_move` via `refresh_static_eval_from`.
+    pub prior_static_eval: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +524,7 @@ pub fn make_move(pos: &mut Position, mv: Move) -> Undo {
         prior_ep: pos.ep_target(),
         prior_halfmove: pos.halfmove_clock(),
         prior_zobrist: pos.zobrist(),
+        prior_static_eval: pos.static_eval_white(),
     };
 
     // Stash prior position's EP-key contribution before mutation. The
@@ -623,10 +628,14 @@ pub fn make_move(pos: &mut Position, mv: Move) -> Undo {
         new_castling,
     );
 
+    // ----- Incremental static eval -----
+    update_static_eval_after_make(pos, mv, mover, captured, capture_sq);
+
     // ----- Debug assertions -----
     // `from_scratch` runs in debug only; the release path trusts the
     // incremental delta exclusively (validated by the always-on
-    // `make_move_no_from_scratch_in_release` perf sentinel).
+    // `make_move_no_from_scratch_in_release` and
+    // `make_move_no_eval_recompute_in_release` perf sentinels).
     #[cfg(debug_assertions)]
     {
         pos.debug_assert_consistent();
@@ -634,6 +643,11 @@ pub fn make_move(pos: &mut Position, mv: Move) -> Undo {
             pos.zobrist(),
             zobrist::from_scratch(pos),
             "incremental zobrist diverged after make_move {mv:?}",
+        );
+        debug_assert_eq!(
+            pos.static_eval_white(),
+            crate::eval::eval_white_from_scratch(pos),
+            "incremental static_eval diverged after make_move {mv:?}",
         );
     }
 
@@ -740,6 +754,9 @@ pub fn unmake_move(pos: &mut Position, mv: Move, undo: Undo) {
     // is structural: we wrote prior_zobrist into Undo at make-time.
     pos.refresh_zobrist_from(undo.prior_zobrist);
 
+    // Restore static_eval directly from undo (same structural guarantee).
+    pos.refresh_static_eval_from(undo.prior_static_eval);
+
     #[cfg(debug_assertions)]
     {
         pos.debug_assert_consistent();
@@ -747,6 +764,11 @@ pub fn unmake_move(pos: &mut Position, mv: Move, undo: Undo) {
             pos.zobrist(),
             zobrist::from_scratch(pos),
             "unmake restored zobrist disagrees with from_scratch",
+        );
+        debug_assert_eq!(
+            pos.static_eval_white(),
+            crate::eval::eval_white_from_scratch(pos),
+            "unmake restored static_eval disagrees with from_scratch",
         );
     }
 }
@@ -835,6 +857,81 @@ fn update_zobrist_after_make(
     z ^= zobrist::turn_key();
 
     pos.refresh_zobrist_from(z);
+}
+
+/// Apply the incremental static-eval delta after `make_move` has completed
+/// all bitboard/mailbox/aux-state mutations. Called after
+/// `update_zobrist_after_make` so the position state is fully consistent.
+///
+/// Reads `pos.static_eval_white()` as the starting value, computes the delta
+/// per plan §7's six flag arms, and writes the result via
+/// `pos.refresh_static_eval_from`. The caller (make_move) follows this with a
+/// debug-build round-trip assert against `eval_white_from_scratch`.
+fn update_static_eval_after_make(
+    pos: &mut Position,
+    mv: Move,
+    mover: Piece,
+    captured: Option<Piece>,
+    capture_sq: Square,
+) {
+    use crate::eval::PSQT;
+
+    let from = mv.from_square();
+    let to = mv.to_square();
+    let flag = mv.flag();
+    // Take colors from the `mover` parameter — order-agnostic at the call
+    // boundary (mirrors update_zobrist_after_make's discipline).
+    let us = mover.color;
+    let them = us.flip();
+
+    let start = pos.static_eval_white();
+
+    let delta = match flag {
+        MoveFlag::Quiet | MoveFlag::DoublePush => {
+            PSQT[us as usize][mover.kind.index()][to.index() as usize]
+                - PSQT[us as usize][mover.kind.index()][from.index() as usize]
+        }
+        MoveFlag::Capture => {
+            let victim = captured.expect("capture flag has victim");
+            PSQT[us as usize][mover.kind.index()][to.index() as usize]
+                - PSQT[us as usize][mover.kind.index()][from.index() as usize]
+                - PSQT[them as usize][victim.kind.index()][capture_sq.index() as usize]
+        }
+        MoveFlag::EnPassant => {
+            // capture_sq is the square of the captured pawn (≠ to).
+            let victim = captured.expect("EP has captured pawn");
+            PSQT[us as usize][PieceKind::Pawn.index()][to.index() as usize]
+                - PSQT[us as usize][PieceKind::Pawn.index()][from.index() as usize]
+                - PSQT[them as usize][victim.kind.index()][capture_sq.index() as usize]
+        }
+        MoveFlag::KingCastle | MoveFlag::QueenCastle => {
+            let (rook_from, rook_to) = castle_rook_squares(us, flag);
+            PSQT[us as usize][PieceKind::King.index()][to.index() as usize]
+                - PSQT[us as usize][PieceKind::King.index()][from.index() as usize]
+                + PSQT[us as usize][PieceKind::Rook.index()][rook_to.index() as usize]
+                - PSQT[us as usize][PieceKind::Rook.index()][rook_from.index() as usize]
+        }
+        MoveFlag::KnightPromo
+        | MoveFlag::BishopPromo
+        | MoveFlag::RookPromo
+        | MoveFlag::QueenPromo => {
+            let promo_kind = mv.promotion_kind().expect("promo flag has kind");
+            PSQT[us as usize][promo_kind.index()][to.index() as usize]
+                - PSQT[us as usize][PieceKind::Pawn.index()][from.index() as usize]
+        }
+        MoveFlag::KnightPromoCapture
+        | MoveFlag::BishopPromoCapture
+        | MoveFlag::RookPromoCapture
+        | MoveFlag::QueenPromoCapture => {
+            let promo_kind = mv.promotion_kind().expect("promo-capture flag has kind");
+            let victim = captured.expect("promo-capture flag has victim");
+            PSQT[us as usize][promo_kind.index()][to.index() as usize]
+                - PSQT[us as usize][PieceKind::Pawn.index()][from.index() as usize]
+                - PSQT[them as usize][victim.kind.index()][capture_sq.index() as usize]
+        }
+    };
+
+    pos.refresh_static_eval_from(start + delta);
 }
 
 // ===========================================================================
@@ -2019,12 +2116,15 @@ mod tests {
     }
 
     /// Always-on release-build perf sentinel. Compiled out in debug builds
-    /// (where the round-trip assert against `from_scratch` adds 50–100ns
+    /// (where the round-trip asserts against `from_scratch` add 50–100ns
     /// per call and would skew the threshold). In release, runs 1M
     /// (make, unmake) cycles on a quiet pawn push and asserts elapsed time
-    /// is below a generous threshold. A reintroduced from-scratch call on
-    /// the release path (~50 ns/op overhead = ~5–10× slowdown) would push
-    /// past this threshold and fail.
+    /// is below a generous threshold.
+    ///
+    /// Catches both accidental from-scratch reintroductions: the M1.E
+    /// `zobrist::from_scratch` (~50 ns/op) and the M3.A
+    /// `eval::eval_white_from_scratch` (~30–40 ns/op). Either would push
+    /// past 100 ns/cycle.
     ///
     /// Run via `cargo test --release` (no filter). The plan's Verification
     /// step 5 invokes this.
@@ -2749,5 +2849,354 @@ mod tests {
         // `Box<dyn Error>` downstream in M2.B/C.
         fn assert_error<E: std::error::Error>(_: &E) {}
         assert_error(&UciMoveError::Malformed);
+    }
+
+    // ===========================================================================
+    // M3.A — incremental static_eval tests (C1–C4). See `docs/plans/m3.a.md` §C.
+    //
+    // These tests verify that `pos.static_eval_white()` is maintained correctly
+    // by `make_move` / `unmake_move` — analogous to the M1.E Zobrist round-trip
+    // tests.
+    // ===========================================================================
+
+    // -----------------------------------------------------------------------
+    // C1 — after make_move, static_eval_white matches eval_white_from_scratch.
+    // -----------------------------------------------------------------------
+
+    /// For each flag category, after `make_move`, `pos.static_eval_white()`
+    /// must equal `eval::eval_white_from_scratch(&pos)`. One position per
+    /// flag category:
+    ///   Quiet, DoublePush, Capture, EnPassant, KingCastle, QueenCastle,
+    ///   KnightPromo, BishopPromo, RookPromo, QueenPromo,
+    ///   KnightPromoCapture, BishopPromoCapture, RookPromoCapture, QueenPromoCapture.
+    #[test]
+    fn static_eval_after_make_matches_from_scratch_anchor() {
+        struct C1Case {
+            fen: &'static str,
+            mv: Move,
+            label: &'static str,
+        }
+        let cases: &[C1Case] = &[
+            // Quiet pawn push.
+            C1Case {
+                fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                mv: Move::quiet(Square::E2, Square::E3),
+                label: "quiet",
+            },
+            // Double pawn push.
+            C1Case {
+                fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                mv: Move::new(Square::E2, Square::E4, MoveFlag::DoublePush),
+                label: "double_push",
+            },
+            // Capture: white d4 captures black e5 pawn.
+            C1Case {
+                fen: "rnbqkbnr/pppp1ppp/8/4p3/3P4/8/PPP1PPPP/RNBQKBNR w KQkq e6 0 2",
+                mv: Move::capture(Square::D4, Square::E5),
+                label: "capture",
+            },
+            // En passant: position after 1.e4 d5 2.e5 f5; white plays exf6 EP.
+            C1Case {
+                fen: "rnbqkbnr/ppppp1pp/8/4Pp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+                mv: Move::new(Square::E5, Square::F6, MoveFlag::EnPassant),
+                label: "en_passant",
+            },
+            // King-side castle.
+            C1Case {
+                fen: "4k3/8/8/8/8/8/8/4K2R w K - 0 1",
+                mv: Move::new(Square::E1, Square::G1, MoveFlag::KingCastle),
+                label: "castle_king",
+            },
+            // Queen-side castle.
+            C1Case {
+                fen: "4k3/8/8/8/8/8/8/R3K3 w Q - 0 1",
+                mv: Move::new(Square::E1, Square::C1, MoveFlag::QueenCastle),
+                label: "castle_queen",
+            },
+            // Knight promotion (no capture).
+            C1Case {
+                fen: "8/4P3/8/8/8/8/4k3/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::E8, MoveFlag::KnightPromo),
+                label: "knight_promo",
+            },
+            // Bishop promotion (no capture).
+            C1Case {
+                fen: "8/4P3/8/8/8/8/4k3/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::E8, MoveFlag::BishopPromo),
+                label: "bishop_promo",
+            },
+            // Rook promotion (no capture).
+            C1Case {
+                fen: "8/4P3/8/8/8/8/4k3/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::E8, MoveFlag::RookPromo),
+                label: "rook_promo",
+            },
+            // Queen promotion (no capture).
+            C1Case {
+                fen: "8/4P3/8/8/8/8/4k3/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::E8, MoveFlag::QueenPromo),
+                label: "queen_promo",
+            },
+            // Knight promo-capture.
+            C1Case {
+                fen: "4kn2/4P3/8/8/8/8/8/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::F8, MoveFlag::KnightPromoCapture),
+                label: "knight_promo_capture",
+            },
+            // Bishop promo-capture: white pawn e7 captures black knight on f8, promotes to bishop.
+            C1Case {
+                fen: "4kn2/4P3/8/8/8/8/8/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::F8, MoveFlag::BishopPromoCapture),
+                label: "bishop_promo_capture",
+            },
+            // Rook promo-capture: white pawn e7 captures black knight on f8, promotes to rook.
+            C1Case {
+                fen: "4kn2/4P3/8/8/8/8/8/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::F8, MoveFlag::RookPromoCapture),
+                label: "rook_promo_capture",
+            },
+            // Queen promo-capture.
+            C1Case {
+                fen: "4kn2/4P3/8/8/8/8/8/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::F8, MoveFlag::QueenPromoCapture),
+                label: "queen_promo_capture",
+            },
+        ];
+
+        for c in cases {
+            let mut pos = Position::from_fen(c.fen)
+                .unwrap_or_else(|e| panic!("C1 FEN failed for '{}': {e:?}", c.label));
+            let _undo = make_move(&mut pos, c.mv);
+            let incremental = pos.static_eval_white();
+            let from_scratch = crate::eval::eval_white_from_scratch(&pos);
+            assert_eq!(
+                incremental, from_scratch,
+                "C1 '{}': static_eval_white()={} != eval_white_from_scratch()={}",
+                c.label, incremental, from_scratch,
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // C2 — after make+unmake, static_eval_white is restored.
+    // -----------------------------------------------------------------------
+
+    /// For each flag category from C1, after `make_move` then `unmake_move`,
+    /// `static_eval_white()` must equal the pre-make value. Covers all 14
+    /// MoveFlag variants: Quiet, DoublePush, KingCastle, QueenCastle, Capture,
+    /// EnPassant, KnightPromo, BishopPromo, RookPromo, QueenPromo,
+    /// KnightPromoCapture, BishopPromoCapture, RookPromoCapture, QueenPromoCapture.
+    #[test]
+    fn static_eval_round_trip_after_make_unmake() {
+        // Reuse the same case table as C1.
+        struct C2Case {
+            fen: &'static str,
+            mv: Move,
+            label: &'static str,
+        }
+        let cases: &[C2Case] = &[
+            C2Case {
+                fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                mv: Move::quiet(Square::E2, Square::E3),
+                label: "quiet",
+            },
+            C2Case {
+                fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                mv: Move::new(Square::E2, Square::E4, MoveFlag::DoublePush),
+                label: "double_push",
+            },
+            C2Case {
+                fen: "rnbqkbnr/pppp1ppp/8/4p3/3P4/8/PPP1PPPP/RNBQKBNR w KQkq e6 0 2",
+                mv: Move::capture(Square::D4, Square::E5),
+                label: "capture",
+            },
+            C2Case {
+                fen: "rnbqkbnr/ppppp1pp/8/4Pp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+                mv: Move::new(Square::E5, Square::F6, MoveFlag::EnPassant),
+                label: "en_passant",
+            },
+            C2Case {
+                fen: "4k3/8/8/8/8/8/8/4K2R w K - 0 1",
+                mv: Move::new(Square::E1, Square::G1, MoveFlag::KingCastle),
+                label: "castle_king",
+            },
+            C2Case {
+                fen: "4k3/8/8/8/8/8/8/R3K3 w Q - 0 1",
+                mv: Move::new(Square::E1, Square::C1, MoveFlag::QueenCastle),
+                label: "castle_queen",
+            },
+            C2Case {
+                fen: "8/4P3/8/8/8/8/4k3/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::E8, MoveFlag::KnightPromo),
+                label: "knight_promo",
+            },
+            C2Case {
+                fen: "8/4P3/8/8/8/8/4k3/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::E8, MoveFlag::BishopPromo),
+                label: "bishop_promo",
+            },
+            C2Case {
+                fen: "8/4P3/8/8/8/8/4k3/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::E8, MoveFlag::RookPromo),
+                label: "rook_promo",
+            },
+            C2Case {
+                fen: "8/4P3/8/8/8/8/4k3/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::E8, MoveFlag::QueenPromo),
+                label: "queen_promo",
+            },
+            C2Case {
+                fen: "4kn2/4P3/8/8/8/8/8/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::F8, MoveFlag::KnightPromoCapture),
+                label: "knight_promo_capture",
+            },
+            // Bishop promo-capture: white pawn e7 captures black knight on f8, promotes to bishop.
+            C2Case {
+                fen: "4kn2/4P3/8/8/8/8/8/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::F8, MoveFlag::BishopPromoCapture),
+                label: "bishop_promo_capture",
+            },
+            // Rook promo-capture: white pawn e7 captures black knight on f8, promotes to rook.
+            C2Case {
+                fen: "4kn2/4P3/8/8/8/8/8/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::F8, MoveFlag::RookPromoCapture),
+                label: "rook_promo_capture",
+            },
+            C2Case {
+                fen: "4kn2/4P3/8/8/8/8/8/4K3 w - - 0 1",
+                mv: Move::new(Square::E7, Square::F8, MoveFlag::QueenPromoCapture),
+                label: "queen_promo_capture",
+            },
+        ];
+
+        for c in cases {
+            let mut pos = Position::from_fen(c.fen)
+                .unwrap_or_else(|e| panic!("C2 FEN failed for '{}': {e:?}", c.label));
+            let before = pos.static_eval_white();
+            let undo = make_move(&mut pos, c.mv);
+            unmake_move(&mut pos, c.mv, undo);
+            let after = pos.static_eval_white();
+            assert_eq!(
+                after, before,
+                "C2 '{}': static_eval_white not restored: before={before}, after={after}",
+                c.label,
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // C3 — proptest: random walk then unwind restores static_eval_white.
+    // -----------------------------------------------------------------------
+
+    // Walk 4 plies from each UCI_SEED_FEN using SplitMix64 for move
+    // selection, stack the (mv, undo) pairs, unwind via stack-pop unmake,
+    // assert `static_eval_white` after full unwind equals the initial value.
+    // Cases: 256. SplitMix64 is re-implemented inline to keep mov.rs tests
+    // self-contained.
+    proptest! {
+        #[test]
+        fn prop_static_eval_round_trip_random_walk(seed in 0u64..u64::MAX) {
+            const UCI_SEED_FENS: &[&str] = &[
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+                "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+                "r2q1rk1/pP1p2pp/Q4n2/bbp1p3/Np6/1B3NBn/pPPP1PPP/R3K2R b KQ - 0 1",
+                "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+                "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+            ];
+
+            let fen_idx = (seed as usize) % UCI_SEED_FENS.len();
+            let mut pos = Position::from_fen(UCI_SEED_FENS[fen_idx]).unwrap();
+            let initial_eval = pos.static_eval_white();
+
+            let mut state = seed;
+            let mut stack: Vec<(Move, Undo)> = Vec::with_capacity(4);
+
+            for _ in 0..4 {
+                let mut ml = crate::movegen::MoveList::new();
+                crate::movegen::generate_moves(&pos, &mut ml);
+                if ml.is_empty() {
+                    break;
+                }
+                // One SplitMix64 step for move selection.
+                state = state.wrapping_add(0x9E3779B97F4A7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z = z ^ (z >> 31);
+                let mv = ml.as_slice()[(z as usize) % ml.len()];
+                let undo = make_move(&mut pos, mv);
+                stack.push((mv, undo));
+            }
+
+            // Unwind.
+            while let Some((mv, undo)) = stack.pop() {
+                unmake_move(&mut pos, mv, undo);
+            }
+
+            let final_eval = pos.static_eval_white();
+            prop_assert_eq!(
+                final_eval,
+                initial_eval,
+                "C3: static_eval_white not restored after random walk + full unwind \
+                (initial={}, got={})",
+                initial_eval,
+                final_eval,
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // C4 — proptest: after make_move, static_eval_white matches from_scratch.
+    // -----------------------------------------------------------------------
+
+    // Walk 4 plies; at each ply, assert static_eval_white() == eval_white_from_scratch(&pos).
+    // Cases: 256.
+    proptest! {
+        #[test]
+        fn prop_static_eval_matches_from_scratch_after_make(seed in 0u64..u64::MAX) {
+            const UCI_SEED_FENS: &[&str] = &[
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+                "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+                "r2q1rk1/pP1p2pp/Q4n2/bbp1p3/Np6/1B3NBn/pPPP1PPP/R3K2R b KQ - 0 1",
+                "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+                "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+            ];
+
+            let fen_idx = (seed as usize) % UCI_SEED_FENS.len();
+            let mut pos = Position::from_fen(UCI_SEED_FENS[fen_idx]).unwrap();
+
+            let mut state = seed;
+            let mut stack: Vec<(Move, Undo)> = Vec::with_capacity(4);
+
+            for _ in 0..4 {
+                let mut ml = crate::movegen::MoveList::new();
+                crate::movegen::generate_moves(&pos, &mut ml);
+                if ml.is_empty() {
+                    break;
+                }
+                state = state.wrapping_add(0x9E3779B97F4A7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z = z ^ (z >> 31);
+                let mv = ml.as_slice()[(z as usize) % ml.len()];
+                let undo = make_move(&mut pos, mv);
+                stack.push((mv, undo));
+
+                let incremental = pos.static_eval_white();
+                let from_scratch = crate::eval::eval_white_from_scratch(&pos);
+                let depth = stack.len();
+                prop_assert_eq!(
+                    incremental,
+                    from_scratch,
+                    "C4: static_eval_white()={} != eval_white_from_scratch()={} after {} plies",
+                    incremental,
+                    from_scratch,
+                    depth,
+                );
+            }
+        }
     }
 }

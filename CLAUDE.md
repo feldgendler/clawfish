@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M2 complete; M3 next — alpha-beta + material eval.** Architectural commitments settled (see `docs/decisions/`).
+**Phase: M3.A complete; M3.B next — game-history + draw-detection plumbing.** Architectural commitments settled (see `docs/decisions/`).
 
 - M1: complete through M1.G (perft + criterion benchmark harness; 119 Mnps bulk on starting D4).
 - M2.A: complete — `Move::to_uci` + `Move::from_uci` + `UciMoveError`. Generate-and-match parsing strategy; null move `0000` rejected as `NullMove`; strict lowercase input. No new ADR.
@@ -14,6 +14,59 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 - M2.C: complete — `engine` + `search` modules: `Engine<W, S>` orchestrator + reader thread + per-`go` worker + `Arc<AtomicBool>` cancellation per **ADR-0011**. `Search` trait + `SearchContext` + `Stub` impl. End-to-end exercisable: `printf 'uci\nquit\n' | target/release/chess` produces `id name chess 0.1.0 / id author Alex Feldgendler / uciok`.
 - M2.D: complete — `RandomMover` SplitMix64-seeded random-mover replaces `Stub`. First real UCI option: `Random_Seed` (`type spin default 0 min 0 max 2147483647`). `Search` trait extended with `set_seed` / `reset` lifecycle hooks. New `Engine::join_in_flight_worker` helper unifies the stop+join sequence used by `handle_go`, `handle_ucinewgame`, and `handle_setoption`'s success arm — closes a deadlock under in-flight `go infinite`. End-to-end self-play game terminates legally with the embedded seed (E36). No new ADR.
 - M2.E: complete — `scripts/install-fastchess.sh` + `scripts/match.sh` (three subcommands: `compliance` / `self-play` / `vs-stockfish`) + **ADR-0012**. `RandomMover::go` info-line emission added (`info depth 0 score cp 0 nodes 1 time <ms> pv <move>`) to close `--compliance` Step 12. E37 + E33 amendment in `tests/uci_integration.rs`. fastchess `--compliance` 40/40 pass; 4 smoke games (2 self-play + 2 vs-Stockfish) all `[Termination "normal"]`, zero illegal moves, zero stalled connections. M2 exit criterion met.
+- M3.A: complete — `eval` module + `GreedyMover` Search impl. PeSTO middlegame material + PST tables vendored verbatim (split into `src/eval/data.rs` for cargo-mutants exclusion). `Position::static_eval_white: i32` field maintained incrementally by `make_move` / `unmake_move` per **ADR-0014**, mirroring the M1.E Zobrist pattern (debug round-trip assert + release perf sentinel). Insufficient-material draw detection (KvK / KvN / KvB → 0) lives in `evaluate`. `RandomMover` deleted; `GreedyMover` becomes production search. `score cp` now real (e.g. `info depth 1 score cp 36 ... pv g1f3` from startpos), not M2.D's placeholder 0. Self-play smoke shifts from random shuffles (343/450 ply) to material-greedy blunders (20/20 ply by resign adjudication). vs-Stockfish-1320: chess loses both at 37 / 41 ply. fastchess `--compliance` 40/40, 0 illegal moves, 0 stalled connections. 615 lib tests, 644 total. mutation 0 missed.
+
+### What M3.A landed
+
+The first `Search` impl that *evaluates* — depth-1 best-eval replaces uniform random as production search:
+
+- **`src/eval.rs`** — `pub fn evaluate(&Position) -> i32` (side-to-move-relative centipawn score). Insufficient-material override returns 0 for KvK / KvN / KvB; otherwise reads `Position::static_eval_white()` and flips for Black. `pub(crate) fn eval_white_from_scratch(&Position) -> i32` for from-scratch recomputation (debug round-trip assert + parse-time initialization).
+- **`src/eval/data.rs`** (NEW separate file) — vendored PeSTO middlegame data: `MATERIAL[6] = [82, 337, 365, 477, 1025, 0]` plus six `MG_*_PST: [i32; 64]` arrays. File-level cargo-mutants exclusion mirrors the `src/magic/constants.rs` precedent for vendored constants.
+- **`PSQT[2][6][64]`** — compile-time const built via `const fn build_psqt()` in `src/eval.rs`. Indexed by `[color_idx][kind_idx][sq_idx]`. White lookup `+(MATERIAL[kind] + MG_PST[kind][sq ^ 56])`; Black lookup `-(MATERIAL[kind] + MG_PST[kind][sq])`. The `s ^ 56` flip converts our LERF index (a1 = 0) to PeSTO's a8-origin array index. Logic-side mutations on `build_psqt` and `evaluate` are exercised by mutation testing; the data tables are excluded.
+- **`Position::static_eval_white: i32` field** — combined material + PST score from White's perspective. Maintained incrementally by `make_move` / `unmake_move`. Initialized via `refresh_static_eval()` (analog of `refresh_zobrist`) in `Position::starting_position()` and after FEN parse. `pub(crate)` accessor; field is private. `Copy + PartialEq + Eq` derives stay valid (i32 is Copy; field is invariant-derived).
+- **`Undo::prior_static_eval: i32`** — captured by `make_move` before any mutation; restored by `unmake_move` directly via `refresh_static_eval_from`. `Undo` grows from 16 B → 24 B with alignment.
+- **`update_static_eval_after_make` private helper** — order-agnostic (takes `mover: Piece` by value; uses `mover.color`, not `pos.side_to_move()`). Six flag-arm deltas mirror the `update_zobrist_after_make` shape: Quiet/DoublePush, Capture, EnPassant (uses `capture_sq`, not `to`), KingCastle/QueenCastle (king + rook), four `*Promo` (uses `promo_kind`), four `*PromoCapture`.
+- **Debug round-trip assert** — both `make_move` and `unmake_move` debug-assert `pos.static_eval_white() == eval::eval_white_from_scratch(pos)` after the delta. Release builds trust the delta; `make_move_no_from_scratch_in_release` perf sentinel covers both invariants (zobrist + eval) at ≤100 ns/cycle.
+- **`GreedyMover` in `src/search.rs`** — replaces `RandomMover`. Algorithm per ADR-0014 / plan §10.1: enumerate legal moves, score each via `-evaluate(post_make)` (negate for mover's perspective), pick max via reservoir sampling (one SplitMix64 step per tied move; uniform over the tied set). ONE `pos_clone` mutated in place via make/unmake (single clone, then unmade per iteration; debug-build round-trip asserts run on each step). Honors `infinite` / `movetime` / `ponder` via 1 ms-cadence wait loop. Inherits `set_seed` / `reset` lifecycle from M2.D.
+- **`info` line emitted BEFORE wait loop** — at the moment depth-1 search completes, not after cancellation. Real `score cp` (e.g. `info depth 1 score cp 36 nodes 20 time 0 pv g1f3` from startpos) replaces M2.D's placeholder `cp 0`. Empty `searchmoves` filter / mate / stalemate emit `info depth 0 score cp 0 nodes 0 ... pv 0000` and return `bestmove 0000`.
+- **`RandomMover` deleted entirely** — struct, impl, M2.D-only tests (D2–D10, D12), `find_seed_pair_for_b2e` / `find_terminating_seed_for_e36` helpers all gone. `splitmix64_next` survives under `GreedyMover` ownership; D1 SplitMix64 reference test + D11 `should_abort` test stay verbatim.
+- **`Random_Seed` UCI option preserved** — same min/max/default/case-insensitive parse. Now drives `GreedyMover`'s tie-break PRNG.
+- **Engine plumbing** — `run_stdio()` builds `Engine::new(io::stdout(), GreedyMover::new(0))`. Two `engine.rs::tests` (`handle_setoption_random_seed_changes_future_bestmoves_but_not_past_ones` and `..._case_insensitive_and_boundary`) had to be rewritten to use a KvK-with-ties FEN — the original tests asserted "different seeds give different bestmoves from startpos", but PeSTO eval makes `g1f3` the unique best move from startpos. KvK exposes the reservoir-sampling code path (all 8 white-king moves tie at 0).
+- **E36 deleted; E38 added** to `tests/uci_integration.rs` — pinned at `SELF_PLAY_SEED = 0`, `EXPECTED_FINAL_PLY = 116`, `EXPECTED_LAST_BESTMOVE = "f2f3"`. GreedyMover terminates faster than RandomMover (active material capture, not random shuffles).
+- **`scripts/match.sh` header strings** updated RandomMover → GreedyMover. `-draw` adjudication still deliberately omitted (depth-1 scores too noisy to base draw heuristic on; future M3.C alpha-beta with iterative deepening will revisit).
+
+### M3.A — implementation highlights
+
+- **PSQT layout split decision.** Plan committed to a precomputed `PSQT[color][kind][square]` table built at compile time via `const fn build_psqt()`, eliminating per-eval branches on color and on the LERF↔PeSTO rank-flip. Logic stays in `src/eval.rs`; vendored data lives in `src/eval/data.rs`.
+- **Combined material+PST single field, not separate.** Per plan §5.1: one delta-update site, one source of truth, eliminates dual-source-of-truth drift risk. M1.E's Zobrist field is precedent.
+- **Combined static-eval as the NNUE hook (ADR-0004 extension).** When NNUE arrives at M9, the PSQT-based incremental update slots out for the accumulator update; signature stays. Exactly the discrete-function shape the make/unmake API was designed for.
+- **`evaluate`'s insufficient-material short-circuit** is local — relies on `validate_post_parse` having ensured exactly 2 kings; total_count == 3 then implies exactly one non-king piece, so the `knight_count == 1 || bishop_count == 1` test is sufficient. Same-color KBvKB deferred to M6.
+- **Mutation-testing data exclusion.** First plan-review pass surfaced that ~185 `delete -` mutants would survive on PeSTO PST literals (B1 PSQT-symmetry test is structurally invariant under sign flips that affect both color sides). Final-review pass 1 confirmed empirically. Resolution: split the vendored data into `src/eval/data.rs` + file-level `exclude_globs` (matching `src/magic/constants.rs`). Final-review pass 3 verified: 82 mutants in scope (down from 265), 0 missed, 71 caught, 1 timeout (effective catch on `delete ! in GreedyMover::go`'s wait-loop guard), 10 unviable (compile-failure mutants).
+- **`info` line emitted BEFORE the wait loop.** M2.D emitted post-wait because the score was always 0. With real depth-1 evaluation, GUIs watching `info score cp` to track engine eval should see it the moment search decides — not after cancellation under `go infinite`.
+- **D17/F1 use KvK midboard FEN** (`8/8/8/8/4K3/8/8/4k3 w - - 0 1`) — all 8 white-king moves leave KvK; all 8 candidate scores tie. The first plan draft claimed startpos produces 8+ ties, but PeSTO PST values make startpos moves nearly all-distinct (e2e3 → +18, d2d3 → +13, etc.) — empirically wrong; reservoir sampling wouldn't be exercised. KvK genuinely produces 8 ties.
+- **PST anchor tests pin combined values, not bare material.** A8 = `PSQT[White][Pawn][A2] == 47` (= material 82 + MG_PAWN[E2 ^ 56 = 48] = -35); A9 = -47; A10 = `PSQT[White][King][E1] == 8` (king material is 0; PST is the entire term). These three concrete anchors plus B1 (exhaustive `PSQT[White][k][s] == -PSQT[Black][k][s ^ 56]`) plus A1 (startpos symmetric → 0) triangulate eval correctness without needing a `mirror_position` helper.
+- **Two engine tests rewritten for KvK.** With PeSTO eval making `g1f3` the unique startpos best, "seed 42 vs seed 0 gives different bestmoves" cannot fire. Switched to KvK on the orchestrator side too — same reservoir-sampling test, exposes the same PRNG-driven divergence under genuine ties.
+- **E38 final-ply / last-bestmove** captured during impl by running with placeholder values, reading the assertion failure, committing the captured constants. Same M2.D protocol as `find_terminating_seed_for_e36`.
+- **`make_move_no_from_scratch_in_release` perf sentinel** retained (single test); its docstring expanded to call out both invariants (zobrist `from_scratch` ~50 ns/op AND `eval_white_from_scratch` ~30–40 ns/op). Either reintroduction trips the same 100 ns/cycle threshold; no need for two parallel sentinels.
+- **`update_static_eval_after_make` uses `mover.color` parameter, not `pos.side_to_move()`.** Order-agnostic at the call boundary — moving the call before `set_aux_state` would silently break a `pos.side_to_move()`-derived implementation. Mirrors `update_zobrist_after_make` discipline.
+
+### M3.A — verification (Apple M4, dev machine)
+
+| Metric | Result |
+|---|---|
+| Tests | 615 lib + 5 uci-integration + 24 other = **644 fast + 4 ignored**. All passing. |
+| `cargo build --release` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo fmt --check` | clean |
+| `cargo llvm-cov --summary-only --lib` | Total **96.08% region / 96.18% line / 96.35% function**. `eval.rs`: 87.80% region / 84.92% line — gap is `cargo-llvm-cov` not instrumenting the const-fn `build_psqt` body (compile-time evaluation); the resulting PSQT data is verified by anchor tests A8/A9/A10 + symmetry B1. `mov.rs` 96.85%, `search.rs` 98.56%, `position.rs` 98.68% — no real gaps. |
+| `cargo mutants --in-diff` | 82 mutants tested (185 PST-data `delete -` mutants excluded via `src/eval/data.rs` file-level rule, mirroring `src/magic/constants.rs` precedent); **71 caught + 1 timeout (effective catch via test hang on `delete ! in GreedyMover::go`) + 10 unviable (compile-failure); 0 missed.** |
+| `scripts/match.sh compliance` | 40/40 fastchess `--compliance` steps pass ("Engine passed all compliance checks."). |
+| `scripts/match.sh self-play` | 2 games at 20 ply each, both `[Termination "adjudication"]` via `-resign movecount=3 score=600` (depth-1 blunders compound fast). 0 illegal, 0 stalled. |
+| `scripts/match.sh vs-stockfish` | 2 games vs Stockfish 18 capped at UCI_Elo=1320: game 1 `[Termination "adjudication"]` 37 ply; game 2 `[Termination "normal"]` 41 ply (sf18 mates). 0 illegal, 0 stalled. |
+| Smoke (uci) | `printf 'uci\nposition startpos\ngo movetime 50\nquit\n' \| target/release/chess` produces `info depth 1 score cp 36 nodes 20 time 0 pv g1f3` followed by `bestmove g1f3`. The `cp 36` is the real depth-1 evaluation, not M2.D's placeholder 0. |
+| Benchmark | **Skipped** — UCI dispatch is per-line; depth-1 evaluate over 30 legal moves is ~500 ns total. M3.C alpha-beta will be the first phase with a meaningful nps figure. Same precedent as M2.A–M2.E. |
+
+All three review loops converged. Plan archived at `docs/plans/m3.a.md` (3 plan-review passes). ADR-0014 codifies eval composition. Test-suite review converged in 2 passes; final review in 3 (the third pass closed the must-fix on PST-data mutation exclusion via the split-file refactor).
 
 ### What M2.E landed
 
@@ -202,11 +255,9 @@ All four loops (plan, test-suite, final code+tests, benchmark capture) converged
 
 ### What's next
 
-**M3 — Alpha-beta + material eval.** First *playing* engine. Negamax with iterative deepening, quiescence search, simple material + piece-square table eval. No transposition table yet.
+**M3.B — game-history + draw-detection plumbing.** `Engine::game_history: Vec<u64>` populated by `handle_position` (Polyglot Zobrist after every applied move) and cleared by `handle_ucinewgame`. `SearchContext::history` reference plumbed through. Helper functions `is_repetition_in_search` (single prior occurrence in search-stack counts as draw, per CPW) and `is_50_move_draw` (`halfmove_clock >= 100`). Still GreedyMover; no consumer of these helpers until M3.C alpha-beta lands.
 
-- Exit criterion (per `docs/roadmap.md`): beats the random mover ~100% via SPRT; estimated rating from self-play and a known-strength reference.
-- SPRT framework now live (M2.E shipped fastchess + ADR-0012 conventions). M3 is the first phase to actually use it for change acceptance.
-- ADRs likely to bind on M3: alpha-beta search structure, eval composition, iterative-deepening time management.
+After M3.B: M3.C (negamax + alpha-beta core) is the first phase to use the new fastchess SPRT harness for change acceptance.
 
 ## How to pick up a new session
 

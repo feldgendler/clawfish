@@ -2,7 +2,7 @@
 # fastchess smoke runner for the chess engine.
 #
 # Subcommands:
-#   self-play    2-game self-play (RandomMover seed=1 vs seed=2)
+#   self-play    2-game self-play (GreedyMover seed=1 vs seed=2)
 #   vs-stockfish 2-game match against Stockfish 18 capped at UCI_Elo=1320
 #   compliance   fastchess --compliance UCI shake-out on target/release/chess
 #
@@ -10,8 +10,9 @@
 #        MATCH_DEBUG=1 scripts/match.sh <subcommand>   (enables set -x)
 #
 # Adjudication: -maxmoves 300 -resign movecount=3 score=600
-# No -draw knob: the random mover emits no score cp, so any score-threshold
-# draw heuristic would fire trivially after movenumber plies. See ADR-0012.
+# No -draw knob: GreedyMover emits a real score cp, but game trajectories under
+# depth-1 greedy tend to be tactical; score-threshold draw filters may fire
+# too eagerly. Omitting -draw keeps smoke-game results unambiguous. See ADR-0012.
 
 set -euo pipefail
 
@@ -36,7 +37,7 @@ usage() {
     echo "Usage: scripts/match.sh <subcommand>"
     echo ""
     echo "Subcommands:"
-    echo "  self-play      2-game self-play, RandomMover seed=1 vs seed=2"
+    echo "  self-play      2-game self-play, GreedyMover seed=1 vs seed=2"
     echo "  vs-stockfish   2-game vs Stockfish 18 capped at UCI_Elo=1320"
     echo "  compliance     fastchess --compliance UCI check on target/release/chess"
 }
