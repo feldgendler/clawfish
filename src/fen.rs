@@ -294,7 +294,7 @@ fn parse_ep(s: &str) -> Result<Option<Square>, FenError> {
 /// passant capture actually exists in `p`; `None` otherwise. Inputs come
 /// straight from `parse_ep`, so `ep_sq.rank()` is guaranteed 2 or 5.
 ///
-/// The four conditions for keeping the EP target:
+/// The five conditions for keeping the EP target:
 /// 1. `ep` is `Some(_)` (no-op for `None`).
 /// 2. The side-to-move matches the EP rank's expected capturer — Black for
 ///    rank 3 (white pushed; black to capture), White for rank 6 (mirror).
@@ -303,8 +303,13 @@ fn parse_ep(s: &str) -> Result<Option<Square>, FenError> {
 ///    *beyond* the EP target (rank 4 for rank-3 EP, rank 5 for rank-6 EP).
 /// 4. At least one side-to-move pawn is adjacent to the pushed pawn —
 ///    delegated to [`ep_capturer_exists`].
+/// 5. The EP target square itself is empty — a piece on `ep_sq` blocks the
+///    capture (the would-be capturer can't land there). After a real
+///    double-push made by `make_move`, this is a tautology because the
+///    pawn passed over an empty square; the check fires only on phantom
+///    FENs where some other piece has been placed on the EP square.
 ///
-/// Failing any of (2)–(4) yields `None` (silent sanitization, no error —
+/// Failing any of (2)–(5) yields `None` (silent sanitization, no error —
 /// matches Stockfish's behavior on phantom EPs).
 fn sanitize_ep(p: &Position, side: Color, ep: Option<Square>) -> Option<Square> {
     let ep_sq = ep?;
@@ -320,6 +325,9 @@ fn sanitize_ep(p: &Position, side: Color, ep: Option<Square>) -> Option<Square> 
     let pushed_sq = Square::from_file_rank(ep_sq.file(), pawn_rank)
         .expect("ep_sq.file() in 0..8 and pawn_rank in {3,4}");
     if p.piece_at(pushed_sq) != Some(pushed) {
+        return None;
+    }
+    if p.piece_at(ep_sq).is_some() {
         return None;
     }
     if !ep_capturer_exists(p, side, ep_sq.file(), pawn_rank) {
@@ -617,6 +625,27 @@ mod tests {
         // black pawn on d4 or f4. No pseudo-legal capture exists → drop EP.
         let fen = "4k3/8/8/8/4P3/8/8/4K3 b - e3 0 1";
         let p = Position::from_fen(fen).expect("phantom EP FEN must parse");
+        assert_eq!(p.ep_target(), None);
+    }
+
+    #[test]
+    fn parse_sanitizes_ep_when_destination_obstructed_rank6() {
+        // EP=e6, white to move, black pawn on e5 (just pushed), white pawn
+        // on d5 (geometric capturer adjacent), BUT a black knight occupies
+        // e6 — the EP destination is obstructed, so no capture is possible.
+        // Stockfish 18 silently sanitizes this to `-`; we match.
+        let fen = "4k3/8/4n3/3Pp3/8/8/8/4K3 w - e6 0 1";
+        let p = Position::from_fen(fen).expect("FEN must parse");
+        assert_eq!(p.ep_target(), None);
+    }
+
+    #[test]
+    fn parse_sanitizes_ep_when_destination_obstructed_rank3() {
+        // Symmetric to the rank-6 obstructed test: EP=e3, black to move,
+        // white pawn on e4 (just pushed), black pawn on d4 (capturer), BUT
+        // a white knight occupies e3 — destination obstructed.
+        let fen = "4k3/8/8/8/3pP3/4N3/8/4K3 b - e3 0 1";
+        let p = Position::from_fen(fen).expect("FEN must parse");
         assert_eq!(p.ep_target(), None);
     }
 
