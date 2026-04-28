@@ -123,9 +123,10 @@ pub const fn turn_key() -> u64 {
 /// white to move) — see `docs/architecture.md` "FEN parsing" row. The
 /// capturer rank below is derived from `side_to_move` alone; for an
 /// undefined cross-mismatched position (e.g. `ep` on rank 3 with
-/// white-to-move, which the FEN parser allows but a real game would
-/// never produce) this function returns `None` (the wrong rank for the
-/// own pawn means no adjacency match), which is the safest outcome.
+/// white-to-move, which both the FEN parser and `make_move` now sanitize
+/// away — but a direct `set_aux_state` caller could still construct it)
+/// this function returns `None` (the wrong rank for the own pawn means
+/// no adjacency match), which is the safest outcome.
 pub fn ep_file_to_hash(pos: &Position) -> Option<u8> {
     let ep = pos.ep_target()?;
     // The relevant pawn is the side-to-move's would-be CAPTURER, not the
@@ -416,8 +417,18 @@ mod tests {
         // EP target e3 set (as if from 1.e4), black to move.  Black has no
         // pawn on rank 4 at d4 or f4, so no pseudo-legal capturer exists.
         // (Mirrors the condition in Polyglot test vector #2.)
-        let pos =
-            Position::from_fen("4k3/8/8/8/4P3/8/8/4K3 b - e3 0 1").expect("test FEN must parse");
+        //
+        // The FEN parser would phantom-EP-sanitize this position to
+        // ep_target=None (matches Stockfish), short-circuiting the
+        // "no capturer" branch we want to exercise. Construct via
+        // set_piece + set_aux_state directly so the EP target genuinely
+        // reaches `ep_file_to_hash`.
+        let mut pos = Position::empty();
+        pos.set_piece(Square::E1, Piece::new(Color::White, PieceKind::King));
+        pos.set_piece(Square::E8, Piece::new(Color::Black, PieceKind::King));
+        pos.set_piece(Square::E4, Piece::new(Color::White, PieceKind::Pawn));
+        pos.set_aux_state(Color::Black, CastlingRights::NONE, Some(Square::E3), 0, 1);
+        pos.refresh_zobrist();
         assert_eq!(ep_file_to_hash(&pos), None);
     }
 

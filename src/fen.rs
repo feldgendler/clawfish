@@ -10,6 +10,20 @@
 //!     - exactly one king per color,
 //!     - no pawns on rank 1 or 8,
 //!     - EP target square (when present) is on rank 3 or 6.
+//!
+//! **Phantom-EP sanitization (Stockfish-compatible).** A syntactically valid
+//! EP target on rank 3 or 6 is *silently cleared to `None`* unless a
+//! pseudo-legal en passant capture actually exists in the parsed position.
+//! Concretely, the EP target is kept iff: the side-to-move matches the EP
+//! rank's expected capturer (Black for rank 3, White for rank 6), the
+//! opposing pawn that supposedly just double-pushed is present on the file
+//! and rank one step beyond the EP target, and at least one side-to-move
+//! pawn sits adjacent (file ±1, same rank as the pushed pawn) to make the
+//! capture. This matches Stockfish's behavior and keeps the field in lock-
+//! step with `make_move`'s post-double-push EP — see [`ep_capturer_exists`]
+//! for the shared adjacency predicate. Round-trip is therefore *not*
+//! identity for FEN strings carrying a phantom EP: `from_fen` will drop
+//! it, and the re-formatted FEN emits `-` for that field.
 
 use std::fmt;
 
@@ -87,8 +101,9 @@ pub(crate) fn parse(s: &str) -> Result<Position, FenError> {
     // 4. Castling rights.
     let castling = parse_castling(fields[2])?;
 
-    // 5. En passant target. EP-rank check fires before set_aux_state.
-    let ep = parse_ep(fields[3])?;
+    // 5. En passant target. EP-rank check fires before set_aux_state;
+    //    phantom-EP sanitization runs after placement is known (step 8).
+    let ep_raw = parse_ep(fields[3])?;
 
     // 6. Halfmove clock. Strict-decimal: reject leading '+' (the radix
     //    parser accepts it; the spec/Reviewer-revision §C does not).
@@ -113,18 +128,23 @@ pub(crate) fn parse(s: &str) -> Result<Position, FenError> {
         return Err(FenError::BadFullmoveNumber(fields[5].to_string()));
     }
 
-    // 8. Apply auxiliary state.
+    // 8. Phantom-EP sanitization (see module docstring): drop a
+    //    syntactically valid EP target if no pseudo-legal en passant capture
+    //    actually exists in the parsed position. Stockfish-compatible.
+    let ep = sanitize_ep(&p, side, ep_raw);
+
+    // 9. Apply auxiliary state.
     p.set_aux_state(side, castling, ep, halfmove, fullmove);
 
-    // 9. Cross-field invariant: king count.
+    // 10. Cross-field invariant: king count.
     p.validate_post_parse()?;
 
-    // 10. Compute the Polyglot Zobrist hash from scratch (per ADR-0009).
+    // 11. Compute the Polyglot Zobrist hash from scratch (per ADR-0009).
     //     M1.E will switch to incremental updates inside make/unmake; the
     //     parser path stays at from-scratch.
     p.refresh_zobrist();
 
-    // 11. Compute the combined material + PST score from scratch (M3.A).
+    // 12. Compute the combined material + PST score from scratch (M3.A).
     p.refresh_static_eval();
 
     Ok(p)
@@ -270,6 +290,81 @@ fn parse_ep(s: &str) -> Result<Option<Square>, FenError> {
     Ok(Some(sq))
 }
 
+/// Phantom-EP sanitization. Returns `Some(ep_sq)` iff a pseudo-legal en
+/// passant capture actually exists in `p`; `None` otherwise. Inputs come
+/// straight from `parse_ep`, so `ep_sq.rank()` is guaranteed 2 or 5.
+///
+/// The four conditions for keeping the EP target:
+/// 1. `ep` is `Some(_)` (no-op for `None`).
+/// 2. The side-to-move matches the EP rank's expected capturer — Black for
+///    rank 3 (white pushed; black to capture), White for rank 6 (mirror).
+/// 3. The opponent's pawn that supposedly just double-pushed is present on
+///    `(ep_sq.file(), pawn_rank)` where `pawn_rank` is the rank one step
+///    *beyond* the EP target (rank 4 for rank-3 EP, rank 5 for rank-6 EP).
+/// 4. At least one side-to-move pawn is adjacent to the pushed pawn —
+///    delegated to [`ep_capturer_exists`].
+///
+/// Failing any of (2)–(4) yields `None` (silent sanitization, no error —
+/// matches Stockfish's behavior on phantom EPs).
+fn sanitize_ep(p: &Position, side: Color, ep: Option<Square>) -> Option<Square> {
+    let ep_sq = ep?;
+    let (expected_side, pawn_rank) = match ep_sq.rank() {
+        2 => (Color::Black, 3),
+        5 => (Color::White, 4),
+        _ => unreachable!("parse_ep enforced rank 2 or 5"),
+    };
+    if side != expected_side {
+        return None;
+    }
+    let pushed = Piece::new(expected_side.flip(), PieceKind::Pawn);
+    let pushed_sq = Square::from_file_rank(ep_sq.file(), pawn_rank)
+        .expect("ep_sq.file() in 0..8 and pawn_rank in {3,4}");
+    if p.piece_at(pushed_sq) != Some(pushed) {
+        return None;
+    }
+    if !ep_capturer_exists(p, side, ep_sq.file(), pawn_rank) {
+        return None;
+    }
+    Some(ep_sq)
+}
+
+/// True iff `capturer_color` has a pawn at `(ep_file ± 1, capturer_rank)` —
+/// i.e. a pawn that geometrically can make the en passant capture toward an
+/// EP target on file `ep_file`.
+///
+/// The "capturer rank" is the rank of the *just-pushed enemy pawn* (= the
+/// rank from which the would-be capturer attacks): rank 4 (idx 3) for an
+/// EP target on rank 3, rank 5 (idx 4) for an EP target on rank 6.
+///
+/// This is the adjacency predicate shared by [`sanitize_ep`] (FEN parse
+/// time) and `mov::make_move` (after a double-push). The matching predicate
+/// in `zobrist::ep_file_to_hash` reads the position's own `ep_target` and
+/// `side_to_move`; this one is parametric so it can run *before*
+/// `set_aux_state` writes those fields.
+pub(crate) fn ep_capturer_exists(
+    pos: &Position,
+    capturer_color: Color,
+    ep_file: u8,
+    capturer_rank: u8,
+) -> bool {
+    let capturer_pawn = Piece::new(capturer_color, PieceKind::Pawn);
+    if ep_file > 0 {
+        let adj = Square::from_file_rank(ep_file - 1, capturer_rank)
+            .expect("ep_file-1 in 0..8 and rank in 0..8");
+        if pos.piece_at(adj) == Some(capturer_pawn) {
+            return true;
+        }
+    }
+    if ep_file < 7 {
+        let adj = Square::from_file_rank(ep_file + 1, capturer_rank)
+            .expect("ep_file+1 in 0..8 and rank in 0..8");
+        if pos.piece_at(adj) == Some(capturer_pawn) {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn format(p: &Position, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     // 1. Placement: ranks 8 down to 1, separated by '/'.
     for rank_index in (0..8u8).rev() {
@@ -368,23 +463,31 @@ mod tests {
 
     #[test]
     fn parse_after_e4() {
-        // FEN spec §16.1.4 example after 1. e4.
+        // FEN spec §16.1.4 example after 1. e4. The spec sets EP=e3 after
+        // the double push regardless of capturability; our parser applies
+        // Stockfish-style phantom-EP sanitization (see module docstring) —
+        // black has no pawn on d4 or f4, so the EP target drops to None
+        // and the re-formatted FEN emits `-` in that field.
         let fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1";
         let p = Position::from_fen(fen).expect("post-1.e4 FEN must parse");
         assert_eq!(p.side_to_move(), Color::Black);
-        assert_eq!(p.ep_target(), Some(Square::E3));
-        assert_eq!(p.to_fen(), fen);
+        assert_eq!(p.ep_target(), None);
+        let canonical = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1";
+        assert_eq!(p.to_fen(), canonical);
     }
 
     #[test]
     fn parse_after_c5() {
-        // FEN spec §16.1.4 example after 1. e4 c5.
+        // FEN spec §16.1.4 example after 1. e4 c5. Same story: white has
+        // no pawn on b5 or d5 to capture en passant at c6, so the phantom
+        // EP target sanitizes to None.
         let fen = "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2";
         let p = Position::from_fen(fen).expect("post-1.e4-c5 FEN must parse");
         assert_eq!(p.side_to_move(), Color::White);
-        assert_eq!(p.ep_target(), Some(Square::C6));
+        assert_eq!(p.ep_target(), None);
         assert_eq!(p.fullmove_number(), 2);
-        assert_eq!(p.to_fen(), fen);
+        let canonical = "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2";
+        assert_eq!(p.to_fen(), canonical);
     }
 
     #[test]
@@ -457,26 +560,84 @@ mod tests {
     }
 
     #[test]
-    fn parse_accepts_ep_rank3_with_white_to_move() {
-        // Per Decision §8: the parse-time EP-rank check enforces only "rank 3
-        // OR rank 6", deliberately NOT cross-checking rank-vs-side-to-move.
-        // White-to-move + EP-on-rank-3 is a "shouldn't happen from a legal
-        // game" position, but we accept it (the lax stance documented in §8
-        // matches how we treat side-not-to-move-in-check and similar
-        // semantic-but-not-structural rules).
+    fn parse_sanitizes_ep_rank3_with_white_to_move() {
+        // White-to-move + EP target on rank 3 is impossible from any legal
+        // game (rank-3 EP means white just pushed; black would now move).
+        // The phantom-EP sanitizer drops it to None silently — matches
+        // Stockfish.
         let fen = "4k3/8/8/8/8/4P3/8/4K3 w - e3 0 1";
         let p = Position::from_fen(fen).expect("rank-3 EP with white to move must parse");
         assert_eq!(p.side_to_move(), Color::White);
-        assert_eq!(p.ep_target(), Some(Square::E3));
+        assert_eq!(p.ep_target(), None);
     }
 
     #[test]
-    fn parse_accepts_ep_rank6_with_black_to_move() {
-        // Symmetric companion to parse_accepts_ep_rank3_with_white_to_move.
+    fn parse_sanitizes_ep_rank6_with_black_to_move() {
+        // Symmetric companion to parse_sanitizes_ep_rank3_with_white_to_move.
         let fen = "4k3/8/8/4p3/8/8/8/4K3 b - e6 0 1";
         let p = Position::from_fen(fen).expect("rank-6 EP with black to move must parse");
         assert_eq!(p.side_to_move(), Color::Black);
+        assert_eq!(p.ep_target(), None);
+    }
+
+    #[test]
+    fn parse_keeps_ep_when_capturer_exists_black_to_move() {
+        // EP=e3, black to move, white pawn on e4 (just pushed), black pawn
+        // on f4 (capturer). Pseudo-legal capture exists → EP retained,
+        // round-trip is identity.
+        let fen = "4k3/8/8/8/4Pp2/8/8/4K3 b - e3 0 1";
+        let p = Position::from_fen(fen).expect("EP-capturable FEN must parse");
+        assert_eq!(p.ep_target(), Some(Square::E3));
+        assert_eq!(p.to_fen(), fen);
+    }
+
+    #[test]
+    fn parse_keeps_ep_when_capturer_exists_white_to_move() {
+        // EP=e6, white to move, black pawn on e5 (just pushed), white pawn
+        // on d5 (capturer). Symmetric companion.
+        let fen = "4k3/8/8/3Pp3/8/8/8/4K3 w - e6 0 1";
+        let p = Position::from_fen(fen).expect("EP-capturable FEN must parse");
         assert_eq!(p.ep_target(), Some(Square::E6));
+        assert_eq!(p.to_fen(), fen);
+    }
+
+    #[test]
+    fn parse_sanitizes_ep_when_pushed_pawn_missing() {
+        // EP=e3, black to move, black pawn on d4 (geometric capturer) but
+        // NO white pawn on e4 — the supposedly just-pushed pawn isn't
+        // there. Sanitize: a real EP capture can't actually be made.
+        let fen = "4k3/8/8/8/3p4/8/8/4K3 b - e3 0 1";
+        let p = Position::from_fen(fen).expect("FEN with absent pushed pawn must parse");
+        assert_eq!(p.ep_target(), None);
+    }
+
+    #[test]
+    fn parse_sanitizes_ep_when_no_capturer_adjacent() {
+        // EP=e3, black to move, white pawn on e4 (just pushed), but no
+        // black pawn on d4 or f4. No pseudo-legal capture exists → drop EP.
+        let fen = "4k3/8/8/8/4P3/8/8/4K3 b - e3 0 1";
+        let p = Position::from_fen(fen).expect("phantom EP FEN must parse");
+        assert_eq!(p.ep_target(), None);
+    }
+
+    #[test]
+    fn parse_keeps_ep_a_file_capturer() {
+        // EP target on the a-file — file-edge guard: only a right neighbor
+        // exists. White pawn on b5 (capturer), black pawn on a5 (pushed),
+        // white to move, EP=a6.
+        let fen = "4k3/8/8/pP6/8/8/8/4K3 w - a6 0 1";
+        let p = Position::from_fen(fen).expect("a-file EP FEN must parse");
+        assert_eq!(p.ep_target(), Some(Square::A6));
+    }
+
+    #[test]
+    fn parse_keeps_ep_h_file_capturer() {
+        // EP target on the h-file — file-edge guard: only a left neighbor
+        // exists. White pawn on g5 (capturer), black pawn on h5 (pushed),
+        // white to move, EP=h6.
+        let fen = "4k3/8/8/6Pp/8/8/8/4K3 w - h6 0 1";
+        let p = Position::from_fen(fen).expect("h-file EP FEN must parse");
+        assert_eq!(p.ep_target(), Some(Square::H6));
     }
 
     #[test]
@@ -1239,10 +1400,17 @@ mod tests {
                 effective_mask &= !0b1000;
             }
 
+            // Apply the same phantom-EP sanitization that `parse` runs, so
+            // the source position carries the post-sanitization EP value
+            // and the round-trip via FEN remains identity. Without this,
+            // randomly generated EP+placement combinations would clear at
+            // parse time, breaking `prop_assert_eq!(&parsed, &p)`.
+            let sanitized_ep = sanitize_ep(&p, side, ep);
+
             p.set_aux_state(
                 side,
                 rights_from_mask(effective_mask),
-                ep,
+                sanitized_ep,
                 halfmove,
                 fullmove,
             );
