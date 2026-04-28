@@ -31,20 +31,33 @@ use crate::piece::{Color, Piece, PieceKind};
 use crate::position::{CastlingRights, Position};
 use crate::square::Square;
 
+/// Parse error returned by [`Position::from_fen`] when the input string
+/// violates the FEN spec or the engine's structural sanity checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FenError {
+    /// The input did not split into exactly 6 space-separated fields.
     WrongFieldCount {
+        /// Number of fields actually found.
         found: usize,
     },
+    /// The piece-placement field (field 1) could not be parsed.
     BadPiecePlacement(String),
+    /// The active-color field (field 2) was not `"w"` or `"b"`.
     BadActiveColor(String),
+    /// The castling-rights field (field 3) contained invalid or out-of-order letters.
     BadCastlingRights(String),
+    /// The en passant target field (field 4) was not `"-"` or a rank-3/6 square.
     BadEnPassant(String),
+    /// The halfmove-clock field (field 5) could not be parsed as a `u8`.
     BadHalfmoveClock(String),
+    /// The fullmove-number field (field 6) could not be parsed as a non-zero `u16`.
     BadFullmoveNumber(String),
+    /// The board contains no king for the given color.
     MissingKing(Color),
+    /// The board contains more than one king for the given color.
     TooManyKings(Color),
+    /// A pawn is placed on rank 1 or rank 8, which is illegal in standard chess.
     PawnOnBackRank(Square),
     /// A castling-rights letter is set, but the implied king/rook positions
     /// are absent or wrong-colored. M1.F §13 of `docs/plans/m1.f.md`:
@@ -52,6 +65,7 @@ pub enum FenError {
     /// `right` value is the *single* offending right (one variant per
     /// failure: `WHITE_KING`, `WHITE_QUEEN`, `BLACK_KING`, `BLACK_QUEEN`).
     InconsistentCastlingRights {
+        /// The specific castling right whose implied piece position is inconsistent.
         right: CastlingRights,
     },
 }

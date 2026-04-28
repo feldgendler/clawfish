@@ -20,20 +20,30 @@ use crate::{Move, Position};
 /// position (bad entries silently dropped — plan §6).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SearchLimits {
+    /// `go depth <N>`: cap the search at N plies. `None` = no depth cap.
     pub depth: Option<u32>,
+    /// `go nodes <N>`: stop after evaluating N nodes. `None` = no node cap.
     pub nodes: Option<u64>,
     /// `go movetime <ms>`. Signed to mirror `wtime`/`btime` (the UCI clock
     /// can go negative under time-trouble overshoot); negative `movetime`
     /// in practice means "search briefly" — GreedyMover treats `Some(<= 0)`
     /// the same as `Some(0)`.
     pub movetime: Option<i64>,
+    /// `go mate <N>`: search for a mate in N moves. `None` = no mate constraint.
     pub mate: Option<u32>,
+    /// `go infinite`: search until a `stop` command is received.
     pub infinite: bool,
+    /// `go ponder`: search in pondering mode; wait for `ponderhit` or `stop`.
     pub ponder: bool,
+    /// White's remaining clock time in milliseconds.
     pub wtime: Option<i64>,
+    /// Black's remaining clock time in milliseconds.
     pub btime: Option<i64>,
+    /// White's per-move increment in milliseconds.
     pub winc: Option<u64>,
+    /// Black's per-move increment in milliseconds.
     pub binc: Option<u64>,
+    /// Moves remaining until the next time control. `None` = sudden death.
     pub movestogo: Option<u32>,
     /// Restrict candidate moves to this set. `None` = no restriction.
     /// `Some(empty)` is a degenerate case — search should emit `bestmove
@@ -54,6 +64,7 @@ pub struct SearchContext {
     /// `Instant::now()` at the moment `handle_go` built the context. Used
     /// by future `info time` emission (M3+).
     pub start: Instant,
+    /// Parsed `go` parameters for this search invocation.
     pub limits: SearchLimits,
 }
 
@@ -87,9 +98,13 @@ pub struct SearchResult {
     /// `None` ⇒ the orchestrator emits `bestmove 0000` (spec line 49).
     /// `Some(mv)` ⇒ the orchestrator emits `bestmove <uci>`.
     pub bestmove: Option<Move>,
+    /// Move to ponder on, if any. `None` when the implementation does not suggest a ponder move.
     pub ponder: Option<Move>,
+    /// Depth of the completed search (plies). 0 when no moves were evaluated.
     pub depth: u32,
+    /// Score in centipawns from the side-to-move's perspective, or `None` if not available.
     pub score_cp: Option<i32>,
+    /// Total nodes evaluated during this search invocation.
     pub nodes: u64,
 }
 

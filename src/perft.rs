@@ -119,14 +119,23 @@ pub fn divide(pos: &Position, depth: u32) -> Vec<(Move, u64)> {
 /// catching specific bug classes.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct PerftCounts {
+    /// Total leaf nodes (equals `perft(pos, depth)` for the same depth).
     pub nodes: u64,
+    /// Moves that captured an enemy piece (includes en passant).
     pub captures: u64,
+    /// Moves that captured via en passant.
     pub en_passant: u64,
+    /// Castling moves (kingside or queenside).
     pub castles: u64,
+    /// Moves that promoted a pawn (all four promotion types counted separately).
     pub promotions: u64,
+    /// Moves that left the opponent's king in check.
     pub checks: u64,
+    /// Moves that gave check by uncovering an attack from another piece.
     pub discovery_checks: u64,
+    /// Moves that gave check from two pieces simultaneously.
     pub double_checks: u64,
+    /// Moves that delivered checkmate (a subset of `checks`).
     pub checkmates: u64,
 }
 

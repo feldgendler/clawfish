@@ -1,6 +1,10 @@
+//! Square type: a 64-cell board index with file/rank accessors. Uses the
+//! LERF layout (0 = a1, 63 = h8) shared with `Bitboard`.
+
 use crate::bitboard::{Bitboard, Squares};
 use std::fmt;
 
+/// A square on the chess board, stored as a LERF index (0 = a1, 63 = h8).
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Square(u8);
 
@@ -9,80 +13,150 @@ impl Square {
     /// like `[T; Square::COUNT]` indexed by square.
     pub const COUNT: usize = 64;
 
+    /// The a1 square (bit 0).
     pub const A1: Square = Square(0);
+    /// The b1 square (bit 1).
     pub const B1: Square = Square(1);
+    /// The c1 square (bit 2).
     pub const C1: Square = Square(2);
+    /// The d1 square (bit 3).
     pub const D1: Square = Square(3);
+    /// The e1 square (bit 4).
     pub const E1: Square = Square(4);
+    /// The f1 square (bit 5).
     pub const F1: Square = Square(5);
+    /// The g1 square (bit 6).
     pub const G1: Square = Square(6);
+    /// The h1 square (bit 7).
     pub const H1: Square = Square(7);
+    /// The a2 square (bit 8).
     pub const A2: Square = Square(8);
+    /// The b2 square (bit 9).
     pub const B2: Square = Square(9);
+    /// The c2 square (bit 10).
     pub const C2: Square = Square(10);
+    /// The d2 square (bit 11).
     pub const D2: Square = Square(11);
+    /// The e2 square (bit 12).
     pub const E2: Square = Square(12);
+    /// The f2 square (bit 13).
     pub const F2: Square = Square(13);
+    /// The g2 square (bit 14).
     pub const G2: Square = Square(14);
+    /// The h2 square (bit 15).
     pub const H2: Square = Square(15);
+    /// The a3 square (bit 16).
     pub const A3: Square = Square(16);
+    /// The b3 square (bit 17).
     pub const B3: Square = Square(17);
+    /// The c3 square (bit 18).
     pub const C3: Square = Square(18);
+    /// The d3 square (bit 19).
     pub const D3: Square = Square(19);
+    /// The e3 square (bit 20).
     pub const E3: Square = Square(20);
+    /// The f3 square (bit 21).
     pub const F3: Square = Square(21);
+    /// The g3 square (bit 22).
     pub const G3: Square = Square(22);
+    /// The h3 square (bit 23).
     pub const H3: Square = Square(23);
+    /// The a4 square (bit 24).
     pub const A4: Square = Square(24);
+    /// The b4 square (bit 25).
     pub const B4: Square = Square(25);
+    /// The c4 square (bit 26).
     pub const C4: Square = Square(26);
+    /// The d4 square (bit 27).
     pub const D4: Square = Square(27);
+    /// The e4 square (bit 28).
     pub const E4: Square = Square(28);
+    /// The f4 square (bit 29).
     pub const F4: Square = Square(29);
+    /// The g4 square (bit 30).
     pub const G4: Square = Square(30);
+    /// The h4 square (bit 31).
     pub const H4: Square = Square(31);
+    /// The a5 square (bit 32).
     pub const A5: Square = Square(32);
+    /// The b5 square (bit 33).
     pub const B5: Square = Square(33);
+    /// The c5 square (bit 34).
     pub const C5: Square = Square(34);
+    /// The d5 square (bit 35).
     pub const D5: Square = Square(35);
+    /// The e5 square (bit 36).
     pub const E5: Square = Square(36);
+    /// The f5 square (bit 37).
     pub const F5: Square = Square(37);
+    /// The g5 square (bit 38).
     pub const G5: Square = Square(38);
+    /// The h5 square (bit 39).
     pub const H5: Square = Square(39);
+    /// The a6 square (bit 40).
     pub const A6: Square = Square(40);
+    /// The b6 square (bit 41).
     pub const B6: Square = Square(41);
+    /// The c6 square (bit 42).
     pub const C6: Square = Square(42);
+    /// The d6 square (bit 43).
     pub const D6: Square = Square(43);
+    /// The e6 square (bit 44).
     pub const E6: Square = Square(44);
+    /// The f6 square (bit 45).
     pub const F6: Square = Square(45);
+    /// The g6 square (bit 46).
     pub const G6: Square = Square(46);
+    /// The h6 square (bit 47).
     pub const H6: Square = Square(47);
+    /// The a7 square (bit 48).
     pub const A7: Square = Square(48);
+    /// The b7 square (bit 49).
     pub const B7: Square = Square(49);
+    /// The c7 square (bit 50).
     pub const C7: Square = Square(50);
+    /// The d7 square (bit 51).
     pub const D7: Square = Square(51);
+    /// The e7 square (bit 52).
     pub const E7: Square = Square(52);
+    /// The f7 square (bit 53).
     pub const F7: Square = Square(53);
+    /// The g7 square (bit 54).
     pub const G7: Square = Square(54);
+    /// The h7 square (bit 55).
     pub const H7: Square = Square(55);
+    /// The a8 square (bit 56).
     pub const A8: Square = Square(56);
+    /// The b8 square (bit 57).
     pub const B8: Square = Square(57);
+    /// The c8 square (bit 58).
     pub const C8: Square = Square(58);
+    /// The d8 square (bit 59).
     pub const D8: Square = Square(59);
+    /// The e8 square (bit 60).
     pub const E8: Square = Square(60);
+    /// The f8 square (bit 61).
     pub const F8: Square = Square(61);
+    /// The g8 square (bit 62).
     pub const G8: Square = Square(62);
+    /// The h8 square (bit 63).
     pub const H8: Square = Square(63);
 
+    /// Constructs a square from a LERF index (0–63), returning `None` if out of range.
     pub const fn new(index: u8) -> Option<Self> {
         if index < 64 { Some(Self(index)) } else { None }
     }
 
+    /// Constructs a square from a LERF index without bounds checking.
+    ///
+    /// The caller must guarantee `index < 64`; debug builds assert this.
     pub const fn new_unchecked(index: u8) -> Self {
         debug_assert!(index < 64);
         Self(index)
     }
 
+    /// Constructs a square from file and rank (both 0–7, a-file = 0, rank 1 = 0).
+    /// Returns `None` if either coordinate is out of range.
     pub const fn from_file_rank(file: u8, rank: u8) -> Option<Self> {
         if file >= 8 || rank >= 8 {
             None
@@ -91,18 +165,22 @@ impl Square {
         }
     }
 
+    /// LERF index of this square (0 = a1, 63 = h8).
     pub const fn index(self) -> u8 {
         self.0
     }
 
+    /// File of this square (0–7, a-file = 0).
     pub const fn file(self) -> u8 {
         self.0 % 8
     }
 
+    /// Rank of this square (0–7, rank 1 = 0).
     pub const fn rank(self) -> u8 {
         self.0 / 8
     }
 
+    /// Parses a UCI square string (e.g. `"e4"`), returning `None` on invalid input.
     pub fn parse_uci(s: &str) -> Option<Self> {
         let bytes = s.as_bytes();
         if bytes.len() != 2 {
@@ -118,6 +196,7 @@ impl Square {
         Some(Self(rank * 8 + file))
     }
 
+    /// Returns an iterator over all 64 squares in LERF order (a1 first, h8 last).
     pub fn all() -> Squares {
         Bitboard::FULL.iter()
     }

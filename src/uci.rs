@@ -40,7 +40,12 @@ pub enum Command {
     /// `setoption name <id> [value <x>]`. `name` is non-empty by parser
     /// contract; `value` is `Some(_)` iff the `value` keyword was given
     /// (and may be `Some(String::new())` if `value` had an empty body).
-    SetOption { name: String, value: Option<String> },
+    SetOption {
+        /// Option name; non-empty.
+        name: String,
+        /// Option value; `None` if the `value` keyword was absent.
+        value: Option<String>,
+    },
     /// `register …`
     Register(Register),
     /// `ucinewgame`
@@ -48,7 +53,9 @@ pub enum Command {
     /// `position [startpos|fen <…>] [moves <m1> <m2> …]`. `moves` are
     /// collected as raw `String`s; M2.C parses via [`Move::from_uci`].
     Position {
+        /// Starting position specification (`startpos` or `fen <…>`).
         spec: PositionSpec,
+        /// Raw UCI move strings following the `moves` keyword, in order.
         moves: Vec<String>,
     },
     /// `go [params …]`
@@ -67,7 +74,9 @@ pub enum Command {
 /// `debug on` / `debug off` argument.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DebugMode {
+    /// `debug on` — enable engine debug output.
     On,
+    /// `debug off` — disable engine debug output.
     Off,
 }
 
@@ -81,7 +90,9 @@ pub enum Register {
     /// both-`None` case to [`Command::Unknown`]. Constructing
     /// `Identify { name: None, code: None }` directly is API misuse.
     Identify {
+        /// Registrant name; `None` if the `name` keyword was absent or had an empty body.
         name: Option<String>,
+        /// Registration code; `None` if the `code` keyword was absent or had an empty body.
         code: Option<String>,
     },
 }
@@ -115,8 +126,11 @@ pub struct GoParams {
     pub winc: Option<u64>,
     /// `binc <x>` — black increment per move (ms).
     pub binc: Option<u64>,
+    /// `movestogo <x>` — moves remaining until the next time control.
     pub movestogo: Option<u32>,
+    /// `depth <x>` — search to this many plies.
     pub depth: Option<u32>,
+    /// `nodes <x>` — search at most this many nodes.
     pub nodes: Option<u64>,
     /// `mate <x>` — search for mate in x moves. `Some(0)` is a degenerate
     /// "is the current position checkmate?" query handled by consumers.

@@ -53,10 +53,12 @@ impl MoveList {
         self.len += 1;
     }
 
+    /// Number of moves currently stored.
     pub fn len(&self) -> usize {
         self.len as usize
     }
 
+    /// Returns `true` if no moves have been pushed.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
