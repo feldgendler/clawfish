@@ -317,7 +317,19 @@ Subagents inherit the orchestrator's model unless their definition specifies oth
 | Final reviewer | `final-reviewer.md` | Opus | Last gate before commit; absorbs cascade from cheaper plan/test reviewers. Cheap insurance — typically converges in 1 pass. |
 | Research subagent | `chess-researcher.md` | Sonnet | Cross-source synthesis still needs reasoning. Output is reviewed downstream by the user reading chat and by the plan reviewer. |
 | Coder (default) | `chess-coder.md` | Sonnet | Plans here are prescriptive (signatures, test names, order spelled out). Transcription is largely model-independent. |
-| Coder (architecturally tricky) | (override via `Agent` tool's `model: opus`) | Opus | Plan flags which subtasks need it (e.g. tricky lifetime / trait choices, novel invariants). Opt-in at spawn time. |
+| Coder (architecturally tricky) | (override via `Agent` tool's `model: opus`) | Opus | Plan flags which subtasks need it. See "When to flag a coder slice for Opus" below. Opt-in at spawn time. |
+
+### When to flag a coder slice for Opus
+
+The default Sonnet coder does well on prescriptive transcription (signatures + test names + order spelled out). It is reliably weaker on judgment calls that require *generalizing across files or invariants*. Flag a slice for `model: opus` when it involves any of:
+
+- **Tricky lifetime / trait / generics gymnastics** — the original criterion.
+- **Novel invariants** that need to be *invented* during implementation, not just transcribed from the plan.
+- **Parallel-precedent application** — adding a helper, field, or test alongside an existing one (M3.A's `update_static_eval_after_make` next to `update_zobrist_after_make`, or M3.A's `make_move_no_from_scratch_in_release` after the M1.E sentinel). Sonnet tends to literal-pattern-match (duplicate the existing helper byte-for-byte with a different name) rather than think through whether the *discipline* of the existing helper applies and whether one helper or two is the right factoring. The plan must spell out: "match existing helper's order-agnostic param discipline; do not duplicate the test, expand its docstring."
+- **Project-discipline application across modules** — e.g. when a slice adds vendored data, the coder must remember to add a cargo-mutants exclusion mirroring `src/magic/constants.rs`. Sonnet missed this in M3.A; final-review caught it.
+- **Anticipating qualitative behavior shifts that break existing tests** — M3.A made `g1f3` the unique startpos best, breaking two engine tests that asserted "different seeds → different bestmoves from startpos." A careful pre-impl pass would have updated the test surface; Sonnet caught it during impl after the test failures, which is fine but late. Plan should pre-emptively flag tests that depend on the prior phase's non-determinism.
+
+When the plan flags a slice with one of these markers, spawn the coder with `model: opus`. When in doubt, flag — the cost difference is bounded and final-review converges faster on Opus-implemented slices.
 
 ### Calibration
 
@@ -343,6 +355,13 @@ The calibration pass is one-time per role. Re-run if the workflow changes shape 
     - **Substantive convergence on every headline call**: fail-soft negamax; triangular PV table; defer PVS / aspiration windows to M4; qsearch = stand-pat + captures + queen promos + in-check evasions (no checks, no delta pruning at M3); MVV-LVA + movegen-order quiets; ID aborts between iterations only; ~2k–4k node cancellation cadence; repetition via game-history `Vec<u64>` plumbed through `SearchContext`; insufficient-material in eval.
     - **Differences are wording-crispness or minor-parameter only**: score type `i32` (Sonnet) vs `i16` (Opus, citing M9 NNUE SIMD); MATE constant 30000 vs 32000; mate-distance pruning M3 (Sonnet) vs M4 (Opus); performance estimate 5–20 Mnps (Sonnet) vs 0.5–2 Mnps (Opus) — empirical resolution deferred to M3.C bench. Both reports surfaced the PV-update-under-cancellation pitfall (Opus framed it as a named bug taxonomy; Sonnet folded it into the "Common pitfalls" list). No must-fix gap in either direction.
     - **Outcome:** chess-researcher Sonnet tier confirmed; remove from watchlist. Both reports are kept (the Opus parallel pass is preserved as the calibration evidence and as a useful second perspective for plan-mode reference).
+
+- **2026-04-28 — chess-coder (M3.A, observational).** Sonnet ran three slices (test-writing + test-suite-fix + impl); not a parallel A/B. Mechanical execution clean; deviations reported honestly. Final-review pass 1 caught **1 must-fix + 3 should-fix items** that were within Sonnet's nominal scope but reflect *judgment calls Sonnet did not make*:
+    - Cargo-mutants exclusion gap on `src/eval/data.rs` (PST data) — Sonnet did not generalize from the existing `src/magic/constants.rs` precedent. ~150 mutants would have shipped uncaught. Required a split-file refactor to address.
+    - Duplicate `make_move_no_eval_recompute_in_release` perf sentinel byte-identical to the M1.E zobrist sentinel — pattern-matched the form rather than thinking through factoring.
+    - `update_static_eval_after_make` derived `us` from `pos.side_to_move().flip()` rather than the `mover.color` parameter — fragile call-ordering dependency; the parallel `update_zobrist_after_make` uses `mover.color`. Plan §7 prose called out the discipline; Sonnet didn't carry it into code.
+    - Stale `TODO M3.A impl` comment on `Undo::prior_static_eval` after the field was populated.
+    - **Outcome (no tier change):** all four caught by final-review (Opus); cascade worked. Workflow updated with "When to flag a coder slice for Opus" criteria covering parallel-precedent application, project-discipline application across modules, and qualitative-behavior-shift anticipation. Plans for M3.B+ should explicitly flag any slice meeting these criteria for `model: opus`. **Stop-loss not triggered** — these are should-fix items caught by review, not must-fix items shipped.
 
 **Watchlist** (tiers without calibration data — next time the role fires, run Sonnet + Opus in parallel before relying on the cheaper tier):
 
