@@ -365,7 +365,7 @@ The calibration pass is one-time per role. Re-run if the workflow changes shape 
 
 **Watchlist** (tiers without calibration data — next time the role fires, run Sonnet + Opus in parallel before relying on the cheaper tier):
 
-- *(none currently)*
+- **chess-coder.** Two observational data points so far (M2.E clean, M3.A 4 should-fixes caught by final-review). Never had a parallel A/B. The M3.A calibration entry above identifies *categorical* gaps (parallel-precedent, project-discipline, behavior-shift anticipation) that should be either confirmed systemic (→ tier change) or shown to be M3.A-specific via a true A/B. **Trigger: M3.C** (negamax alpha-beta core — first substantive coder slice with novel invariants and parallel-helper potential). Spawn Sonnet + Opus on the same slice; compare diffs and final-review feedback.
 
 ### Stop-loss
 
