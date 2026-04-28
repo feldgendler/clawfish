@@ -47,7 +47,10 @@ pub enum Command {
     UciNewGame,
     /// `position [startpos|fen <…>] [moves <m1> <m2> …]`. `moves` are
     /// collected as raw `String`s; M2.C parses via [`Move::from_uci`].
-    Position { spec: PositionSpec, moves: Vec<String> },
+    Position {
+        spec: PositionSpec,
+        moves: Vec<String>,
+    },
     /// `go [params …]`
     Go(GoParams),
     /// `stop`
@@ -77,7 +80,10 @@ pub enum Register {
     /// `Some` by parser contract — `parse_uci_line` collapses the
     /// both-`None` case to [`Command::Unknown`]. Constructing
     /// `Identify { name: None, code: None }` directly is API misuse.
-    Identify { name: Option<String>, code: Option<String> },
+    Identify {
+        name: Option<String>,
+        code: Option<String>,
+    },
 }
 
 /// `position` first-arg.
@@ -473,9 +479,7 @@ mod tests {
     fn parses_setoption_value_with_spaces() {
         // Spec example: setoption name UCI_Opponent value GM 2800 human Gary Kasparov
         assert_eq!(
-            parse_uci_line(
-                "setoption name UCI_Opponent value GM 2800 human Gary Kasparov"
-            ),
+            parse_uci_line("setoption name UCI_Opponent value GM 2800 human Gary Kasparov"),
             Command::SetOption {
                 name: "UCI_Opponent".to_string(),
                 value: Some("GM 2800 human Gary Kasparov".to_string()),
@@ -504,9 +508,7 @@ mod tests {
         // No round-trip / re-serialization is asserted — that's M2.C/D's
         // concern.
         assert_eq!(
-            parse_uci_line(
-                "setoption name NalimovPath value c:\\chess\\tb\\4;c:\\chess\\tb\\5"
-            ),
+            parse_uci_line("setoption name NalimovPath value c:\\chess\\tb\\4;c:\\chess\\tb\\5"),
             Command::SetOption {
                 name: "NalimovPath".to_string(),
                 value: Some("c:\\chess\\tb\\4;c:\\chess\\tb\\5".to_string()),
@@ -518,7 +520,10 @@ mod tests {
 
     #[test]
     fn parses_register_later() {
-        assert_eq!(parse_uci_line("register later"), Command::Register(Register::Later));
+        assert_eq!(
+            parse_uci_line("register later"),
+            Command::Register(Register::Later)
+        );
     }
 
     #[test]
@@ -597,7 +602,10 @@ mod tests {
     fn parses_position_startpos() {
         assert_eq!(
             parse_uci_line("position startpos"),
-            Command::Position { spec: PositionSpec::StartPos, moves: vec![] },
+            Command::Position {
+                spec: PositionSpec::StartPos,
+                moves: vec![]
+            },
         );
     }
 
@@ -641,7 +649,10 @@ mod tests {
         // for the disambiguating test.
         assert_eq!(
             parse_uci_line("position startpos garbage"),
-            Command::Position { spec: PositionSpec::StartPos, moves: vec![] },
+            Command::Position {
+                spec: PositionSpec::StartPos,
+                moves: vec![]
+            },
         );
     }
 
@@ -657,7 +668,10 @@ mod tests {
         // moves the spec/Stockfish say should be ignored.
         assert_eq!(
             parse_uci_line("position startpos foo moves e2e4"),
-            Command::Position { spec: PositionSpec::StartPos, moves: vec![] },
+            Command::Position {
+                spec: PositionSpec::StartPos,
+                moves: vec![]
+            },
         );
     }
 
@@ -669,7 +683,10 @@ mod tests {
         // doesn't choke on an immediately-EOL `moves` keyword.
         assert_eq!(
             parse_uci_line("position startpos moves"),
-            Command::Position { spec: PositionSpec::StartPos, moves: vec![] },
+            Command::Position {
+                spec: PositionSpec::StartPos,
+                moves: vec![]
+            },
         );
     }
 
@@ -729,7 +746,9 @@ mod tests {
         // non-canonical whitespace and fail this test.
         let canonical = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
         assert_eq!(
-            parse_uci_line("position fen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR\tw\tKQkq\t-\t0\t1"),
+            parse_uci_line(
+                "position fen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR\tw\tKQkq\t-\t0\t1"
+            ),
             Command::Position {
                 spec: PositionSpec::Fen(canonical.to_string()),
                 moves: vec![],
@@ -786,7 +805,10 @@ mod tests {
     fn parses_go_infinite() {
         assert_eq!(
             parse_uci_line("go infinite"),
-            Command::Go(GoParams { infinite: true, ..GoParams::default() }),
+            Command::Go(GoParams {
+                infinite: true,
+                ..GoParams::default()
+            }),
         );
     }
 
@@ -794,7 +816,10 @@ mod tests {
     fn parses_go_ponder() {
         assert_eq!(
             parse_uci_line("go ponder"),
-            Command::Go(GoParams { ponder: true, ..GoParams::default() }),
+            Command::Go(GoParams {
+                ponder: true,
+                ..GoParams::default()
+            }),
         );
     }
 
@@ -802,7 +827,10 @@ mod tests {
     fn parses_go_movetime() {
         assert_eq!(
             parse_uci_line("go movetime 1500"),
-            Command::Go(GoParams { movetime: Some(1500), ..GoParams::default() }),
+            Command::Go(GoParams {
+                movetime: Some(1500),
+                ..GoParams::default()
+            }),
         );
     }
 
@@ -825,7 +853,10 @@ mod tests {
     fn parses_go_depth() {
         assert_eq!(
             parse_uci_line("go depth 8"),
-            Command::Go(GoParams { depth: Some(8), ..GoParams::default() }),
+            Command::Go(GoParams {
+                depth: Some(8),
+                ..GoParams::default()
+            }),
         );
     }
 
@@ -833,7 +864,10 @@ mod tests {
     fn parses_go_nodes() {
         assert_eq!(
             parse_uci_line("go nodes 1000000"),
-            Command::Go(GoParams { nodes: Some(1_000_000), ..GoParams::default() }),
+            Command::Go(GoParams {
+                nodes: Some(1_000_000),
+                ..GoParams::default()
+            }),
         );
     }
 
@@ -841,7 +875,10 @@ mod tests {
     fn parses_go_mate() {
         assert_eq!(
             parse_uci_line("go mate 5"),
-            Command::Go(GoParams { mate: Some(5), ..GoParams::default() }),
+            Command::Go(GoParams {
+                mate: Some(5),
+                ..GoParams::default()
+            }),
         );
     }
 
@@ -851,7 +888,10 @@ mod tests {
         // per §4 — `mate 0` parses cleanly to Some(0); consumers handle.
         assert_eq!(
             parse_uci_line("go mate 0"),
-            Command::Go(GoParams { mate: Some(0), ..GoParams::default() }),
+            Command::Go(GoParams {
+                mate: Some(0),
+                ..GoParams::default()
+            }),
         );
     }
 
@@ -1018,7 +1058,10 @@ mod tests {
         // A buggy impl that scanned forward looking for `name` (rather
         // than requiring it as the next token) would silently accept
         // this and produce SetOption { name: "X", value: Some("Y") }.
-        assert_eq!(parse_uci_line("setoption foo name X value Y"), Command::Unknown);
+        assert_eq!(
+            parse_uci_line("setoption foo name X value Y"),
+            Command::Unknown
+        );
     }
 
     #[test]
@@ -1204,7 +1247,10 @@ mod tests {
         // Stockfish-confirmed (§3.1).
         assert_eq!(
             parse_uci_line("go foo wtime 5000"),
-            Command::Go(GoParams { wtime: Some(5000), ..GoParams::default() }),
+            Command::Go(GoParams {
+                wtime: Some(5000),
+                ..GoParams::default()
+            }),
         );
     }
 
@@ -1225,7 +1271,10 @@ mod tests {
     fn go_repeated_keyword_last_wins() {
         assert_eq!(
             parse_uci_line("go depth 4 depth 8"),
-            Command::Go(GoParams { depth: Some(8), ..GoParams::default() }),
+            Command::Go(GoParams {
+                depth: Some(8),
+                ..GoParams::default()
+            }),
         );
     }
 
@@ -1278,7 +1327,10 @@ mod tests {
         // winc is u64; negative parse fails → field stays None.
         assert_eq!(
             parse_uci_line("go winc -100 binc 200"),
-            Command::Go(GoParams { binc: Some(200), ..GoParams::default() }),
+            Command::Go(GoParams {
+                binc: Some(200),
+                ..GoParams::default()
+            }),
         );
     }
 
@@ -1288,7 +1340,10 @@ mod tests {
         // field stays None. depth still parsed.
         assert_eq!(
             parse_uci_line("go nodes 99999999999999999999999 depth 4"),
-            Command::Go(GoParams { depth: Some(4), ..GoParams::default() }),
+            Command::Go(GoParams {
+                depth: Some(4),
+                ..GoParams::default()
+            }),
         );
     }
 
@@ -1343,14 +1398,40 @@ mod tests {
         prop_oneof![
             // Known keywords.
             prop::sample::select(vec![
-                "uci", "debug", "isready", "setoption", "register",
-                "ucinewgame", "position", "go", "stop", "ponderhit", "quit",
-                "on", "off", "name", "value", "later", "code",
-                "startpos", "fen", "moves",
-                "ponder", "infinite", "wtime", "btime", "winc", "binc",
-                "movestogo", "depth", "nodes", "mate", "movetime", "searchmoves",
+                "uci",
+                "debug",
+                "isready",
+                "setoption",
+                "register",
+                "ucinewgame",
+                "position",
+                "go",
+                "stop",
+                "ponderhit",
+                "quit",
+                "on",
+                "off",
+                "name",
+                "value",
+                "later",
+                "code",
+                "startpos",
+                "fen",
+                "moves",
+                "ponder",
+                "infinite",
+                "wtime",
+                "btime",
+                "winc",
+                "binc",
+                "movestogo",
+                "depth",
+                "nodes",
+                "mate",
+                "movetime",
+                "searchmoves",
             ])
-                .prop_map(String::from),
+            .prop_map(String::from),
             // Typical option-name pieces.
             prop::sample::select(vec!["Hash", "Clear", "UCI_Opponent", "Foo", "Bar"])
                 .prop_map(String::from),
@@ -1364,8 +1445,7 @@ mod tests {
             // intentionally avoid prop::string::string_regex here to
             // keep the strategy's outputs tractable for grep-by-eye
             // when proptest shrinks).
-            prop::sample::select(vec!["foo", "bar", "baz", "qux", "quux"])
-                .prop_map(String::from),
+            prop::sample::select(vec!["foo", "bar", "baz", "qux", "quux"]).prop_map(String::from),
         ]
     }
 

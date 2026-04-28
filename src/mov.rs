@@ -302,9 +302,7 @@ impl Move {
         generate_moves(pos, &mut moves);
         let slice = moves.as_slice();
         let pred = |mv: &&Move| {
-            mv.from_square() == from
-                && mv.to_square() == to
-                && mv.promotion_kind() == promo
+            mv.from_square() == from && mv.to_square() == to && mv.promotion_kind() == promo
         };
         let result = slice.iter().find(pred).copied();
         // Defense-in-depth: the uniqueness invariant is pinned externally
@@ -363,9 +361,7 @@ impl fmt::Display for UciMoveError {
             UciMoveError::NullMove => {
                 "null move `0000` not accepted (UCI defines it as engine→GUI only)"
             }
-            UciMoveError::IllegalForPosition => {
-                "UCI move not legal in the given position"
-            }
+            UciMoveError::IllegalForPosition => "UCI move not legal in the given position",
         };
         f.write_str(msg)
     }
@@ -2229,10 +2225,9 @@ mod tests {
     #[test]
     fn from_uci_capture_inferred() {
         // White knight on f3 captures black pawn on e5.
-        let pos = Position::from_fen(
-            "rnbqkbnr/pppp1ppp/8/4p3/8/5N2/PPPPPPPP/RNBQKB1R w KQkq - 0 2",
-        )
-        .unwrap();
+        let pos =
+            Position::from_fen("rnbqkbnr/pppp1ppp/8/4p3/8/5N2/PPPPPPPP/RNBQKB1R w KQkq - 0 2")
+                .unwrap();
         let mv = Move::from_uci("f3e5", &pos).expect("f3xe5 is a legal capture");
         assert_eq!(mv.from_square(), Square::F3);
         assert_eq!(mv.to_square(), Square::E5);
@@ -2548,11 +2543,11 @@ mod tests {
         for c in CASES {
             let pos = Position::from_fen(c.before).expect("before FEN parses");
             let uci = c.mv.to_uci();
-            let parsed = Move::from_uci(&uci, &pos).unwrap_or_else(|e| {
-                panic!("round-trip failed for {} ({uci}): {e:?}", c.label)
-            });
+            let parsed = Move::from_uci(&uci, &pos)
+                .unwrap_or_else(|e| panic!("round-trip failed for {} ({uci}): {e:?}", c.label));
             assert_eq!(
-                parsed, c.mv,
+                parsed,
+                c.mv,
                 "round-trip mismatch for {} (uci={uci}): parsed flag {:?}, expected flag {:?}",
                 c.label,
                 parsed.flag(),
@@ -2592,9 +2587,8 @@ mod tests {
             generate_moves(&pos, &mut moves);
             for mv in moves.as_slice() {
                 let uci = mv.to_uci();
-                let parsed = Move::from_uci(&uci, &pos).unwrap_or_else(|e| {
-                    panic!("D1 round-trip failed for {uci} from {fen}: {e:?}")
-                });
+                let parsed = Move::from_uci(&uci, &pos)
+                    .unwrap_or_else(|e| panic!("D1 round-trip failed for {uci} from {fen}: {e:?}"));
                 assert_eq!(
                     parsed, *mv,
                     "D1 round-trip mismatch from {fen}: uci={uci}, expected={mv:?}, parsed={parsed:?}",
@@ -2649,9 +2643,7 @@ mod tests {
         // mid-game positions with EP targets, mid-game castling rights,
         // and pawn-promotion candidates from the canonical-6 seeds.
         (0..UCI_SEED_FENS.len(), 0usize..=4, any::<u64>())
-            .prop_map(|(idx, walk_len, rng_seed)| {
-                uci_walk(UCI_SEED_FENS[idx], walk_len, rng_seed)
-            })
+            .prop_map(|(idx, walk_len, rng_seed)| uci_walk(UCI_SEED_FENS[idx], walk_len, rng_seed))
     }
 
     proptest! {
