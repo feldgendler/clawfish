@@ -21,6 +21,7 @@ Before reporting completion:
 - `cargo build` clean on your scope.
 - `cargo test` passing on your scope.
 - `cargo clippy --all-targets -- -D warnings` clean if you've touched lint-relevant code.
+- `cargo fmt` (run it, don't just `--check` — leaves the tree formatted). The pre-commit hook runs `rustfmt --check` against staged files and will block commit on drift; doing it here costs ~50 ms and saves a final-review pass. **Do not skip even when "I only edited one line."**
 
 Report back:
 
