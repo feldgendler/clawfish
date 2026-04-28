@@ -161,7 +161,7 @@ impl Search for RandomMover {
         &mut self,
         position: &Position,
         ctx: &SearchContext,
-        _info_sink: &dyn Fn(&str),
+        info_sink: &dyn Fn(&str),
     ) -> SearchResult {
         // Always compute the candidate before checking cancellation. The
         // alternative (early-exit on pre-set stop) creates a race against
@@ -194,6 +194,16 @@ impl Search for RandomMover {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
+
+        // Post-wait: time reflects the full wall-clock spent in this go, symmetric
+        // with how M3+ iterative-deepening will report info time on its final iteration.
+        let elapsed_ms = ctx.start.elapsed().as_millis();
+        let pv_token = candidate
+            .map(|m| m.to_uci())
+            .unwrap_or_else(|| "0000".to_string());
+        info_sink(&format!(
+            "info depth 0 score cp 0 nodes 1 time {elapsed_ms} pv {pv_token}"
+        ));
 
         SearchResult {
             bestmove: candidate,

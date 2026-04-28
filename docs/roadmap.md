@@ -4,7 +4,44 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1 complete; M2.A / M2.B / M2.C / M2.D landed; M2.E next — tournament harness + fastchess (ADR-0012 binds).**
+**M1 complete; M2 complete (M2.A / M2.B / M2.C / M2.D / M2.E landed); M3 next — alpha-beta + material eval.**
+
+### M2.E — what landed
+
+The external validation layer that closes M2:
+
+- **`scripts/install-fastchess.sh`** — idempotent SHA256-pinned installer. Three constants (`EXPECTED_RELEASE_TAG`, `EXPECTED_VERSION_LINE`, `EXPECTED_SHA256`); platform + curl pre-flights; pre-flight version-line gate short-circuits on already-installed runs. Bumping the pinned release is a three-line edit.
+- **`scripts/match.sh`** — three-subcommand wrapper: `compliance`, `self-play`, `vs-stockfish`. Locator: `vendor/fastchess/fastchess` first, `command -v fastchess` fallback; either way the resolved binary is gated against `EXPECTED_VERSION_LINE`. `cargo build --release` runs before each subcommand. Adjudication: `-maxmoves 300 -resign movecount=3 score=600`; `-draw` deliberately omitted. `ulimit -n 4096 || true` (best-effort) to dodge the macOS-256-fd default.
+- **ADR-0012** — codifies fastchess as the runner, `vendor/fastchess/` as the install path, the engine-registry-via-shell-wrapper convention (no `engines.json`), output-path layout for smoke and SPRT, the M2 smoke contract, and the `RandomMover::go` info-line requirement.
+- **`RandomMover::go` info-line emission** (~6 LOC in `src/search.rs`) — emits `info depth 0 score cp 0 nodes 1 time <ms> pv <move-or-0000>` via `info_sink` after the wait loop. `score cp 0` is empirically required by fastchess `--compliance` Step 12. `pv 0000` placeholder for mate / stalemate / empty searchmoves filter.
+- **E37 + E33 amendment** — `tests/uci_integration.rs::integration_unknown_command_silently_ignored` (new) pins the silence-on-unknown contract via `assert_eq!(lines, vec!["readyok"])`. E33 amended with `assert!(lines.iter().any(|l| l.starts_with("info depth ")))` to pin the §11 emission. Both reuse existing helpers; no new test file.
+- **`docs/workflow.md`** — new "Running a match" section pointing at `scripts/match.sh` subcommands.
+- **`bench/m2.md`** — milestone summary per ADR-0010 / ADR-0012.
+
+### M2.E — implementation highlights
+
+- **`fastchess --compliance` Step 12 was the load-bearing discovery.** Plan-review pass-1 reviewer empirically ran the compliance check against the M2.D binary and found Steps 1–11 pass but Step 12 ("Check if engine prints an info line") fails. Plan §11 added the info-line emission to close it. After the fix, fastchess 1.8.0-alpha runs all 40 compliance steps to completion ("Engine passed all compliance checks.") — Steps 13–40 were previously gated behind the failing Step 12.
+- **`score cp 0` is required.** The plan's first-draft committed on "no `score cp`" with the rationale "would be a lie." Empirical probe overturned that — `info depth N nodes K time M pv MV` without `score` fails Step 12 regardless of other fields. `info depth N score cp 0 nodes K time M pv MV` passes. fastchess defaults missing scores to 0 in adjudication anyway, so emitting `0` explicitly is the same value, just visible.
+- **`-rounds 1 -repeat` not `-rounds 2 -repeat`.** Plan-review pass-1 SF4: with deterministic seeds (Random_Seed=1 vs =2) and no opening book, `-rounds 2 -repeat` produces 4 PGNs that are 2 identical trajectories duplicated. Cutting to `-rounds 1 -repeat` yields 2 honest games.
+- **Adjudication knobs surprised on the upside.** Plan anticipated `-maxmoves 300` would fire on most random-vs-random games. Empirically, both self-play games naturally reached insufficient material (343 ply / 450 ply; both `[Termination "normal"]`) — random play captures pieces fast enough that lone-king endgames arrive before the 600-ply cap. vs-Stockfish smoke also natural mate at 56 ply / 25 ply. The `-resign` knob was a no-op for these 4 games — kept as a no-cost hedge for future runs.
+- **No new test file.** First plan draft proposed `tests/uci_smoke.rs`; pass-1 must-fix #2 surfaced that S1–S4 of the proposed tests duplicated existing E33–E35 with weaker assertions. Resolution: drop the new file, add only E37 (the genuinely novel silent-on-unknown test) to `tests/uci_integration.rs` reusing existing helpers.
+- **`ulimit -n 4096`** baked into `match.sh` as a best-effort prep step. macOS default of 256 was too low even at `-concurrency 1`.
+
+### M2.E — verification (Apple M4, dev machine)
+
+| Metric | Result |
+|---|---|
+| Tests | 591 lib + 5 uci-integration + 24 other = **620 fast + 6 ignored**. All passing. |
+| `cargo build --release` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo fmt --check` | clean |
+| `cargo llvm-cov --summary-only --lib` | `search.rs`: 78.58% region / 78.69% line (pre-existing gap on the two `#[ignore]`-gated documentation helpers + Search trait no-op defaults; the new info-line emission path is fully covered). `engine.rs`: 97.41% region / 96.92% line. Total: 95.34% region / 95.43% line. |
+| `cargo mutants --in-diff` | 1 mutant generated; **1 caught; 0 missed; 0 timeouts; 0 unviable**. The single mutant (replace `RandomMover::go` body with `Default::default()`) is caught by E33's `info depth ` assertion + existing M2.D anchors. |
+| `scripts/match.sh compliance` | All 40 steps pass per fastchess `--compliance` ("Engine passed all compliance checks."). |
+| `scripts/match.sh self-play` | 2 games at 343 / 450 plies; both `[Termination "normal"]` (Draw by insufficient mating material). C3=C4=C5=0. |
+| `scripts/match.sh vs-stockfish` | 2 games at 56 / 25 plies; both `[Termination "normal"]` (sf18 mated). C3=C4=C5=0. |
+
+All review loops converged. Plan archived at `docs/plans/m2.e.md`. ADR-0012 codifies the harness layout. Plan went through 3 reviewer passes; test-suite review through 2; final review through 2.
 
 ### M2.D — what landed
 
@@ -332,7 +369,7 @@ Plays legal random moves through a tournament harness (fastchess; see ADR-0012 b
 | **M2.B** ✓ — UCI command parser | `uci` module: `Command` enum + helper types + `parse_uci_line(&str) -> Command`. Per-command leniency rules grounded in 12 empirical Stockfish 18 probes (strict-first-token, `debug` strict-exact-2-tokens, `position` lenient-stop, `go` lenient-skip). Move strings + FEN strings collected raw — M2.C parses. Total function: no `Result`, no panics. 96 tests; 99.9% line coverage; 0 missed mutants on `--in-diff` (49 caught, 6 unviable). | ~600–900 lines (actual: ~1430 lines incl. ~700 lines of impl + ~700 lines of 96 tests) |
 | **M2.C** ✓ — Engine I/O loop + Search trait | `Engine<W, S>` orchestrator + reader thread + per-`go` worker + `Arc<AtomicBool>` cancellation per ADR-0011. Handlers for every UCI 2006 GUI→engine command. `position` reset-on-error (FEN err keeps prior; move err resets to base; both info-string-rejected unconditionally). `searchmoves` silently drops bad entries. `Search` trait + `SearchContext` + `Stub` impl (lex-first legal move; honors `infinite`/`movetime`/`ponder`). `handle_quit` joins worker (bounded by polling cadence) so `bestmove` is in stdout before `run` returns. Always-compute-candidate-before-cancellation eliminates quit-vs-go race. 7 new tests added in final-review pass closed all 3 missed mutants. | ~800–1200 lines (actual: ~1300 lines impl + tests + ~330 lines plan + ~140 lines ADR-0011) |
 | **M2.D** ✓ — Random search + `Random_Seed` option | `RandomMover` SplitMix64-seeded `Search` impl replaces `Stub` (lex-first). `Search` trait extended with default-no-op `set_seed` / `reset` lifecycle hooks. `Random_Seed` UCI option (`type spin default 0 min 0 max 2147483647`); strict validation rejects values above declared `max`. PRNG state continuous across `go`; `setoption` and `ucinewgame` both reset state. `Engine::join_in_flight_worker` consolidates the stop+join idiom — also called by `handle_ucinewgame` and `handle_setoption` to close a deadlock under in-flight `go infinite`. End-to-end self-play test E36 drives the binary through a full game with seed 8 → terminates ply 106 → `bestmove d3d1`. 23 mutants / 23 caught; 100% coverage on production `splitmix64_next` + `RandomMover`. | ~700–1000 lines (actual: ~1700 lines impl + tests + ~700-line plan; +24 net new tests) |
-| **M2.E** — Tournament harness + fastchess | `scripts/match.sh` wrapper around `fastchess`; documentation for downloading the `mac-arm64` release and reading PGN/log output. Integration test that spawns the release binary, drives it through a complete self-game via piped stdin/stdout, asserts the game terminates legally (checkmate / stalemate / 50-move / threefold / insufficient material per FIDE) and that the PGN parses. ADR-0012 codifies the harness layout. `docs/workflow.md` gains a "running a match" runbook | ~400–700 lines |
+| **M2.E** ✓ — Tournament harness + fastchess | `scripts/install-fastchess.sh` SHA256-pinned installer + `scripts/match.sh` three-subcommand wrapper (`compliance`/`self-play`/`vs-stockfish`). ADR-0012 codifies layout; `docs/workflow.md` "Running a match" runbook. `RandomMover::go` info-line emission (`info depth 0 score cp 0 nodes 1 time <ms> pv <move>`) added to close `--compliance` Step 12. E37 (`integration_unknown_command_silently_ignored`) + E33 amendment in `tests/uci_integration.rs` reusing existing helpers — no new test file. Self-play (2 games) + vs-Stockfish (2 games) + compliance all pass C1–C7 with C3=C4=0; bench/m2.md captured. Closes M2: complete game played through fastchess against itself and Stockfish without protocol errors. | ~400–700 lines (actual: ~510 lines incl. ~140-line ADR-0012, ~100-line bench/m2.md, ~110-line match.sh, ~80-line install script, ~50-line E37 + E33 amend, ~20-line workflow runbook section, plus the ~6-LOC src/search.rs info-line emission) |
 
 Phases A → D are foundational and largely sequential; A and B are independent of each other and could be planned in either order, but C depends on both. E is the validation layer (analogous to M1.G).
 

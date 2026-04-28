@@ -121,6 +121,10 @@ fn integration_full_handshake_starting_position() {
         lines.iter().any(|l| l.starts_with("bestmove")),
         "expected 'bestmove' in output;\nfull output:\n{output}"
     );
+    assert!(
+        lines.iter().any(|l| l.starts_with("info depth ")),
+        "expected an 'info depth …' line in output (per plan §11);\nfull output:\n{output}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -388,4 +392,43 @@ fn integration_self_play_game_terminates_legally() {
     }
     // Unreachable: the loop always returns or panics at MAX_PLY.
     unreachable!("loop exits via return or panic before falling through");
+}
+
+// ---------------------------------------------------------------------------
+// E37 — unknown command silently ignored
+// ---------------------------------------------------------------------------
+
+/// Pipe a garbage line followed by `isready` and `quit`. Assert that the
+/// complete captured output is exactly `["readyok"]` — proving the unknown
+/// command is silently dropped (M2.C contract: `Unknown` commands are silent
+/// when `debug` is off) AND the `isready` round-trip still works AND nothing
+/// else is emitted (no spurious echo, no `info string` debug line, no
+/// stray `option`/`id` lines).
+///
+/// `assert_eq!` on the full line list is tighter than separate `any`/`!any`
+/// assertions: a regression that echoes the garbage line, or emits a
+/// stray `info string` debug line, or any other non-empty line, would fail
+/// here. The contract is total silence-but-`readyok`; the test pins it
+/// totally.
+#[test]
+fn integration_unknown_command_silently_ignored() {
+    let mut child = spawn_engine();
+    let stdout = child.stdout.take().expect("stdout handle");
+    let line_rx = drain_stdout(stdout);
+
+    let mut stdin = child.stdin.take().expect("stdin handle");
+    stdin.write_all(b"joho garbage\nisready\nquit\n").unwrap();
+    drop(stdin);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let exited = wait_for_exit(&mut child, deadline);
+
+    let lines = collect_lines(&line_rx);
+
+    assert!(exited, "engine did not exit within 2 s");
+    assert_eq!(
+        lines,
+        vec!["readyok".to_string()],
+        "expected exactly one line of output, 'readyok'; got {lines:?}"
+    );
 }

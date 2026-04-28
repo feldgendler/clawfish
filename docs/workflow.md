@@ -106,6 +106,23 @@ The dimensions of final review:
 
 The final review's purpose is to catch what the plan didn't anticipate and the tests didn't cover. On reviewer convergence, the agent proceeds directly to benchmarking and commit — no user-approval gate. The user can interject at any point during the loop by sending a message; absent intervention, the work commits when the loop terminates.
 
+## Running a match
+
+Tournament smoke runs are driven by `scripts/match.sh` per ADR-0012.
+
+- `scripts/match.sh self-play` — 2-game self-play (RandomMover seed=1 vs seed=2); artifacts in `target/matches/smoke/`.
+- `scripts/match.sh vs-stockfish` — 2-game match against Stockfish 18 capped at `UCI_Elo=1320`; artifacts in `target/matches/smoke/`.
+- `scripts/match.sh compliance` — fastchess `--compliance` UCI check; all 40 steps must pass on fastchess 1.8.0-alpha ("Engine passed all compliance checks.").
+
+Artifacts:
+
+- Raw PGN and log → `target/matches/smoke/` (gitignored).
+- Milestone summary → `bench/m2.md` (M2) or `bench/sprt/<dated>.md` (M3+ SPRT).
+
+First-time install: `scripts/install-fastchess.sh` (idempotent; downloads and SHA256-verifies the pinned binary into `vendor/fastchess/`).
+
+See ADR-0012 for layout details, adjudication parameters, and the fresh-clone bootstrap sequence.
+
 ## Static analysis and dependency hygiene
 
 Standing checks that complement the review loops. The review loops catch reasoning errors; these catch mechanical drift.
