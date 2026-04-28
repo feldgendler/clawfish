@@ -256,9 +256,46 @@ Property tests (via `proptest`) and ordinary unit tests are **complementary**, n
 Sequential Probability Ratio Test. The standard for accepting/rejecting engine changes once games are playable (M3+).
 
 - Standard bounds: H0 elo0=0, H1 elo1=5 (conservative); or elo0=-3, elo1=3 for marginal changes.
-- Run via `cutechess-cli` or `fastchess`.
+- Run via `fastchess` (per ADR-0012).
 - Fast time controls (e.g. 10+0.1) for many games.
 - Accept if SPRT crosses the upper bound; reject on lower.
+
+### SPRT methodology — baselines from historical commits, not feature flags
+
+The reference for any SPRT match is **a binary built from a prior git commit**, not a feature-flagged version of the current code. Build both binaries (current branch HEAD + the baseline commit's HEAD), pit them via fastchess, accept/reject on the SPRT bound.
+
+- **Why not feature flags.** A flag-per-prior-behavior approach grows linearly with milestone count and produces a code surface where every search/eval function carries a "circa-M3" / "circa-M4" / … parametrization. The field universally rejects this pattern (Stockfish/Fishtest, Komodo, Ethereal all use historical-commit builds). The codebase always reflects the *current* engine; prior behaviors live only in git history.
+- **Build flow** (will be wired into `scripts/sprt.sh` when M3.F lands; not yet implemented):
+  - `git worktree add target/sprt-baselines/<sha> <sha>` — isolated checkout so cargo's `target/` doesn't conflict.
+  - `cargo build --release` in the worktree → cached binary at `target/sprt-baselines/<sha>/target/release/chess`.
+  - `cargo build --release` in the working tree.
+  - `fastchess` SPRT match between the two binaries.
+- **Caching.** Built baselines are keyed by SHA; re-runs against the same baseline are free.
+- **Refactors don't need SPRT.** Functional equivalence is verified by `cargo test`; the deterministic `bench` UCI command (lands at M3.F) catches "did the search behavior accidentally change" in seconds. Reserve SPRT for changes that intend a strength delta or that touch search/eval where neutrality isn't trivially testable.
+
+### Baseline tag naming convention
+
+SPRT baselines are referenced by **annotated git tags**, not bare SHAs. A bare SHA is forgettable and offers no signal in an SPRT log; an annotated tag is self-documenting.
+
+- **Format**: `baseline/<descriptive-slug>`.
+- **Slug**: lowercase, hyphen-separated, describes the engine's *behavior* at the tagged commit — not the milestone the commit landed in. The behavior name is what makes the tag legible years later in an SPRT log; milestone numbers require cross-referencing the roadmap.
+- **Annotated, not lightweight** (`git tag -a`). The annotation explains what the tag marks: which behavior, when it was last in production, and why it's a useful reference point. Pre-formatted so `git tag -ln5 baseline/random-mover` reads cleanly without consulting the roadmap.
+- **Each tag is the commit when the named behavior was last in production** — i.e., the last commit on `main` before the next phase replaced it. Tagged once and never moved or deleted (immutable historical reference).
+- **Pushed to `origin` once the project has a remote** (currently no GitHub remote per the tooling backlog; tags live locally for now and will push on first `git push --tags`).
+
+Tags created so far:
+
+| Tag | Commit | Marks |
+|---|---|---|
+| `baseline/random-mover` | `08b980d` (M2.E end) | Last commit shipping uniform-random move selection as production search. The reference point for the M3 exit criterion ("beats the random mover ~100%"). |
+
+Tags expected to be created at future milestone boundaries (illustrative — not commitments):
+
+- `baseline/material-greedy` — last commit shipping depth-1 best-eval as production search (M3.A end / M3.B start).
+- `baseline/alpha-beta-no-tt` — last commit shipping alpha-beta + qsearch + ID without TT (M3 end / M4 start).
+- `baseline/alpha-beta-tt` — last commit shipping the bare TT (M4.A end / M4.B start), etc.
+
+Not every commit gets a baseline tag. The criterion: tag a commit if a future SPRT might want to cite it as a fixed reference point (typically end-of-milestone or end-of-substantial-feature). Within-milestone refactors and intermediate sub-phase commits don't get tagged — they're just steps in the history.
 
 ## Benchmarking conventions
 
@@ -302,9 +339,14 @@ The calibration pass is one-time per role. Re-run if the workflow changes shape 
     - **chess-coder (Sonnet, 2 slices).** Phase 1+2 (src + tests) and Phase 4 (scripts + ADR + runbook) shipped correctly; Phase 4 coder also caught the 12-vs-40 fastchess-compliance-step discrepancy in their report (real observational reasoning). Single workflow gap: neither slice ran `cargo fmt`, leaving final-review to catch it. Closed by adding `cargo fmt` to `chess-coder.md`'s verification checklist.
     - **Outcome:** No tier changes. test-suite-reviewer removed from watchlist; chess-coder verification step extended.
 
+- **2026-04-28 — chess-researcher (M3 search-basics brief, parallel A/B).** Sonnet + Opus spawned on the same brief covering negamax framing / mate scoring / PV recovery / quiescence / move ordering / iterative deepening / cancellation / repetition / draw detection / pitfalls / performance budget. Reports produced at `docs/research/m3-search-basics.md` (Sonnet) and `docs/research/m3-search-basics.opus.md` (Opus).
+    - **Substantive convergence on every headline call**: fail-soft negamax; triangular PV table; defer PVS / aspiration windows to M4; qsearch = stand-pat + captures + queen promos + in-check evasions (no checks, no delta pruning at M3); MVV-LVA + movegen-order quiets; ID aborts between iterations only; ~2k–4k node cancellation cadence; repetition via game-history `Vec<u64>` plumbed through `SearchContext`; insufficient-material in eval.
+    - **Differences are wording-crispness or minor-parameter only**: score type `i32` (Sonnet) vs `i16` (Opus, citing M9 NNUE SIMD); MATE constant 30000 vs 32000; mate-distance pruning M3 (Sonnet) vs M4 (Opus); performance estimate 5–20 Mnps (Sonnet) vs 0.5–2 Mnps (Opus) — empirical resolution deferred to M3.C bench. Both reports surfaced the PV-update-under-cancellation pitfall (Opus framed it as a named bug taxonomy; Sonnet folded it into the "Common pitfalls" list). No must-fix gap in either direction.
+    - **Outcome:** chess-researcher Sonnet tier confirmed; remove from watchlist. Both reports are kept (the Opus parallel pass is preserved as the calibration evidence and as a useful second perspective for plan-mode reference).
+
 **Watchlist** (tiers without calibration data — next time the role fires, run Sonnet + Opus in parallel before relying on the cheaper tier):
 
-- **chess-researcher.** Pre-M2 research (`docs/research/m2-uci-threading.md`, `docs/research/m2-tournament-harness.md`) predates the tier system and used a single agent on Sonnet. No comparison data point exists. Research outputs are particularly hazardous to drop without calibration because the failure mode is *silent omission* (a missed source, a missed gotcha) rather than visibly-wrong output, and the user reading chat can only catch what the report says — not what it leaves out. Next time a research subagent is needed, spawn Sonnet + Opus in parallel on the same brief, diff the synthesis sections, and decide.
+- *(none currently)*
 
 ### Stop-loss
 
