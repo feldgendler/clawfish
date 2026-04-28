@@ -124,6 +124,9 @@ pub(crate) fn parse(s: &str) -> Result<Position, FenError> {
     //     parser path stays at from-scratch.
     p.refresh_zobrist();
 
+    // 11. Compute the combined material + PST score from scratch (M3.A).
+    p.refresh_static_eval();
+
     Ok(p)
 }
 
@@ -1251,10 +1254,11 @@ mod tests {
             p.validate_post_parse()
                 .expect("constructed position must pass validate_post_parse");
 
-            // set_piece/set_aux_state don't refresh the Zobrist field; do it
-            // once at the end so structural equality with the FEN-roundtripped
-            // position (whose parser refreshes zobrist) holds.
+            // set_piece/set_aux_state don't refresh the Zobrist or static-eval
+            // fields; do both once at the end so structural equality with the
+            // FEN-roundtripped position (whose parser refreshes both) holds.
             p.refresh_zobrist();
+            p.refresh_static_eval();
 
             let s = p.to_fen();
             let parsed = Position::from_fen(&s).map_err(|e| {

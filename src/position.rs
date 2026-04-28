@@ -109,6 +109,11 @@ pub struct Position {
     /// XOR updates inside `make_move` / `unmake_move`. Private — cross-module
     /// mutation goes through `refresh_zobrist`. See ADR-0009.
     zobrist: u64,
+    /// Combined material + PST score from White's perspective (always
+    /// positive = White advantage). Maintained incrementally by
+    /// `make_move` / `unmake_move` (M3.A Slice 2). Populated from scratch
+    /// by `refresh_static_eval` after construction and FEN parse.
+    static_eval_white: i32,
 }
 
 impl Position {
@@ -132,6 +137,7 @@ impl Position {
             halfmove_clock: 0,
             fullmove_number: 1,
             zobrist: 0,
+            static_eval_white: 0,
         }
     }
 
@@ -210,8 +216,10 @@ impl Position {
             halfmove_clock: 0,
             fullmove_number: 1,
             zobrist: 0,
+            static_eval_white: 0,
         };
         p.refresh_zobrist();
+        p.refresh_static_eval();
         p
     }
 
@@ -457,6 +465,24 @@ impl Position {
     /// validate against `from_scratch`.
     pub(crate) fn refresh_zobrist_from(&mut self, value: u64) {
         self.zobrist = value;
+    }
+
+    /// Combined material + PST score from White's perspective, maintained
+    /// incrementally by `make_move` / `unmake_move`. Populated from scratch
+    /// by `refresh_static_eval` after construction and FEN parse.
+    pub(crate) fn static_eval_white(&self) -> i32 {
+        self.static_eval_white
+    }
+
+    /// Recompute `static_eval_white` from scratch via `eval::eval_white_from_scratch`.
+    pub(crate) fn refresh_static_eval(&mut self) {
+        self.static_eval_white = crate::eval::eval_white_from_scratch(self);
+    }
+
+    /// Write `value` into `static_eval_white` directly, bypassing
+    /// from-scratch recomputation. Used by `make_move` / `unmake_move`.
+    pub(crate) fn refresh_static_eval_from(&mut self, value: i32) {
+        self.static_eval_white = value;
     }
 
     /// Apply `mv` to `self`, returning an [`Undo`](crate::mov::Undo) token
@@ -952,10 +978,11 @@ mod tests {
         p.set_piece(Square::E8, BLACK_KING);
         p.set_piece(Square::G8, BLACK_KNIGHT);
         p.set_aux_state(Color::White, CastlingRights::NONE, None, 3, 17);
-        // set_piece/set_aux_state don't refresh the Zobrist field; do it once
-        // at the end so structural equality with the FEN-roundtripped position
-        // (whose parser refreshes zobrist) holds.
+        // set_piece/set_aux_state don't refresh the Zobrist or static-eval fields;
+        // do it once at the end so structural equality with the FEN-roundtripped
+        // position (whose parser refreshes both) holds.
         p.refresh_zobrist();
+        p.refresh_static_eval();
 
         let formatted = format!("{}", p);
         let parsed = Position::from_fen(&formatted).expect("formatted FEN must parse");
@@ -988,6 +1015,7 @@ mod tests {
         // at the end so structural equality with the FEN-roundtripped position
         // holds.
         p.refresh_zobrist();
+        p.refresh_static_eval();
 
         let formatted = format!("{}", p);
         let parsed = Position::from_fen(&formatted).expect("formatted castle/EP FEN must parse");

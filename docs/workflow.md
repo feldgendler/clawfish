@@ -288,10 +288,10 @@ Tags created so far:
 | Tag | Commit | Marks |
 |---|---|---|
 | `baseline/random-mover` | `08b980d` (M2.E end) | Last commit shipping uniform-random move selection as production search. The reference point for the M3 exit criterion ("beats the random mover ~100%"). |
+| `baseline/material-greedy` | M3.A end | Last commit shipping depth-1 best-eval (PeSTO MG material + PST) as production search. Reference point for any future SPRT match against the depth-1 greedy behavior. |
 
 Tags expected to be created at future milestone boundaries (illustrative — not commitments):
 
-- `baseline/material-greedy` — last commit shipping depth-1 best-eval as production search (M3.A end / M3.B start).
 - `baseline/alpha-beta-no-tt` — last commit shipping alpha-beta + qsearch + ID without TT (M3 end / M4 start).
 - `baseline/alpha-beta-tt` — last commit shipping the bare TT (M4.A end / M4.B start), etc.
 

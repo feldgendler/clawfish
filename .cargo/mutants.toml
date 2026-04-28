@@ -20,6 +20,16 @@ exclude_globs = [
 
     # Stub entry point — println! only, nothing meaningful to mutate.
     "src/main.rs",
+
+    # Vendored PeSTO middlegame evaluation data (M3.A): MATERIAL constants
+    # plus six MG_*_PST tables. Same precedent as src/magic/constants.rs.
+    # Mutation testing on negative literals would generate ~185 `delete -`
+    # survivors that the structural symmetry test (B1 in src/eval.rs) is
+    # invariant under (sign-flips on both color sides cancel). End-to-end
+    # validation lives at higher layers — the published PeSTO source is
+    # authoritative, and SPRT vs RandomMover (M3.F) plus the smoke games in
+    # scripts/match.sh exercise the data in actual play.
+    "src/eval/data.rs",
 ]
 
 # ---- Mutant-level exclusions (by name regex) ------------------------------

@@ -1,5 +1,6 @@
 pub mod bitboard;
 pub mod engine;
+pub mod eval;
 pub mod fen;
 pub mod magic;
 pub mod mov;
@@ -15,6 +16,7 @@ pub mod zobrist;
 
 pub use bitboard::Bitboard;
 pub use engine::{reader_loop, run_stdio};
+pub use eval::evaluate;
 pub use fen::FenError;
 pub use magic::{bishop_attacks, queen_attacks, rook_attacks};
 pub use mov::{Move, MoveFlag, UciMoveError, Undo};
