@@ -1,0 +1,39 @@
+[package]
+name = "chess-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# `arbitrary-derive` is intentionally NOT enabled — the `Arbitrary<String>`
+# impl is in the `arbitrary` crate proper (always pulled in by
+# `libfuzzer-sys`), not behind a feature flag. The `arbitrary-derive`
+# feature only enables the `#[derive(Arbitrary)]` proc-macro, which the
+# current harnesses don't use. Re-enable when a future fuzz target adds
+# a custom-derive type.
+libfuzzer-sys = "0.4"
+chess = { path = ".." }
+
+# `cargo-fuzz` requires a separate workspace from the parent crate so that
+# `libfuzzer-sys` and its transitives stay out of the root `Cargo.lock` and
+# therefore out of the `cargo audit` / `cargo deny` policy at the repo root.
+# See ADR-0013.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_fen"
+path = "fuzz_targets/fuzz_fen.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_uci"
+path = "fuzz_targets/fuzz_uci.rs"
+test = false
+doc = false
+bench = false

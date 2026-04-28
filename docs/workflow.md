@@ -131,6 +131,20 @@ Standing checks that complement the review loops. The review loops catch reasoni
 
 - **`cargo mutants`** — see "Mutation testing" under final review above, and "Mutation-testing scope" below for the `--in-diff` workflow that keeps the run bounded.
 
+### Fuzzing
+
+Coverage-guided fuzzing of the project's string→AST parsers (FEN and UCI). Per ADR-0013.
+
+- **Targets.** `fuzz_fen` (`Position::from_fen`) and `fuzz_uci` (`parse_uci_line`) under `fuzz/fuzz_targets/`. Both use `Arbitrary<String>` harnesses.
+- **Cadence.** Re-run on parser change (`src/fen.rs`, `src/uci.rs`, or anything they call) → ≥30-min run on the affected target. Per major milestone → 2-hour run on each target as a backstop. **Not** in pre-commit.
+- **First-time install.** `cargo install cargo-fuzz`. Nightly toolchain auto-selected inside `fuzz/` via `fuzz/rust-toolchain.toml` — no `+nightly` typing required from inside the directory.
+- **Run.** `cd fuzz && cargo fuzz run --sanitizer none <target> -- -max_len=200 -max_total_time=<seconds>`. The `--sanitizer none` is correct for the current targets (no fuzzed path reaches `unsafe`); revisit per ADR-0013 §5 if that changes.
+- **Smoke (~10 seconds).** `cd fuzz && cargo fuzz run --sanitizer none <target> -- -runs=1000 -max_len=200`. Useful as a fast post-edit check.
+- **Triage.** `cargo fuzz tmin <target> <artifact>` minimizes a crash. Embed minimized literal as a `#[test]` in `src/fen.rs::tests` or `src/uci.rs::tests`; fix parser; re-run target until clean.
+- **Seed maintenance.** Adding a fixture to `src/uci.rs::tests` does *not* auto-flow into the seed corpus. To add a seed, write a new file under `fuzz/corpus/<target>/`. To remove one, `git rm`. No extraction tooling.
+- **Policy isolation.** The fuzz workspace is independent (`[workspace] members = ["."]` inside `fuzz/Cargo.toml`); `libfuzzer-sys` and its transitives are not in the root `Cargo.lock`. Root `cargo audit` and `cargo deny check` therefore do not see fuzz deps. Run `cd fuzz && cargo audit` separately to check fuzz-side advisories.
+- **Campaign results.** Per-campaign summary appended to `docs/research/tooling-fuzzing-results.md`. **Not** in `bench/` — ADR-0010 reserves that for performance baselines.
+
 ## Mutation-testing scope
 
 Mutation testing runtime grows roughly linearly with codebase size. A full-repo run is acceptable while the project is small, but doesn't scale — by the time the search layer lands, a full pass would take an hour-plus. Two scoping mechanisms keep the per-unit cost bounded; combine them as needed.

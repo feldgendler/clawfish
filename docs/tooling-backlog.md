@@ -2,15 +2,7 @@
 
 Industry-best-practice items surfaced during the 2026-04-27 workflow review but not yet adopted. **Listed in recommended implementation order** — pick from the top when the next slot opens for tooling work.
 
-## 1. Fuzzing (`cargo-fuzz`)
-
-**Why first now.** Highest-ROI target is the FEN parser (already shipped — strict spec, lots of edge cases). UCI parser at M2 is the next obvious one. Defer until UCI lands so the same setup amortizes across two targets. Nightly-Rust requirement is friction; alternative is structure-aware property testing with `arbitrary` + `proptest` on stable, which the property-testing infrastructure already covers partially.
-
-**Effort.** Nightly toolchain installation, `cargo fuzz init`, write a fuzz target wrapping `Fen::parse`, run for a few CPU-hours. Investigate any panic. Repeat for UCI at M2.
-
-**Integration.** Run periodically on parsers (any module that ingests external strings). Standalone `cargo fuzz` invocation, not in the pre-commit hook.
-
-## 2. CI (GitHub Actions)
+## 1. CI (GitHub Actions)
 
 **Why last in the active queue.** Blocked: the project is not on GitHub yet. When it moves, this consolidates everything above (fmt, clippy, test, coverage, audit, deny, plus any of the items implemented by then). Especially valuable since the user doesn't read code and depends on external green/red signals.
 
@@ -26,10 +18,14 @@ Industry-best-practice items surfaced during the 2026-04-27 workflow review but 
 - **`unsafe` audit policy** — defer until the engine first uses `unsafe` (likely a hot-path `get_unchecked` in magic-bitboard lookups, possibly M1.C or later). At that point write an ADR for when `unsafe` is allowed and how it's reviewed.
 - **LICENSE file** — needed when the repo goes public or accepts external contributions. `Cargo.toml` is currently `publish = false`; cargo-deny ignores via `[licenses] private = { ignore = true }`.
 - **CHANGELOG.md** — auto-generatable from conventional commits; only valuable once releases or external consumers exist.
-- **codecov.io / Codecov trend tracking** — depends on CI (#5); revisit then.
+- **codecov.io / Codecov trend tracking** — depends on CI (#1); revisit then.
 - **Doc-coverage lint (`#![deny(missing_docs)]`)** — low ROI for an engine the user isn't reading; reconsider only if the codebase ever becomes a library others consume.
 
 ---
+
+## Done since the 2026-04-27 review
+
+- **Fuzzing (`cargo-fuzz`)** — completed 2026-04-28 per ADR-0013 (`docs/decisions/0013-fuzzing-strategy.md`). `fuzz/` workspace (independent — `libfuzzer-sys` stays out of root `cargo audit` / `cargo deny` scope). Two `Arbitrary<String>` harnesses: `fuzz_fen` and `fuzz_uci`. Hand-curated seed corpora (35 fen, 30 uci) under `fuzz/corpus/<target>/`. `--sanitizer none` (no fuzzed parser path reaches `unsafe`). Cadence + commands documented under `docs/workflow.md` "Fuzzing". The first 2-hour campaigns per target are deferred to a later session — operator runs `cd fuzz && cargo fuzz run --sanitizer none <target> -- -max_len=200 -max_total_time=7200` once nightly is installed; campaign-result tables go to `docs/research/tooling-fuzzing-results.md`.
 
 ## Done in the 2026-04-27 review
 
