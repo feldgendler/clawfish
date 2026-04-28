@@ -31,6 +31,24 @@ Total executions across both targets: **2.28 billion**. Zero panics, zero OOMs, 
 
 The libFuzzer-discovered corpus expansion (fuzz_fen 35 → 513; fuzz_uci 30 → 1185) is gitignored per `fuzz/.gitignore`'s `!corpus/<target>/{fen,uci}-*` allowlist; only hand-curated seeds are committed.
 
+### 2026-04-28 — `-max_len=4096` smoke (Apple M4, --jobs=5)
+
+Same parameters as the saturation campaign except `-max_len=4096` (libFuzzer's default — 20× the saturation campaign's 200-byte cap) and `-max_total_time=900` (15 min wall-clock per target → ~1.25 CPU-hours per target). Hypothesis being tested: whether `ft` keeps growing past the 200-byte cap, indicating signal space the saturation campaign undersampled.
+
+| target | runs | exec/s per worker | wall-clock | cov | ft | Δft vs 200-byte | corp | crashes |
+|---|---|---|---|---|---|---|---|---|
+| fuzz_fen | 749,971,601 | 165k–210k | 913s | 228 | 496 | +10 | 196 | 0 |
+| fuzz_uci | 140,397,202 | 25k–35k | 916s | 434 | 2238 | **+479** | 1461 | 0 |
+
+Findings:
+
+- **`cov` unchanged on both targets** — basic-block coverage was already saturated at the 200-byte cap. No new code paths.
+- **fuzz_fen `ft` grew marginally** (+10) — comparison-signal exploration plateau holds even at 4096 bytes. FEN's grammar is dense and mostly token-bounded by the placement field's `/`-delimiters.
+- **fuzz_uci `ft` grew substantially** (+479) — the 200-byte cap was meaningfully undersampling the UCI parser's signal space. UCI commands with long move-lists or `searchmoves` body tokens exercise comparison signals the shorter cap couldn't reach. Still 0 crashes after 140M execs at 4k bytes.
+- **exec/s dropped** as expected (longer inputs = more bytes per execution; fuzz_uci hit ~30k/worker vs ~140k at 200 bytes — ~5× slowdown for ~20× input length, sublinear because libFuzzer's mutation cost is per-input not per-byte).
+
+Operational decision: keep `-max_len=200` as the default for routine post-edit smokes (fast feedback) and per-major-milestone backstops (saturation evidence). Run `-max_len=4096` opportunistically — at minimum once per target before any future ADR-0013 cadence change, and any time the parser's input-length contract is touched. The +479 `ft` delta on fuzz_uci is signal that 200-byte saturation isn't the same as 4096-byte saturation; future work that depends on long-input correctness (e.g. PGN-to-FEN converters, position-with-move-list endpoints) should re-check.
+
 ## Crashes triaged
 
 ### crash-ad3313fd7ec85772df26cda530d51185d9751093 (fuzz_fen, 2026-04-28)
