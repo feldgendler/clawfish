@@ -90,14 +90,23 @@ Three parallel research passes covered M1's design space:
   - Cute Chess GUI on macOS: skip; suggest `chessx` cask or Lichess paste-import for PGN replay.
   - Binds **ADR-0012** on M2.E.
 
-### Search
-*Not yet researched.*
+### Search (M3) — researched 2026-04-28
 
-### Evaluation
-*Not yet researched.*
+- **[`research/m3-search-basics.md`](research/m3-search-basics.md)** (Sonnet pass) and **[`research/m3-search-basics.opus.md`](research/m3-search-basics.opus.md)** (Opus calibration parallel pass).
+  - Headline calls (both reports converge): **fail-soft negamax**; **triangular PV table** (~4 KB at MAX_PLY=64); **MVV-LVA captures-first** + quiet moves in movegen order (no killer/history yet); **mate-distance pruning** safe and cheap; **PVS / aspiration windows defer to M4** (need TT-move ordering to pay off); **qsearch scope** = stand-pat + captures + queen promos + in-check all-evasions (no checks, no underpromotions, no delta pruning at M3); **stand-pat forbidden when in check**; **ID aborts between iterations only — never mid-iteration** (mid-iteration partials discarded); **cancellation cadence** 2048–4096 nodes via existing `SearchContext::should_abort`; **repetition + 50-move via game-history `Vec<u64>` plumbed through `SearchContext`** (push/pop around make/unmake; first-occurrence-in-search counts as draw); **insufficient-material draw detection lives in eval**.
+  - Calibration outcome: substantive convergence; minor wording-only differences (i32 vs i16 score type; 30000 vs 32000 MATE constant; mate-distance pruning M3 vs M4). chess-researcher tier confirmed for Sonnet.
 
-### Time management
-*Partially covered by `m2-uci-threading.md` for the deadline-polling interface; algorithm not yet researched.*
+### Evaluation (M3) — researched 2026-04-28
+
+- **[`research/m3-eval-material-pst.md`](research/m3-eval-material-pst.md)**.
+  - Headline calls: **Vendor PeSTO middlegame values verbatim** (Texel-tuned; P=82, N=337, B=365, R=477, Q=1025, K=0). **Single-phase MG-only is fine for M3** — tapering = M6; known weakness is bare-king endgame king behavior, acceptable vs SPRT-vs-RandomMover target. **Eval perspective: side-to-move-relative**. **PST symmetry via rank-flip at lookup** (`square ^ 56` for white if a1=0). **Insufficient-material in eval**: KvK / KvN / KvB → 0 (skip same-color-bishops at M3). **Incremental PST delta in `Undo`** from M3.A — aligns with NNUE hook (ADR-0004).
+  - All PeSTO PST data tables vendored verbatim in the report so M3.A can copy them directly.
+  - Open question for M3.A plan: confirm engine's a1=0 vs a8=0 square indexing convention before writing the lookup formula.
+
+### Time management (M3) — researched 2026-04-28
+
+- **[`research/m3-time-management.md`](research/m3-time-management.md)** (extends `m2-uci-threading.md`'s deadline-polling primitive with the algorithm layer).
+  - Headline calls: **Soft cap = `remaining/20 + increment/2`** (CPW baseline). **Hard cap = `min(3 × soft_cap, remaining - latency_margin)`**. **Latency margin = 50 ms** default, configurable via new `MoveOverhead` UCI option (`type spin default 50 min 0 max 5000`). **Sudden death (no `movestogo`):** divisor = 20 (conservative). **`movetime` overrides everything** (`soft = hard = movetime - latency`). **Non-time limits** (`depth`/`nodes`/`mate`/`infinite`) bypass time mgmt. **PV-stability / search-instability extensions defer to M4**. **Pondering: M5+**. Mocked-clock unit tests for `compute_caps` per `docs/workflow.md` TDD scope.
 
 ### NNUE
 *Not yet researched.*

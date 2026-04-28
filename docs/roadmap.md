@@ -378,6 +378,29 @@ First playing engine. Negamax with iterative deepening, quiescence search, simpl
 
 **Exit criteria:** beats the random mover ~100% via SPRT; estimated rating from self-play and a known-strength reference.
 
+**Status — prior-art research complete (2026-04-28).** Three research reports in `docs/research/`: `m3-search-basics.md` (+ `m3-search-basics.opus.md` calibration parallel pass), `m3-eval-material-pst.md`, `m3-time-management.md`. Synthesis recorded in `docs/prior-art.md`. chess-researcher Sonnet tier confirmed via Sonnet+Opus calibration on the search-basics brief.
+
+**ADRs likely to bind per-phase, as each lands.** None gates M3.A. Material in `docs/research/` and `docs/prior-art.md`.
+
+- **ADR-0013** — Search structure: fail-soft negamax + triangular PV + ply-adjusted mate scores + mate-distance pruning. **Binds on M3.C.**
+- **ADR-0014** — Eval composition: material + PST single-phase, vendored PeSTO MG values, incremental delta in `Undo`. **Binds on M3.A.**
+- **ADR-0015** — Time management: `compute_caps` formula + soft/hard cap discipline + `MoveOverhead` UCI option. **Binds on M3.E.**
+
+(Numbers tentative; ADRs land just before the phase that depends on them.)
+
+**Sub-phases.** M3 is decomposed into six plan-and-execute cycles. Each phase gets its own plan-mode pass with the self-review loop (see `workflow.md`), executes independently, lands its own commit(s), runs its own tests before we move to the next phase. Sized for ~300–800 LOC each per the workflow's typical-unit target.
+
+| Phase | Scope | Approx size |
+|---|---|---|
+| **M3.A** — Material + PST eval + `GreedyMover` (depth-1 production search) | `eval` module: pure-function `evaluate(&Position) -> i32` returning side-to-move-relative score. PeSTO middlegame tables vendored verbatim (data, not code). Insufficient-material draw detection (KvK / KvN / KvB → 0). Incremental PST delta in `Undo` per ADR-0004 NNUE-hook discipline. **`GreedyMover` Search impl** — depth-1 best-eval (enumerate legal moves; `score = -evaluate(after_make)`; lex-first tie-break). Replaces `RandomMover` as the production `Search` in `src/main.rs`; emits `info depth 1 score cp X nodes N time T pv MV`. **`Random_Seed` UCI option moves out** of the production binary (alpha-beta in M3.C is deterministic too). **`src/bin/chess-random.rs`** — sibling binary that retains `RandomMover` + `Random_Seed`; needed to remain runnable as the SPRT baseline for M3.F ("beats RandomMover ~100%"). E36 self-play test + `scripts/match.sh self-play` switch to spawning `chess-random`. Color-swap symmetry property tests on eval. ADR-0014 lands here. **First version that plays measurably better than random.** | ~700 |
+| **M3.B** — Game-history + draw-detection plumbing | `Engine::game_history: Vec<u64>` populated by `handle_position` (Polyglot Zobrist after every applied move) and cleared by `handle_ucinewgame`. `SearchContext::history` reference plumbed through. Helper functions `is_repetition_in_search` (single prior occurrence in search-stack counts as draw, per CPW) and `is_50_move_draw` (`halfmove_clock >= 100`). Still RandomMover. | ~300 |
+| **M3.C** — Negamax alpha-beta core | Fail-soft negamax with `i32` scores. Mate scoring `MATE - ply` / `-(MATE - ply)`; UCI emit `score mate N` with full-moves conversion. Mate-distance pruning. Triangular PV table (~4 KB at MAX_PLY=64). MVV-LVA capture ordering; quiet moves in movegen order. Fixed depth via `go depth N` only (no ID, no time mgmt yet — single iteration). Calls `evaluate` at leaves (horizon effect accepted; qsearch lands in M3.D). Replaces `RandomMover` as the production `Search` impl. Honors M3.B repetition/50-move helpers. ADR-0013 lands here. | ~700 |
+| **M3.D** — Quiescence search | Stand-pat baseline (forbidden when in check). Captures + queen promotions extended at leaves. In-check all-evasions. Terminal detection in qsearch. No delta pruning, no non-capture checks, no underpromotions (M4+ refinements). Replaces M3.C's leaf eval call. | ~400 |
+| **M3.E** — Iterative deepening + time management | `compute_caps(GoParams, Color, latency) -> (soft, hard)` pure function with mocked-clock unit tests. Soft cap = `remaining/20 + increment/2`; hard cap = `min(3 × soft, remaining - latency)`. ID outer loop with abort-between-iterations discipline; mid-iteration aborts discard partial result. Prior-iteration root PV move tried first (the only ordering hint available without TT). New `MoveOverhead` UCI option (default 50 ms). ADR-0015 lands here. | ~600 |
+| **M3.F** — `bench` command + SPRT validation | UCI `bench` command running a fixed position set and reporting deterministic node count (regression baseline per CPW convention). SPRT match vs RandomMover via the M2.E fastchess harness — expected to cross the upper bound in ~5–10 games. First rating estimate from self-play + Stockfish-with-Elo-cap calibration matches. `bench/m3.md` milestone summary. Closes M3. | ~300 |
+
+A and B are independent and can be planned/executed in parallel. C–F are sequential.
+
 ### M4 — Search basics
 Transposition table (Zobrist), move ordering (PV move, MVV-LVA, killer moves, history heuristic), aspiration windows.
 
