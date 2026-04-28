@@ -22,7 +22,7 @@
 
 use std::hint::black_box;
 
-use chess::{Position, perft, perft_bulk};
+use clawfish::{Position, perft, perft_bulk};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 const STARTING_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";

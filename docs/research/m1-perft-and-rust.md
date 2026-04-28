@@ -161,7 +161,7 @@ Sources: [Chess-EPDs/perft.epd](https://github.com/ChrisWhittington/Chess-EPDs/b
 
 **Integration tests vs inline unit tests:**
 
-- Place perft tests as integration tests in `tests/perft.rs` (or `tests/perft/`). Integration tests import the library's public API (`use chess::perft;`), which matches how users of the library would call it, and they compile as a separate crate. This is the right home for cross-position regression suites.
+- Place perft tests as integration tests in `tests/perft.rs` (or `tests/perft/`). Integration tests import the library's public API (`use clawfish::perft;`), which matches how users of the library would call it, and they compile as a separate crate. This is the right home for cross-position regression suites.
 - Use inline `#[cfg(test)] mod tests` inside `src/perft.rs` for unit-level checks of the perft function's internal logic (e.g., that depth-0 returns 1, that depth-1 from a trivial position matches manual count).
 
 **Gating slow tests with `#[ignore]`:**
@@ -213,7 +213,7 @@ The standard Cargo pattern for an engine is a single package containing both `sr
 ```rust
 // src/main.rs
 fn main() {
-    chess::uci::run();
+    clawfish::uci::run();
 }
 ```
 
@@ -328,7 +328,7 @@ Sources: [Criterion Getting Started](https://bheisler.github.io/criterion.rs/boo
 
 ```toml
 [package]
-name = "chess"
+name = "clawfish"
 version = "0.1.0"
 edition = "2024"
 description = "Standard chess engine"

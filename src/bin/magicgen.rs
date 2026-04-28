@@ -23,9 +23,9 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use chess::bitboard::Bitboard;
-use chess::slow_attacks;
-use chess::square::Square;
+use clawfish::bitboard::Bitboard;
+use clawfish::slow_attacks;
+use clawfish::square::Square;
 
 // ---------- constants ----------
 
@@ -62,7 +62,7 @@ impl SplitMix64 {
 
 // ---------- piece taxonomy (binary-local) ----------
 
-/// Binary-local piece taxonomy. Distinct from `chess::piece::PieceKind` —
+/// Binary-local piece taxonomy. Distinct from `clawfish::piece::PieceKind` —
 /// magicgen only deals with sliders, and importing the engine's full piece
 /// taxonomy here would muddy the boundary.
 #[derive(Copy, Clone, Debug)]

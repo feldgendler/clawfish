@@ -1,7 +1,7 @@
 //! Integration tests for the perft module (M1.G).
 //!
 //! Per `docs/plans/m1.g.md` §"Test layout — Integration tests". Tests
-//! consume the public crate-root API (`chess::*`) only.
+//! consume the public crate-root API (`clawfish::*`) only.
 //!
 //! ## Partition
 //!
@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use chess::{Position, divide, perft, perft_bulk};
+use clawfish::{Position, divide, perft, perft_bulk};
 
 // -----------------------------------------------------------------------
 // Fixture loading.

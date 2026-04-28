@@ -27,14 +27,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "chess"
+name = "clawfish"
 version = "0.1.0"
 
 [[package]]
-name = "chess-fuzz"
+name = "clawfish-fuzz"
 version = "0.0.0"
 dependencies = [
- "chess",
+ "clawfish",
  "libfuzzer-sys",
 ]
 

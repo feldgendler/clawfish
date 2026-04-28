@@ -7,7 +7,7 @@
 //! side-to-move asymmetry. Together they constitute the gold-standard
 //! correctness check for the Polyglot Zobrist implementation.
 
-use chess::Position;
+use clawfish::Position;
 
 // ---------------------------------------------------------------------------
 // The 9 published Polyglot test vectors.

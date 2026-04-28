@@ -4,7 +4,7 @@
 //! ## Public API
 //!
 //! ```ignore
-//! use chess::{Position, MoveList, generate_moves, in_check};
+//! use clawfish::{Position, MoveList, generate_moves, in_check};
 //!
 //! let pos = Position::starting_position();
 //! let mut moves = MoveList::new();

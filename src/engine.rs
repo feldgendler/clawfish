@@ -88,7 +88,7 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
     }
 
     fn handle_uci(&mut self) {
-        self.write_line(&format!("id name chess {}", env!("CARGO_PKG_VERSION")));
+        self.write_line(&format!("id name clawfish {}", env!("CARGO_PKG_VERSION")));
         self.write_line("id author Alex Feldgendler");
         self.write_line("option name Random_Seed type spin default 0 min 0 max 2147483647");
         self.write_line("uciok");

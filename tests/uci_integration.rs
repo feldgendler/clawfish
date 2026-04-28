@@ -1,6 +1,6 @@
 //! Process-spawn integration tests for the UCI engine binary (M2.C, §E).
 //!
-//! These tests spawn the `chess` binary as a subprocess, pipe UCI commands
+//! These tests spawn the `clawfish` binary as a subprocess, pipe UCI commands
 //! in, and verify the output. A dedicated reader thread prevents the test
 //! from blocking on a full pipe buffer; `child.kill()` is the timeout
 //! safety net.
@@ -9,7 +9,7 @@
 //! complementary to the in-process unit tests in `src/engine.rs::tests`,
 //! which exercise the orchestrator without going through real stdin/stdout.
 
-use chess::{Move, MoveList, Position, generate_moves};
+use clawfish::{Move, MoveList, Position, generate_moves};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command as ProcCommand, Stdio};
 use std::sync::mpsc;
@@ -20,14 +20,14 @@ use std::time::{Duration, Instant};
 // Helpers shared by all three tests.
 // ---------------------------------------------------------------------------
 
-/// Spawn the chess binary with piped stdin/stdout and stderr discarded.
+/// Spawn the clawfish binary with piped stdin/stdout and stderr discarded.
 fn spawn_engine() -> std::process::Child {
-    ProcCommand::new(env!("CARGO_BIN_EXE_chess"))
+    ProcCommand::new(env!("CARGO_BIN_EXE_clawfish"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn chess binary")
+        .expect("spawn clawfish binary")
 }
 
 /// Start a thread that reads lines from `stdout` into an mpsc channel until
