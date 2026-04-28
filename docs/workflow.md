@@ -165,6 +165,8 @@ cargo mutants --in-diff /tmp/<unit>.diff --iterate
 
 The `--in-diff` runs do not exercise mutants on lines that haven't changed since the previous unit. Test additions in the unit might reveal mutants in pre-existing untouched code that the previous run missed; conversely, a refactor elsewhere could move a previously-caught line out of test coverage. To catch this drift, run the **full suite** (`cargo mutants` with no `--in-diff`) once per major milestone (M1, M2, M3, …) — at the milestone's final unit's commit, after that unit's per-unit pass converges. Frequency tradeoff: more often means more confidence and slower commits; the milestone cadence is the balance for now and can be revisited if drift becomes a recurring source of late-discovered survivors.
 
+**Don't kick this off autonomously.** Full-suite runs take hours (~3+ h on the dev machine), tie up the working directory's build cache, and burn interactive cycles. The agent surfaces the next-best moment to run it (typically off-hours, before sleep, so it completes overnight) and waits for explicit user go-ahead. Per-unit `--in-diff` runs (minutes) remain part of the autonomous flow.
+
 ### File-glob fallback: `--file`
 
 `-f <GLOB>` limits to a fixed file set, ignoring git history. Useful when the relevant scope is known but a diff isn't (e.g. mutation-testing a single module while debugging it). Not part of the standard per-unit workflow, but available.
@@ -400,6 +402,7 @@ The main agent's context grows across a cycle (subagent return messages, plan re
 
 When a session produces new decisions, update the relevant doc *before* stopping:
 - New architectural decision → write `docs/decisions/NNNN-name.md` and reference it from `docs/architecture.md`.
+- New load-bearing invariant or design surface that doesn't merit a full ADR (e.g. a phase's data-structure invariant) → add a settled-commitments row + a per-feature section to `docs/architecture.md`. Roadmap/milestone entries are forward-looking or retrospective; they are not the home for invariants future engineers need to consult.
 - Milestone progress or revision → update `docs/roadmap.md`.
 - New ground rule from user → update `CLAUDE.md`.
 - Prior-art research output → append to `docs/prior-art.md` under the relevant component section.
