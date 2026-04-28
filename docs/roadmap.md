@@ -4,7 +4,39 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1 complete; M2.A / M2.B / M2.C landed; M2.D next — random-mover Search impl + `bestmove` plumbing (no new ADR).**
+**M1 complete; M2.A / M2.B / M2.C / M2.D landed; M2.E next — tournament harness + fastchess (ADR-0012 binds).**
+
+### M2.D — what landed
+
+The `RandomMover` SplitMix64-seeded `Search` impl + the engine's first real UCI option:
+
+- **`RandomMover` in `src/search.rs`** — picks uniformly at random from the legal-move list (post-`searchmoves` filter) via one SplitMix64 step per `go`. Honors `infinite` / `movetime` / `ponder` by polling `should_abort` (1 ms cadence). Same race-free always-compute-candidate-first invariant as `Stub`.
+- **`splitmix64_next`** — public-domain reference vendored verbatim. ~10 lines, no new dep. Modulo bias for legal-move counts ≤ 218 is < 4×10⁻¹⁸; no rejection sampling.
+- **`Search` trait extended** with `set_seed(&mut self, _seed: u64) {}` and `reset(&mut self) {}` — both default-no-op. `RandomMover` overrides; M3+ alpha-beta and `InfoEmittingFake` inherit no-op.
+- **`Random_Seed` UCI option** — `option name Random_Seed type spin default 0 min 0 max 2147483647`. Case-insensitive name match. Strict value validation against `MAX_RANDOM_SEED = 2_147_483_647` (= `i32::MAX`, the protocol-declared `max`). Silent on success even under `debug on`; debug-on echo on bad value.
+- **PRNG semantics** — continuous state across `go` calls; `setoption` resets state immediately to the new seed (not deferred to `ucinewgame`); `ucinewgame` resets state to the current seed.
+- **`Engine::join_in_flight_worker`** — new private helper consolidating the "signal stop + join" idiom previously inlined in `handle_go`'s back-to-back path. Now also called by `handle_ucinewgame` and `handle_setoption`'s `Random_Seed` success arm before they acquire the search mutex — closes a deadlock that would have hung the engine if a GUI sent `ucinewgame` or `setoption` while a `go infinite` worker was holding the mutex.
+- **End-to-end self-play test E36** — drives the binary via `position startpos moves <accumulated>` + `go movetime 10` until terminal. Validates every bestmove with `Move::from_uci` against a parallel `Position`. Pinned at `SELF_PLAY_SEED = 8`, terminates at ply 106 with `bestmove d3d1`.
+
+### M2.D — implementation highlights
+
+- **No new fields on `Engine`.** The seed lives solely in `RandomMover.seed` to eliminate two-source-of-truth drift.
+- **The plan's claim that "non-terminating random self-play is a strong signal of a movegen bug" was empirically wrong.** Random play between two random movers in a draw-rule-less engine can shuffle pieces back and forth indefinitely; we don't implement 50-move / threefold yet (explicit non-goal). Seeds 0–7 cycled past 300 ply; seed 8 was the first to terminate. The `find_terminating_seed_for_e36` `#[ignore]` test documents the search.
+- **Strict O3 resolution on `Random_Seed`** — values in `(MAX_RANDOM_SEED, u32::MAX]` (valid `u32` but above declared `max`) are rejected. Stockfish 18 silently accepts these; we honor the declared protocol contract instead.
+
+### M2.D — verification (Apple M4, dev machine)
+
+| Metric | Result |
+|---|---|
+| Tests | 598 lib + 4 uci-integration + 24 other = **626 fast + 6 ignored**. All passing. |
+| `cargo build --release` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo llvm-cov --summary-only --lib` | `engine.rs`: 97.41% region / 96.92% line / 91.18% function. `search.rs`: 77.15% region / 78.69% line — production `splitmix64_next` and `RandomMover` at 100%; cosmetic gap is the two `#[ignore]` documentation helpers and the trait's no-op defaults (overridden by `RandomMover`, never called on `InfoEmittingFake`). |
+| `cargo mutants --in-diff` | 23 mutants generated; **23 caught; 0 missed; 0 timeouts; 0 unviable**. |
+| Smoke | `printf 'uci\nquit\n' | target/release/chess` produces 4 lines including `option name Random_Seed type spin default 0 min 0 max 2147483647`; exits ≤ 2 s. |
+| Benchmark | **Skipped** — UCI dispatch is per-line; `RandomMover::go`'s per-`go` cost is one SplitMix64 step (~0.6 ns). Same precedent as M2.A / M2.B / M2.C. |
+
+All three review loops converged. Plan archived at `docs/plans/m2.d.md`. The plan went 5 reviewer passes; the test suite 2; the final review 2 (the second pass's mutation rerun caught the new `join_in_flight_worker` helper at 100%).
 
 ### M2.C — what landed
 
@@ -299,7 +331,7 @@ Plays legal random moves through a tournament harness (fastchess; see ADR-0012 b
 | **M2.A** ✓ — UCI move encoding | `Move::to_uci` (Display delegate) + `Move::from_uci` (generate-and-match against `generate_moves`) + `UciMoveError` (4 variants). Long algebraic per UCI spec; null move `0000` rejected; strict lowercase input. Defers legality entirely to movegen (consistent with ADR-0007). Debug-only `debug_assert!` on `(from, to, promo)` uniqueness inside `from_uci` (defense-in-depth alongside property test) | ~400–600 lines (actual: ~860 lines incl. 38 new tests) |
 | **M2.B** ✓ — UCI command parser | `uci` module: `Command` enum + helper types + `parse_uci_line(&str) -> Command`. Per-command leniency rules grounded in 12 empirical Stockfish 18 probes (strict-first-token, `debug` strict-exact-2-tokens, `position` lenient-stop, `go` lenient-skip). Move strings + FEN strings collected raw — M2.C parses. Total function: no `Result`, no panics. 96 tests; 99.9% line coverage; 0 missed mutants on `--in-diff` (49 caught, 6 unviable). | ~600–900 lines (actual: ~1430 lines incl. ~700 lines of impl + ~700 lines of 96 tests) |
 | **M2.C** ✓ — Engine I/O loop + Search trait | `Engine<W, S>` orchestrator + reader thread + per-`go` worker + `Arc<AtomicBool>` cancellation per ADR-0011. Handlers for every UCI 2006 GUI→engine command. `position` reset-on-error (FEN err keeps prior; move err resets to base; both info-string-rejected unconditionally). `searchmoves` silently drops bad entries. `Search` trait + `SearchContext` + `Stub` impl (lex-first legal move; honors `infinite`/`movetime`/`ponder`). `handle_quit` joins worker (bounded by polling cadence) so `bestmove` is in stdout before `run` returns. Always-compute-candidate-before-cancellation eliminates quit-vs-go race. 7 new tests added in final-review pass closed all 3 missed mutants. | ~800–1200 lines (actual: ~1300 lines impl + tests + ~330 lines plan + ~140 lines ADR-0011) |
-| **M2.D** — Random search + `go`/`bestmove` | `Search` trait/struct with `start(pos, params, output) -> Handle` and `Handle::stop()`, preserving the eval/search interception point per ADR-0004 (NNUE + skill-dial future hooks). Random move via SplitMix64; seed from system time or a custom `Random_Seed` UCI option for reproducibility. Honors `go movetime <ms>` (sleeps then emits), `go infinite` (waits for `stop`), `stop` (cancels pending emit), `searchmoves` (filters legal-move pool). `bestmove <uci>` output. End-to-end test: drive a full game from `position startpos` through repeated `go movetime 10` until terminal | ~700–1000 lines |
+| **M2.D** ✓ — Random search + `Random_Seed` option | `RandomMover` SplitMix64-seeded `Search` impl replaces `Stub` (lex-first). `Search` trait extended with default-no-op `set_seed` / `reset` lifecycle hooks. `Random_Seed` UCI option (`type spin default 0 min 0 max 2147483647`); strict validation rejects values above declared `max`. PRNG state continuous across `go`; `setoption` and `ucinewgame` both reset state. `Engine::join_in_flight_worker` consolidates the stop+join idiom — also called by `handle_ucinewgame` and `handle_setoption` to close a deadlock under in-flight `go infinite`. End-to-end self-play test E36 drives the binary through a full game with seed 8 → terminates ply 106 → `bestmove d3d1`. 23 mutants / 23 caught; 100% coverage on production `splitmix64_next` + `RandomMover`. | ~700–1000 lines (actual: ~1700 lines impl + tests + ~700-line plan; +24 net new tests) |
 | **M2.E** — Tournament harness + fastchess | `scripts/match.sh` wrapper around `fastchess`; documentation for downloading the `mac-arm64` release and reading PGN/log output. Integration test that spawns the release binary, drives it through a complete self-game via piped stdin/stdout, asserts the game terminates legally (checkmate / stalemate / 50-move / threefold / insufficient material per FIDE) and that the PGN parses. ADR-0012 codifies the harness layout. `docs/workflow.md` gains a "running a match" runbook | ~400–700 lines |
 
 Phases A → D are foundational and largely sequential; A and B are independent of each other and could be planned in either order, but C depends on both. E is the validation layer (analogous to M1.G).

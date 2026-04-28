@@ -10,7 +10,7 @@
 //!   `BufRead` into `Command`s on an `mpsc::Sender`.
 //! - [`run_stdio`] is the production wrapper: spawns the reader thread on
 //!   `io::stdin().lock()`, builds an `Engine` with `io::stdout()` and the
-//!   `Stub` search, calls `run`, then `std::process::exit(0)`.
+//!   `RandomMover` search, calls `run`, then `std::process::exit(0)`.
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,8 +18,14 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::search::{Search, SearchContext, SearchLimits, SearchResult, Stub};
+use crate::search::{RandomMover, Search, SearchContext, SearchLimits, SearchResult};
 use crate::{Command, DebugMode, GoParams, Move, Position, PositionSpec, Register, parse_uci_line};
+
+// Type is u32; value is 2^31 - 1 (the protocol-declared `max`). Not i32 —
+// the comparison band [0, MAX_RANDOM_SEED] is unsigned by construction.
+// Must match the `max` in the `option name Random_Seed …` line emitted by
+// `handle_uci`.
+const MAX_RANDOM_SEED: u32 = 2_147_483_647;
 
 /// UCI orchestrator. Owns engine state, dispatches parsed `Command`s to
 /// per-command handlers, drives the search worker thread.
@@ -84,6 +90,7 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
     fn handle_uci(&mut self) {
         self.write_line(&format!("id name chess {}", env!("CARGO_PKG_VERSION")));
         self.write_line("id author Alex Feldgendler");
+        self.write_line("option name Random_Seed type spin default 0 min 0 max 2147483647");
         self.write_line("uciok");
     }
 
@@ -92,7 +99,14 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
     }
 
     fn handle_ucinewgame(&mut self) {
+        // Signal and join any in-flight worker before mutating state or
+        // acquiring the search mutex. A `go infinite` still running when
+        // `ucinewgame` arrives would otherwise hold the lock for the full
+        // polling duration, blocking the orchestrator and preventing it from
+        // ever processing the inevitable `stop`. ADR-0011 v3.
+        self.join_in_flight_worker();
         self.position = Position::starting_position();
+        self.search.lock().unwrap().reset();
     }
 
     fn handle_position(&mut self, spec: PositionSpec, moves: Vec<String>) {
@@ -127,13 +141,10 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
 
     fn handle_go(&mut self, params: GoParams) {
         // (1) Implicit-stop on back-to-back go: signal the previous worker to
-        // stop and join it. Setting stop=true before join is load-bearing for
-        // infinite searches; without it the join would block forever waiting
-        // for the worker to exit on its own.
-        if let Some(h) = self.search_handle.take() {
-            self.stop.store(true, Ordering::Relaxed);
-            let _ = h.join();
-        }
+        // stop and join it via the shared helper. Setting stop=true before join
+        // is load-bearing for infinite searches; without it the join would block
+        // forever waiting for the worker to exit on its own.
+        self.join_in_flight_worker();
         // (2) Clear the cancellation flag so the new search starts fresh.
         self.stop.store(false, Ordering::Relaxed);
 
@@ -220,6 +231,44 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
     }
 
     fn handle_setoption(&mut self, name: String, value: Option<String>) {
+        if name.eq_ignore_ascii_case("random_seed") {
+            // Strict: parse as u32, then reject if above the declared max.
+            // Honors the protocol contract that values fall in [min, max].
+            let parsed: Option<u32> = value
+                .as_deref()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&n| n <= MAX_RANDOM_SEED);
+            match parsed {
+                Some(n) => {
+                    // Join any in-flight worker before acquiring the search mutex.
+                    // A `go infinite` running concurrently would hold the lock for
+                    // the entire polling duration, blocking the orchestrator and
+                    // preventing it from processing `stop`. ADR-0011 v3.
+                    self.join_in_flight_worker();
+                    self.search.lock().unwrap().set_seed(n as u64);
+                    // Silent on success — even under `debug on`. Same convention as
+                    // `handle_debug`: state-mutating commands without a protocol
+                    // response do not echo themselves.
+                }
+                None => {
+                    // Bad parse, out-of-range, or missing value — silent if
+                    // debug off; info string if debug on. The engine's
+                    // existing seed value is unchanged.
+                    let msg = match value.as_deref() {
+                        Some(v) => format!("Random_Seed: rejected value '{v}'"),
+                        None => "Random_Seed: rejected (no value given)".to_string(),
+                    };
+                    self.info_string_debug(&msg);
+                }
+            }
+            return;
+        }
+
+        // Unknown option — preserve M2.C behavior: silent if debug off, info
+        // string if debug on. Do NOT emit Stockfish's bare "No such option:"
+        // line (research §1.4, §2.5). Idiom mirrors existing M2.C handler:
+        // the `if self.debug` guard wraps the whole format-and-write because
+        // `details` allocation is conditional too.
         if self.debug {
             let details = match value {
                 Some(ref v) => format!("name {name} value {v}"),
@@ -265,6 +314,21 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         // deadlock waiting for more stdin input. run_stdio calls process::exit
         // immediately after run returns, reaping the reader thread.
         if let Some(h) = self.search_handle.take() {
+            let _ = h.join();
+        }
+    }
+
+    /// Signal stop and join the in-flight search worker, if any.
+    ///
+    /// Used by `handle_go` (back-to-back go), `handle_ucinewgame`, and
+    /// `handle_setoption`'s `Random_Seed` success path — anything that needs
+    /// to mutate engine state or hold the search mutex for a non-trivial
+    /// duration. ADR-0011 v3 guarantees the worker exits within ≤ 1 ms (its
+    /// cancellation-poll cadence). The caller must clear `self.stop` afterward
+    /// when a new search is about to begin (only `handle_go` does this).
+    fn join_in_flight_worker(&mut self) {
+        if let Some(h) = self.search_handle.take() {
+            self.stop.store(true, Ordering::Relaxed);
             let _ = h.join();
         }
     }
@@ -318,14 +382,15 @@ pub fn reader_loop(stdin: impl BufRead, tx: mpsc::Sender<Command>) {
 }
 
 /// Production wrapper: spawn the reader thread on `io::stdin().lock()`,
-/// build an `Engine` with `io::stdout()` and the `Stub` search, drive
-/// `run`, then `std::process::exit(0)`.
+/// build an `Engine` with `io::stdout()` and `RandomMover` (seed 0 matches
+/// the protocol-declared `default 0`), drive `run`, then
+/// `std::process::exit(0)`.
 pub fn run_stdio() -> ! {
     let (tx, rx) = mpsc::channel::<Command>();
     std::thread::spawn(move || {
         reader_loop(std::io::BufReader::new(std::io::stdin()), tx);
     });
-    let mut engine = Engine::new(std::io::stdout(), Stub);
+    let mut engine = Engine::new(std::io::stdout(), RandomMover::new(0));
     engine.run(rx);
     std::process::exit(0);
 }
@@ -333,9 +398,8 @@ pub fn run_stdio() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::Stub;
-    use crate::search::{SearchContext, SearchResult};
-    use crate::{Command, Position, parse_uci_line};
+    use crate::search::{RandomMover, SearchContext, SearchResult};
+    use crate::{Command, Move, Position, parse_uci_line};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
@@ -388,14 +452,14 @@ mod tests {
     // Group A harness
     // -----------------------------------------------------------------------
 
-    /// Builds an `Engine<CapturedWriter, Stub>`, sends each UCI line as a
-    /// parsed `Command` over an mpsc channel, appends `Command::Quit`, runs
+    /// Builds an `Engine<CapturedWriter, RandomMover>`, sends each UCI line as
+    /// a parsed `Command` over an mpsc channel, appends `Command::Quit`, runs
     /// to completion, and returns the captured stdout + a clone of the final
     /// position.
     fn drive(commands: &[&str]) -> (String, Position) {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, Stub);
+        let mut engine = Engine::new(writer, RandomMover::new(0));
 
         let (tx, rx) = mpsc::channel::<Command>();
         for line in commands {
@@ -436,6 +500,10 @@ mod tests {
             .iter()
             .position(|l| l.starts_with("id author"))
             .expect("id author line present");
+        let option_random_seed_idx = lines
+            .iter()
+            .position(|l| l.starts_with("option name Random_Seed"))
+            .expect("option name Random_Seed line present");
         let uciok_idx = lines
             .iter()
             .position(|l| *l == "uciok")
@@ -445,8 +513,12 @@ mod tests {
             "id name must come before id author"
         );
         assert!(
-            id_author_idx < uciok_idx,
-            "id author must come before uciok"
+            id_author_idx < option_random_seed_idx,
+            "id author must come before option name Random_Seed"
+        );
+        assert!(
+            option_random_seed_idx < uciok_idx,
+            "option name Random_Seed must come before uciok"
         );
     }
 
@@ -629,14 +701,18 @@ mod tests {
     #[test]
     fn handle_setoption_emits_info_string_when_debug_on() {
         // Pins plan §11: setoption emits `info string setoption received: …`
-        // when debug is on. Catches a mutant where the body is replaced
-        // with `()`. Also pins both the `Some(value)` and `None` arms of
-        // the `details` formatter.
+        // when debug is on for unknown options. Catches a mutant where the body
+        // is replaced with `()`. Also pins both the `Some(value)` and `None`
+        // arms of the `details` formatter.
+        // (iii) Random_Seed with valid value under debug on: must be SILENT on
+        // success (not echoed — different from unknown options).
         let (stdout, _) = drive(&[
             "debug on",
             "setoption name Hash value 16",
             "setoption name Clear",
+            "setoption name Random_Seed value 42",
         ]);
+        // (i) Unknown options still echo under debug on — count must still be 2.
         let info_lines: Vec<&str> = stdout
             .lines()
             .filter(|l| l.starts_with("info string setoption received:"))
@@ -644,7 +720,7 @@ mod tests {
         assert_eq!(
             info_lines.len(),
             2,
-            "expected 2 setoption info-string lines; got:\n{stdout}"
+            "expected 2 setoption info-string lines (Hash + Clear only); got:\n{stdout}"
         );
         assert!(
             info_lines.iter().any(|l| l.contains("name Hash value 16")),
@@ -655,6 +731,14 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("name Clear") && !l.contains("value")),
             "expected `name Clear` (no value) in setoption info string;\nlines: {info_lines:?}",
+        );
+        // (iv) Explicit assertion: Random_Seed success must produce zero
+        // Random_Seed-mentioning info lines. Catches a mutant that swaps the
+        // success branch to echo.
+        assert_eq!(
+            stdout.lines().filter(|l| l.contains("Random_Seed")).count(),
+            0,
+            "setoption name Random_Seed value 42 must not produce any Random_Seed info lines under debug on; got:\n{stdout}",
         );
     }
 
@@ -718,11 +802,11 @@ mod tests {
     #[test]
     fn handle_go_searchmoves_filters_to_specified_moves() {
         // Pins plan §6: `go searchmoves a2a4 b2b4` restricts the search to
-        // those two legal moves. Stub picks lex-first within the filter,
-        // which is `a2a4` (not `a2a3` — a2a3 is excluded).
+        // those two legal moves. RandomMover picks uniformly from the filtered
+        // set, so the bestmove must be one of {a2a4, b2b4}.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, Stub);
+        let mut engine = Engine::new(writer, RandomMover::new(0));
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -731,21 +815,28 @@ mod tests {
         engine.run(rx);
 
         let stdout = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let bestmove_line = stdout
+            .lines()
+            .find(|l| l.starts_with("bestmove"))
+            .expect("bestmove line must be present");
+        let uci_str = bestmove_line
+            .strip_prefix("bestmove ")
+            .expect("bestmove line has 'bestmove ' prefix");
         assert!(
-            stdout.lines().any(|l| l == "bestmove a2a4"),
-            "searchmoves a2a4/b2b4 must restrict Stub to lex-first within filter (a2a4);\nstdout:\n{stdout}",
+            uci_str == "a2a4" || uci_str == "b2b4",
+            "searchmoves a2a4/b2b4 must restrict bestmove to that set; got '{uci_str}';\nstdout:\n{stdout}",
         );
     }
 
     #[test]
     fn handle_go_searchmoves_all_bad_yields_bestmove_0000() {
         // Pins plan §6: when `searchmoves` parses to a list of all-illegal
-        // entries, the resulting filter is `Some(Vec::new())` — Stub finds
-        // no candidate and emits `bestmove 0000`. Distinct from "no
-        // searchmoves keyword" which would let Stub pick any legal move.
+        // entries, the resulting filter is `Some(Vec::new())` — RandomMover
+        // finds no candidate and emits `bestmove 0000`. Distinct from "no
+        // searchmoves keyword" which would let the mover pick any legal move.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, Stub);
+        let mut engine = Engine::new(writer, RandomMover::new(0));
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -763,11 +854,11 @@ mod tests {
     #[test]
     fn handle_go_searchmoves_silently_drops_bad_entries() {
         // Pins plan §6: `searchmoves a2a4 z9z9 b2b4` parses with `z9z9`
-        // silently dropped, leaving the filter `[a2a4, b2b4]`. Stub picks
-        // lex-first within the filter (a2a4).
+        // silently dropped, leaving the filter [a2a4, b2b4]. RandomMover picks
+        // uniformly from the filtered set, so bestmove ∈ {a2a4, b2b4}.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, Stub);
+        let mut engine = Engine::new(writer, RandomMover::new(0));
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -777,9 +868,16 @@ mod tests {
         engine.run(rx);
 
         let stdout = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let bestmove_line = stdout
+            .lines()
+            .find(|l| l.starts_with("bestmove"))
+            .expect("bestmove line must be present");
+        let uci_str = bestmove_line
+            .strip_prefix("bestmove ")
+            .expect("bestmove line has 'bestmove ' prefix");
         assert!(
-            stdout.lines().any(|l| l == "bestmove a2a4"),
-            "bad searchmoves entries must be silently dropped, keeping the rest;\nstdout:\n{stdout}",
+            uci_str == "a2a4" || uci_str == "b2b4",
+            "bad searchmoves entries must be silently dropped; bestmove must ∈ {{a2a4, b2b4}}; got '{uci_str}';\nstdout:\n{stdout}",
         );
     }
 
@@ -820,11 +918,18 @@ mod tests {
 
     #[test]
     fn handle_setoption_silent_no_output_when_debug_off() {
-        // Forward-compat caveat: pin will be revised when first real option/registration/ponder lands.
-        let (stdout, _) = drive(&["setoption name Hash value 16"]);
+        // (i) Random_Seed with valid value — success path. Silent on debug off.
+        let (stdout_seed, _) = drive(&["setoption name Random_Seed value 42"]);
         assert!(
-            stdout.is_empty(),
-            "setoption must produce zero output (no bytes whatsoever) when debug is off; got: {stdout:?}",
+            stdout_seed.is_empty(),
+            "setoption name Random_Seed value 42 must produce zero output when debug is off; got: {stdout_seed:?}",
+        );
+
+        // (ii) Unknown option — preserved M2.C behavior. Silent on debug off.
+        let (stdout_hash, _) = drive(&["setoption name Hash value 16"]);
+        assert!(
+            stdout_hash.is_empty(),
+            "setoption name Hash value 16 must produce zero output when debug is off; got: {stdout_hash:?}",
         );
     }
 
@@ -873,9 +978,12 @@ mod tests {
 
     #[test]
     fn go_then_stop_emits_bestmove_for_legal_position() {
+        // Intent: mid-search cancellation. After `stop`, the worker must emit
+        // a legal bestmove from startpos (not `bestmove 0000`). RandomMover
+        // picks uniformly — we assert any legal UCI move, not a specific one.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, Stub);
+        let mut engine = Engine::new(writer, RandomMover::new(0));
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -892,19 +1000,25 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
         tx.send(parse_uci_line("stop")).unwrap();
 
-        // Poll for `bestmove a2a3` before sending Quit. handle_quit does
-        // not join the worker (plan §9), so sending Quit immediately
-        // would race the worker's write. The poll proves the worker has
-        // observed the cancellation and emitted its bestmove.
+        // Poll for any `bestmove <legal-uci>` before sending Quit.
+        // handle_quit joins the worker (ADR-0011 v3), so bestmove is
+        // guaranteed to be in stdout before `run` returns. The poll here is
+        // defensive synchronization only — it confirms the worker has emitted
+        // its bestmove before we issue Quit, without relying on timing.
+        let startpos = Position::starting_position();
         let bestmove_deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let snap = snapshot_output(&buf_clone);
-            if snap.lines().any(|l| l == "bestmove a2a3") {
+            if let Some(line) = snap.lines().find(|l| l.starts_with("bestmove")) {
+                let uci_str = line.strip_prefix("bestmove ").expect("bestmove prefix");
+                Move::from_uci(uci_str, &startpos).unwrap_or_else(|e| {
+                    panic!("bestmove '{uci_str}' is not legal for startpos: {e};\noutput:\n{snap}")
+                });
                 break;
             }
             assert!(
                 Instant::now() < bestmove_deadline,
-                "bestmove a2a3 did not appear within 1 s of stop;\noutput:\n{snap}"
+                "no bestmove appeared within 1 s of stop;\noutput:\n{snap}"
             );
             thread::sleep(Duration::from_millis(2));
         }
@@ -915,14 +1029,13 @@ mod tests {
 
     #[test]
     fn go_with_movetime_emits_bestmove_after_deadline() {
-        // Run the engine on a separate thread so we can time how long it
-        // takes for `bestmove` to appear in the buffer — independently of
-        // when `Quit` is processed. Sending `Quit` in the same channel
-        // would set the cancellation flag immediately, defeating the
-        // movetime deadline.
+        // Intent: wallclock deadline honored. Run the engine on a separate
+        // thread so we can time how long it takes for `bestmove` to appear in
+        // the buffer — independently of when `Quit` is processed. RandomMover
+        // picks uniformly — we assert any legal UCI move, not a specific one.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, Stub);
+        let mut engine = Engine::new(writer, RandomMover::new(0));
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -931,20 +1044,25 @@ mod tests {
         let handle = thread::spawn(move || engine.run(rx));
 
         // Time from when we send `go movetime 50` until `bestmove` is in
-        // the buffer. Anchor: must take >= 40 ms (catches a Stub that
+        // the buffer. Anchor: must take >= 40 ms (catches a mover that
         // ignores movetime). Must complete well within 1 s.
+        let startpos = Position::starting_position();
         let go_sent = Instant::now();
         tx.send(parse_uci_line("go movetime 50")).unwrap();
 
         let bestmove_deadline = go_sent + Duration::from_secs(1);
         let observed_at = loop {
             let snap = snapshot_output(&buf_clone);
-            if snap.lines().any(|l| l == "bestmove a2a3") {
+            if let Some(line) = snap.lines().find(|l| l.starts_with("bestmove")) {
+                let uci_str = line.strip_prefix("bestmove ").expect("bestmove prefix");
+                Move::from_uci(uci_str, &startpos).unwrap_or_else(|e| {
+                    panic!("bestmove '{uci_str}' is not legal for startpos: {e};\noutput:\n{snap}")
+                });
                 break Instant::now();
             }
             assert!(
                 Instant::now() < bestmove_deadline,
-                "bestmove a2a3 did not appear within 1 s of go movetime 50;\noutput:\n{snap}"
+                "no bestmove appeared within 1 s of go movetime 50;\noutput:\n{snap}"
             );
             thread::sleep(Duration::from_millis(2));
         };
@@ -952,7 +1070,7 @@ mod tests {
         let elapsed = observed_at.duration_since(go_sent);
         assert!(
             elapsed >= Duration::from_millis(40),
-            "go movetime 50 → bestmove must take >= 40 ms; took {elapsed:?} (Stub may be ignoring movetime)"
+            "go movetime 50 → bestmove must take >= 40 ms; took {elapsed:?} (mover may be ignoring movetime)"
         );
 
         tx.send(Command::Quit).unwrap();
@@ -961,14 +1079,14 @@ mod tests {
 
     #[test]
     fn go_completes_immediately_without_infinite_or_movetime() {
-        // Bare `go` (no infinite/movetime/ponder): Stub picks the candidate
-        // and returns without entering a polling loop (plan §8 "Else: emit
-        // immediately"). But the worker still writes from a spawned thread,
-        // so the same poll-before-quit pattern as B18 is required to avoid
-        // racing handle_quit's no-join return path (plan §9).
+        // Intent: bare go is immediate. RandomMover picks the candidate and
+        // returns without entering a polling loop (plan §8 "Else: emit
+        // immediately"). The worker still writes from a spawned thread, so the
+        // same poll-before-quit pattern as B18 is required to avoid racing
+        // handle_quit's no-join return path. We assert any legal UCI move.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, Stub);
+        let mut engine = Engine::new(writer, RandomMover::new(0));
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -976,24 +1094,29 @@ mod tests {
         let buf_clone = Arc::clone(&buf);
         let handle = thread::spawn(move || engine.run(rx));
 
+        let startpos = Position::starting_position();
         let go_sent = Instant::now();
         tx.send(parse_uci_line("go")).unwrap();
 
         let bestmove_deadline = go_sent + Duration::from_secs(1);
         let observed_at = loop {
             let snap = snapshot_output(&buf_clone);
-            if snap.lines().any(|l| l == "bestmove a2a3") {
+            if let Some(line) = snap.lines().find(|l| l.starts_with("bestmove")) {
+                let uci_str = line.strip_prefix("bestmove ").expect("bestmove prefix");
+                Move::from_uci(uci_str, &startpos).unwrap_or_else(|e| {
+                    panic!("bestmove '{uci_str}' is not legal for startpos: {e};\noutput:\n{snap}")
+                });
                 break Instant::now();
             }
             assert!(
                 Instant::now() < bestmove_deadline,
-                "bestmove a2a3 did not appear within 1 s of bare go;\noutput:\n{snap}"
+                "no bestmove appeared within 1 s of bare go;\noutput:\n{snap}"
             );
             thread::sleep(Duration::from_millis(2));
         };
 
         // Anchor "immediately" — bare go must complete fast (well under
-        // 100 ms even on loaded CI). Catches a regression where Stub
+        // 100 ms even on loaded CI). Catches a regression where the mover
         // accidentally enters the polling loop on bare go.
         let elapsed = observed_at.duration_since(go_sent);
         assert!(
@@ -1015,7 +1138,7 @@ mod tests {
         // exits, and this poll would time out.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, Stub);
+        let mut engine = Engine::new(writer, RandomMover::new(0));
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -1070,9 +1193,13 @@ mod tests {
 
     #[test]
     fn quit_during_go_returns_run_promptly() {
+        // handle_quit joins the worker so bestmove is visible in stdout before
+        // run returns (ADR-0011 v3). This test verifies both that run returns
+        // promptly AND that a bestmove line is present in the captured output.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, Stub);
+        let buf_clone = Arc::clone(&buf);
+        let mut engine = Engine::new(writer, RandomMover::new(0));
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -1099,16 +1226,30 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         handle.join().expect("engine thread should not panic");
-        // Per plan §9 and B22: do NOT assert bestmove is in output.
-        // handle_quit does not join the worker; the worker may still be in
-        // its sleep loop when run returns.
+
+        // handle_quit joins the worker before run returns, so bestmove must
+        // already be in the output buffer by now. Validate it's a legal move.
+        let snap = snapshot_output(&buf_clone);
+        let bestmove_line = snap
+            .lines()
+            .find(|l| l.starts_with("bestmove"))
+            .unwrap_or_else(|| {
+                panic!("bestmove must be in output after handle_quit joins the worker (ADR-0011 v3);\noutput:\n{snap}")
+            });
+        let uci_str = bestmove_line
+            .strip_prefix("bestmove ")
+            .expect("bestmove prefix");
+        let startpos = Position::starting_position();
+        Move::from_uci(uci_str, &startpos).unwrap_or_else(|e| {
+            panic!("bestmove '{uci_str}' is not legal for startpos: {e};\noutput:\n{snap}")
+        });
     }
 
     #[test]
     fn back_to_back_go_implicit_stops_previous() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, Stub);
+        let mut engine = Engine::new(writer, RandomMover::new(0));
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -1210,6 +1351,581 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Group B.2 — New M2.D tests (B.2.a–h)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_uci_emits_random_seed_option_between_id_author_and_uciok() {
+        // Pins the exact option-line text and protocol ordering. Catches a
+        // mutant that typos the option-line string or reorders lines.
+        let (stdout, _) = drive(&["uci"]);
+        let lines: Vec<&str> = stdout.lines().collect();
+
+        let option_line = lines
+            .iter()
+            .find(|l| l.starts_with("option name Random_Seed"))
+            .copied()
+            .expect("option name Random_Seed line must be present in uci output");
+        assert_eq!(
+            option_line, "option name Random_Seed type spin default 0 min 0 max 2147483647",
+            "option line text must match exactly"
+        );
+
+        let id_author_idx = lines
+            .iter()
+            .position(|l| l.starts_with("id author"))
+            .expect("id author line present");
+        let option_idx = lines
+            .iter()
+            .position(|l| l.starts_with("option name Random_Seed"))
+            .expect("option line present");
+        let uciok_idx = lines
+            .iter()
+            .position(|l| *l == "uciok")
+            .expect("uciok line present");
+        assert!(
+            id_author_idx < option_idx,
+            "id author (line {id_author_idx}) must come before option name Random_Seed (line {option_idx})"
+        );
+        assert!(
+            option_idx < uciok_idx,
+            "option name Random_Seed (line {option_idx}) must come before uciok (line {uciok_idx})"
+        );
+    }
+
+    #[test]
+    fn handle_setoption_random_seed_case_insensitive_and_boundary() {
+        // (i) Case-insensitivity: three spellings of the option name all route
+        // to the same seed value. Verified by capturing the bestmove from each
+        // variant (all seeded with 42) and asserting:
+        //   (a) all three case-variant bestmoves are equal to each other, and
+        //   (b) they differ from the control (no setoption → seed 0).
+        // Assertion (b) catches the "silently dropped" mutant: if all three
+        // variants are ignored, the seed stays at 0 and matches the control.
+
+        // Control: seed 0 (default, no setoption).
+        let (stdout_ctrl, _) = drive(&["position startpos", "go"]);
+        let ctrl_bestmove = stdout_ctrl
+            .lines()
+            .find(|l| l.starts_with("bestmove"))
+            .expect("control bestmove must be present")
+            .strip_prefix("bestmove ")
+            .expect("bestmove prefix")
+            .to_string();
+
+        // Three case variants, all with seed 42.
+        let mut variant_bestmoves: Vec<String> = Vec::new();
+        for name_variant in &["random_seed", "RANDOM_SEED", "Random_Seed"] {
+            let (stdout, _) = drive(&[
+                &format!("setoption name {name_variant} value 42"),
+                "position startpos",
+                "go",
+            ]);
+            let uci_str = stdout
+                .lines()
+                .find(|l| l.starts_with("bestmove"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "bestmove must be present after go with seed variant '{name_variant}';\nstdout:\n{stdout}"
+                    )
+                })
+                .strip_prefix("bestmove ")
+                .expect("bestmove prefix")
+                .to_string();
+            variant_bestmoves.push(uci_str);
+        }
+
+        // (a) All three case-variant bestmoves must be equal.
+        assert_eq!(
+            variant_bestmoves[0], variant_bestmoves[1],
+            "random_seed and RANDOM_SEED must produce the same bestmove with seed 42; \
+            got '{}'  vs  '{}'",
+            variant_bestmoves[0], variant_bestmoves[1]
+        );
+        assert_eq!(
+            variant_bestmoves[1], variant_bestmoves[2],
+            "RANDOM_SEED and Random_Seed must produce the same bestmove with seed 42; \
+            got '{}'  vs  '{}'",
+            variant_bestmoves[1], variant_bestmoves[2]
+        );
+
+        // (b) All three case-variant bestmoves must differ from the control.
+        // If this fails, the variants were silently dropped (all stayed at seed 0).
+        for (name_variant, mv) in ["random_seed", "RANDOM_SEED", "Random_Seed"]
+            .iter()
+            .zip(&variant_bestmoves)
+        {
+            assert_ne!(
+                mv, &ctrl_bestmove,
+                "setoption name {name_variant} value 42 must change the bestmove relative \
+                to the seed-0 control — if equal, the option was silently dropped; \
+                control='{ctrl_bestmove}' variant='{mv}'"
+            );
+        }
+
+        // (ii) Boundary acceptance: max value 2147483647 is accepted and takes
+        // effect (bestmove must differ from the seed-0 control).
+        let (stdout_max, _) = drive(&[
+            "setoption name Random_Seed value 2147483647",
+            "position startpos",
+            "go",
+        ]);
+        let uci_max = stdout_max
+            .lines()
+            .find(|l| l.starts_with("bestmove"))
+            .expect("bestmove must be present after go with max seed (2147483647)")
+            .strip_prefix("bestmove ")
+            .expect("bestmove prefix")
+            .to_string();
+        // The boundary seed must produce a legal move.
+        Move::from_uci(&uci_max, &Position::starting_position()).unwrap_or_else(|e| {
+            panic!(
+                "bestmove '{uci_max}' is not legal for startpos (max seed 2147483647): {e};\nstdout:\n{stdout_max}"
+            )
+        });
+        // The boundary seed must produce a different bestmove than seed 0.
+        // If they happen to match (1/20 coincidence), the seed was not applied.
+        // Note: statistically, seed 2147483647 and seed 0 differ on startpos
+        // with probability 19/20; if this assertion fails spuriously, pick a
+        // different known-different boundary seed.
+        assert_ne!(
+            uci_max, ctrl_bestmove,
+            "setoption name Random_Seed value 2147483647 must change the bestmove \
+            relative to the seed-0 control — if equal, the boundary value was rejected; \
+            control='{ctrl_bestmove}' max='{uci_max}'"
+        );
+    }
+
+    #[test]
+    fn handle_setoption_random_seed_bad_value_silent_when_debug_off() {
+        // Four sub-sends, each producing zero output bytes when debug is off.
+        let bad_inputs: &[&str] = &[
+            "setoption name Random_Seed value abc",
+            "setoption name Random_Seed value -1",
+            "setoption name Random_Seed value 2147483648",
+            "setoption name Random_Seed",
+        ];
+        for input in bad_inputs {
+            let (stdout, _) = drive(&[input]);
+            assert!(
+                stdout.is_empty(),
+                "bad Random_Seed input '{input}' must produce zero output when debug is off; got: {stdout:?}",
+            );
+        }
+
+        // After all four bad sends, the engine's seed must be unchanged.
+        // Pre-configure seed 42 so the unchanged-seed assertion can distinguish
+        // "unchanged at 42" from "wiped to 0" — a mutant that zeroes the seed
+        // on bad input would produce a different bestmove than the M_REF below.
+        //
+        // This uses a single engine instance on a background thread so we can
+        // poll for M_REF before sending the bad inputs, avoiding races between
+        // the go#1 worker and the subsequent setoption commands.
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let buf_clone = Arc::clone(&buf);
+        let mut engine = Engine::new(writer, RandomMover::new(0));
+        let (tx, rx) = mpsc::channel::<Command>();
+        let handle = thread::spawn(move || engine.run(rx));
+
+        // (1) Set seed 42, go twice, capture the 2nd pick as M_REF2. The 2nd
+        // pick is the reference because after go#1, the PRNG state has advanced
+        // one step; the tested path also does go#1 and then go#2 after bad
+        // inputs. If bad inputs do not change the seed, M_AFTER_BAD == M_REF2.
+        tx.send(parse_uci_line("setoption name Random_Seed value 42"))
+            .unwrap();
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("go")).unwrap();
+
+        // Wait for the first bestmove.
+        {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let snap = snapshot_output(&buf_clone);
+                if snap.lines().any(|l| l.starts_with("bestmove")) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "first reference bestmove did not appear within 1 s"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("go")).unwrap();
+
+        let m_ref2 = {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let snap = snapshot_output(&buf_clone);
+                let bestmoves: Vec<&str> =
+                    snap.lines().filter(|l| l.starts_with("bestmove")).collect();
+                if bestmoves.len() >= 2 {
+                    break bestmoves[1]
+                        .strip_prefix("bestmove ")
+                        .expect("prefix")
+                        .to_string();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "second reference bestmove did not appear within 1 s"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+
+        // (2) Reset seed 42 (back to the start of the seed-42 sequence) so the
+        // next go produces the 1st pick. Then go once to advance PRNG one step,
+        // send the four bad-value inputs, and go again to capture M_AFTER_BAD.
+        // If bad inputs leave the seed unchanged, M_AFTER_BAD == M_REF2.
+        tx.send(parse_uci_line("setoption name Random_Seed value 42"))
+            .unwrap();
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("go")).unwrap();
+
+        // Wait for go#3 bestmove (3rd total).
+        {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let snap = snapshot_output(&buf_clone);
+                let n = snap.lines().filter(|l| l.starts_with("bestmove")).count();
+                if n >= 3 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "go#3 bestmove did not appear within 1 s"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        // Now the PRNG is in the same state as after M_REF2's predecessor.
+        // Send the four bad-value inputs — these must not change seed or state.
+        for input in bad_inputs {
+            tx.send(parse_uci_line(input)).unwrap();
+        }
+
+        // go#4: must produce the same move as M_REF2 (the 2nd pick from seed-42).
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("go")).unwrap();
+
+        let m_after_bad = {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let snap = snapshot_output(&buf_clone);
+                let bestmoves: Vec<&str> =
+                    snap.lines().filter(|l| l.starts_with("bestmove")).collect();
+                if bestmoves.len() >= 4 {
+                    break bestmoves[3]
+                        .strip_prefix("bestmove ")
+                        .expect("prefix")
+                        .to_string();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "post-bad-input bestmove did not appear within 1 s"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+
+        tx.send(Command::Quit).unwrap();
+        handle.join().expect("engine thread should not panic");
+
+        // Seed must be unchanged — M_AFTER_BAD must equal M_REF2.
+        assert_eq!(
+            m_ref2, m_after_bad,
+            "bad Random_Seed inputs must not change the seed; \
+            M_REF2 (2nd pick from seed-42)='{m_ref2}' M_AFTER_BAD='{m_after_bad}'"
+        );
+    }
+
+    #[test]
+    fn handle_setoption_random_seed_bad_value_emits_info_string_when_debug_on() {
+        // Same four sub-sends as B.2.c under debug on. Bad-value path emits
+        // `info string Random_Seed: rejected …` lines. Fully implemented in Phase 1.
+        let (stdout, _) = drive(&[
+            "debug on",
+            "setoption name Random_Seed value abc",
+            "setoption name Random_Seed value -1",
+            "setoption name Random_Seed value 2147483648",
+            "setoption name Random_Seed",
+        ]);
+
+        let rejected_lines: Vec<&str> = stdout
+            .lines()
+            .filter(|l| l.starts_with("info string Random_Seed: rejected"))
+            .collect();
+        assert_eq!(
+            rejected_lines.len(),
+            4,
+            "expected 4 'info string Random_Seed: rejected …' lines; got:\n{stdout}"
+        );
+
+        // First three: `rejected value '<v>'`
+        assert!(
+            rejected_lines
+                .iter()
+                .any(|l| l.contains("rejected value 'abc'")),
+            "expected rejected value 'abc'; lines: {rejected_lines:?}",
+        );
+        assert!(
+            rejected_lines
+                .iter()
+                .any(|l| l.contains("rejected value '-1'")),
+            "expected rejected value '-1'; lines: {rejected_lines:?}",
+        );
+        assert!(
+            rejected_lines
+                .iter()
+                .any(|l| l.contains("rejected value '2147483648'")),
+            "expected rejected value '2147483648'; lines: {rejected_lines:?}",
+        );
+        // Fourth: `rejected (no value given)`
+        assert!(
+            rejected_lines
+                .iter()
+                .any(|l| l.contains("rejected (no value given)")),
+            "expected 'rejected (no value given)'; lines: {rejected_lines:?}",
+        );
+    }
+
+    #[test]
+    fn handle_setoption_random_seed_changes_future_bestmoves_but_not_past_ones() {
+        // Pre-computed (Phase 1): SEED_A=0 → h2h4, SEED_B=1 → c2c4.
+        const SEED_A: u32 = 0;
+        const SEED_B: u32 = 1;
+
+        // (1) Set seed A, go, capture M1.
+        let (stdout_a, _) = drive(&[
+            &format!("setoption name Random_Seed value {SEED_A}"),
+            "position startpos",
+            "go",
+        ]);
+        let m1 = stdout_a
+            .lines()
+            .find(|l| l.starts_with("bestmove"))
+            .expect("bestmove M1 present")
+            .strip_prefix("bestmove ")
+            .expect("prefix")
+            .to_string();
+        assert_eq!(
+            m1, "h2h4",
+            "SEED_A=0 must produce bestmove h2h4; got '{m1}'"
+        );
+
+        // (2) Set seed B, go, capture M2.
+        let (stdout_b, _) = drive(&[
+            &format!("setoption name Random_Seed value {SEED_B}"),
+            "position startpos",
+            "go",
+        ]);
+        let m2 = stdout_b
+            .lines()
+            .find(|l| l.starts_with("bestmove"))
+            .expect("bestmove M2 present")
+            .strip_prefix("bestmove ")
+            .expect("prefix")
+            .to_string();
+        assert_eq!(
+            m2, "c2c4",
+            "SEED_B=1 must produce bestmove c2c4; got '{m2}'"
+        );
+
+        assert_ne!(m1, m2, "SEED_A and SEED_B must produce different bestmoves");
+    }
+
+    #[test]
+    fn handle_ucinewgame_resets_random_mover_state() {
+        // Drives a single engine instance through:
+        //   1. setoption name Random_Seed value 7  (sets seed=7, state=7)
+        //   2. position startpos + go              → capture bestmove M1
+        //   3. ucinewgame                          (calls reset: state → seed = 7)
+        //   4. position startpos + go              → capture bestmove M2
+        // Assert M1 == M2: ucinewgame restores state to seed, so the
+        // same first PRNG step is replayed.
+        //
+        // The engine is driven on a background thread (threading-test pattern)
+        // so we can observe M1 in the buffer before sending ucinewgame. Without
+        // this synchronization the orchestrator could process ucinewgame while
+        // the worker for go#1 is still queued but not yet run, causing the
+        // worker to advance PRNG from the reset seed and leaving go#2 starting
+        // at step1(seed) instead of seed.
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let buf_clone = Arc::clone(&buf);
+        let mut engine = Engine::new(writer, RandomMover::new(0));
+        let (tx, rx) = mpsc::channel::<Command>();
+
+        let handle = thread::spawn(move || engine.run(rx));
+
+        tx.send(parse_uci_line("setoption name Random_Seed value 7"))
+            .unwrap();
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("go")).unwrap();
+
+        // Wait until go#1's bestmove appears so the worker has fully run and
+        // advanced PRNG state before we send ucinewgame.
+        let m1 = {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let snap = snapshot_output(&buf_clone);
+                if let Some(line) = snap.lines().find(|l| l.starts_with("bestmove")) {
+                    break line.strip_prefix("bestmove ").expect("prefix").to_string();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "go#1 bestmove did not appear within 1 s"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+
+        // go#1 worker is done; send ucinewgame to reset state back to seed=7.
+        tx.send(parse_uci_line("ucinewgame")).unwrap();
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("go")).unwrap();
+
+        // Wait until go#2's bestmove appears (a second bestmove line).
+        let m2 = {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let snap = snapshot_output(&buf_clone);
+                let bestmoves: Vec<&str> =
+                    snap.lines().filter(|l| l.starts_with("bestmove")).collect();
+                if bestmoves.len() >= 2 {
+                    break bestmoves[1]
+                        .strip_prefix("bestmove ")
+                        .expect("prefix")
+                        .to_string();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "go#2 bestmove did not appear within 1 s"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+
+        tx.send(Command::Quit).unwrap();
+        handle.join().expect("engine thread should not panic");
+
+        assert_eq!(
+            m1, m2,
+            "ucinewgame must reset PRNG state to seed; M1='{m1}' M2='{m2}'"
+        );
+    }
+
+    #[test]
+    fn handle_setoption_random_seed_resets_state_immediately() {
+        // (1) Set seed 7, go 3 times. State advances 3 steps.
+        // (2) Set seed 7 again (resets state back to seed).
+        // (3) Next go must match the FIRST go of a fresh seed-7 sequence.
+        // Pins §2.1 decision: setoption resets state immediately, not deferred.
+
+        // Fresh seed-7 reference: what does the 1st go produce?
+        let (stdout_ref, _) = drive(&[
+            "setoption name Random_Seed value 7",
+            "position startpos",
+            "go",
+        ]);
+        let m_ref = stdout_ref
+            .lines()
+            .find(|l| l.starts_with("bestmove"))
+            .expect("bestmove reference present")
+            .strip_prefix("bestmove ")
+            .expect("prefix")
+            .to_string();
+
+        // Drive a separate engine on a background thread so we can observe each
+        // bestmove before sending the next command. Without this, the orchestrator
+        // could process `setoption` (the second set) while go#3's worker is
+        // still queued, causing go#4 to start from step1(seed) instead of seed.
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let buf_clone = Arc::clone(&buf);
+        let mut engine = Engine::new(writer, RandomMover::new(0));
+        let (tx, rx) = mpsc::channel::<Command>();
+
+        let handle = thread::spawn(move || engine.run(rx));
+
+        tx.send(parse_uci_line("setoption name Random_Seed value 7"))
+            .unwrap();
+
+        // Helper closure: wait for the N-th bestmove to appear.
+        let wait_for_nth_bestmove = |n: usize| -> String {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let snap = snapshot_output(&buf_clone);
+                let bestmoves: Vec<&str> =
+                    snap.lines().filter(|l| l.starts_with("bestmove")).collect();
+                if bestmoves.len() >= n {
+                    return bestmoves[n - 1]
+                        .strip_prefix("bestmove ")
+                        .expect("prefix")
+                        .to_string();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "bestmove #{n} did not appear within 1 s"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+
+        // go#1, go#2, go#3 — advance PRNG 3 steps.
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("go")).unwrap();
+        wait_for_nth_bestmove(1);
+
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("go")).unwrap();
+        wait_for_nth_bestmove(2);
+
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("go")).unwrap();
+        wait_for_nth_bestmove(3);
+
+        // Reset: same seed. State must snap back to seed=7.
+        tx.send(parse_uci_line("setoption name Random_Seed value 7"))
+            .unwrap();
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("go")).unwrap();
+        let m_after_reset = wait_for_nth_bestmove(4);
+
+        tx.send(Command::Quit).unwrap();
+        handle.join().expect("engine thread should not panic");
+
+        assert_eq!(
+            m_ref, m_after_reset,
+            "setoption must reset PRNG state immediately; after reset expected '{m_ref}', got '{m_after_reset}'"
+        );
+    }
+
+    #[test]
+    fn random_mover_determinism_across_repeated_runs_with_fixed_seed() {
+        // Run the same UCI transcript twice with a fresh Engine each time.
+        // Assert identical stdout from both runs.
+        let transcript: &[&str] = &[
+            "uci",
+            "setoption name Random_Seed value 99",
+            "position startpos",
+            "go",
+            "position startpos moves e2e4",
+            "go",
+        ];
+        let (stdout_a, _) = drive(transcript);
+        let (stdout_b, _) = drive(transcript);
+        assert_eq!(
+            stdout_a, stdout_b,
+            "identical seed + transcript must produce identical stdout;\nrun A:\n{stdout_a}\nrun B:\n{stdout_b}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Group C — reader_loop tests (C25–C27)
     // -----------------------------------------------------------------------
 
@@ -1297,8 +2013,14 @@ mod tests {
                 })),
                 Just(Command::IsReady),
                 Just(Command::UciNewGame),
-                // SetOption with non-empty name
+                // SetOption with non-empty name (exercises the unknown-option path)
                 "[a-zA-Z][a-zA-Z0-9_]*".prop_map(|name| Command::SetOption { name, value: None }),
+                // SetOption with Random_Seed + numeric value (exercises the success arm and
+                // catches a regression where success-arm parsing panics on arbitrary digit strings)
+                "[0-9]{1,5}".prop_map(|v| Command::SetOption {
+                    name: "Random_Seed".to_string(),
+                    value: Some(v),
+                }),
                 Just(Command::Register(Register::Later)),
                 // Position startpos with no moves (safe: always valid)
                 Just(Command::Position {
@@ -1341,7 +2063,7 @@ mod tests {
 
                 let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
                 let writer = CapturedWriter(Arc::clone(&buf));
-                let mut engine = Engine::new(writer, Stub);
+                let mut engine = Engine::new(writer, RandomMover::new(0xDEAD_BEEF));
                 let (tx, rx) = mpsc::channel::<Command>();
                 for cmd in cmds {
                     tx.send(cmd).unwrap();
