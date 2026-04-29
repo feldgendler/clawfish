@@ -5,6 +5,70 @@
 # survive the test suite. Surviving mutants point at gaps in test coverage.
 #
 # Run with: cargo mutants
+#
+# ===========================================================================
+# Triaging a single survivor — manual mutation + targeted test
+# ===========================================================================
+#
+# When a survivor is reported and you need to understand WHY a test fails to
+# catch it (or to iterate on candidate fixtures), don't re-run the full
+# `cargo mutants` suite each time — that burns ~an hour per pass.
+#
+# Instead: apply the mutation by hand via Edit, run only the suspect test(s),
+# revert. Cycle time: seconds per iteration.
+#
+#   1. Edit the source file to apply the mutation (e.g., delete a `-`,
+#      change `+` to `-`).
+#   2. `cargo test --lib <test_name_pattern>`
+#   3. Test passes against broken code → fixture fails to catch; iterate.
+#      Test fails → caught.
+#   4. Revert the mutation in source.
+#
+# Fall back to full `cargo mutants --in-diff` only to confirm the final test
+# surface catches what it should.
+#
+# ===========================================================================
+# `exclude_re` rules — don't anchor on line numbers
+# ===========================================================================
+#
+# `exclude_re` patterns match against cargo-mutants' display name for each
+# mutant (typically `<file>:<line>:<col>: <op> in <function>`). It's tempting
+# to disambiguate two same-shape mutants in the same function (e.g. two
+# `delete -` mutants in `qsearch`) by anchoring the regex to a specific
+# `:<line>:<col>:` prefix. DON'T.
+#
+# Line-anchored exclusions are fragile to refactoring:
+#   - Any unrelated edit that shifts the line silently breaks the exclusion
+#     (no error — the rule simply matches no mutant).
+#   - A different mutation at the same line silently gets excluded
+#     (false-negative).
+# The exclusion's intent rots invisibly.
+#
+# Better approaches, in order of preference:
+#
+#   1. REFACTOR the bug-prone pattern into a named helper. When two same-
+#      shape mutants in the same function are genuinely different bugs,
+#      extracting one into a separate function gives cargo-mutants two
+#      distinct function names. More importantly, the named helper is
+#      directly unit-testable in isolation — often the structural reason
+#      the mutation was hard to catch is *because* the bug-prone code is
+#      mixed in with surrounding logic. M3.D's `negate_window(alpha, beta)`
+#      precedent: the `(-beta, -alpha)` open-coded bound-negation in
+#      qsearch's recursive call had two `delete -` mutations that were
+#      structurally undetectable at the qsearch integration level (1-2
+#      plies of recursion is too shallow to expose the effect). Extracting
+#      `negate_window` made both mutations catchable by a 5-line
+#      pure-function test.
+#   2. Anchor on a distinctive token in the mutant's display (if cargo-
+#      mutants surfaces source context).
+#   3. Wrap the bug-prone call in a uniquely-named `#[inline]` shim function.
+#   4. Document the gap explicitly and accept the over-filter — last resort.
+#
+# Avoid:
+#   - `:<line>:<col>:` anchors. Line numbers shift on any edit.
+#   - Broad function-level patterns (`<op> in <function>`) when the function
+#     has multiple mutants of the same shape but different semantic targets
+#     — the rule will silently over-filter sibling mutants.
 
 # ---- File-level exclusions ------------------------------------------------
 exclude_globs = [
@@ -158,4 +222,41 @@ exclude_re = [
     # rank. push_dr is hardcoded to ±1. For x ∈ {-1, +1}: 2 * x == 2 / x
     # (both yield ±2). Equivalent for the only inputs that ever appear.
     "replace \\* with / in emit_pawn_moves",
+
+    # ---- AlphaBetaMover::qsearch — assignment guards equivalent on equality
+    #
+    # Several guards in qsearch fire on strict greater-than:
+    #   `if sp > alpha { alpha = sp; }`     (stand-pat alpha-tightening, L547)
+    #   `if score > best { best = score; }` (move-loop best-tracking, L599)
+    #   `if score > alpha { alpha = score; }` (move-loop alpha-tightening, L601)
+    # Mutating `>` to `>=` makes the guard fire on equality too. But on
+    # equality, the assignment is a no-op (alpha = alpha is identity, etc.),
+    # so the post-condition is identical. No test input can distinguish.
+    # The same `>=` variant of `>` and the `==`-only mutant for `sp > alpha`
+    # are also equivalent for this reason.
+    "replace > with >= in AlphaBetaMover::qsearch",
+    "replace > with == in AlphaBetaMover::qsearch",
+
+    # ---- AlphaBetaMover::qsearch — MD-pruning trigger boundary ---------
+    #
+    # `if mating_value < beta { beta = mating_value; if alpha >= mating_value { return mating_value; } }`
+    # at L516. Mutating `<` to `<=` makes the outer guard fire when
+    # mating_value == beta. In that case the inner `beta = mating_value`
+    # assignment is a no-op (beta == beta), and the inner check
+    # `alpha >= mating_value` is a function of (alpha, mating_value) only —
+    # unchanged. So `<` ≡ `<=` here.
+    "replace < with <= in AlphaBetaMover::qsearch",
+
+    # ---- AlphaBetaMover::qsearch — cancellation cadence operator ------
+    #
+    # `if self.nodes & 4095 == 0 && ctx.should_abort(...)` at L506. Mutating
+    # `&` to `^` switches the gate's predicate. Both gates are inert under
+    # the test surface: `n & 4095 == 0` fires only when nodes is a multiple
+    # of 4096; `n ^ 4095 == 0` fires only when nodes equals 4095 exactly.
+    # M3.D tests don't run long enough to reach either set, so neither
+    # version of the gate ever triggers ctx.should_abort within the test
+    # suite. The same `&` cadence is also present in negamax (M3.C
+    # precedent — also untreated by an exclusion since no test distinguishes).
+    "replace & with \\^ in AlphaBetaMover::qsearch",
+
 ]

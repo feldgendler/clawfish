@@ -41,7 +41,7 @@ Current architectural state. Decisions and their rationale live in `docs/decisio
 | Tournament harness | `fastchess` 1.8.0-alpha (pre-built `mac-arm64` binary at `vendor/fastchess/fastchess`, gitignored). `scripts/install-fastchess.sh` is the SHA256-pinned installer (three constants: `EXPECTED_RELEASE_TAG`, `EXPECTED_VERSION_LINE`, `EXPECTED_SHA256`). `scripts/match.sh` is the canonical entry point (subcommands `compliance`, `self-play`, `vs-stockfish`). Raw PGN/log → gitignored `target/matches/{smoke,sprt}/<name>-<ts>.{pgn,log}`. Milestone summary → committed `bench/m2.md` (M2), `bench/m3.md` (M3+) per ADR-0010. Adjudication: `-maxmoves 300` + best-effort `-resign movecount=3 score=600`; `-draw` deliberately omitted (random mover emitted no real `score cp`, and depth-1 GreedyMover scores are too noisy to base draw heuristic on; revisit at M3.C iterative-deepening). M2 smoke contract: 2-game self-play + 2-game vs Stockfish + `--compliance` 40/40 — with `[Termination "illegal move"]` and `[Termination "stalled connection"]` PGN tags as the load-bearing failure-mode gates. | `decisions/0012-tournament-harness.md`, `docs/plans/m2.e.md` |
 | Evaluation v1 | `evaluate(&Position) -> i32` in `src/eval.rs` returns side-to-move-relative centipawn score. Two terms folded into a precomputed `PSQT[color][kind][square]` const table: PeSTO MG material (`P=82, N=337, B=365, R=477, Q=1025, K=0`) + PeSTO MG piece-square tables (vendored verbatim into `src/eval/data.rs`; file-level `cargo mutants` exclusion mirrors `src/magic/constants.rs`). White lookup `+(MATERIAL[k] + MG_PST[k][s ^ 56])`; Black `-(MATERIAL[k] + MG_PST[k][s])` — the `s ^ 56` flip converts our LERF index (a1=0) to PeSTO's a8-origin layout. Insufficient-material override returns 0 for KvK / KvN / KvB (KBvKB same-color deferred to M6). King-MG-PST included despite king material = 0 — the PST captures middlegame king-safety preferences. Single-phase MG-only; tapering, bishop pair, mobility, king safety, pawn structure all deferred to M6. | `decisions/0014-eval-material-pst.md`, `docs/plans/m3.a.md`, `docs/research/m3-eval-material-pst.md` |
 | Eval state | `Position::static_eval_white: i32` field — combined material + PST score from White's perspective, maintained incrementally by `make_move` / `unmake_move`. `Undo::prior_static_eval` captures the pre-make value; `unmake_move` restores via `refresh_static_eval_from`. Six flag-arm deltas in `update_static_eval_after_make` (private helper in `src/mov.rs`); uses the `mover.color` parameter for order-agnostic invocation. Debug builds round-trip-assert `pos.static_eval_white() == eval::eval_white_from_scratch(pos)` after both `make_move` and `unmake_move`; release builds trust the delta. Always-on `make_move_no_from_scratch_in_release` perf sentinel covers BOTH zobrist and eval from-scratch reintroductions at the 100 ns/cycle threshold. Same NNUE-hook discipline as ADR-0004: when NNUE arrives, the PSQT-based delta slots out for the accumulator delta with no signature change. | `decisions/0014-eval-material-pst.md`, `decisions/0004-nnue-hooks-from-day-one.md`, `docs/plans/m3.a.md` |
-| Production search | `AlphaBetaMover` Search impl in `src/search.rs` — fail-soft negamax with `i32` scores, `MATE = 30000`, ply-adjusted mate-in-N, mate-distance pruning, triangular PV table (8 KiB inline), MVV-LVA capture ordering, M3.B repetition/50-move helper integration at `ply > 0`, 4096-node cancellation cadence with parallel `root_score` lockstep update (so `info ... score cp` reflects the completed subtree under partial-abort scenarios, not the propagated 0 sentinel). Single-iteration; default depth 4 when `go depth` not specified. Qsearch + iterative deepening + time management deferred to M3.D / M3.E. Trait surface unchanged from M2.C. **20-0 sweep** vs M3.A `baseline/material-greedy` at fixed depth 4. ~8.55 Mnps single-threaded depth-8 from startpos (Apple M4). | `docs/plans/m3.c.md`, `decisions/0013-search-structure.md`, `bench/m3.md` |
+| Production search | `AlphaBetaMover` Search impl in `src/search.rs` — fail-soft negamax with `i32` scores, `MATE = 30000`, ply-adjusted mate-in-N, mate-distance pruning, triangular PV table (8 KiB inline), MVV-LVA capture ordering, M3.B repetition/50-move helper integration at `ply > 0`, 4096-node cancellation cadence with parallel `root_score` lockstep update (so `info ... score cp` reflects the completed subtree under partial-abort scenarios, not the propagated 0 sentinel). **Qsearch at depth==0 leaves** (M3.D): stand-pat (forbidden when in check), captures + queen-promos filter, in-check all-evasions, terminal detection (in-check + empty → mate; not-in-check + empty → stand-pat per CPW false-stalemate guard), MVV-LVA reused. Negamax restructured per plan §5: PV clear → depth==0 delegation to qsearch → nodes+poll (preserves "1 leaf = 1 node" budget). Single-iteration; default depth 4 when `go depth` not specified. Iterative deepening + time management deferred to M3.E. Trait surface unchanged from M2.C. **20-0 sweep** vs M3.A `baseline/material-greedy` at fixed depth 4 (M3.C: 0 mate adjudications; M3.D: 7 of 20 by mate detection — qsearch's mate-extension visible). **10.87 Mnps** single-threaded depth-8 from startpos at M3.D (Apple M4); M3.C was 8.55 Mnps. | `docs/plans/m3.c.md`, `docs/plans/m3.d.md`, `decisions/0013-search-structure.md`, `bench/m3.md` |
 | Game history | `Engine::game_history: Vec<u64>` carries the full Polyglot Zobrist trajectory **including the current position** under invariant `history.last() == position.zobrist()`. `Engine::new()` initializes to `vec![startpos.zobrist()]`; `handle_ucinewgame` resets to `vec![startpos.zobrist()]`; `handle_position` rebuilds from the new base on each successful command (FEN parse error preserves prior; move-clause error resets to `vec![base.zobrist()]` from the new base). `SearchContext::history: Vec<u64>` is owned and cloned from `Engine::game_history` at `go`-spawn time; the per-`go` worker holds its own copy so subsequent `go` invocations see a pristine engine state. M3.C's negamax will mutate the worker's copy via push/pop on make/unmake. | `docs/plans/m3.b.md`, `docs/milestones/m3.b.md` |
 | Draw-detection helpers | `pub(crate) fn is_repetition(history: &[u64], halfmove_clock: u8) -> bool` and `pub(crate) fn is_fifty_move_draw(halfmove_clock: u8) -> bool` in `src/search.rs`. `is_repetition` walks priors backward in 2-ply steps (only same-side-to-move positions can match), capped at `min(halfmove_clock, history.len()-1)`; first match returns true (per CPW single-occurrence-in-search rule; FIDE 9.2 three-fold-claim is the GUI/adjudicator's job). `is_fifty_move_draw` returns true at `>= 100` plies (FIDE 9.3 claimable threshold). Plumbed at M3.B; consumed by M3.C alpha-beta. | `docs/plans/m3.b.md`, `docs/research/m3-search-basics.md` §8–§9 |
 
@@ -111,9 +111,9 @@ See `decisions/0014-eval-material-pst.md` and `docs/research/m3-eval-material-ps
 
 **Public surface.** `Search` trait + `SearchContext` + `SearchLimits` + `SearchResult` in `src/search.rs` (unchanged trait signature since M2.C).
 
-**Production impl.** `AlphaBetaMover` in `src/search.rs` — replaces M3.A's `GreedyMover` with full alpha-beta recursion. ADR-0013 codifies the structure. Algorithm:
+**Production impl.** `AlphaBetaMover` in `src/search.rs` — replaces M3.A's `GreedyMover` with full alpha-beta recursion + qsearch leaf-extension. ADR-0013 codifies the structure. Algorithm:
 
-1. Single-iteration negamax at the requested depth (`go depth N`; default 4 if no `depth` specified). No iterative deepening (M3.E), no qsearch (M3.D), no transposition table (M4).
+1. Single-iteration negamax at the requested depth (`go depth N`; default 4 if no `depth` specified). Qsearch at depth==0 leaves (M3.D). No iterative deepening (M3.E), no transposition table (M4).
 2. Per-go reset: clone `ctx.history` into search-owned `self.history`, zero `nodes`, clear `aborted`, clear `pv.lengths[..]`, clear `root_score`.
 3. Build `pos_clone = *position` and call `negamax(pos_clone, depth, ply=0, -INF, INF, ctx)`. Balanced make/unmake restores `pos_clone` to the original; debug_assert verifies.
 4. After negamax returns: if `self.aborted`, use `self.root_score.unwrap_or(0)` as the score (the completed-subtree score, NOT the abort sentinel — see ADR-0013 §5 root-score lockstep). Otherwise use the negamax return value.
@@ -121,13 +121,13 @@ See `decisions/0014-eval-material-pst.md` and `docs/research/m3-eval-material-ps
 6. Emit `info depth <N> score <cp|mate N> nodes <N> time <ms> pv <line>` BEFORE the wait loop. PV is the full triangular-table root line.
 7. If `infinite || movetime.is_some() || ponder`: sleep 1 ms while `!should_abort()`.
 
-**Negamax body** (`src/search.rs::AlphaBetaMover::negamax`, plan §5's 11 numbered steps):
+**Negamax body** (`src/search.rs::AlphaBetaMover::negamax`, M3.D plan §5 restructure):
 
-1. Cancellation poll at `nodes & 4095 == 0` cadence + `should_abort`. On abort: set `self.aborted = true`, return 0.
-2. `pv.clear_ply(ply)` so a no-improving-move return leaves an empty PV slot.
-3. Repetition + 50-move draw checks at `ply > 0` only (root must always pick a move; helpers from M3.B).
-4. Mate-distance pruning: tighten `(alpha, beta)` against `MATE - ply` / `-(MATE - ply)`; return early if window collapses.
-5. Horizon: at `depth == 0` return `evaluate(pos)`.
+1. `pv.clear_ply(ply)` first — runs even on the leaf path so a stale `lengths[ply] > 0` from a prior subtree doesn't make the parent's `pv.update` copy stale child PV moves.
+2. Horizon: at `depth == 0`, delegate to `qsearch` BEFORE the nodes increment. Qsearch's own per-frame increment + cancellation poll covers the leaf — preserves the "1 leaf = 1 node" budget contract under `go nodes <N>`.
+3. Cancellation poll at `nodes & 4095 == 0` cadence + `should_abort` (non-leaf only). On abort: set `self.aborted = true`, return 0.
+4. Repetition + 50-move draw checks at `ply > 0` only (root must always pick a move; helpers from M3.B).
+5. Mate-distance pruning: tighten `(alpha, beta)` against `MATE - ply` / `-(MATE - ply)`; return early if window collapses.
 6. Generate legal moves; at `ply == 0` apply `searchmoves` filter.
 7. Empty move list: at `ply == 0 with searchmoves filter active`, return 0 (degenerate user input). Otherwise mate (`-(MATE - ply)`) if in_check, stalemate (0) if not.
 8. MVV-LVA sort descending by score.
@@ -135,15 +135,30 @@ See `decisions/0014-eval-material-pst.md` and `docs/research/m3-eval-material-ps
 10. On post-call `self.aborted`: return 0 without committing score / PV update.
 11. PV update at `ply == 0 && score > alpha`: `pv.update(ply, mv)` AND `self.root_score = Some(score)` (lockstep — ADR-0013 §5).
 
+**Qsearch body** (`src/search.rs::AlphaBetaMover::qsearch`, M3.D plan §3):
+
+1. Per-frame nodes increment + cancellation poll (sole counter for depth==0 leaves).
+2. Mate-distance pruning (may short-circuit before stand-pat is computed; safe).
+3. In-check triage via `in_check(pos)` — decides whether stand-pat is permitted and which moves are searched.
+4. Stand-pat lower-bound: only when not in check; `>= beta` returns stand_pat (fail-soft cutoff); `> alpha` tightens. `best_init = stand_pat` on not-in-check, `-INF` on in-check (forbidden in check per CPW; stand-pat-in-check is unsound).
+5. Move generation: full legal moves in check (evasions); captures + queen-promos otherwise (filter from `generate_moves` output via `qsearch_move_filter`).
+6. Terminal: in-check + empty → mate `-(MATE - ply)`; not-in-check + empty → return `best_init = stand_pat` (false-stalemate guard per CPW pitfall §10.7 — empty-after-capture-filter does NOT mean stalemate).
+7. MVV-LVA ordering on the resulting list (reuses negamax's `mvv_lva_score`).
+8. Fail-soft recursion with post-recursion abort propagation. Push/pop on `self.history` is balanced even on abort (the abort check runs after pop+unmake).
+
+**Qsearch filter.** `qsearch_move_filter(mv) -> bool` accepts `Capture | EnPassant | QueenPromo | QueenPromoCapture`. Excludes under-promotions and under-promo-captures despite the latter being captures — under-promotion's tactical value (avoiding stalemate, knight-fork tactics) is rare enough at M3 strength that the extra qsearch breadth isn't justified. M5 may revisit (single-reply qsearch extension + stalemate-conditional rook/bishop under-promo-in-qsearch).
+
+**Qsearch does NOT consult repetition / 50-move helpers.** By design (plan §3 "Subtleties to honor"). Captures + queen-promos reset halfmove_clock; in-check evasions can include non-capture king moves (which don't reset clock), but the chain of in-check evasions required to produce a repetition is vanishingly rare and detectable only by explicit history-walking that we deliberately skip for tightness. Pinned by `qsearch_skips_fifty_move_at_threshold` and `qsearch_skips_repetition_when_history_contains_current_position` tests.
+
 **Move ordering.** MVV-LVA on captures (`victim_value × 16 - attacker_value` using PeSTO MG values), promotions valued by promo piece (queen-promo 1025 cp lands above small-victim large-attacker captures like QxP at 287 cp — see ADR-0013 §6 for the worked-out table), quiets in movegen order. M4 will add killer / history / TT-move ordering.
 
 **Cancellation.** Per ADR-0013 §7: 4096-node poll cadence; sentinel-return-0 on abort; post-call `self.aborted` check skips score/PV update. Worker thread joined by `handle_quit` so `bestmove` write is visible before `run` returns.
 
 **`Random_Seed` UCI option preserved as no-op.** Alpha-beta is deterministic; the `set_seed` default trait method is a no-op for `AlphaBetaMover`. Cleanup deferred to a separate commit (would touch `scripts/match.sh`'s self-play target which still uses seed-based per-engine differentiation).
 
-**Why no qsearch / ID at M3.C.** Plan keeps M3.C narrow: the negamax core + repetition/50-move integration + production-search-trait wiring is one coherent unit. M3.D adds qsearch (replaces depth==0 → evaluate with depth==0 → qsearch); M3.E adds iterative deepening + soft/hard time-management.
+**Why no ID at M3.D.** Plan keeps M3.D narrow: qsearch as a leaf-evaluation refinement, not a search-depth refinement. M3.E adds iterative deepening + soft/hard time-management (wraps `negamax` in an outer ID loop; qsearch unaffected).
 
-See `docs/plans/m3.c.md`, `docs/decisions/0013-search-structure.md`, `bench/m3.md` (M3.C section).
+See `docs/plans/m3.c.md`, `docs/plans/m3.d.md`, `docs/decisions/0013-search-structure.md`, `bench/m3.md` (M3.C and M3.D sections).
 
 ## Game history and draw-detection helpers
 

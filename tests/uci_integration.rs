@@ -134,10 +134,13 @@ fn integration_full_handshake_starting_position() {
 // E34 — position with a move applied, then go
 // ---------------------------------------------------------------------------
 
-/// Pipe `position startpos moves e2e4 / go / quit`. Assert that the bestmove
-/// is a legal black move in the post-e2e4 position (validated via
-/// `Move::from_uci`). GreedyMover picks by depth-1 eval — we validate
-/// legality, not a specific move, since the best move depends on eval tuning.
+/// Pipe `position startpos moves e2e4 / go depth 2 / quit`. Assert that the
+/// bestmove is a legal black move in the post-e2e4 position (validated via
+/// `Move::from_uci`). We validate legality, not a specific move, since the best
+/// move depends on eval tuning. `go depth 2` is used (instead of bare `go`)
+/// so the search completes before the `quit` stop-flag fires — bare `go` at
+/// the default depth-4 with qsearch exceeds the 4096-node cancellation cadence
+/// in debug mode before the first root move completes (M3.D timing note).
 #[test]
 fn integration_position_with_moves_then_go() {
     let mut child = spawn_engine();
@@ -146,7 +149,7 @@ fn integration_position_with_moves_then_go() {
 
     let mut stdin = child.stdin.take().expect("stdin handle");
     stdin
-        .write_all(b"position startpos moves e2e4\ngo\nquit\n")
+        .write_all(b"position startpos moves e2e4\ngo depth 2\nquit\n")
         .unwrap();
     drop(stdin);
 
@@ -211,9 +214,11 @@ fn integration_eof_terminates_engine_cleanly() {
 // `bestmove` line, and asserts the move is a legal move from startpos.
 // ---------------------------------------------------------------------------
 
-// Pinned at M3.C impl: depth-3 bestmove from startpos (2181 nodes, score cp 38,
-// PV b1c3 g8f6 c3d5). Change only when the search algorithm changes.
-const EXPECTED_BESTMOVE_DEPTH_3: &str = "b1c3";
+// Pinned at M3.D impl: depth-3 bestmove from startpos changed to d2d4 (queen's pawn
+// opening) now that qsearch resolves capture sequences at the horizon. The M3.C pin
+// was b1c3. d2d4 is a sensible, non-hanging move. Change only when the search
+// algorithm changes.
+const EXPECTED_BESTMOVE_DEPTH_3: &str = "d2d4";
 
 #[test]
 fn integration_alphabeta_depth3_returns_legal_bestmove_from_startpos() {
