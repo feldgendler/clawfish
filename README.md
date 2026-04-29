@@ -56,18 +56,21 @@ The project's casual progression, in tiers. Each is informal — not a strict
 commitment, just a way to think about what "done enough for now" means at
 each stage.
 
-| # | Goal | Status |
-|---|---|---|
-| 1 | Play correct chess at all (legal moves, no protocol bugs) | **✓ achieved at M2** — RandomMover speaking UCI through fastchess |
-| 2 | Beat the project's owner reliably | **✓ achieved at M3** — at ~2114 Elo, comfortably ahead of the owner's casual chess.com level |
-| 3 | Beat grandmasters reliably | targeting end-M5 / mid-M6 (~2700-2900 Elo equivalent; proxy: ≥60% vs Stockfish UCI_Elo=2800) |
-| 4 | Grow out of reach for the best humans | targeting M9 (NNUE, ~3300+ Elo equivalent) |
-| 5 | Compete on par with or beat the strongest engines | aspirational; would require parallel search (M8) + NNUE (M9) plus aggressive M5 pruning + a high-quality training pipeline. Not on the current roadmap as a hard target. |
+| # | Goal | Target CCRL Blitz | Status |
+|---|---|---|---|
+| 1 | Play correct chess at all (legal moves, no protocol bugs) | n/a (random play sits below CCRL's listing floor) | **✓ achieved at M2** — RandomMover speaking UCI through fastchess |
+| 2 | Beat the project's owner reliably | ~2000-2400 | **✓ achieved at M3** — measured ~2114 at our anchor; ~2100-2300 CCRL Blitz equivalent estimated, comfortably ahead of the owner's casual chess.com level |
+| 3 | Beat grandmasters reliably | ~2600-2900 | targeting end-M5 / mid-M6 (proxy: ≥60% vs Stockfish UCI_Elo=2800) |
+| 4 | Grow out of reach for the best humans | ~3200-3500 | targeting M9 (NNUE) |
+| 5 | Compete on par with or beat the strongest engines | 3600+ | aspirational; would require parallel search (M8) + NNUE (M9) plus aggressive M5 pruning + a high-quality training pipeline. Not on the current roadmap as a hard target. |
 
-Goals 3-5 are stated against approximate Elo proxies (since real GMs and
-elite engines aren't directly accessible for routine matches). The
-proxies and methodology caveats are documented in `bench/sprt/` per
-matching milestone.
+Goals 3-5 are stated against approximate Elo proxies (since real GMs
+and elite engines aren't directly accessible for routine matches).
+CCRL Blitz is chosen as the reference scale because the project tests
+at fast TC; CCRL 40/4 numbers would be modestly higher (engines without
+TT suffer at fast TC more than at slow TC). The proxies and
+methodology caveats are documented in `bench/sprt/` per matching
+milestone.
 
 ## Documentation
 
