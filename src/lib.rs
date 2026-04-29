@@ -19,6 +19,7 @@ pub mod position;
 pub mod search;
 pub mod slow_attacks;
 pub mod square;
+pub mod tt;
 pub mod uci;
 pub mod zobrist;
 

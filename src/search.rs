@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::tt::{TranspositionTable, TtBound, TtData, score_from_tt, score_to_tt};
 use crate::{Color, Move, Position};
 
 /// Parsed `go` parameters routed into search. Constructed by `handle_go` from
@@ -79,6 +80,11 @@ pub struct SearchContext {
     /// position. Cloned from `Engine::game_history` at `go`-start.
     /// M3.C negamax will push/pop entries on make/unmake during recursion.
     pub history: Vec<u64>,
+    /// M4.A: shared transposition table. `None` for tests / search impls
+    /// without TT (e.g. `MockSearch`); `Some` in production via
+    /// `Engine::handle_go`/`handle_bench`. Visibility scoped to the crate
+    /// because `TranspositionTable` is itself `pub(crate)`.
+    pub(crate) tt: Option<Arc<TranspositionTable>>,
 }
 
 impl SearchContext {
@@ -170,7 +176,7 @@ const INF: i32 = 30_001;
 /// Minimum mate score magnitude; used to distinguish mate scores from
 /// centipawn scores in `score_to_uci`. A score with `|score| >= MATE_IN_MAX_PLY`
 /// is a mate score.
-const MATE_IN_MAX_PLY: i32 = MATE - MAX_PLY as i32; // 29_936
+pub(crate) const MATE_IN_MAX_PLY: i32 = MATE - MAX_PLY as i32; // 29_936
 
 /// Construct the "iteration-1 aborted before any root improvement" fallback
 /// result for `Search::go` (M3.E).
@@ -265,14 +271,10 @@ pub(crate) struct AlphaBetaMover {
     /// the search aborts mid-root the reported score reflects the best fully
     /// explored subtree rather than the aborted return value of 0.
     root_score: Option<i32>,
-    /// Best root move from the prior completed iterative-deepening iteration
-    /// (M3.E). Consumed by `negamax` at `ply == 0` to prepend it ahead of the
-    /// MVV-LVA-sorted root move list. Reset to `None` at the start of each
-    /// `go` (so iteration 1 has no prior hint); set to `Some(bestmove)` at the
-    /// end of each fully-completed iteration. Mid-iteration aborts do NOT
-    /// clear it. After a `go` returns, the field's stale state is overwritten
-    /// by the next `go`'s top-of-`go` reset.
-    prior_root_move: Option<Move>,
+    /// M4.A: per-`go` TT handle. Cloned from `ctx.tt` at top of `Search::go`;
+    /// `None` between searches and for searches that don't use a TT (tests
+    /// exercising `negamax_for_test` directly without a TT context).
+    tt: Option<Arc<TranspositionTable>>,
 }
 
 impl AlphaBetaMover {
@@ -284,25 +286,8 @@ impl AlphaBetaMover {
             nodes: 0,
             aborted: false,
             root_score: None,
-            prior_root_move: None,
+            tt: None,
         }
-    }
-
-    /// Test-only access to `prior_root_move` (M3.E). Production code never reads
-    /// this — the field is internal to the ID outer loop and `negamax` ply==0
-    /// reorder. Tests inspect it to verify the prior-PV hint plumbing.
-    #[cfg(test)]
-    pub(super) fn prior_root_move_for_test(&self) -> Option<Move> {
-        self.prior_root_move
-    }
-
-    /// Test-only setter for `prior_root_move` (M3.E). Production code never sets
-    /// this directly; the ID outer loop sets it from the prior iteration's PV.
-    /// Tests use this to construct fixtures where the hint is pre-set, then
-    /// drive `negamax_for_test` directly to observe the reorder behavior.
-    #[cfg(test)]
-    pub(super) fn set_prior_root_move_for_test(&mut self, mv: Option<Move>) {
-        self.prior_root_move = mv;
     }
 }
 
@@ -318,7 +303,11 @@ impl Search for AlphaBetaMover {
         self.nodes = 0;
         self.aborted = false;
         self.root_score = None;
-        self.prior_root_move = None;
+        // M4.A: install the TT and advance its generation once per `go` (ADR-0018 §9).
+        self.tt = ctx.tt.clone();
+        if let Some(tt) = &self.tt {
+            tt.new_search();
+        }
         for i in 0..MAX_PLY {
             self.pv.lengths[i] = 0;
         }
@@ -332,15 +321,15 @@ impl Search for AlphaBetaMover {
 
         for depth in 1..=max_depth {
             // Per-iteration reset (subset of per-go reset). `nodes` is NOT
-            // reset — it accumulates across iterations. `prior_root_move` is
-            // NOT reset — it carries iteration N's hint into iteration N+1.
+            // reset — it accumulates across iterations. The TT survives across
+            // iterations (the cross-iteration hint is what makes ID worthwhile).
             self.aborted = false;
             self.root_score = None;
             for i in 0..MAX_PLY {
                 self.pv.lengths[i] = 0;
             }
 
-            let returned = self.negamax(&mut pos_clone, depth, 0, -INF, INF, ctx);
+            let returned = self.negamax(&mut pos_clone, depth, 0, -INF, INF, true, ctx);
 
             if self.aborted {
                 // Mid-iteration abort: discard partial PV/score; preserve prior
@@ -351,7 +340,6 @@ impl Search for AlphaBetaMover {
             // Iteration completed. Snapshot.
             let bestmove = (self.pv.lengths[0] > 0).then(|| self.pv.moves[0][0]);
             last_complete = Some((depth, bestmove, returned));
-            self.prior_root_move = bestmove;
 
             // Single Instant::now() reused for both the elapsed-ms field and
             // the soft-cap check below — avoids a duplicate syscall and keeps
@@ -436,6 +424,12 @@ impl Search for AlphaBetaMover {
 
 impl AlphaBetaMover {
     /// Fail-soft negamax with alpha-beta pruning and triangular PV recovery.
+    ///
+    /// `is_pv` is the synthetic ordering predicate that gates TT cutoffs
+    /// (ADR-0018 §11). `true` at the root and at the first child of a PV
+    /// parent (recursion-order index 0); `false` everywhere else. PVS at M4.D
+    /// will replace it with the window-based `beta - alpha == 1` check.
+    #[allow(clippy::too_many_arguments)]
     fn negamax(
         &mut self,
         pos: &mut Position,
@@ -443,6 +437,7 @@ impl AlphaBetaMover {
         ply: u32,
         mut alpha: i32,
         mut beta: i32,
+        is_pv: bool,
         ctx: &SearchContext,
     ) -> i32 {
         use crate::movegen::{MoveList, generate_moves, in_check};
@@ -456,6 +451,7 @@ impl AlphaBetaMover {
         // 2. Horizon: delegate to qsearch BEFORE incrementing self.nodes.
         //    qsearch's own per-frame increment + cancellation poll covers the leaf.
         //    Preserves M3.C's "1 leaf = 1 node" budget under `go nodes <N>`.
+        //    Qsearch does not consult the TT in M4.A (ADR-0018 §6).
         if depth == 0 {
             return self.qsearch(pos, alpha, beta, ply, ctx);
         }
@@ -467,7 +463,15 @@ impl AlphaBetaMover {
             return 0;
         }
 
-        // 4. Repetition + 50-move draw checks — only at ply > 0 (root must pick a move).
+        // 4. Capture caller's pre-MDP alpha BEFORE any mutation (load-bearing
+        //    for bound classification at step 12). MDP can tighten alpha
+        //    upward; classifying Exact vs Upper against the MDP-tightened
+        //    alpha would mis-label fail-lows as Exact. ADR-0018 §13.
+        let original_alpha = alpha;
+
+        // 5. Repetition + 50-move draw checks — only at ply > 0 (root must
+        //    pick a move). Runs BEFORE the TT probe (ADR-0018 §10): a stale
+        //    TT score for the same key would otherwise mis-score a draw.
         if ply > 0 {
             if is_fifty_move_draw(pos.halfmove_clock()) {
                 return 0;
@@ -477,7 +481,7 @@ impl AlphaBetaMover {
             }
         }
 
-        // 5. Mate-distance pruning.
+        // 6. Mate-distance pruning (may tighten alpha/beta).
         let mating_value = MATE - ply as i32;
         if mating_value < beta {
             beta = mating_value;
@@ -493,7 +497,25 @@ impl AlphaBetaMover {
             }
         }
 
-        // 6. Generate moves.
+        // 7. TT probe. Compares post-MDP `(alpha, beta)`; never returns
+        //    early at PV nodes (ADR-0018 §11).
+        let mut tt_move: u16 = 0;
+        if let Some(tt) = &self.tt
+            && let Some(entry) = tt.probe(pos.zobrist())
+        {
+            tt_move = entry.best_move;
+            if !is_pv && entry.depth as u32 >= depth {
+                let tt_score = score_from_tt(entry.score as i32, ply as i32);
+                match entry.bound() {
+                    TtBound::Exact => return tt_score,
+                    TtBound::Lower if tt_score >= beta => return tt_score,
+                    TtBound::Upper if tt_score <= alpha => return tt_score,
+                    _ => {}
+                }
+            }
+        }
+
+        // 8. Generate moves.
         let mut ml = MoveList::new();
         generate_moves(pos, &mut ml);
         let mut moves_vec = ml.iter().collect::<Vec<_>>();
@@ -505,7 +527,7 @@ impl AlphaBetaMover {
             moves_vec.retain(|m| filter.contains(m));
         }
 
-        // 7. Terminal: no legal moves.
+        // 9. Terminal: no legal moves.
         //    At ply==0 with searchmoves filter active, an empty list is a degenerate
         //    user input (all-illegal or empty filter). Short-circuit BEFORE the
         //    in_check triage — otherwise a check position with a degenerate filter
@@ -521,34 +543,42 @@ impl AlphaBetaMover {
             }
         }
 
-        // 8. Order: MVV-LVA descending.
+        // 10. Order: MVV-LVA descending, then promote the TT move (if any) to
+        //     index 0. `Move::default().bits() == 0` is the no-move sentinel
+        //     and is never produced by movegen, so `tt_move == 0` falls
+        //     through. The legality scan over the legal-move list rejects
+        //     garbage values (ADR-0018 §12).
         moves_vec.sort_by_cached_key(|&m| -mvv_lva_score(m, pos));
-
-        // 8a. Root reorder hint (M3.E): try the prior ID iteration's best move
-        //     first. `remove(idx) + insert(0)` (vs `swap`) preserves the
-        //     relative MVV-LVA order of the rest of the list — only the
-        //     prior-PV move moves to the front. `idx != 0` skips the no-op
-        //     case (prior already first).
-        if ply == 0
-            && let Some(pm) = self.prior_root_move
-            && let Some(idx) = moves_vec.iter().position(|m| *m == pm)
+        if tt_move != 0
+            && let Some(idx) = moves_vec.iter().position(|m| m.bits() == tt_move)
             && idx != 0
         {
-            let prior = moves_vec.remove(idx);
-            moves_vec.insert(0, prior);
+            let mv = moves_vec.remove(idx);
+            moves_vec.insert(0, mv);
         }
 
-        // 9. Recurse fail-soft.
+        // 11. Recurse fail-soft. `child_is_pv = is_pv && i == 0` per ADR-0018 §11
+        //     where `i` is the recursion-order index (post-step-10 reorder).
         let mut best = -INF;
-        for mv in moves_vec {
+        let mut cutoff_move: Option<Move> = None;
+        for (i, &mv) in moves_vec.iter().enumerate() {
             let undo = pos.make_move(mv);
             self.history.push(pos.zobrist());
             let (child_alpha, child_beta) = negate_window(alpha, beta);
-            let score = -self.negamax(pos, depth - 1, ply + 1, child_alpha, child_beta, ctx);
+            let child_is_pv = is_pv && i == 0;
+            let score = -self.negamax(
+                pos,
+                depth - 1,
+                ply + 1,
+                child_alpha,
+                child_beta,
+                child_is_pv,
+                ctx,
+            );
             self.history.pop();
             pos.unmake_move(mv, undo);
 
-            // 10. Abort check: score from an aborted search is invalid.
+            // Abort check: score from an aborted search is invalid.
             if self.aborted {
                 return 0;
             }
@@ -557,7 +587,7 @@ impl AlphaBetaMover {
                 best = score;
                 if score > alpha {
                     alpha = score;
-                    // 11. PV update: this move improved alpha at this ply.
+                    // PV update: this move improved alpha at this ply.
                     self.pv.update(ply as usize, mv);
                     // Track the root score in lockstep with the PV so that if
                     // the search aborts later, `go` can report the score of the
@@ -567,9 +597,48 @@ impl AlphaBetaMover {
                     }
                 }
                 if alpha >= beta {
+                    cutoff_move = Some(mv);
                     break; // beta cutoff — fail-soft: return `best`, not `beta`
                 }
             }
+        }
+
+        // 12. Store on completion. Skip on abort (partial bounds are not real)
+        //     and never mid-loop (the abort path returns above without storing).
+        //     Together this guarantees aborted iterations never overwrite a
+        //     prior iteration's entry. Bound classification compares against
+        //     `original_alpha` — the caller's pre-MDP alpha (step 4).
+        if let Some(tt) = &self.tt
+            && !self.aborted
+        {
+            let bound = if best >= beta {
+                TtBound::Lower
+            } else if best > original_alpha {
+                TtBound::Exact
+            } else {
+                TtBound::Upper
+            };
+            let best_move_packed: u16 = match bound {
+                TtBound::Lower => cutoff_move.map(|m| m.bits()).unwrap_or(0),
+                TtBound::Exact if self.pv.lengths[ply as usize] > 0 => {
+                    self.pv.moves[ply as usize][0].bits()
+                }
+                _ => 0,
+            };
+            let adjusted = score_to_tt(best, ply as i32);
+            debug_assert!(
+                adjusted == adjusted as i16 as i32,
+                "TT score overflow: adjusted={adjusted}"
+            );
+            tt.store(
+                pos.zobrist(),
+                TtData {
+                    score: adjusted as i16,
+                    depth: depth as u8,
+                    bound,
+                    best_move: best_move_packed,
+                },
+            );
         }
 
         best
@@ -579,6 +648,7 @@ impl AlphaBetaMover {
     /// because tests cannot call private methods directly; production code
     /// never calls this.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn negamax_for_test(
         &mut self,
         pos: &mut Position,
@@ -586,9 +656,18 @@ impl AlphaBetaMover {
         ply: u32,
         alpha: i32,
         beta: i32,
+        is_pv: bool,
         ctx: &SearchContext,
     ) -> i32 {
-        self.negamax(pos, depth, ply, alpha, beta, ctx)
+        self.negamax(pos, depth, ply, alpha, beta, is_pv, ctx)
+    }
+
+    /// Test-only setter to install a TT directly without going through
+    /// `Search::go`. Production code never sets this — the per-`go` install
+    /// happens at the top of `Search::go`.
+    #[cfg(test)]
+    pub(super) fn set_tt_for_test(&mut self, tt: Option<Arc<TranspositionTable>>) {
+        self.tt = tt;
     }
 
     /// Test-only: return the root PV as a `Vec<Move>`.
@@ -1017,6 +1096,7 @@ mod tests {
             start: Instant::now(),
             limits: SearchLimits::default(),
             history: Vec::new(),
+            tt: None,
         };
         (ctx, stop)
     }
@@ -1030,6 +1110,26 @@ mod tests {
             },
             ..ctx
         };
+        (ctx, stop)
+    }
+
+    /// Test helper: build a non-aborting context wired with `tt`. M4.A
+    /// added the TT field; tests that pre-populate or inspect TT entries
+    /// use this instead of `non_aborting_ctx`.
+    fn non_aborting_ctx_with_tt(tt: Arc<TranspositionTable>) -> (SearchContext, Arc<AtomicBool>) {
+        let (mut ctx, stop) = non_aborting_ctx();
+        ctx.tt = Some(tt);
+        (ctx, stop)
+    }
+
+    /// Test helper: build a non-aborting context wired with depth `d` and
+    /// `tt`.
+    fn non_aborting_ctx_at_depth_with_tt(
+        d: u32,
+        tt: Arc<TranspositionTable>,
+    ) -> (SearchContext, Arc<AtomicBool>) {
+        let (mut ctx, stop) = non_aborting_ctx_at_depth(d);
+        ctx.tt = Some(tt);
         (ctx, stop)
     }
 
@@ -1050,6 +1150,7 @@ mod tests {
                 start: Instant::now(),
                 limits: SearchLimits::default(),
                 history: Vec::new(),
+                tt: None,
             };
             assert!(!ctx.should_abort(0), "should not abort before stop is set");
             stop.store(true, Ordering::Relaxed);
@@ -1067,6 +1168,7 @@ mod tests {
                 start: Instant::now(),
                 limits: SearchLimits::default(),
                 history: Vec::new(),
+                tt: None,
             };
             assert!(
                 ctx.should_abort(0),
@@ -1087,6 +1189,7 @@ mod tests {
                     ..SearchLimits::default()
                 },
                 history: Vec::new(),
+                tt: None,
             };
             assert!(
                 ctx.should_abort(1_000),
@@ -1580,7 +1683,7 @@ mod tests {
         let other_zobrist: u64 = 0xDEAD_BEEF_CAFE_0000;
         ab.history = vec![pos.zobrist(), other_zobrist, pos.zobrist()];
 
-        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, &ctx_depth2);
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, true, &ctx_depth2);
         assert_eq!(
             score, 0,
             "repetition at ply > 0 must return score 0; got {score}"
@@ -1598,7 +1701,7 @@ mod tests {
         let mut ab = AlphaBetaMover::new();
         ab.history = vec![pos.zobrist()];
 
-        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, &ctx_depth2);
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, true, &ctx_depth2);
         assert_eq!(
             score, 0,
             "50-move draw at halfmove=100 must return score 0; got {score}"
@@ -1668,6 +1771,7 @@ mod tests {
                         ..SearchLimits::default()
                     },
                     history: vec![pos.zobrist()],
+                    tt: None,
                 };
 
                 let mut ab = AlphaBetaMover::new();
@@ -1741,6 +1845,7 @@ mod tests {
                 ..SearchLimits::default()
             },
             history: vec![pos.zobrist()],
+            tt: None,
         };
         let mut ab = AlphaBetaMover::new();
         let result = ab.go(&pos, &ctx, &|_| {});
@@ -1809,6 +1914,7 @@ mod tests {
                 ..SearchLimits::default()
             },
             history: vec![pos.zobrist()],
+            tt: None,
         };
         let mut ab = AlphaBetaMover::new();
         let result = ab.go(&pos, &ctx, &|_| {});
@@ -1863,6 +1969,7 @@ mod tests {
                 ..SearchLimits::default()
             },
             history: vec![pos.zobrist()],
+            tt: None,
         };
         let mut ab = AlphaBetaMover::new();
         let result = ab.go(&pos, &ctx, &|_| {});
@@ -1895,6 +2002,7 @@ mod tests {
                 ..SearchLimits::default()
             },
             history: vec![pos.zobrist()],
+            tt: None,
         };
         let mut ab = AlphaBetaMover::new();
         let info_lines: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
@@ -2586,7 +2694,7 @@ mod tests {
         let mut ab = AlphaBetaMover::new();
         ab.history = vec![pos.zobrist()];
         let (ctx, _stop) = non_aborting_ctx();
-        let score = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, &ctx);
 
         assert!(
             score < 700,
@@ -3228,8 +3336,8 @@ mod tests {
     //
     // Per `docs/plans/m3.e.md` §8.2. Tests drive `AlphaBetaMover::go` with
     // constructed `SearchContext`s; they observe behavior via captured
-    // `info_sink` lines, `result.depth/bestmove/score_cp/nodes`, and the
-    // `prior_root_move_for_test` accessor.
+    // `info_sink` lines and `result.depth/bestmove/score_cp/nodes`. The
+    // M3.E `prior_root_move` machinery is replaced by M4.A's TT in S7.
     // -----------------------------------------------------------------------
 
     /// Build a `SearchContext` from a position with the given limits. Soft
@@ -3243,6 +3351,7 @@ mod tests {
             start: Instant::now(),
             limits,
             history: vec![pos.zobrist()],
+            tt: None,
         };
         (ctx, stop)
     }
@@ -3261,6 +3370,7 @@ mod tests {
             start: now,
             limits,
             history: vec![pos.zobrist()],
+            tt: None,
         };
         (ctx, stop)
     }
@@ -3344,6 +3454,7 @@ mod tests {
             start: now,
             limits: limits_with(|l| l.depth = Some(20)),
             history: vec![pos.zobrist()],
+            tt: None,
         };
         let mut ab = AlphaBetaMover::new();
         let (result, infos) = drive_go(&mut ab, &pos, &ctx);
@@ -3533,146 +3644,6 @@ mod tests {
     }
 
     #[test]
-    fn id_prior_root_move_is_iteration_n_bestmove_at_iteration_n_plus_1() {
-        // After driving go depth 3 from startpos, the mover's
-        // prior_root_move should equal the final iteration's bestmove.
-        let pos = Position::starting_position();
-        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(3)));
-        let mut ab = AlphaBetaMover::new();
-        let (result, _) = drive_go(&mut ab, &pos, &ctx);
-
-        let bm = result.bestmove.expect("depth-3 must have bestmove");
-        assert_eq!(
-            ab.prior_root_move_for_test(),
-            Some(bm),
-            "prior_root_move after go must equal final iteration's bestmove"
-        );
-    }
-
-    #[test]
-    fn id_prior_root_move_no_hint_when_not_in_movelist() {
-        // Pre-set prior_root_move to a move that is NOT in startpos's legal
-        // move list. `Move::default() == Move(0)` decodes as a1->a1 Quiet,
-        // which is never produced by movegen.
-        //
-        // To exercise the intended code path (negamax step 8a's
-        // `position()` lookup returning None, the `if let` guard skipping),
-        // we MUST bypass `Search::go`'s top-of-go reset that clears
-        // `prior_root_move` to None before iteration 1. Direct call to
-        // `negamax_for_test` is the bypass — it forwards verbatim to
-        // `negamax` without the per-go reset. Same pattern as
-        // `id_prior_root_move_reorders_root_movelist_before_search`.
-        let pos = Position::starting_position();
-        let mut ab = AlphaBetaMover::new();
-        ab.set_prior_root_move_for_test(Some(Move::default()));
-        let (ctx, _stop) = ctx_for(&pos, SearchLimits::default());
-        let mut pos_clone = pos;
-        // Call negamax_for_test directly — bypasses go's per-go reset of
-        // prior_root_move. The illegal hint reaches step 8a, the
-        // position() lookup returns None, the guard skips, and the search
-        // proceeds with standard MVV-LVA ordering. No panic; the score is
-        // a valid alpha-beta value.
-        let score = ab.negamax_for_test(&mut pos_clone, 2, 0, -INF, INF, &ctx);
-        assert!(
-            (-INF..=INF).contains(&score),
-            "score from non-aborted depth-2 search must be a finite alpha-beta value; got {score}"
-        );
-        // pv[0][0] must be set (depth-2 from startpos always has a best
-        // root move that improves alpha from -INF).
-        assert!(
-            !ab.pv_root_for_test().is_empty(),
-            "depth-2 negamax must populate pv[0]; got empty PV"
-        );
-    }
-
-    #[test]
-    fn id_prior_root_move_reorders_root_movelist_before_search() {
-        // Node-count differential pin: a correct reorder makes the hinted
-        // run search the prior move FIRST at root, which (when the prior is
-        // the eventual best) tightens alpha sooner and prunes more nodes.
-        // A stub that omits the reorder gets only MVV-LVA + movegen order,
-        // generally producing a different (typically larger) node count.
-        //
-        // Protocol:
-        // (1) Drive an unhinted go depth 3 from startpos via negamax_for_test
-        //     directly (bypass the ID outer loop and its iteration-2 hint
-        //     auto-set). Capture the natural bestmove + node count.
-        // (2) Drive the same depth 3 with prior_root_move pre-set to that
-        //     natural bestmove. The reorder moves it to position 0; alpha
-        //     tightens identically to the unhinted run for that first move,
-        //     but the hinted run is guaranteed to evaluate that move first
-        //     (the unhinted run only happens to evaluate it first if it is
-        //     also MVV-LVA-first or movegen-first).
-        // (3) Drive the same depth 3 with prior_root_move pre-set to a
-        //     DIFFERENT legal move (one that is unlikely to be the natural
-        //     best). The reorder moves it to position 0; alpha-beta will
-        //     evaluate it first, then the rest of the moves in MVV-LVA
-        //     order. Node count differs from the unhinted run.
-        //
-        // Pin: assert node count for run (3) ≠ node count for run (1).
-        // A complete deletion of the reorder code makes run (3) identical
-        // to run (1) (both fall through to MVV-LVA), which would fail the
-        // assertion. This is the only adversarial pin against the reorder.
-        let pos = Position::starting_position();
-
-        // Run (1): unhinted depth-3 via negamax_for_test (no ID auto-hint).
-        let (ctx, _stop) = ctx_for(&pos, SearchLimits::default());
-        let mut ab1 = AlphaBetaMover::new();
-        let mut pos_clone1 = pos;
-        let _ = ab1.negamax_for_test(&mut pos_clone1, 3, 0, -INF, INF, &ctx);
-        let nodes_unhinted = ab1.nodes;
-        let bestmove_unhinted = ab1
-            .pv_root_for_test()
-            .first()
-            .copied()
-            .expect("depth-3 unhinted must produce a PV");
-
-        // Run (3): hinted with a DIFFERENT move from the natural best.
-        // Critical: the alt move must NOT be movegen-first (i.e. the first
-        // legal move from `generate_moves`). Startpos quiets all have
-        // MVV-LVA score 0, so MVV-LVA sort is stable and the unhinted run
-        // searches movegen-first first. If we pick `alt_move = movegen-first
-        // (and bestmove_unhinted happens to be a different move)`, the
-        // reorder is a no-op (alt_move is already at index 0 in MVV-LVA
-        // order). To exercise the reorder, pick a move from the LAST
-        // position in the legal-move iterator — which is NEVER movegen-first
-        // for any non-trivial position. Skip if it equals the natural best
-        // (would also produce identical node counts: hinted and unhinted both
-        // see the natural best at index 0 of the searched moves).
-        let mut ml = MoveList::new();
-        generate_moves(&pos, &mut ml);
-        let all_moves: Vec<Move> = ml.iter().collect();
-        let alt_move = *all_moves
-            .iter()
-            .rev()
-            .find(|m| **m != bestmove_unhinted)
-            .expect("startpos has > 1 legal move; last-non-best must exist");
-        // Defensive: confirm the chosen alt is NOT the movegen-first move
-        // (otherwise the reorder is trivially a no-op and the test cannot
-        // distinguish reorder-correct from reorder-stub).
-        assert_ne!(
-            alt_move, all_moves[0],
-            "test fixture: alt_move must NOT be movegen-first; reorder would be a no-op"
-        );
-        let mut ab3 = AlphaBetaMover::new();
-        ab3.set_prior_root_move_for_test(Some(alt_move));
-        let mut pos_clone3 = pos;
-        let _ = ab3.negamax_for_test(&mut pos_clone3, 3, 0, -INF, INF, &ctx);
-        let nodes_hinted_alt = ab3.nodes;
-
-        // Adversarial pin: a stub that ignores prior_root_move would produce
-        // identical node counts (both fall through to MVV-LVA order). The
-        // reorder must change the search ORDER, which changes node count.
-        assert_ne!(
-            nodes_unhinted,
-            nodes_hinted_alt,
-            "prior_root_move reorder must change root search order, observable as node count delta; \
-             nodes_unhinted={nodes_unhinted}, nodes_hinted_alt={nodes_hinted_alt} (alt_move={})",
-            alt_move.to_uci()
-        );
-    }
-
-    #[test]
     fn id_default_max_depth_for_bare_go_is_4() {
         // Bare `go` (no fields set) → max_depth = 4 (legacy fallback).
         let pos = Position::starting_position();
@@ -3833,6 +3804,7 @@ mod tests {
             start: now,
             limits: limits_with(|l| l.depth = Some(20)),
             history: vec![pos.zobrist()],
+            tt: None,
         };
         let stop_flip = Arc::clone(&stop);
         let infos: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
@@ -3851,5 +3823,703 @@ mod tests {
         );
         assert_eq!(infos.len(), 1, "exactly one info line emitted before stop");
         assert!(result.bestmove.is_some());
+    }
+
+    // ===========================================================================
+    // M4.A — TT integration tests S1–S13 (per docs/plans/m4.a.md §5.2).
+    // ===========================================================================
+
+    /// Build a `SearchContext` with the given TT installed and the given limits.
+    fn ctx_for_with_tt(
+        pos: &Position,
+        limits: SearchLimits,
+        tt: Arc<TranspositionTable>,
+    ) -> (SearchContext, Arc<AtomicBool>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            deadline: None,
+            soft_deadline: None,
+            start: Instant::now(),
+            limits,
+            history: vec![pos.zobrist()],
+            tt: Some(tt),
+        };
+        (ctx, stop)
+    }
+
+    // -----------------------------------------------------------------------
+    // S1 — Exact bound stored at root after full search.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn negamax_stores_exact_bound_at_root_after_full_search() {
+        let pos = Position::starting_position();
+        let tt = Arc::new(TranspositionTable::new(1));
+        let (ctx, _stop) = ctx_for_with_tt(&pos, limits_with(|l| l.depth = Some(2)), tt.clone());
+        let mut ab = AlphaBetaMover::new();
+        let _ = drive_go(&mut ab, &pos, &ctx);
+
+        let entry = tt
+            .probe(pos.zobrist())
+            .expect("root entry must be present after full search");
+        assert!(
+            entry.depth as u32 >= 2,
+            "stored depth must be >= search depth; got {}",
+            entry.depth
+        );
+        assert_eq!(
+            entry.bound(),
+            TtBound::Exact,
+            "full-window root search must store an Exact bound; got {:?}",
+            entry.bound()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S2 — Lower bound stored after a beta cutoff.
+    // -----------------------------------------------------------------------
+
+    /// Drive negamax with a fail-high window so the root produces a Lower
+    /// bound. Startpos at depth 2 with `(alpha, beta) = (-100, -99)` — every
+    /// reasonable root score exceeds beta, triggering an immediate beta
+    /// cutoff at root. After the call, the root entry must have bound==Lower.
+    #[test]
+    fn negamax_stores_lower_bound_after_beta_cutoff() {
+        let pos = Position::starting_position();
+        let tt = Arc::new(TranspositionTable::new(1));
+        let (ctx, _stop) = non_aborting_ctx_with_tt(tt.clone());
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        ab.set_tt_for_test(Some(tt.clone()));
+
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, -100, -99, false, &ctx);
+
+        let entry = tt
+            .probe(pos.zobrist())
+            .expect("root entry must be present after fail-high search");
+        assert_eq!(
+            entry.bound(),
+            TtBound::Lower,
+            "beta-cutoff at root must store Lower; got {:?}",
+            entry.bound()
+        );
+        assert!(
+            entry.best_move != 0,
+            "Lower-bound store must record the cutoff move; got 0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S3 — Aborted search must not store.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn negamax_does_not_store_after_abort() {
+        let pos = Position::starting_position();
+        let tt = Arc::new(TranspositionTable::new(1));
+        let stop = Arc::new(AtomicBool::new(true));
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            deadline: None,
+            soft_deadline: None,
+            start: Instant::now(),
+            limits: limits_with(|l| l.depth = Some(10)),
+            history: vec![pos.zobrist()],
+            tt: Some(tt.clone()),
+        };
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.go(&pos, &ctx, &|_| {});
+
+        // The TT generation advanced via new_search() from 0 → 1. Iteration 1
+        // from startpos visits ~20 nodes (well below the 4096 cadence), so it
+        // completes and DOES store at root. The inter-iteration stop check
+        // then breaks the loop, preventing iter 2 from running. Iteration 1's
+        // store at gen 1 is therefore expected. The abort-skip discipline
+        // applies to iterations that abort MID-loop (depth >= 4096-cadence).
+        //
+        // To pin the abort-skip half cleanly, drive `negamax_for_test`
+        // directly with a pre-set abort flag and verify NO entry is stored.
+        let pos2 = Position::starting_position();
+        let tt2 = Arc::new(TranspositionTable::new(1));
+        let (ctx2, _stop2) = non_aborting_ctx_with_tt(tt2.clone());
+        let mut ab2 = AlphaBetaMover::new();
+        ab2.history = vec![pos2.zobrist()];
+        ab2.set_tt_for_test(Some(tt2.clone()));
+        ab2.aborted = true;
+        let _ = ab2.negamax_for_test(&mut pos2.clone(), 2, 0, -INF, INF, true, &ctx2);
+        assert!(
+            tt2.probe(pos2.zobrist()).is_none(),
+            "negamax with self.aborted=true must not store a TT entry"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S3b — No mid-loop store: pre-populated entry survives a partial iteration.
+    // -----------------------------------------------------------------------
+
+    /// Pin "no mid-loop store under partial iteration." Pre-populate the
+    /// root TT entry with a marker (depth=99, score=12345). Drive
+    /// `Search::go` at depth 5 with `deadline` already in the past, so the
+    /// 4096-cadence cancellation fires inside iter 1's recursion (Kiwipete
+    /// at depth 5 visits »4096 nodes — empirically ~50k+) BEFORE iter 1
+    /// completes its move loop. The store discipline (skip-if-aborted +
+    /// end-of-loop-only) implies the marker entry survives untouched.
+    /// A buggy mid-loop store would overwrite the marker with a
+    /// partial-iter-1 entry of much lower depth.
+    ///
+    /// Choosing Kiwipete (large branching factor) over startpos here is
+    /// load-bearing: startpos depth-1 visits ~20 nodes — below the 4096
+    /// cadence — so iter 1 from startpos completes and legitimately stores
+    /// before any cancellation poll fires. The cadence-fire-during-iter-1
+    /// regime requires a fixture where iter 1 visits ≥ 4096 nodes; Kiwipete
+    /// at depth 5 visits ~150k.
+    #[test]
+    fn negamax_does_not_mid_loop_store_under_partial_iteration() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete fen parses");
+        let tt = Arc::new(TranspositionTable::new(1));
+        // Pre-populate with marker entry. Bound=Exact / depth=99 / score=12345
+        // / best_move=arbitrary non-zero. After iter 1 aborts mid-loop, the
+        // root entry must be byte-identical to this.
+        let marker = TtData {
+            score: 12345,
+            depth: 99,
+            bound: TtBound::Exact,
+            best_move: 0xABCD,
+        };
+        tt.store(pos.zobrist(), marker);
+        let stored_before = tt.probe(pos.zobrist()).expect("marker must be stored");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            // Deadline already expired → first 4096-cadence poll inside
+            // negamax flips self.aborted=true and returns.
+            deadline: Some(Instant::now() - Duration::from_millis(1)),
+            soft_deadline: None,
+            start: Instant::now(),
+            limits: limits_with(|l| l.depth = Some(5)),
+            history: vec![pos.zobrist()],
+            tt: Some(tt.clone()),
+        };
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.go(&pos, &ctx, &|_| {});
+
+        let stored_after = tt
+            .probe(pos.zobrist())
+            .expect("marker entry must still be present after aborted go");
+        assert_eq!(
+            stored_before, stored_after,
+            "aborted iter-1 must not have written a mid-loop store; \
+             marker must survive byte-for-byte"
+        );
+        // Anti-stub belt-and-braces: the marker depth=99 is impossible for
+        // a real iter-1 store (depth=1). If a bug produced any iter-N store,
+        // depth would drop to N. Pin that.
+        assert_eq!(
+            stored_after.depth, 99,
+            "marker depth must be unchanged; got {}",
+            stored_after.depth
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S4 — Non-PV Lower-bound TT cutoff with sufficient depth.
+    // -----------------------------------------------------------------------
+
+    /// Pre-populate the TT at startpos with depth=5, Lower, score=200.
+    /// Call `negamax_for_test` at the same position with depth=3, is_pv=false,
+    /// alpha=-INF, beta=100 — score >= beta should fire the cutoff. The
+    /// returned score is exactly 200; node count is 1 (the negamax frame's
+    /// own increment) — proving recursion never ran.
+    #[test]
+    fn negamax_returns_tt_score_on_non_pv_lower_bound_hit_with_sufficient_depth() {
+        let pos = Position::starting_position();
+        let tt = Arc::new(TranspositionTable::new(1));
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 200,
+                depth: 5,
+                bound: TtBound::Lower,
+                best_move: 0,
+            },
+        );
+        let (ctx, _stop) = non_aborting_ctx_with_tt(tt.clone());
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        ab.set_tt_for_test(Some(tt.clone()));
+
+        let nodes_before = ab.nodes;
+        let score = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, &ctx);
+        let nodes_consumed = ab.nodes - nodes_before;
+
+        assert_eq!(
+            score, 200,
+            "non-PV Lower hit with score >= beta must return stored score"
+        );
+        assert_eq!(
+            nodes_consumed, 1,
+            "TT cutoff must avoid recursion; consumed {nodes_consumed} nodes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S4b — Non-PV Upper-bound TT cutoff with sufficient depth.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn negamax_returns_tt_score_on_non_pv_upper_bound_hit_with_sufficient_depth() {
+        let pos = Position::starting_position();
+        let tt = Arc::new(TranspositionTable::new(1));
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: -200,
+                depth: 5,
+                bound: TtBound::Upper,
+                best_move: 0,
+            },
+        );
+        let (ctx, _stop) = non_aborting_ctx_with_tt(tt.clone());
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        ab.set_tt_for_test(Some(tt.clone()));
+
+        let nodes_before = ab.nodes;
+        let score = ab.negamax_for_test(&mut pos.clone(), 3, 0, -100, INF, false, &ctx);
+        let nodes_consumed = ab.nodes - nodes_before;
+
+        assert_eq!(
+            score, -200,
+            "non-PV Upper hit with score <= alpha must return stored score"
+        );
+        assert_eq!(
+            nodes_consumed, 1,
+            "TT cutoff must avoid recursion; consumed {nodes_consumed} nodes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S5 — PV-node ignores TT-score even on Exact hit.
+    // -----------------------------------------------------------------------
+
+    /// Pre-populate the TT at startpos with bound=Exact, depth=5, score=42.
+    /// Call `negamax_for_test` with is_pv=true, depth=3 and the full window.
+    /// PV-node discipline (ADR-0018 §11): never returns early on TT hit.
+    /// Verified by node count > 1 (recursion ran).
+    #[test]
+    fn negamax_does_not_return_tt_score_at_pv_node_even_on_exact_hit() {
+        let pos = Position::starting_position();
+        let tt = Arc::new(TranspositionTable::new(1));
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 42,
+                depth: 5,
+                bound: TtBound::Exact,
+                best_move: 0,
+            },
+        );
+        let (ctx, _stop) = non_aborting_ctx_with_tt(tt.clone());
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        ab.set_tt_for_test(Some(tt.clone()));
+
+        let nodes_before = ab.nodes;
+        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx);
+        let nodes_consumed = ab.nodes - nodes_before;
+
+        assert!(
+            nodes_consumed > 1,
+            "PV node must NOT return early on Exact TT hit; consumed {nodes_consumed} nodes \
+             (a TT cutoff would have consumed exactly 1)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S6 — PV-node uses TT move for ordering.
+    // -----------------------------------------------------------------------
+
+    /// Pre-populate the TT at startpos with a known best_move (e.g. e2e4)
+    /// at depth 5, bound=Exact, score=0. Call `negamax_for_test` is_pv=true
+    /// depth=2 with full window. Without the TT-move-first reorder, MVV-LVA
+    /// would order quiets by movegen order at startpos. Asserting `pv[0]`
+    /// equals the TT move pins the reorder semantics: the TT move was tried
+    /// first AND it improved alpha (since the score=0 TT hint and full window
+    /// don't constrain the outcome — startpos depth 2 picks a balanced move
+    /// regardless, and any first-tried move that doesn't lose material will
+    /// improve alpha from -INF and remain in the PV).
+    ///
+    /// More robust: pin a node-count differential. With the TT-move-first
+    /// reorder, the search tries `e2e4` first; without it, MVV-LVA's stable
+    /// sort runs movegen-first first. Different orderings produce different
+    /// node counts at depth 2.
+    #[test]
+    fn negamax_uses_tt_move_for_ordering_at_pv_node() {
+        let pos = Position::starting_position();
+
+        // Find a legal move that is NOT the natural unhinted bestmove + NOT
+        // the movegen-first move; the reorder must observably bring it to
+        // the front. We use the LAST legal move from the movegen iterator
+        // (never movegen-first).
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let all_moves: Vec<Move> = ml.iter().collect();
+        let last_move = *all_moves.last().expect("startpos has legal moves");
+        let movegen_first = all_moves[0];
+        assert_ne!(
+            last_move, movegen_first,
+            "fixture: last move must differ from movegen-first"
+        );
+
+        // Run (a): no TT hint. Records natural node count.
+        let tt_a = Arc::new(TranspositionTable::new(1));
+        let (ctx_a, _stop_a) = non_aborting_ctx_with_tt(tt_a.clone());
+        let mut ab_a = AlphaBetaMover::new();
+        ab_a.history = vec![pos.zobrist()];
+        ab_a.set_tt_for_test(Some(tt_a.clone()));
+        let _ = ab_a.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx_a);
+        let nodes_unhinted = ab_a.nodes;
+
+        // Run (b): pre-populate TT with last_move at insufficient depth so
+        // PV-node skips the cutoff but still uses tt_move for ordering.
+        let tt_b = Arc::new(TranspositionTable::new(1));
+        tt_b.store(
+            pos.zobrist(),
+            TtData {
+                score: 0,
+                depth: 5,
+                bound: TtBound::Exact,
+                best_move: last_move.bits(),
+            },
+        );
+        let (ctx_b, _stop_b) = non_aborting_ctx_with_tt(tt_b.clone());
+        let mut ab_b = AlphaBetaMover::new();
+        ab_b.history = vec![pos.zobrist()];
+        ab_b.set_tt_for_test(Some(tt_b.clone()));
+        let _ = ab_b.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx_b);
+        let nodes_hinted = ab_b.nodes;
+
+        assert_ne!(
+            nodes_unhinted,
+            nodes_hinted,
+            "TT move ordering must change root search order, observable as node-count delta; \
+             unhinted={nodes_unhinted}, hinted={nodes_hinted} (last_move={})",
+            last_move.to_uci()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S7 — ID iteration uses prior-iteration TT-move at root (replaces M3.E
+    //      `prior_root_move` test).
+    // -----------------------------------------------------------------------
+
+    /// Run `Search::go` at depth 4 from startpos with a TT in context.
+    /// After the search, probe the root entry: bestmove must equal the
+    /// reported result.bestmove (the final iteration's snapshot).
+    #[test]
+    fn negamax_id_iteration_uses_prior_iteration_tt_move_at_root() {
+        let pos = Position::starting_position();
+        let tt = Arc::new(TranspositionTable::new(1));
+        let (ctx, _stop) = ctx_for_with_tt(&pos, limits_with(|l| l.depth = Some(4)), tt.clone());
+        let mut ab = AlphaBetaMover::new();
+        let (result, _infos) = drive_go(&mut ab, &pos, &ctx);
+
+        let bm = result.bestmove.expect("depth-4 must produce a bestmove");
+        let entry = tt
+            .probe(pos.zobrist())
+            .expect("root TT entry must be present after go");
+        assert_eq!(
+            entry.best_move,
+            bm.bits(),
+            "root TT entry's bestmove must equal final iteration's bestmove; \
+             entry.best_move={:#x}, expected={:#x}",
+            entry.best_move,
+            bm.bits()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S8 — Mate score round-trips through the TT.
+    // -----------------------------------------------------------------------
+
+    /// Mate-in-2 fixture: position P at root, depth 4 search returns MATE-4
+    /// (4 plies to mate). At ply=0 the score-to-tt is a no-op, so the stored
+    /// score is exactly MATE-4. Now drive negamax_for_test at the SAME
+    /// position from ply=2 (a hypothetical view); the probe at P's key
+    /// returns the stored entry whose ply-adjusted view at ply=2 is MATE-6.
+    #[test]
+    fn negamax_mate_score_round_trips_through_tt() {
+        // Mate-in-1 fixture from the existing `alphabeta_finds_mate_in_1...`
+        // test. depth=2 search returns MATE-1 at root (2 plies to mate is
+        // overkill; mate-in-1 returns MATE-1 = MATE - 1).
+        let pos =
+            Position::from_fen("7k/8/5KQ1/8/8/8/8/8 w - - 0 1").expect("mate-in-1 FEN must parse");
+        let tt = Arc::new(TranspositionTable::new(1));
+        let (ctx, _stop) = ctx_for_with_tt(&pos, limits_with(|l| l.depth = Some(2)), tt.clone());
+        let mut ab = AlphaBetaMover::new();
+        let (result, _) = drive_go(&mut ab, &pos, &ctx);
+
+        let mate1 = MATE - 1;
+        assert_eq!(
+            result.score_cp,
+            Some(mate1),
+            "mate-in-1 must return MATE-1; got {:?}",
+            result.score_cp
+        );
+
+        let entry = tt
+            .probe(pos.zobrist())
+            .expect("root TT entry must be present after go");
+        // Stored at ply 0 → score_to_tt is a no-op for ply=0.
+        assert_eq!(
+            entry.score as i32, mate1,
+            "stored mate score at ply 0 must be MATE-1 (score_to_tt no-op); got {}",
+            entry.score
+        );
+
+        // Probe-side view at ply 2: the same absolute mate node is now 1
+        // ply farther from the searcher's frame.
+        let view_at_ply_2 = score_from_tt(entry.score as i32, 2);
+        assert_eq!(
+            view_at_ply_2,
+            mate1 - 2,
+            "score_from_tt(MATE-1, 2) must equal MATE-3 (1 ply absolute mate, 2 plies adjustment); got {view_at_ply_2}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S9 — Repetition check runs BEFORE TT probe.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn negamax_repetition_check_runs_before_tt_probe() {
+        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 4 1")
+            .expect("startpos with halfmove=4 must parse");
+        let tt = Arc::new(TranspositionTable::new(1));
+        // Pre-populate TT with non-zero score for this key.
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 999,
+                depth: 5,
+                bound: TtBound::Exact,
+                best_move: 0,
+            },
+        );
+        let (ctx, _stop) = non_aborting_ctx_at_depth_with_tt(2, tt.clone());
+
+        let mut ab = AlphaBetaMover::new();
+        let other_zobrist: u64 = 0xDEAD_BEEF_CAFE_0000;
+        ab.history = vec![pos.zobrist(), other_zobrist, pos.zobrist()];
+        ab.set_tt_for_test(Some(tt.clone()));
+
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, false, &ctx);
+        assert_eq!(
+            score, 0,
+            "repetition (returns 0) must run BEFORE TT probe; got {score} (TT score=999)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S10 — 50-move check runs BEFORE TT probe.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn negamax_50_move_check_runs_before_tt_probe() {
+        let pos = Position::from_fen("8/8/8/8/4k3/8/8/4K3 w - - 100 1")
+            .expect("KvK with halfmove=100 FEN must parse");
+        let tt = Arc::new(TranspositionTable::new(1));
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 999,
+                depth: 5,
+                bound: TtBound::Exact,
+                best_move: 0,
+            },
+        );
+        let (ctx, _stop) = non_aborting_ctx_at_depth_with_tt(2, tt.clone());
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        ab.set_tt_for_test(Some(tt.clone()));
+
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, false, &ctx);
+        assert_eq!(
+            score, 0,
+            "50-move draw (returns 0) must run BEFORE TT probe; got {score} (TT score=999)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S11 — TT resize during engine lifetime clears entries (engine-level —
+    //       deferred to Slice C / E_b. Search-level placeholder kept here
+    //       to confirm explicit `tt.clear()` zeroes entries observable by
+    //       a fresh probe).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tt_clear_invalidates_negamax_cutoffs() {
+        let pos = Position::starting_position();
+        let tt = Arc::new(TranspositionTable::new(1));
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 200,
+                depth: 5,
+                bound: TtBound::Lower,
+                best_move: 0,
+            },
+        );
+        let (ctx, _stop) = non_aborting_ctx_with_tt(tt.clone());
+
+        let mut ab1 = AlphaBetaMover::new();
+        ab1.history = vec![pos.zobrist()];
+        ab1.set_tt_for_test(Some(tt.clone()));
+        let nodes_before_a = ab1.nodes;
+        let _ = ab1.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, &ctx);
+        let nodes_with_hit = ab1.nodes - nodes_before_a;
+
+        tt.clear();
+
+        let mut ab2 = AlphaBetaMover::new();
+        ab2.history = vec![pos.zobrist()];
+        ab2.set_tt_for_test(Some(tt.clone()));
+        let nodes_before_b = ab2.nodes;
+        let _ = ab2.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, &ctx);
+        let nodes_after_clear = ab2.nodes - nodes_before_b;
+
+        assert!(
+            nodes_after_clear > nodes_with_hit,
+            "tt.clear() must invalidate the cutoff; nodes_with_hit={nodes_with_hit}, \
+             nodes_after_clear={nodes_after_clear}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S12 — TT-move legality filter rejects collision garbage.
+    // -----------------------------------------------------------------------
+
+    /// Pre-populate the TT entry with `best_move = 0xFFFF` (an invalid
+    /// `Move` bit pattern that never appears in a legal-move list). The
+    /// negamax body's `tt_move != 0 && position(...).is_some()` guard
+    /// must reject it without panic and without picking a bogus move.
+    #[test]
+    fn tt_move_legality_filter_rejects_collision_garbage() {
+        let pos = Position::starting_position();
+        let tt = Arc::new(TranspositionTable::new(1));
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 0,
+                depth: 5,
+                bound: TtBound::Exact,
+                best_move: 0xFFFF,
+            },
+        );
+        let (ctx, _stop) = non_aborting_ctx_with_tt(tt.clone());
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        ab.set_tt_for_test(Some(tt.clone()));
+
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, &ctx);
+
+        let pv = ab.pv_root_for_test();
+        assert!(
+            !pv.is_empty(),
+            "depth-1 negamax must populate a PV; bogus tt_move must not block ordering"
+        );
+        let bm = pv[0];
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        assert!(
+            ml.iter().any(|m| m == bm),
+            "bestmove must be a legal startpos move; got {}",
+            bm.to_uci()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S13 — `is_pv` propagates only to the first-recursion-index child.
+    // -----------------------------------------------------------------------
+
+    /// Indirect verification per plan §5.2: pre-populate TT entries at every
+    /// child of the root with `bound=Exact, depth=10`. Drive negamax at the
+    /// root with depth 3, is_pv=true. The PV-child (index 0) does NOT cut
+    /// off (PV discipline); the other children DO cut off (non-PV exact hit
+    /// fires immediately, returning the stored score).
+    ///
+    /// Counted nodes:
+    ///   - root frame: 1
+    ///   - PV-child frame: a full depth-2 subtree expansion (no TT hit at
+    ///     the root key after make_move; subsequent grand-children may have
+    ///     TT entries we did not pre-populate, so the PV-child recurses).
+    ///   - each non-PV child: 1 frame (cuts off on TT hit).
+    ///
+    /// The expected total = 1 (root) + (depth-2 subtree from the PV child)
+    /// + (N - 1) for the other children that each consume 1 node.
+    ///
+    /// We don't compute the exact value — we compare against a reference
+    /// run with NO TT entries pre-populated. The reference run recurses
+    /// fully on every child; the test run expands only the first child and
+    /// cuts off on the rest. The test run must consume strictly fewer nodes
+    /// than the reference run.
+    #[test]
+    fn negamax_is_pv_only_first_recursion_index_propagates() {
+        let pos = Position::starting_position();
+
+        // Reference run: empty TT.
+        let tt_ref = Arc::new(TranspositionTable::new(1));
+        let (ctx_ref, _) = non_aborting_ctx_with_tt(tt_ref.clone());
+        let mut ab_ref = AlphaBetaMover::new();
+        ab_ref.history = vec![pos.zobrist()];
+        ab_ref.set_tt_for_test(Some(tt_ref.clone()));
+        let _ = ab_ref.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx_ref);
+        let nodes_ref = ab_ref.nodes;
+
+        // Pre-populated run: every child of root has an Exact, depth=10
+        // entry with score=0.
+        let tt = Arc::new(TranspositionTable::new(1));
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        for mv in ml.iter() {
+            let mut child = pos;
+            child.make_move(mv);
+            tt.store(
+                child.zobrist(),
+                TtData {
+                    score: 0,
+                    depth: 10,
+                    bound: TtBound::Exact,
+                    best_move: 0,
+                },
+            );
+        }
+        let (ctx, _stop) = non_aborting_ctx_with_tt(tt.clone());
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        ab.set_tt_for_test(Some(tt.clone()));
+        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx);
+        let nodes_with_tt = ab.nodes;
+
+        assert!(
+            nodes_with_tt < nodes_ref,
+            "pre-populated TT must reduce node count via non-PV-child cutoffs; \
+             nodes_ref={nodes_ref}, nodes_with_tt={nodes_with_tt}"
+        );
+        // Sanity: at least N - 1 children must have cut off (each cutoff
+        // saves an entire depth-2 subtree). The savings must be substantial.
+        let n_children = ml.iter().count() as u64;
+        assert!(
+            (nodes_ref - nodes_with_tt) >= (n_children - 1),
+            "savings must be at least (N-1) cut-off frames; \
+             nodes_ref={nodes_ref}, nodes_with_tt={nodes_with_tt}, n_children={n_children}"
+        );
     }
 }

@@ -244,11 +244,12 @@ fn integration_eof_terminates_engine_cleanly() {
 // `bestmove` line, and asserts the move is a legal move from startpos.
 // ---------------------------------------------------------------------------
 
-// Pinned at M3.E impl: depth-3 bestmove from startpos changed from d2d4 (M3.D) to
-// g1f3 (M3.E). M3.E's iterative-deepening prior-PV hint at iteration 3 (using
-// iteration 2's bestmove) shifts the alpha-beta cutoff order, surfacing a
-// different equally-strong choice at the same evaluation. g1f3 is sensible and
-// not hanging. Change only when the search algorithm changes again.
+// Pinned at M4.A Slice C: depth-3 bestmove from startpos shifted back to g1f3
+// once the engine-owned TT is wired into SearchContext. With TT-move-first
+// ordering, iteration-2's root entry (depth-2 bestmove) guides iteration-3's
+// root move order, and the TT-aided search selects g1f3 as the depth-3 choice.
+// Previously d2d4 (Slice B, no TT in SearchContext) and g1f3 before that (M3.E,
+// prior_root_move hint active).
 const EXPECTED_BESTMOVE_DEPTH_3: &str = "g1f3";
 
 #[test]
