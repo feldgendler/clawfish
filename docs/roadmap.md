@@ -140,7 +140,7 @@ First efficiency layer over the M3 alpha-beta + qsearch + ID search. Cache searc
   - Open: entry key discipline (full 64-bit Zobrist in entry vs partial-key + xor-trick).
   - Open: per-entry packing.
   - Open: `Hash` UCI option default + bounds.
-  - Open: mate-score depth-adjust on store/probe.
+  - Open: mate-score depth-adjust on store/probe — standard formula `stored = score ± ply` on store, `score = stored ∓ ply` on probe (sign chosen by mate polarity), threshold for "is this a mate score" set at `MATE − MAX_PLY`. Plan must specify the exact formula and threshold, and tests must include a regression that stores a mate-in-N score at ply A and probes at ply B (B ≠ A), asserting the probed score's interpretation matches local re-search of the same position.
   - Open: whether qsearch participates in TT (M4.A scope: probes negamax-only — see M4.A row; qsearch-in-TT deferred). Acknowledged miss: a position visited as a qsearch *interior* node on Branch A (never stored under negamax-only rule) and reached as a horizon node on Branch B incurs a redundant qsearch on B; this is the +5–15 Elo gap between horizon-only and full qsearch-in-TT cited in the literature. Cheap intermediate worth weighing in the plan: "probe-but-don't-store inside qsearch" — catches some interior-becomes-interior transpositions at low cost, composes additively with future full qsearch-in-TT.
   - Open: best-move preservation when overwriting an entry whose new bound has no best move (e.g. fail-low replacing a fail-high).
   - Open: `ucinewgame` clears TT? `Hash` resize mid-session: rebuild-and-clear or rebuild-and-preserve?
