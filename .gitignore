@@ -4,6 +4,7 @@
 .envrc
 mutants.out
 mutants.out.old
+mutants_run.log
 .claude/scheduled_tasks.lock
 .claude/worktrees/
 fuzz/target/

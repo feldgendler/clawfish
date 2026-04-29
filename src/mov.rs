@@ -144,7 +144,14 @@ impl MoveFlag {
 
 /// 16-bit packed encoding of a chess move: bits 0–5 from-square,
 /// bits 6–11 to-square, bits 12–15 flag nibble. See module docs.
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+///
+/// `Default` produces `Move(0)` which decodes as `from=A1, to=A1, flag=Quiet`
+/// — never emitted by movegen (a1→a1 is illegal); safe as a zero-value
+/// sentinel for array initialization (e.g. [`PvTable`](crate::search)). Distinct
+/// from M5's null-move pseudo-move concept; the `from_uci` doc-comment about
+/// "no `Move::NULL` sentinel today" remains accurate — we are not adding `NULL`
+/// as a named constant here.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Default)]
 #[repr(transparent)]
 pub struct Move(u16);
 

@@ -6,12 +6,13 @@
 //! polled by the orchestrator's worker thread and must obey `should_abort`
 //! (per ADR-0011 and `docs/plans/m2.c.md` §3).
 //!
-//! M3.A ships the [`GreedyMover`] implementation: a depth-1 best-eval mover
-//! with reservoir-sampled tie-break PRNG. See plan §10.
+//! M3.C ships the [`AlphaBetaMover`] implementation: fail-soft negamax +
+//! alpha-beta with triangular PV recovery, MVV-LVA move ordering, and
+//! repetition/50-move draw detection. See ADR-0013 and plan docs/plans/m3.c.md.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{Move, Position};
 
@@ -26,7 +27,7 @@ pub struct SearchLimits {
     pub nodes: Option<u64>,
     /// `go movetime <ms>`. Signed to mirror `wtime`/`btime` (the UCI clock
     /// can go negative under time-trouble overshoot); negative `movetime`
-    /// in practice means "search briefly" — GreedyMover treats `Some(<= 0)`
+    /// in practice means "search briefly" — the engine treats `Some(<= 0)`
     /// the same as `Some(0)`.
     pub movetime: Option<i64>,
     /// `go mate <N>`: search for a mate in N moves. `None` = no mate constraint.
@@ -106,7 +107,14 @@ pub struct SearchResult {
     pub ponder: Option<Move>,
     /// Depth of the completed search (plies). 0 when no moves were evaluated.
     pub depth: u32,
-    /// Score in centipawns from the side-to-move's perspective, or `None` if not available.
+    /// Score from the side-to-move's perspective. May carry a mate-relative
+    /// score (`MATE - ply` for winning, `-(MATE - ply)` for losing) rather
+    /// than a true centipawn value when the search returned a mate. M3.C-era
+    /// contract gap; planned cleanup splits this into `score_cp` (true
+    /// centipawns; `None` when score is mate) plus `score_mate_plies` (signed
+    /// plies-to-mate; `None` when score is cp). Consumers wanting cp-vs-mate
+    /// discrimination should call `score_to_uci`. Deferred fix: M3.E or a
+    /// separate M3.C+1 cleanup commit.
     pub score_cp: Option<i32>,
     /// Total nodes evaluated during this search invocation.
     pub nodes: u64,
@@ -132,142 +140,399 @@ pub trait Search: Send {
     fn set_seed(&mut self, _seed: u64) {}
 
     /// Notify the search that a new game has started (`ucinewgame`). Default:
-    /// no-op. GreedyMover resets `state` to `seed` here. M3+ alpha-beta
-    /// will eventually clear killer/history/TT here.
+    /// no-op. M4 will clear killer/history/TT here.
     fn reset(&mut self) {}
 }
 
-/// SplitMix64 PRNG step. Constants vendored verbatim from prng.di.unimi.it
-/// (research §3.1, plan §3). Public-domain; same provenance as the Polyglot
-/// Zobrist table. `wrapping_*` is required — overflow is intentional.
-#[inline]
-pub(crate) fn splitmix64_next(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E3779B97F4A7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
-}
-
 // ---------------------------------------------------------------------------
-// GreedyMover — depth-1 best-eval with reservoir-sampled tie-break (M3.A).
+// M3.C — AlphaBetaMover: fail-soft negamax + alpha-beta + triangular PV.
 // ---------------------------------------------------------------------------
 
-/// Depth-1 best-eval mover. Evaluates every legal move at depth 1 via
-/// `-evaluate(post_make)`, picks the move with the highest score, and
-/// breaks ties with SplitMix64 reservoir sampling (one PRNG step per tied
-/// move). Production `Search` impl introduced in M3.A.
-pub(crate) struct GreedyMover {
-    /// The seed configured via `Random_Seed` (or the default, 0).
-    seed: u64,
-    /// PRNG state. Advances by one SplitMix64 step per tied move encountered.
-    state: u64,
+/// Maximum search depth in plies. PV table is sized to this constant.
+const MAX_PLY: usize = 64;
+
+/// Mate score: returned when a side is delivering mate. Ply-adjusted so faster
+/// mates compare higher.
+const MATE: i32 = 30_000;
+
+/// Sentinel infinity value: wider than any MATE score; used for the initial
+/// alpha/beta window.
+const INF: i32 = 30_001;
+
+/// Minimum mate score magnitude; used to distinguish mate scores from
+/// centipawn scores in `score_to_uci`. A score with `|score| >= MATE_IN_MAX_PLY`
+/// is a mate score.
+const MATE_IN_MAX_PLY: i32 = MATE - MAX_PLY as i32; // 29_936
+
+/// Triangular PV table. Holds the best line found at each ply.
+///
+/// `moves[ply]` is a slot-array; `lengths[ply]` is how many moves are populated.
+/// `update(ply, mv)` copies the child PV (`moves[ply+1][..lengths[ply+1]]`) into
+/// `moves[ply][1..]` and prepends `mv`, giving the full PV down to the leaf.
+/// `clear_ply(ply)` resets `lengths[ply] = 0` at the start of each negamax frame
+/// so a no-improving-move return leaves the slot empty rather than stale.
+struct PvTable {
+    moves: [[Move; MAX_PLY]; MAX_PLY],
+    lengths: [usize; MAX_PLY],
 }
 
-impl GreedyMover {
-    pub(crate) fn new(seed: u64) -> Self {
-        Self { seed, state: seed }
+impl PvTable {
+    fn new() -> Self {
+        Self {
+            moves: [[Move::default(); MAX_PLY]; MAX_PLY],
+            lengths: [0; MAX_PLY],
+        }
+    }
+
+    fn clear_ply(&mut self, ply: usize) {
+        self.lengths[ply] = 0;
+    }
+
+    fn update(&mut self, ply: usize, mv: Move) {
+        let child_len = self.lengths[ply + 1];
+        self.moves[ply][0] = mv;
+        for i in 0..child_len {
+            self.moves[ply][i + 1] = self.moves[ply + 1][i];
+        }
+        self.lengths[ply] = 1 + child_len;
     }
 }
 
-impl Search for GreedyMover {
+/// Fail-soft negamax alpha-beta search with triangular PV recovery.
+///
+/// Replaces depth-1 GreedyMover as the production search in M3.C.
+/// Move ordering: MVV-LVA on captures + queen-promotion bonus; quiets in
+/// movegen order. Repetition and 50-move draw detection via M3.B helpers
+/// (at `ply > 0` only — root always picks a move). PV recovered via a
+/// triangular table. Mate scores are ply-adjusted (see ADR-0013 §3).
+pub(crate) struct AlphaBetaMover {
+    pv: PvTable,
+    /// Search-owned Zobrist trajectory. Cloned from `ctx.history` at go-start;
+    /// push/popped around each recursive make/unmake.
+    history: Vec<u64>,
+    /// Running node counter for this search invocation.
+    nodes: u64,
+    /// Set when the cancellation check fires; once set, every recursive return
+    /// propagates 0 without committing the score.
+    aborted: bool,
+    /// Score of the last root move whose subtree completed fully (i.e. whose
+    /// PV was committed). Updated in lockstep with `pv` at ply 0 so that if
+    /// the search aborts mid-root the reported score reflects the best fully
+    /// explored subtree rather than the aborted return value of 0.
+    root_score: Option<i32>,
+}
+
+impl AlphaBetaMover {
+    /// Create a new `AlphaBetaMover` with empty history and zeroed counters.
+    pub(crate) fn new() -> Self {
+        Self {
+            pv: PvTable::new(),
+            history: Vec::new(),
+            nodes: 0,
+            aborted: false,
+            root_score: None,
+        }
+    }
+}
+
+impl Search for AlphaBetaMover {
     fn go(
         &mut self,
         position: &Position,
         ctx: &SearchContext,
         info_sink: &dyn Fn(&str),
     ) -> SearchResult {
-        use crate::eval::evaluate;
+        // Per-go reset.
+        self.history = ctx.history.clone();
+        self.nodes = 0;
+        self.aborted = false;
+        self.root_score = None;
+        for i in 0..MAX_PLY {
+            self.pv.lengths[i] = 0;
+        }
 
-        let mut moves = {
-            let mut ml = crate::movegen::MoveList::new();
-            crate::movegen::generate_moves(position, &mut ml);
-            ml.iter().collect::<Vec<_>>()
+        // Determine target depth. Default 4 when `go` did not specify depth.
+        let depth = ctx.limits.depth.unwrap_or(4).min(MAX_PLY as u32 - 1);
+
+        // Single-iteration negamax. Position is cloned for mutation; make/unmake
+        // are balanced by the recursion.
+        let mut pos_clone = *position;
+        let returned_score = self.negamax(&mut pos_clone, depth, 0, -INF, INF, ctx);
+
+        // Position must be restored by balanced make/unmake.
+        debug_assert_eq!(
+            pos_clone, *position,
+            "negamax must restore position via balanced make/unmake"
+        );
+
+        // When the search aborts mid-root, `returned_score` is the 0 sentinel
+        // propagated up from the abort point — it does not reflect any completed
+        // subtree. Use `root_score` instead: it is updated in lockstep with the PV
+        // at ply 0 and therefore always reflects the score of the last fully
+        // explored root-move subtree. If no root move completed before the abort,
+        // `root_score` is `None` and we fall back to 0 (matching the `pv.lengths[0]
+        // == 0 → bestmove None` case).
+        let score = if self.aborted {
+            self.root_score.unwrap_or(0)
+        } else {
+            returned_score
         };
 
-        if let Some(ref filter) = ctx.limits.searchmoves {
-            moves.retain(|mv| filter.contains(mv));
-        }
+        // bestmove comes from pv[0][0] if any move improved alpha; otherwise None.
+        let bestmove = if self.pv.lengths[0] > 0 {
+            Some(self.pv.moves[0][0])
+        } else {
+            None
+        };
 
-        if moves.is_empty() {
-            let elapsed_ms = ctx.start.elapsed().as_millis();
-            info_sink(&format!(
-                "info depth 0 score cp 0 nodes 0 time {elapsed_ms} pv 0000"
-            ));
-            return SearchResult {
-                bestmove: None,
-                depth: 0,
-                score_cp: Some(0),
-                nodes: 0,
-                ponder: None,
-            };
-        }
-
-        // Reservoir-sampled best-eval scan. One pos_clone mutated in place via
-        // make/unmake — not N separate clones. Required to keep the debug-build
-        // round-trip assert hot loop sane.
-        let mut pos_clone = *position;
-
-        let undo0 = pos_clone.make_move(moves[0]);
-        // Negate: post-make perspective is the opponent; we want our perspective.
-        let mut best_score = -evaluate(&pos_clone);
-        pos_clone.unmake_move(moves[0], undo0);
-        let mut best_mv = moves[0];
-        let mut tie_count: u32 = 1;
-
-        for &mv in &moves[1..] {
-            let undo = pos_clone.make_move(mv);
-            let score = -evaluate(&pos_clone);
-            pos_clone.unmake_move(mv, undo);
-
-            if score > best_score {
-                best_score = score;
-                best_mv = mv;
-                tie_count = 1;
-            } else if score == best_score {
-                tie_count += 1;
-                let r = splitmix64_next(&mut self.state);
-                // Modulo bias for tie_count ≤ 218 is < 4×10⁻¹⁸ — no rejection needed.
-                if (r as usize).is_multiple_of(tie_count as usize) {
-                    best_mv = mv;
-                }
-            }
-        }
-
-        let n = moves.len() as u64;
-
-        // Emit the info line BEFORE the wait loop — the score is real and
-        // a GUI watching `info score cp` should see it immediately.
+        // Emit info line BEFORE the wait loop.
         let elapsed_ms = ctx.start.elapsed().as_millis();
+        let pv_str = if self.pv.lengths[0] == 0 {
+            "0000".to_string()
+        } else {
+            self.pv.moves[0][..self.pv.lengths[0]]
+                .iter()
+                .map(|m| m.to_uci())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         info_sink(&format!(
-            "info depth 1 score cp {best_score} nodes {n} time {elapsed_ms} pv {}",
-            best_mv.to_uci()
+            "info depth {} score {} nodes {} time {} pv {}",
+            depth,
+            score_to_uci(score),
+            self.nodes,
+            elapsed_ms,
+            pv_str
         ));
 
-        // Wait loop: honor infinite / movetime / ponder.
+        // Honor infinite/movetime/ponder wait loop. Same shape as prior movers.
         let wait = ctx.limits.infinite || ctx.limits.movetime.is_some() || ctx.limits.ponder;
         if wait {
-            while !ctx.should_abort(0) {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            while !ctx.should_abort(self.nodes) {
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
 
         SearchResult {
-            bestmove: Some(best_mv),
-            depth: 1,
-            score_cp: Some(best_score),
-            nodes: n,
+            bestmove,
+            depth,
+            score_cp: Some(score),
+            nodes: self.nodes,
             ponder: None,
         }
     }
 
-    fn set_seed(&mut self, seed: u64) {
-        self.seed = seed;
-        self.state = seed;
+    fn reset(&mut self) {
+        self.history.clear();
+        // pv and nodes are reset per-go; M4 will clear killer/history/TT here.
+    }
+}
+
+impl AlphaBetaMover {
+    /// Fail-soft negamax with alpha-beta pruning and triangular PV recovery.
+    fn negamax(
+        &mut self,
+        pos: &mut Position,
+        depth: u32,
+        ply: u32,
+        mut alpha: i32,
+        mut beta: i32,
+        ctx: &SearchContext,
+    ) -> i32 {
+        use crate::eval::evaluate;
+        use crate::movegen::{MoveList, generate_moves, in_check};
+
+        // 1. Cancellation poll at 4096-node cadence.
+        self.nodes += 1;
+        if self.nodes & 4095 == 0 && ctx.should_abort(self.nodes) {
+            self.aborted = true;
+            return 0;
+        }
+
+        // 2. Clear PV slot at this ply so a no-improving-move return leaves length 0.
+        self.pv.clear_ply(ply as usize);
+
+        // 3. Repetition + 50-move draw checks — only at ply > 0 (root must pick a move).
+        if ply > 0 {
+            if is_fifty_move_draw(pos.halfmove_clock()) {
+                return 0;
+            }
+            if is_repetition(&self.history, pos.halfmove_clock()) {
+                return 0;
+            }
+        }
+
+        // 4. Mate-distance pruning.
+        let mating_value = MATE - ply as i32;
+        if mating_value < beta {
+            beta = mating_value;
+            if alpha >= mating_value {
+                return mating_value;
+            }
+        }
+        let mated_value = -(MATE - ply as i32);
+        if mated_value > alpha {
+            alpha = mated_value;
+            if beta <= mated_value {
+                return mated_value;
+            }
+        }
+
+        // 5. Horizon: call evaluate directly (qsearch is M3.D).
+        if depth == 0 {
+            return evaluate(pos);
+        }
+
+        // 6. Generate moves.
+        let mut ml = MoveList::new();
+        generate_moves(pos, &mut ml);
+        let mut moves_vec = ml.iter().collect::<Vec<_>>();
+
+        // Searchmoves filter at root only.
+        if ply == 0
+            && let Some(filter) = &ctx.limits.searchmoves
+        {
+            moves_vec.retain(|m| filter.contains(m));
+        }
+
+        // 7. Terminal: no legal moves.
+        //    At ply==0 with searchmoves filter active, an empty list is a degenerate
+        //    user input (all-illegal or empty filter). Short-circuit BEFORE the
+        //    in_check triage — otherwise a check position with a degenerate filter
+        //    would falsely return -MATE.
+        if moves_vec.is_empty() {
+            if ply == 0 && ctx.limits.searchmoves.is_some() {
+                return 0;
+            }
+            if in_check(pos) {
+                return -(MATE - ply as i32);
+            } else {
+                return 0; // stalemate
+            }
+        }
+
+        // 8. Order: MVV-LVA descending.
+        moves_vec.sort_by_cached_key(|&m| -mvv_lva_score(m, pos));
+
+        // 9. Recurse fail-soft.
+        let mut best = -INF;
+        for mv in moves_vec {
+            let undo = pos.make_move(mv);
+            self.history.push(pos.zobrist());
+            let score = -self.negamax(pos, depth - 1, ply + 1, -beta, -alpha, ctx);
+            self.history.pop();
+            pos.unmake_move(mv, undo);
+
+            // 10. Abort check: score from an aborted search is invalid.
+            if self.aborted {
+                return 0;
+            }
+
+            if score > best {
+                best = score;
+                if score > alpha {
+                    alpha = score;
+                    // 11. PV update: this move improved alpha at this ply.
+                    self.pv.update(ply as usize, mv);
+                    // Track the root score in lockstep with the PV so that if
+                    // the search aborts later, `go` can report the score of the
+                    // last fully-explored root subtree instead of the 0 sentinel.
+                    if ply == 0 {
+                        self.root_score = Some(score);
+                    }
+                }
+                if alpha >= beta {
+                    break; // beta cutoff — fail-soft: return `best`, not `beta`
+                }
+            }
+        }
+
+        best
     }
 
-    fn reset(&mut self) {
-        self.state = self.seed;
+    /// Test-only entry point that forwards verbatim to `negamax`. Exists
+    /// because tests cannot call private methods directly; production code
+    /// never calls this.
+    #[cfg(test)]
+    pub(super) fn negamax_for_test(
+        &mut self,
+        pos: &mut Position,
+        depth: u32,
+        ply: u32,
+        alpha: i32,
+        beta: i32,
+        ctx: &SearchContext,
+    ) -> i32 {
+        self.negamax(pos, depth, ply, alpha, beta, ctx)
+    }
+
+    /// Test-only: return the root PV as a `Vec<Move>`.
+    ///
+    /// Returns `self.pv.moves[0][..self.pv.lengths[0]]` as an owned vector so
+    /// proptest can iterate over consecutive pairs without holding a reference
+    /// into the mover. Production code never calls this.
+    #[cfg(test)]
+    pub(super) fn pv_root_for_test(&self) -> Vec<Move> {
+        self.pv.moves[0][..self.pv.lengths[0]].to_vec()
+    }
+}
+
+/// MVV-LVA move ordering score. Captures and promotions score > 0; quiets score 0.
+///
+/// Victim value × 16 − attacker value ensures victim kind dominates across the
+/// entire MVV-LVA matrix (PeSTO MG: P=82, N=337, B=365, R=477, Q=1025, K=0).
+/// Non-capture promotions score `promo_value` (between large captures and quiets).
+/// Promo-captures score `victim×16 − attacker + promo_value`.
+fn mvv_lva_score(mv: Move, pos: &Position) -> i32 {
+    use crate::eval::MATERIAL;
+    use crate::mov::MoveFlag::*;
+
+    let flag = mv.flag();
+    let attacker_kind = pos.piece_at(mv.from_square()).unwrap().kind;
+    let attacker_value = MATERIAL[attacker_kind as usize];
+
+    match flag {
+        // Quiets sort below all captures/promotions.
+        Quiet | DoublePush | KingCastle | QueenCastle => 0,
+        Capture => {
+            let victim_kind = pos.piece_at(mv.to_square()).unwrap().kind;
+            let victim_value = MATERIAL[victim_kind as usize];
+            victim_value * 16 - attacker_value
+        }
+        EnPassant => {
+            // EP victim is always a pawn regardless of capture-square arithmetic.
+            MATERIAL[crate::piece::PieceKind::Pawn as usize] * 16 - attacker_value
+        }
+        QueenPromo | RookPromo | BishopPromo | KnightPromo => {
+            MATERIAL[mv.promotion_kind().unwrap() as usize] // no victim; no attacker subtraction
+        }
+        QueenPromoCapture | RookPromoCapture | BishopPromoCapture | KnightPromoCapture => {
+            let victim_kind = pos.piece_at(mv.to_square()).unwrap().kind;
+            let victim_value = MATERIAL[victim_kind as usize];
+            let promo_value = MATERIAL[mv.promotion_kind().unwrap() as usize];
+            victim_value * 16 - attacker_value + promo_value
+        }
+    }
+}
+
+/// Convert an internal score to a UCI score token: `"cp <N>"` or `"mate <N>"`.
+///
+/// Scores with `|score| >= MATE_IN_MAX_PLY` are treated as mate scores.
+/// The returned move count is `(MATE - |score| + 1) / 2` (plies-to-mate rounded
+/// up to full moves), negative when the side to move is being mated.
+fn score_to_uci(score: i32) -> String {
+    debug_assert!(
+        score > i32::MIN,
+        "score must be > i32::MIN to avoid abs() overflow"
+    );
+    let abs_score = score.unsigned_abs() as i32;
+    if abs_score >= MATE_IN_MAX_PLY {
+        let plies_to_mate = MATE - abs_score;
+        let moves = (plies_to_mate + 1) / 2;
+        let signed_moves = if score > 0 { moves } else { -moves };
+        format!("mate {signed_moves}")
+    } else {
+        format!("cp {score}")
     }
 }
 
@@ -291,7 +556,6 @@ impl Search for GreedyMover {
 /// severs the repetition chain. The `history.len() - 1` cap is the
 /// safety bound — `halfmove_clock` is loaded from FEN and may exceed
 /// the history depth the engine has actually observed.
-#[allow(dead_code)] // consumed by M3.C alpha-beta
 pub(crate) fn is_repetition(history: &[u64], halfmove_clock: u8) -> bool {
     let Some((&current, prior)) = history.split_last() else {
         return false;
@@ -314,7 +578,6 @@ pub(crate) fn is_repetition(history: &[u64], halfmove_clock: u8) -> bool {
 /// always claim it, so the position is effectively a draw at the search
 /// horizon. The 75-move auto-draw (FIDE 9.6.2, 150 plies) is not
 /// separately handled; we cross the claim threshold first.
-#[allow(dead_code)] // consumed by M3.C alpha-beta
 pub(crate) fn is_fifty_move_draw(halfmove_clock: u8) -> bool {
     halfmove_clock >= 100
 }
@@ -340,56 +603,16 @@ mod tests {
         (ctx, stop)
     }
 
-    fn ctx_with_searchmoves(moves: Vec<Move>) -> (SearchContext, Arc<AtomicBool>) {
-        let stop = Arc::new(AtomicBool::new(false));
+    fn non_aborting_ctx_at_depth(d: u32) -> (SearchContext, Arc<AtomicBool>) {
+        let (ctx, stop) = non_aborting_ctx();
         let ctx = SearchContext {
-            stop: Arc::clone(&stop),
-            deadline: None,
-            start: Instant::now(),
             limits: SearchLimits {
-                searchmoves: Some(moves),
+                depth: Some(d),
                 ..SearchLimits::default()
             },
-            history: Vec::new(),
+            ..ctx
         };
         (ctx, stop)
-    }
-
-    // -----------------------------------------------------------------------
-    // D1 — SplitMix64 reference-output anchor.
-    // -----------------------------------------------------------------------
-
-    /// Pin the first 8 outputs of `splitmix64_next` from `state = 0` against
-    /// hand-computed reference values. Catches any constant-typo regression in
-    /// the PRNG without needing the full `GreedyMover` machinery.
-    ///
-    /// Reference computed offline by running the same algorithm in a standalone
-    /// Rust binary; values verified stable across two independent runs.
-    #[test]
-    fn splitmix64_first_8_outputs_from_seed_0_match_reference() {
-        // Each value is the output *before* any masking — the raw 64-bit PRNG
-        // output. The state starts at 0 and advances by the golden-ratio
-        // constant (0x9E3779B97F4A7C15) on each step before the mixing.
-        #[rustfmt::skip]
-        let expected: [u64; 8] = [
-            0xE220A8397B1DCDAF, // step 0 (state after = 0x9E3779B97F4A7C15)
-            0x6E789E6AA1B965F4, // step 1
-            0x06C45D188009454F, // step 2
-            0xF88BB8A8724C81EC, // step 3
-            0x1B39896A51A8749B, // step 4
-            0x53CB9F0C747EA2EA, // step 5
-            0x2C829ABE1F4532E1, // step 6
-            0xC584133AC916AB3C, // step 7
-        ];
-
-        let mut state = 0u64;
-        for (i, &want) in expected.iter().enumerate() {
-            let got = splitmix64_next(&mut state);
-            assert_eq!(
-                got, want,
-                "splitmix64_next output mismatch at step {i}: got 0x{got:016X}, want 0x{want:016X}"
-            );
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -452,445 +675,6 @@ mod tests {
                 !ctx.should_abort(100),
                 "should not abort when nodes_searched (100) < cap (500)"
             );
-        }
-    }
-
-    // ===========================================================================
-    // M3.A — GreedyMover tests (D13–D22, E1, F1).
-    //
-    // All tests in this section will fail until the GreedyMover::go impl ships
-    // (Slice 3), because the stub returns SearchResult::default() (bestmove=None).
-    // ===========================================================================
-
-    fn go_greedy_no_sink(
-        gm: &mut GreedyMover,
-        pos: &Position,
-        ctx: &SearchContext,
-    ) -> SearchResult {
-        gm.go(pos, ctx, &|_| {})
-    }
-
-    // -----------------------------------------------------------------------
-    // D13 — GreedyMover picks a legal move from startpos.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn greedy_picks_a_legal_move_from_startpos() {
-        let pos = Position::starting_position();
-        let (ctx, _stop) = non_aborting_ctx();
-        let mut gm = GreedyMover::new(0);
-        let result = go_greedy_no_sink(&mut gm, &pos, &ctx);
-
-        let mv = result
-            .bestmove
-            .expect("startpos has 20 legal moves — bestmove must be Some");
-
-        let mut ml = MoveList::new();
-        generate_moves(&pos, &mut ml);
-        assert!(
-            ml.iter().any(|legal| legal == mv),
-            "greedy bestmove {} is not in generate_moves output for startpos",
-            mv.to_uci()
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D14 — GreedyMover emits None in checkmate.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn greedy_emits_none_in_checkmate() {
-        // Fool's mate — white is in checkmate (no legal moves).
-        let fen = "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3";
-        let pos = Position::from_fen(fen).expect("Fool's-mate FEN must parse");
-
-        let (ctx, _stop) = non_aborting_ctx();
-        let result = GreedyMover::new(0).go(&pos, &ctx, &|_| {});
-
-        assert_eq!(
-            result.bestmove, None,
-            "bestmove must be None in a checkmate position"
-        );
-        assert_eq!(
-            result.score_cp,
-            Some(0),
-            "score_cp must be Some(0) in a checkmate position (empty move list)"
-        );
-        assert_eq!(
-            result.nodes, 0,
-            "nodes must be 0 when no moves are evaluated"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D15 — GreedyMover returns candidate even with pre-set cancellation.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn greedy_returns_candidate_even_with_pre_set_cancellation() {
-        let pos = Position::starting_position();
-        let stop = Arc::new(AtomicBool::new(true)); // pre-set
-        let ctx = SearchContext {
-            stop: Arc::clone(&stop),
-            deadline: None,
-            start: Instant::now(),
-            limits: SearchLimits::default(), // no infinite/movetime/ponder
-            history: Vec::new(),
-        };
-
-        let result = GreedyMover::new(0).go(&pos, &ctx, &|_| {});
-        assert!(
-            result.bestmove.is_some(),
-            "bestmove must be Some even when the stop flag is pre-set (no wait loop)"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D16 — GreedyMover honors `infinite` until cancelled.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn greedy_honors_infinite_until_cancelled() {
-        let pos = Position::starting_position();
-        let stop = Arc::new(AtomicBool::new(false));
-        let ctx = SearchContext {
-            stop: Arc::clone(&stop),
-            deadline: None,
-            start: Instant::now(),
-            limits: SearchLimits {
-                infinite: true,
-                ..SearchLimits::default()
-            },
-            history: Vec::new(),
-        };
-
-        let stop_clone = Arc::clone(&stop);
-        let spawn_time = Instant::now();
-        let handle =
-            std::thread::spawn(move || GreedyMover::new(0).go(&pos, &ctx, &|_| {}).bestmove);
-
-        std::thread::sleep(Duration::from_millis(20));
-        stop_clone.store(true, Ordering::Relaxed);
-
-        let result = handle.join().expect("worker thread must not panic");
-        assert!(
-            result.is_some(),
-            "bestmove must be Some even after cancellation from infinite mode"
-        );
-
-        let elapsed = spawn_time.elapsed();
-        assert!(
-            elapsed >= Duration::from_millis(15),
-            "infinite go must block until cancelled (elapsed {elapsed:?} < 15 ms — \
-            worker likely returned immediately without polling should_abort)"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D17 — GreedyMover seed is deterministic for tied positions.
-    // -----------------------------------------------------------------------
-
-    /// Uses KvK with white king on e4. All 8 white-king moves leave a KvK
-    /// position with kings symmetrically placed → all 8 candidate scores are
-    /// equal. Two same-seed instances must produce identical bestmove
-    /// sequences across 5 calls. Pins reservoir-sampling determinism. (The
-    /// "evaluates to 0" insufficient-material claim is pinned by A4, not here;
-    /// D17 only requires that the 8 scores tie, which holds whether `evaluate`
-    /// returns 0 or some non-zero color-symmetric value.)
-    #[test]
-    fn greedy_seed_is_deterministic_for_tied_positions() {
-        // KvK: white king on e4, black king on e1. All white king moves tie.
-        let pos =
-            Position::from_fen("8/8/8/8/4K3/8/8/4k3 w - - 0 1").expect("KvK (ties) FEN must parse");
-        let (ctx, _stop) = non_aborting_ctx();
-
-        let mut gm_a = GreedyMover::new(42);
-        let mut gm_b = GreedyMover::new(42);
-
-        for call in 0..5 {
-            let mv_a = go_greedy_no_sink(&mut gm_a, &pos, &ctx).bestmove;
-            let mv_b = go_greedy_no_sink(&mut gm_b, &pos, &ctx).bestmove;
-            assert_eq!(
-                mv_a, mv_b,
-                "D17: determinism violated at call {call}: gm_a={mv_a:?}, gm_b={mv_b:?}"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // D18 — GreedyMover takes a hanging queen.
-    // -----------------------------------------------------------------------
-
-    /// White knight on c4, black queen on e5, white to move. The knight can
-    /// capture the queen with Nxe5 (c4e5) — a gain of +1025 material (queen
-    /// value) at depth 1. All other legal moves (king moves) leave the queen
-    /// alive. Nxe5 is therefore clearly the depth-1 best move. Assert
-    /// bestmove == c4e5 (knight captures the queen), which proves GreedyMover
-    /// actually evaluates positions rather than picking at random.
-    #[test]
-    fn greedy_takes_hanging_queen() {
-        let pos = Position::from_fen("4k3/8/8/4q3/2N5/8/8/4K3 w - - 0 1")
-            .expect("FEN with hanging queen must parse");
-        let (ctx, _stop) = non_aborting_ctx();
-        let mut gm = GreedyMover::new(0);
-        let result = go_greedy_no_sink(&mut gm, &pos, &ctx);
-
-        let mv = result
-            .bestmove
-            .expect("position has legal moves — bestmove must be Some");
-        let expected = crate::mov::Move::from_uci("c4e5", &pos).expect("c4e5 must be legal (Nxe5)");
-        assert_eq!(
-            mv,
-            expected,
-            "D18: greedy must take the hanging queen (c4e5 = Nxe5); got {}",
-            mv.to_uci()
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D19 — empty searchmoves yields None, no PRNG advance.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn greedy_searchmoves_empty_yields_none_no_prng_advance() {
-        let pos = Position::starting_position();
-        let (ctx_no_filter, _stop_nf) = non_aborting_ctx();
-        let (ctx_empty_filter, _stop_ef) = ctx_with_searchmoves(vec![]);
-
-        let mut tested = GreedyMover::new(7);
-        let mut reference = GreedyMover::new(7);
-
-        // Empty filter must return None.
-        let empty_result = go_greedy_no_sink(&mut tested, &pos, &ctx_empty_filter).bestmove;
-        assert_eq!(
-            empty_result, None,
-            "D19: empty searchmoves must yield bestmove None"
-        );
-
-        // Subsequent unrestricted calls must agree (no PRNG state advanced).
-        let m1 = go_greedy_no_sink(&mut tested, &pos, &ctx_no_filter).bestmove;
-        let m2 = go_greedy_no_sink(&mut reference, &pos, &ctx_no_filter).bestmove;
-        assert_eq!(
-            m1, m2,
-            "D19: PRNG state must not advance on empty-filter go: tested={m1:?}, reference={m2:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D20 — GreedyMover emits an info depth 1 line with score cp.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn greedy_emits_info_depth_1_with_score_cp() {
-        use crate::eval::evaluate;
-        use crate::movegen::{MoveList, generate_moves};
-
-        let pos = Position::starting_position();
-        let (ctx, _stop) = non_aborting_ctx();
-        let mut gm = GreedyMover::new(0);
-
-        let info_lines: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
-        gm.go(&pos, &ctx, &|line| {
-            info_lines.borrow_mut().push(line.to_string())
-        });
-        let info_lines = info_lines.into_inner();
-
-        assert_eq!(
-            info_lines.len(),
-            1,
-            "D20: exactly one info line must be emitted; got: {info_lines:?}"
-        );
-        let line = &info_lines[0];
-        assert!(
-            line.starts_with("info depth 1 score cp "),
-            "D20: info line must start with 'info depth 1 score cp '; got: {line:?}"
-        );
-        assert!(
-            line.contains("nodes"),
-            "D20: info line must contain 'nodes'; got: {line:?}"
-        );
-        assert!(
-            line.contains("time"),
-            "D20: info line must contain 'time'; got: {line:?}"
-        );
-        assert!(
-            line.contains("pv"),
-            "D20: info line must contain 'pv'; got: {line:?}"
-        );
-
-        // Extract the score integer and verify it matches the independently-computed
-        // depth-1 best score. An impl that always emits `score cp 0` (the M2.D
-        // placeholder pattern) would fail this check for startpos.
-        let score_str = line
-            .strip_prefix("info depth 1 score cp ")
-            .expect("already checked prefix above");
-        let score_in_line: i32 = score_str
-            .split_whitespace()
-            .next()
-            .expect("token after 'score cp' must exist")
-            .parse()
-            .expect("score must be an integer");
-
-        // Independently compute the depth-1 best score: for each legal move,
-        // score = -evaluate(after make_move). The max over all legal moves is
-        // the expected value.
-        let mut ml = MoveList::new();
-        generate_moves(&pos, &mut ml);
-        let mut pos_clone = pos;
-        let mut best = i32::MIN;
-        for mv in ml.iter() {
-            let undo = pos_clone.make_move(mv);
-            let s = -evaluate(&pos_clone);
-            pos_clone.unmake_move(mv, undo);
-            if s > best {
-                best = s;
-            }
-        }
-
-        assert_eq!(
-            score_in_line, best,
-            "D20: score cp in info line ({score_in_line}) must match \
-            independently-computed depth-1 best score ({best})"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D21 — set_seed resets PRNG state.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn greedy_set_seed_resets_state() {
-        const SEED: u64 = 42;
-        // KvK tied position for reliable determinism across seeds.
-        let pos = Position::from_fen("8/8/8/8/4K3/8/8/4k3 w - - 0 1").expect("KvK FEN must parse");
-        let (ctx, _stop) = non_aborting_ctx();
-
-        // Capture the bestmove from a fresh instance.
-        let first_mv_fresh = go_greedy_no_sink(&mut GreedyMover::new(SEED), &pos, &ctx).bestmove;
-
-        // Advance a second instance 5 times, then call set_seed.
-        let mut gm = GreedyMover::new(SEED);
-        for _ in 0..5 {
-            go_greedy_no_sink(&mut gm, &pos, &ctx);
-        }
-        gm.set_seed(SEED);
-
-        let mv_after_set_seed = go_greedy_no_sink(&mut gm, &pos, &ctx).bestmove;
-        assert_eq!(
-            mv_after_set_seed, first_mv_fresh,
-            "D21: set_seed must reset state: expected {first_mv_fresh:?}, got {mv_after_set_seed:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // D22 — reset() returns to seed.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn greedy_reset_returns_to_seed() {
-        const SEED: u64 = 42;
-        let pos = Position::from_fen("8/8/8/8/4K3/8/8/4k3 w - - 0 1").expect("KvK FEN must parse");
-        let (ctx, _stop) = non_aborting_ctx();
-
-        let first_mv_fresh = go_greedy_no_sink(&mut GreedyMover::new(SEED), &pos, &ctx).bestmove;
-
-        let mut gm = GreedyMover::new(SEED);
-        for _ in 0..5 {
-            go_greedy_no_sink(&mut gm, &pos, &ctx);
-        }
-        gm.reset();
-
-        let mv_after_reset = go_greedy_no_sink(&mut gm, &pos, &ctx).bestmove;
-        assert_eq!(
-            mv_after_reset, first_mv_fresh,
-            "D22: reset must restore state to seed: expected {first_mv_fresh:?}, got {mv_after_reset:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // E1 — proptest: GreedyMover picks the move with max -evaluate(post_make).
-    // -----------------------------------------------------------------------
-
-    mod proptest_e1 {
-        use super::*;
-        use proptest::prelude::*;
-
-        proptest! {
-            #![proptest_config(ProptestConfig {
-                cases: 256,
-                ..ProptestConfig::default()
-            })]
-            /// For any reachable position with ≥1 legal move, the bestmove
-            /// GreedyMover returns must have `-evaluate(post_make)` equal to
-            /// `max(-evaluate(post_make_for_each_legal))`. Pins the depth-1
-            /// best-eval contract.
-            #[test]
-            fn prop_greedy_picks_max_score_among_legal_moves(
-                seed in 0u64..u64::MAX,
-            ) {
-                use crate::eval::evaluate;
-                use crate::movegen::{MoveList, generate_moves};
-
-                const FENS: &[&str] = &[
-                    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-                    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-                    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
-                    "r2q1rk1/pP1p2pp/Q4n2/bbp1p3/Np6/1B3NBn/pPPP1PPP/R3K2R b KQ - 0 1",
-                    "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
-                    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
-                ];
-
-                let fen = FENS[(seed as usize) % FENS.len()];
-                let pos = Position::from_fen(fen).unwrap();
-
-                let mut ml = MoveList::new();
-                generate_moves(&pos, &mut ml);
-                prop_assume!(!ml.is_empty());
-
-                // Compute the max score across all legal moves.
-                let mut pos_clone = pos;
-                let max_score = {
-                    let mut best = i32::MIN;
-                    for mv in ml.iter() {
-                        let undo = pos_clone.make_move(mv);
-                        let score = -evaluate(&pos_clone);
-                        pos_clone.unmake_move(mv, undo);
-                        if score > best {
-                            best = score;
-                        }
-                    }
-                    best
-                };
-
-                // Ask GreedyMover for its choice.
-                let (ctx, _stop) = {
-                    let stop = Arc::new(AtomicBool::new(false));
-                    let ctx = SearchContext {
-                        stop: Arc::clone(&stop),
-                        deadline: None,
-                        start: std::time::Instant::now(),
-                        limits: SearchLimits::default(),
-                        history: Vec::new(),
-                    };
-                    (ctx, stop)
-                };
-                let result = GreedyMover::new(seed).go(&pos, &ctx, &|_| {});
-                let chosen = result.bestmove.expect("position has legal moves");
-
-                // Verify the chosen move achieves the max score.
-                let undo = pos_clone.make_move(chosen);
-                let chosen_score = -evaluate(&pos_clone);
-                pos_clone.unmake_move(chosen, undo);
-
-                prop_assert_eq!(
-                    chosen_score,
-                    max_score,
-                    "E1: greedy chose move {} with score {} but max available is {}",
-                    chosen.to_uci(),
-                    chosen_score,
-                    max_score
-                );
-            }
         }
     }
 
@@ -959,12 +743,6 @@ mod tests {
     fn is_repetition_match_at_2_ply_returns_true() {
         // History [X, Y, X]: current X at index 2, prior X at index 0 (distance 2).
         // halfmove=2 allows looking back 2 plies. Must return true.
-        // Catches "(0..=) instead of (2..=)" start mutant: at i=0 the loop would
-        // compare current against itself (out-of-bounds or self-match) — either
-        // panics or returns the wrong result.
-        // Also catches "(1..=2).step_by(2)" start mutant (cargo-mutants commonly
-        // perturbs 2 → 1): at i=1, prior[2-1] = prior[1] = Y ≠ X → returns false
-        // → test expects true → caught.
         const X: u64 = 0xDEAD_BEEF;
         const Y: u64 = 0xCAFE_BABE;
         assert!(
@@ -992,9 +770,6 @@ mod tests {
     fn is_repetition_even_distance_match_returns_true() {
         // History [X, A, B, C, D, E, X]: current X at index 6, prior X at index 0.
         // Distance = 6 (even). halfmove=6. Must return true.
-        // A distinct fixture from is_repetition_match_at_4_ply_returns_true (which
-        // uses distance 4); this one exercises the third loop iteration (i=6) and
-        // serves as the companion to the odd-distance-3 fixture in the next test.
         const X: u64 = 0xAAAA;
         assert!(
             is_repetition(&[X, 0x1, 0x2, 0x3, 0x4, 0x5, X], 6),
@@ -1005,11 +780,7 @@ mod tests {
     #[test]
     fn is_repetition_odd_distance_match_returns_false() {
         // History [Y, X, A, B, X]: current X at index 4, prior X at index 1.
-        // Distance from current to prior = 4 - 1 = 3 (odd). halfmove=3 (allows
-        // looking back 3 plies, but step_by(2) only checks i=2; index 1 at i=3 is
-        // never reached — the 2-ply step skips odd-distance entries because
-        // same-side-to-move positions are always at even distance).
-        // A step_by(1) mutant or (1..=) start mutant would check i=3 and return true.
+        // Distance = 3 (odd). step_by(2) never checks i=3 — skips odd-distance entries.
         const X: u64 = 0xBBBB;
         assert!(
             !is_repetition(&[0x9999, X, 0x1, 0x2, X], 3),
@@ -1024,10 +795,7 @@ mod tests {
     #[test]
     fn is_repetition_capped_by_halfmove_clock() {
         // History [X, Y, Z, W, X] (5 entries): current X at index 4, prior X at
-        // index 0 (distance 4). halfmove=2 caps the search at 2 plies — the X at
-        // distance 4 must be invisible.
-        // A "max_back = prior.len()" mutant (dropping the halfmove cap) would set
-        // max_back=4, reach i=4, find the match, and return true — test expects false.
+        // index 0 (distance 4). halfmove=2 caps the search at 2 plies.
         const X: u64 = 0xCCCC;
         assert!(
             !is_repetition(&[X, 0x1, 0x2, 0x3, X], 2),
@@ -1042,9 +810,6 @@ mod tests {
     #[test]
     fn is_repetition_no_panic_when_halfmove_exceeds_history_match() {
         // History [X, Y, X] (prior.len()=2), halfmove=200.
-        // Without the min(halfmove, prior.len()) cap the loop would try i=4,
-        // computing prior[2-4] which underflows (panics in debug, UB in release).
-        // With the cap, max_back=2, only i=2 runs, finds the match, returns true.
         const X: u64 = 0xDDDD;
         assert!(
             is_repetition(&[X, 0x1, X], 200),
@@ -1055,8 +820,6 @@ mod tests {
     #[test]
     fn is_repetition_no_panic_when_halfmove_exceeds_history_no_match() {
         // History [X, Y, Z] (prior.len()=2), halfmove=200, no match.
-        // Companion to the previous test: a buggy max_back = halfmove as usize
-        // (no cap-by-length) would let i=4 run and panic (prior[2-4] underflows).
         assert!(
             !is_repetition(&[0x1, 0x2, 0x3], 200),
             "halfmove exceeds history, no match — must return false without panic"
@@ -1065,16 +828,636 @@ mod tests {
 
     #[test]
     fn is_repetition_halfmove_zero_returns_false() {
-        // History [X, Y, X], halfmove=0.
-        // An irreversible move (pawn move or capture) zeros the clock; after such
-        // a move no repetition is possible. max_back=min(0, 2)=0, the loop body
-        // never runs (range 2..=0 is empty), returns false.
-        // Catches an off-by-one where halfmove=0 might be treated as "go forever"
-        // due to integer underflow in a buggy max_back computation.
+        // History [X, Y, X], halfmove=0. Irreversible move zeroed the clock.
         const X: u64 = 0xEEEE;
         assert!(
             !is_repetition(&[X, 0x1, X], 0),
             "halfmove=0 (irreversible move) must return false"
+        );
+    }
+
+    // ===========================================================================
+    // M3.C — AlphaBetaMover unit tests.
+    // ===========================================================================
+
+    // -----------------------------------------------------------------------
+    // MVV-LVA helper tests (rows 1–4 of §8.1 table)
+    // -----------------------------------------------------------------------
+
+    /// PxQ must score higher than QxP. Victim-dominates-attacker property.
+    #[test]
+    fn mvv_lva_pawn_takes_queen_scores_higher_than_queen_takes_pawn() {
+        let pos =
+            Position::from_fen("4k3/8/2p5/2qQ4/1P6/8/8/4K3 w - - 0 1").expect("FEN must parse");
+
+        let pawn_takes_queen =
+            Move::from_uci("b4c5", &pos).expect("b4c5 must be a legal pawn capture");
+        let queen_takes_pawn =
+            Move::from_uci("d5c6", &pos).expect("d5c6 must be a legal queen capture");
+
+        let pxq = mvv_lva_score(pawn_takes_queen, &pos);
+        let qxp = mvv_lva_score(queen_takes_pawn, &pos);
+        assert!(
+            pxq > qxp,
+            "PxQ score ({pxq}) must be > QxP score ({qxp}) — victim dominates attacker"
+        );
+    }
+
+    /// PromoCapture score must include the promo bonus.
+    #[test]
+    fn mvv_lva_promo_capture_includes_promo_bonus() {
+        // Position: white pawn on a7, black rook on b8, white to move.
+        // a7xb8=Q is a queen-promo-capture.
+        let pos = Position::from_fen("1r5k/P7/8/8/8/8/8/4K3 w - - 0 1").expect("FEN must parse");
+
+        let promo_capture =
+            Move::from_uci("a7b8q", &pos).expect("a7b8q must be a legal queen promo-capture");
+        let non_capture_promo =
+            Move::from_uci("a7a8q", &pos).expect("a7a8q must be a legal queen promo");
+
+        let promo_capture_score = mvv_lva_score(promo_capture, &pos);
+        let non_capture_score = mvv_lva_score(non_capture_promo, &pos);
+        assert!(
+            promo_capture_score > non_capture_score,
+            "promo-capture score ({promo_capture_score}) must exceed non-capture promo score ({non_capture_score})"
+        );
+    }
+
+    /// Quiet / DoublePush / KingCastle / QueenCastle all score exactly 0.
+    #[test]
+    fn mvv_lva_quiet_scores_zero() {
+        let pos = Position::starting_position();
+        let quiet_move = Move::from_uci("e2e3", &pos).expect("e2e3 must be a legal quiet move");
+        let double_push = Move::from_uci("e2e4", &pos).expect("e2e4 must be a legal double push");
+
+        assert_eq!(
+            mvv_lva_score(quiet_move, &pos),
+            0,
+            "quiet move must score 0"
+        );
+        assert_eq!(
+            mvv_lva_score(double_push, &pos),
+            0,
+            "double pawn push must score 0"
+        );
+
+        // Castling: use Kiwipete where both castling rights exist.
+        let kiwipete = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("Kiwipete FEN must parse");
+        let king_castle = Move::from_uci("e1g1", &kiwipete)
+            .expect("e1g1 (king-side castle) must be legal in Kiwipete");
+        let queen_castle = Move::from_uci("e1c1", &kiwipete)
+            .expect("e1c1 (queen-side castle) must be legal in Kiwipete");
+        assert_eq!(
+            mvv_lva_score(king_castle, &kiwipete),
+            0,
+            "king-side castle must score 0"
+        );
+        assert_eq!(
+            mvv_lva_score(queen_castle, &kiwipete),
+            0,
+            "queen-side castle must score 0"
+        );
+    }
+
+    /// En-passant score uses pawn as victim regardless of capture-square geometry.
+    #[test]
+    fn mvv_lva_en_passant_scores_pawn_victim() {
+        // FEN with en-passant available: white pawn on e5, black pawn just pushed
+        // to d5, so EP target is d6.
+        let pos =
+            Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1").expect("EP FEN must parse");
+        let ep_move = Move::from_uci("e5d6", &pos).expect("e5d6 must be a legal EP capture");
+
+        // EP score = P(82)*16 - P(82) = 1312 - 82 = 1230.
+        let ep_score = mvv_lva_score(ep_move, &pos);
+        assert_eq!(
+            ep_score, 1230,
+            "EP score must equal pawn_victim*16 - pawn_attacker = 82*16-82 = 1230; got {ep_score}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // score_to_uci tests (rows 5–8 of §8.1 table)
+    // -----------------------------------------------------------------------
+
+    /// Normal centipawn scores produce "cp <N>".
+    #[test]
+    fn score_to_uci_cp_for_normal_scores() {
+        assert_eq!(score_to_uci(36), "cp 36");
+        assert_eq!(score_to_uci(-1024), "cp -1024");
+        assert_eq!(score_to_uci(0), "cp 0");
+    }
+
+    /// Winning mate scores produce "mate N" with N > 0.
+    #[test]
+    fn score_to_uci_mate_in_n_for_winning_mates() {
+        // MATE - 1 = 29999: mate in 1 ply → 1 full move → "mate 1"
+        assert_eq!(score_to_uci(MATE - 1), "mate 1");
+        // MATE - 5 = 29995: mate in 5 plies → (5+1)/2 = 3 full moves → "mate 3"
+        assert_eq!(score_to_uci(MATE - 5), "mate 3");
+    }
+
+    /// Losing (being mated) scores produce "mate -N" with N > 0.
+    #[test]
+    fn score_to_uci_mate_negative_for_losing_mates() {
+        // -(MATE - 4) = -29996: mated in 4 plies → (4+1)/2 = 2 → "mate -2"
+        assert_eq!(score_to_uci(-(MATE - 4)), "mate -2");
+    }
+
+    /// Boundary: MATE_IN_MAX_PLY triggers "mate"; MATE_IN_MAX_PLY - 1 triggers "cp".
+    #[test]
+    fn score_to_uci_threshold_at_mate_in_max_ply() {
+        // At MATE_IN_MAX_PLY (29936), |score| >= MATE_IN_MAX_PLY → mate string.
+        let score_at_boundary = MATE_IN_MAX_PLY;
+        let result = score_to_uci(score_at_boundary);
+        assert!(
+            result.starts_with("mate "),
+            "score MATE_IN_MAX_PLY ({score_at_boundary}) must produce a 'mate ...' string; got '{result}'"
+        );
+
+        // One below: MATE_IN_MAX_PLY - 1 = 29935 is NOT a mate score → "cp".
+        let below_boundary = MATE_IN_MAX_PLY - 1;
+        assert_eq!(
+            score_to_uci(below_boundary),
+            format!("cp {below_boundary}"),
+            "score MATE_IN_MAX_PLY - 1 ({below_boundary}) must produce a 'cp ...' string"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PvTable tests (rows 9–10 of §8.1 table)
+    // -----------------------------------------------------------------------
+
+    /// clear_ply resets the length at the specified ply and leaves others intact.
+    #[test]
+    fn pv_table_clear_ply_resets_length() {
+        let mut pv = PvTable::new();
+        pv.lengths[3] = 5;
+        pv.lengths[2] = 7;
+        pv.clear_ply(3);
+        assert_eq!(pv.lengths[3], 0, "clear_ply(3) must reset lengths[3] to 0");
+        assert_eq!(pv.lengths[2], 7, "clear_ply(3) must not affect lengths[2]");
+    }
+
+    /// update(ply, mv) copies the child PV into the parent slot correctly.
+    #[test]
+    fn pv_table_update_copies_child_pv() {
+        let mut pv = PvTable::new();
+
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+        let mv_a = Move::new(Square::A1, Square::B1, MoveFlag::Quiet);
+        let mv_b = Move::new(Square::A1, Square::C1, MoveFlag::Quiet);
+        let mv_c = Move::new(Square::A1, Square::D1, MoveFlag::Quiet);
+        let mv_x = Move::new(Square::A1, Square::E1, MoveFlag::Quiet);
+
+        // Simulate child PV at ply 5: [mv_a, mv_b, mv_c], length 3.
+        pv.moves[5][0] = mv_a;
+        pv.moves[5][1] = mv_b;
+        pv.moves[5][2] = mv_c;
+        pv.lengths[5] = 3;
+
+        // Update ply 4 with move mv_x.
+        pv.update(4, mv_x);
+
+        assert_eq!(pv.lengths[4], 4, "lengths[4] must be 1 + child_len (1+3=4)");
+        assert_eq!(
+            pv.moves[4][0], mv_x,
+            "pv.moves[4][0] must be mv_x (the new move)"
+        );
+        assert_eq!(
+            pv.moves[4][1], mv_a,
+            "pv.moves[4][1] must be mv_a (child pv[0])"
+        );
+        assert_eq!(
+            pv.moves[4][2], mv_b,
+            "pv.moves[4][2] must be mv_b (child pv[1])"
+        );
+        assert_eq!(
+            pv.moves[4][3], mv_c,
+            "pv.moves[4][3] must be mv_c (child pv[2])"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AlphaBetaMover integration tests (rows 11–20 of §8.1 table)
+    // -----------------------------------------------------------------------
+
+    fn go_alpha_beta_no_sink(
+        ab: &mut AlphaBetaMover,
+        pos: &Position,
+        ctx: &SearchContext,
+    ) -> SearchResult {
+        ab.go(pos, ctx, &|_| {})
+    }
+
+    /// AlphaBetaMover must find mate-in-1 from a constructed position.
+    ///
+    /// Position: `7k/8/5KQ1/8/8/8/8/8 w - - 0 1`
+    /// Black king h8, white king f6, white queen g6.
+    /// Both Qg6-g7 and Qg6-h7 deliver checkmate (the queen covers all
+    /// escape squares from either destination), so we verify the score
+    /// is MATE−1 rather than asserting a specific move.
+    #[test]
+    fn alphabeta_finds_mate_in_1_from_constructed_position() {
+        let pos =
+            Position::from_fen("7k/8/5KQ1/8/8/8/8/8 w - - 0 1").expect("mate-in-1 FEN must parse");
+        let mut ab = AlphaBetaMover::new();
+        // depth 2 to ensure the engine can see mate-in-1 at depth 1.
+        let (ctx_depth2, _stop) = non_aborting_ctx_at_depth(2);
+        let result = go_alpha_beta_no_sink(&mut ab, &pos, &ctx_depth2);
+
+        assert!(
+            result.bestmove.is_some(),
+            "mate-in-1 position must have a bestmove"
+        );
+        assert_eq!(
+            result.score_cp,
+            Some(MATE - 1),
+            "score must be MATE-1 for a mate-in-1 position"
+        );
+    }
+
+    /// Engine must find a forced mate from a dominating position (Kf6+Qe7 vs Kg8).
+    ///
+    /// Position: `6k1/4Q3/5K2/8/8/8/8/8 w - - 0 1`
+    /// The exact mate distance is not pinned; only that the score crosses
+    /// the MATE_IN_MAX_PLY threshold.
+    #[test]
+    fn alphabeta_finds_forced_mate_from_dominating_position() {
+        let pos = Position::from_fen("6k1/4Q3/5K2/8/8/8/8/8 w - - 0 1")
+            .expect("dominating position FEN must parse");
+        let mut ab = AlphaBetaMover::new();
+        let (ctx_depth4, _stop) = non_aborting_ctx_at_depth(4);
+        let result = go_alpha_beta_no_sink(&mut ab, &pos, &ctx_depth4);
+
+        assert!(
+            result.bestmove.is_some(),
+            "dominating position must have a bestmove"
+        );
+        let score = result.score_cp.expect("must have a score");
+        assert!(
+            score >= MATE_IN_MAX_PLY,
+            "engine must find a forced winning mate; got score cp {score}"
+        );
+    }
+
+    /// Engine must pick the material-winning capture (hanging rook) over passive moves.
+    #[test]
+    fn alphabeta_takes_hanging_rook_over_passive_move() {
+        let pos = Position::from_fen("r3k3/8/8/8/8/8/8/R3K3 w Qq - 0 1")
+            .expect("hanging rook FEN must parse");
+        let mut ab = AlphaBetaMover::new();
+        let (ctx_depth2, _stop) = non_aborting_ctx_at_depth(2);
+        let result = go_alpha_beta_no_sink(&mut ab, &pos, &ctx_depth2);
+
+        let mv = result
+            .bestmove
+            .expect("position has legal moves — bestmove must be Some");
+        let expected = Move::from_uci("a1a8", &pos).expect("a1a8 must be a legal rook capture");
+        assert_eq!(
+            mv,
+            expected,
+            "engine must take the hanging rook (a1a8); got {}",
+            mv.to_uci()
+        );
+    }
+
+    /// Stalemate at root must return score 0 and bestmove None.
+    ///
+    /// Position: `7k/5K2/6Q1/8/8/8/8/8 b - - 0 1` — black king h8, white king f7,
+    /// white queen g6. Black has no legal moves and is not in check → stalemate.
+    #[test]
+    fn alphabeta_returns_zero_for_stalemate_root() {
+        let pos =
+            Position::from_fen("7k/5K2/6Q1/8/8/8/8/8 b - - 0 1").expect("stalemate FEN must parse");
+        let mut ab = AlphaBetaMover::new();
+        let (ctx_depth3, _stop) = non_aborting_ctx_at_depth(3);
+        let result = go_alpha_beta_no_sink(&mut ab, &pos, &ctx_depth3);
+
+        assert_eq!(
+            result.score_cp,
+            Some(0),
+            "stalemate must return score 0; got {:?}",
+            result.score_cp
+        );
+        assert_eq!(result.bestmove, None, "stalemate must return bestmove None");
+    }
+
+    /// At ply > 0, a position repeated in history returns score 0.
+    #[test]
+    fn alphabeta_recognizes_repetition_at_ply_gt_0() {
+        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 4 1")
+            .expect("startpos with halfmove=4 must parse");
+
+        let (ctx_depth2, _stop) = non_aborting_ctx_at_depth(2);
+
+        let mut ab = AlphaBetaMover::new();
+        let other_zobrist: u64 = 0xDEAD_BEEF_CAFE_0000;
+        ab.history = vec![pos.zobrist(), other_zobrist, pos.zobrist()];
+
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, &ctx_depth2);
+        assert_eq!(
+            score, 0,
+            "repetition at ply > 0 must return score 0; got {score}"
+        );
+    }
+
+    /// At ply > 0, a position with halfmove_clock == 100 returns score 0.
+    #[test]
+    fn alphabeta_returns_50_move_draw_at_halfmove_100() {
+        let pos = Position::from_fen("8/8/8/8/4k3/8/8/4K3 w - - 100 1")
+            .expect("KvK with halfmove=100 FEN must parse");
+
+        let (ctx_depth2, _stop) = non_aborting_ctx_at_depth(2);
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, &ctx_depth2);
+        assert_eq!(
+            score, 0,
+            "50-move draw at halfmove=100 must return score 0; got {score}"
+        );
+    }
+
+    /// After `go depth 3` from startpos, the PV first move must be a legal move.
+    #[test]
+    fn alphabeta_pv_first_move_is_legal_in_starting_position() {
+        let pos = Position::starting_position();
+        let mut ab = AlphaBetaMover::new();
+        let (ctx_depth3, _stop) = non_aborting_ctx_at_depth(3);
+        let result = go_alpha_beta_no_sink(&mut ab, &pos, &ctx_depth3);
+
+        let mv = result
+            .bestmove
+            .expect("startpos has legal moves — bestmove must be Some");
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        assert!(
+            ml.iter().any(|legal| legal == mv),
+            "PV first move {} must be in generate_moves(startpos)",
+            mv.to_uci()
+        );
+    }
+
+    /// For each consecutive PV move pair, applying the first move must make
+    /// the second move legal. Tests the triangular-PV legality invariant.
+    mod proptest_m3c_e1 {
+        use super::*;
+        use crate::search::AlphaBetaMover;
+        use proptest::prelude::*;
+
+        const FENS: &[&str] = &[
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r2q1rk1/pP1p2pp/Q4n2/bbp1p3/Np6/1B3NBn/pPPP1PPP/R3K2R b KQ - 0 1",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+            "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+        ];
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 64,
+                ..ProptestConfig::default()
+            })]
+            /// Each consecutive PV move pair (pv[i], pv[i+1]) must satisfy:
+            /// after applying pv[i] from the current position, pv[i+1] is legal
+            /// in the resulting position. Pins the triangular-PV legality invariant
+            /// across the standard fixture set.
+            #[test]
+            fn alphabeta_pv_each_move_is_legal_after_prior(
+                seed in 0u64..u64::MAX,
+            ) {
+                let fen = FENS[(seed as usize) % FENS.len()];
+                let pos = Position::from_fen(fen).unwrap();
+
+                let stop = Arc::new(AtomicBool::new(false));
+                let ctx = SearchContext {
+                    stop: Arc::clone(&stop),
+                    deadline: None,
+                    start: std::time::Instant::now(),
+                    limits: SearchLimits {
+                        depth: Some(3),
+                        ..SearchLimits::default()
+                    },
+                    history: vec![pos.zobrist()],
+                };
+
+                let mut ab = AlphaBetaMover::new();
+                ab.go(&pos, &ctx, &|_| {});
+
+                let pv = ab.pv_root_for_test();
+                let mut cur_pos = pos;
+                for i in 0..pv.len().saturating_sub(1) {
+                    let mv = pv[i];
+                    let next_mv = pv[i + 1];
+
+                    cur_pos.make_move(mv);
+
+                    let mut ml = MoveList::new();
+                    generate_moves(&cur_pos, &mut ml);
+                    prop_assert!(
+                        ml.iter().any(|m| m == next_mv),
+                        "PV[{}] {} must be legal after applying PV[{}] {} in position {}",
+                        i + 1,
+                        next_mv.to_uci(),
+                        i,
+                        mv.to_uci(),
+                        fen
+                    );
+                }
+            }
+        }
+    }
+
+    /// Node count at depth 3 from startpos must be below the loose upper bound.
+    ///
+    /// A full-width depth-3 search would visit ≤ 20^3 = 8000 nodes (loose bound).
+    /// Alpha-beta with MVV-LVA ordering should visit much fewer.
+    #[test]
+    fn alphabeta_node_count_is_below_branching_bound() {
+        let pos = Position::starting_position();
+        let mut ab = AlphaBetaMover::new();
+        let (ctx_depth3, _stop) = non_aborting_ctx_at_depth(3);
+        let result = go_alpha_beta_no_sink(&mut ab, &pos, &ctx_depth3);
+        assert!(
+            result.nodes < 8000,
+            "depth-3 search from startpos must visit fewer than 8000 nodes (loose upper bound); \
+            visited {} nodes",
+            result.nodes
+        );
+    }
+
+    /// With `stop` pre-set before `go`, the search must abort promptly.
+    ///
+    /// The pre-set abort fires at the first 4096-node poll, before any root move
+    /// improves alpha → `bestmove` is always `None` and `score_cp` is the 0 sentinel.
+    #[test]
+    fn alphabeta_search_aborts_on_should_abort() {
+        let pos = Position::starting_position();
+        let stop = Arc::new(AtomicBool::new(true)); // pre-set to abort immediately
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            deadline: None,
+            start: std::time::Instant::now(),
+            limits: SearchLimits {
+                depth: Some(10), // would be slow without early abort
+                ..SearchLimits::default()
+            },
+            history: vec![pos.zobrist()],
+        };
+        let mut ab = AlphaBetaMover::new();
+        let result = ab.go(&pos, &ctx, &|_| {});
+
+        // Cancellation poll cadence is `if self.nodes & 4095 == 0` (every 4096 nodes).
+        assert!(
+            result.nodes <= 5000,
+            "early abort must not search a large node count: got {} \
+            (cadence 4096; first abort fires at nodes=4096)",
+            result.nodes
+        );
+
+        // Pre-set abort fires before any root move can complete.
+        assert_eq!(
+            result.bestmove, None,
+            "pre-set abort fires before any root move can complete"
+        );
+        assert_eq!(
+            result.score_cp,
+            Some(0),
+            "abort sentinel score must be 0 when no root move completed"
+        );
+    }
+
+    /// When the search aborts AFTER the first root move's subtree completes,
+    /// `bestmove` must be `Some` and `score_cp` must reflect the completed
+    /// subtree score — NOT the 0 abort sentinel.
+    ///
+    /// This is a regression test for must-fix #2 (aborted-search score contamination).
+    #[test]
+    fn alphabeta_partial_completion_under_abort_returns_partial_pv_and_score() {
+        // 5000-node budget: enough for the first root move's depth-4 subtree at
+        // startpos to complete (typically ~200–1000 nodes per root move), but
+        // exhausted before all 20 root moves finish.
+        let pos = Position::starting_position();
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            deadline: None,
+            start: std::time::Instant::now(),
+            limits: SearchLimits {
+                depth: Some(4),
+                nodes: Some(5000),
+                ..SearchLimits::default()
+            },
+            history: vec![pos.zobrist()],
+        };
+        let mut ab = AlphaBetaMover::new();
+        let result = ab.go(&pos, &ctx, &|_| {});
+
+        // Precondition: with `nodes: Some(5000)` from startpos at depth 4,
+        // partial completion is reliably reached today (cancellation poll fires
+        // at the 4096-node alignment, after the first root move's subtree has
+        // updated the root PV + score). If a future change shifts node
+        // accounting (cadence, ordering, or budget), the test would fall
+        // through to a vacuous pass — so we assert the precondition explicitly.
+        assert!(
+            result.bestmove.is_some(),
+            "fixture must reach partial completion at depth 4 with nodes=5000; \
+            adjust the budget if abort fires before any root move improves alpha"
+        );
+        let mv = result.bestmove.unwrap();
+        // Verify the move is legal.
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        assert!(
+            ml.iter().any(|legal| legal == mv),
+            "partial-completion bestmove {} must be legal from startpos",
+            mv.to_uci()
+        );
+        // The score must NOT be 0 (the abort sentinel). A real depth-4
+        // centipawn score from startpos is non-zero (empirically ~-30 cp).
+        // We don't pin the exact value; we just assert it differs from the
+        // abort sentinel to catch the score-contamination regression.
+        assert_ne!(
+            result.score_cp,
+            Some(0),
+            "partial-completion score must be the completed-subtree score, not the 0 abort sentinel; \
+            got {:?}",
+            result.score_cp
+        );
+    }
+
+    /// searchmoves filter restricts root move choice.
+    #[test]
+    fn alphabeta_searchmoves_filter_restricts_root_choice() {
+        let pos = Position::starting_position();
+        let e2e4 = Move::from_uci("e2e4", &pos).expect("e2e4 must be legal from startpos");
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            deadline: None,
+            start: std::time::Instant::now(),
+            limits: SearchLimits {
+                depth: Some(3),
+                searchmoves: Some(vec![e2e4]),
+                ..SearchLimits::default()
+            },
+            history: vec![pos.zobrist()],
+        };
+        let mut ab = AlphaBetaMover::new();
+        let result = ab.go(&pos, &ctx, &|_| {});
+
+        assert_eq!(
+            result.bestmove,
+            Some(e2e4),
+            "searchmoves=[e2e4] must restrict bestmove to e2e4; got {:?}",
+            result.bestmove
+        );
+    }
+
+    /// After `go depth 2` from startpos, exactly one `info` line must be emitted,
+    /// starting with `info depth 2 score ...` and containing a `pv` token.
+    #[test]
+    fn alphabeta_emits_info_line_with_score_and_pv() {
+        let pos = Position::starting_position();
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            deadline: None,
+            start: std::time::Instant::now(),
+            limits: SearchLimits {
+                depth: Some(2),
+                ..SearchLimits::default()
+            },
+            history: vec![pos.zobrist()],
+        };
+        let mut ab = AlphaBetaMover::new();
+        let info_lines: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        ab.go(&pos, &ctx, &|line| {
+            info_lines.borrow_mut().push(line.to_string());
+        });
+        let info_lines = info_lines.into_inner();
+
+        assert_eq!(
+            info_lines.len(),
+            1,
+            "exactly one info line must be emitted; got: {info_lines:?}"
+        );
+        let line = &info_lines[0];
+        assert!(
+            line.starts_with("info depth 2 score cp ")
+                || line.starts_with("info depth 2 score mate "),
+            "info line must start with 'info depth 2 score cp ...' or 'info depth 2 score mate ...'; got: {line:?}"
+        );
+        assert!(
+            line.contains(" pv "),
+            "info line must contain 'pv'; got: {line:?}"
         );
     }
 }

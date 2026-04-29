@@ -13,9 +13,12 @@ use crate::piece::{Color, PieceKind};
 use crate::position::Position;
 
 mod data;
-use data::{
-    MATERIAL, MG_BISHOP_PST, MG_KING_PST, MG_KNIGHT_PST, MG_PAWN_PST, MG_QUEEN_PST, MG_ROOK_PST,
-};
+use data::{MG_BISHOP_PST, MG_KING_PST, MG_KNIGHT_PST, MG_PAWN_PST, MG_QUEEN_PST, MG_ROOK_PST};
+
+/// Centipawn material values indexed by `PieceKind::index()` (P=0 … K=5).
+/// King material is 0 — kings are never captured; the king PST term is
+/// purely positional. Re-exported for use in MVV-LVA move ordering.
+pub(crate) use data::MATERIAL;
 
 // ---------------------------------------------------------------------------
 // PSQT — preflattened lookup table (plan §1).

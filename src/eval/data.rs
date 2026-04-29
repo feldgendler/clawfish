@@ -17,7 +17,7 @@
 /// Centipawn material values indexed by `PieceKind::index()` (P=0 … K=5).
 /// King material is 0 — kings are never captured; the king PST term is
 /// purely positional.
-pub(super) const MATERIAL: [i32; 6] = [82, 337, 365, 477, 1025, 0];
+pub(crate) const MATERIAL: [i32; 6] = [82, 337, 365, 477, 1025, 0];
 
 /// PeSTO MG pawn PST.
 #[rustfmt::skip]
