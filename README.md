@@ -3,11 +3,17 @@
 A Rust chess engine, written from scratch and grown incrementally toward
 GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 
-> **Status: early.** Fail-soft alpha-beta with quiescence search, MVV-LVA
-> ordering, mate-distance pruning, and PeSTO middlegame piece-square tables.
-> No iterative deepening, no transposition table yet. Time management,
-> transposition tables, and the rest of the strength path are tracked in
+> **Status: early.** Fail-soft alpha-beta with quiescence search,
+> iterative deepening, MVV-LVA + prior-PV ordering, mate-distance pruning,
+> PeSTO middlegame piece-square tables, and `compute_caps`-driven time
+> management. `bench` UCI command for deterministic node-count regression
+> baselines. No transposition table yet. The rest of the strength path
+> (TT, killer/history, PVS, aspiration; eval improvements; NNUE) is tracked in
 > [`docs/roadmap.md`](docs/roadmap.md).
+>
+> **Current bench:** `bench: 172312700 nodes 11489045 nps` at default depth 7
+> (M3.F end). Run `printf 'bench\nquit\n' | ./target/release/clawfish` to
+> reproduce.
 
 ## Build
 

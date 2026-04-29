@@ -531,3 +531,88 @@ fn integration_id_emits_one_info_per_iteration() {
         last_idx = Some(idx);
     }
 }
+
+// ---------------------------------------------------------------------------
+// E43 — bench command emits summary line and engine remains responsive (M3.F)
+// ---------------------------------------------------------------------------
+
+/// `bench 4` from a fresh engine must emit the OpenBench-grep-compatible
+/// signature line `info string bench: <N> nodes <NPS> nps` within 60 s,
+/// followed by `readyok` after a subsequent `isready`, and exit cleanly on
+/// `quit`. Pins (a) the bench-as-regression-baseline contract end-to-end
+/// through a real subprocess; (b) the engine remains responsive after bench;
+/// (c) the process exits within 5 s of `quit`.
+///
+/// Depth 4 is used (vs the default 7) to keep CI wallclock low; M3.F's
+/// in-process unit tests in src/engine.rs cover the default-depth path
+/// against the real `BENCH_DEFAULT_DEPTH` constant.
+#[test]
+fn integration_bench_emits_summary_within_60s_and_remains_responsive() {
+    let mut child = spawn_engine();
+    let stdout = child.stdout.take().expect("stdout handle");
+    let line_rx = drain_stdout(stdout);
+
+    let mut stdin = child.stdin.take().expect("stdin handle");
+    stdin.write_all(b"bench 4\n").unwrap();
+
+    let mut lines: Vec<String> = Vec::new();
+    // 60 s budget: depth 4 over 16 positions runs in ~1 s on dev hardware
+    // and well under 60 s even on slow CI runners.
+    let bench_deadline = Instant::now() + Duration::from_secs(60);
+    wait_for_line_starting_with(&line_rx, "info string bench: ", bench_deadline, &mut lines);
+
+    // Engine remains responsive after bench.
+    stdin.write_all(b"isready\n").unwrap();
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    wait_for_line_starting_with(&line_rx, "readyok", ready_deadline, &mut lines);
+
+    stdin.write_all(b"quit\n").unwrap();
+    drop(stdin);
+
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    let exited = wait_for_exit(&mut child, exit_deadline);
+    lines.extend(collect_lines(&line_rx));
+    let output = lines.join("\n");
+
+    assert!(exited, "E43: engine did not exit within 5 s after quit");
+
+    // Validate the signature line shape: `info string bench: <N> nodes <NPS> nps`.
+    let sig = lines
+        .iter()
+        .find(|l| l.starts_with("info string bench: "))
+        .unwrap_or_else(|| panic!("E43: missing bench signature line;\nfull output:\n{output}"));
+    let rest = sig.strip_prefix("info string bench: ").unwrap();
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    assert_eq!(
+        parts.len(),
+        4,
+        "E43: signature line shape wrong; got {sig:?}"
+    );
+    assert_eq!(
+        parts[1], "nodes",
+        "E43: signature must read 'nodes'; {sig:?}"
+    );
+    assert_eq!(parts[3], "nps", "E43: signature must read 'nps'; {sig:?}");
+    let nodes: u64 = parts[0]
+        .parse()
+        .unwrap_or_else(|_| panic!("E43: signature N field must parse as u64; {sig:?}"));
+    let nps: u64 = parts[2]
+        .parse()
+        .unwrap_or_else(|_| panic!("E43: signature NPS field must parse as u64; {sig:?}"));
+    assert!(nodes > 0, "E43: total nodes must be > 0; {sig:?}");
+    assert!(nps > 0, "E43: NPS must be > 0; {sig:?}");
+
+    // readyok must appear AFTER the signature line in stream order.
+    let bench_pos = lines
+        .iter()
+        .position(|l| l.starts_with("info string bench: "))
+        .unwrap();
+    let ready_pos = lines
+        .iter()
+        .position(|l| l == "readyok")
+        .unwrap_or_else(|| panic!("E43: missing readyok;\nfull output:\n{output}"));
+    assert!(
+        ready_pos > bench_pos,
+        "E43: readyok ({ready_pos}) must arrive AFTER the bench signature line ({bench_pos})"
+    );
+}

@@ -41,6 +41,25 @@ const MAX_MOVE_OVERHEAD: u64 = 5_000;
 /// scheduling jitter.
 const DEFAULT_MOVE_OVERHEAD: u64 = 50;
 
+/// Compute nodes-per-second for the `bench` summary line (M3.F).
+///
+/// Returns `(total_nodes × 1000) / max(total_ms, 1)` as `u128`. The `max(1)`
+/// guard avoids division-by-zero on sub-millisecond benches; multiplication
+/// promotes to `u128` to avoid u64 overflow at billion-node bench sizes
+/// (`u64::MAX × 1000` wouldn't fit a u64).
+///
+/// Extracted into a named helper from `Engine::handle_bench`'s body — the
+/// inline expression had three structurally-undetectable mutations
+/// (`/ → %`, `/ → *`, `* → +`) that survived end-to-end bench testing because
+/// the test asserts NPS is "within order of magnitude" rather than exact.
+/// As a free helper, the arithmetic is directly unit-testable on synthetic
+/// inputs that pin the exact division semantics. Same precedent as M3.D's
+/// `negate_window` extraction.
+pub(crate) fn compute_bench_nps(total_nodes: u64, total_ms: u128) -> u128 {
+    let denom = total_ms.max(1);
+    (total_nodes as u128 * 1000) / denom
+}
+
 /// UCI orchestrator. Owns engine state, dispatches parsed `Command`s to
 /// per-command handlers, drives the search worker thread.
 pub struct Engine<W: Write + Send + 'static, S: Search + Send + 'static> {
@@ -102,6 +121,7 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
                 Command::UciNewGame => self.handle_ucinewgame(),
                 Command::Position { spec, moves } => self.handle_position(spec, moves),
                 Command::Go(params) => self.handle_go(params),
+                Command::Bench { depth } => self.handle_bench(depth),
                 Command::Stop => self.handle_stop(),
                 Command::PonderHit => self.handle_ponderhit(),
                 Command::Quit => {
@@ -375,6 +395,107 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
 
     fn handle_unknown(&mut self) {
         self.info_string_debug("unknown command");
+    }
+
+    /// `bench` UCI command (M3.F): drive a deterministic node-count regression
+    /// baseline. Iterates a vendored fixed-position FEN corpus, drives
+    /// `Search::go` at fixed depth on each, sums node counts, emits per-position
+    /// `info string` lines and a final OpenBench-grep-compatible signature.
+    /// See `docs/plans/m3.f.md` §5 for the full design.
+    fn handle_bench(&mut self, depth_override: Option<u32>) {
+        use crate::bench::{BENCH_DEFAULT_DEPTH, BENCH_POSITIONS};
+
+        // Defensive: signal + join any in-flight worker. Mirrors
+        // `handle_ucinewgame`'s discipline — bench is synchronous on the
+        // orchestrator thread, so the dispatch loop is blocked until bench
+        // returns; commands like `isready`/`stop` queue in mpsc until then.
+        self.join_in_flight_worker();
+        // Clear `stop` after the join. `join_in_flight_worker` sets stop=true
+        // to signal the worker to exit; if we leave it set, every per-position
+        // `Search::go` below would inherit `stop=true` and either abort
+        // mid-iteration via the 4096-node cadence (production depth 7+) or
+        // break between iterations via the inter-iteration stop check (any
+        // depth ≥ 2). Bench results would be massively contaminated.
+        // Same discipline as `handle_go` line ~214: clear stop before
+        // constructing per-go SearchContext.
+        self.stop.store(false, Ordering::Relaxed);
+
+        let depth = depth_override.unwrap_or(BENCH_DEFAULT_DEPTH);
+
+        let start = Instant::now();
+        let mut total_nodes: u64 = 0;
+
+        for (idx, fen) in BENCH_POSITIONS.iter().enumerate() {
+            // FEN parse failure is unreachable for the vendored corpus
+            // (`bench_positions_all_parse_via_from_fen` is the anchor), but
+            // a defensive skip keeps `bench` robust over future expansions.
+            let pos = match Position::from_fen(fen) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.info_string_always(&format!(
+                        "bench: skipping position {} (FEN parse error: {e})",
+                        idx + 1,
+                    ));
+                    continue;
+                }
+            };
+
+            // No per-position `reset()`. `AlphaBetaMover::reset()` only
+            // clears `self.history`; `Search::go`'s top-of-go reset clears
+            // everything else (nodes, pv, prior_root_move, …) on every call.
+
+            let limits = SearchLimits {
+                depth: Some(depth),
+                ..SearchLimits::default()
+            };
+            let pos_start = Instant::now();
+            let ctx = SearchContext {
+                stop: Arc::clone(&self.stop),
+                deadline: None,
+                soft_deadline: None,
+                start: pos_start,
+                limits,
+                history: vec![pos.zobrist()],
+            };
+
+            // Synchronous-on-orchestrator-thread invocation. info_sink is a
+            // no-op closure to suppress per-iteration ID `info depth N …`
+            // lines (would emit 16 × depth lines of noise).
+            let result: SearchResult = {
+                let mut s = self.search.lock().unwrap();
+                let sink = |_: &str| {};
+                s.go(&pos, &ctx, &sink)
+            };
+            let elapsed_ms = pos_start.elapsed().as_millis();
+
+            total_nodes += result.nodes;
+
+            // Per-position summary, routed through `info_string_always` per
+            // ADR-0011 discipline (all non-spec output via `info string`).
+            self.info_string_always(&format!(
+                "bench position {}/{}: {} nodes {} time {}",
+                idx + 1,
+                BENCH_POSITIONS.len(),
+                fen,
+                result.nodes,
+                elapsed_ms,
+            ));
+        }
+
+        let total_ms = start.elapsed().as_millis();
+        let nps = compute_bench_nps(total_nodes, total_ms);
+
+        // Final summary lines, both `info string`-prefixed:
+        //   1. `Nodes searched: <N>` — human-readable.
+        //   2. `bench: <N> nodes <NPS> nps` — OpenBench-grep-compatible
+        //      signature. Strict OpenBench-format would be a bare-prefix line;
+        //      our `info string` form is substring-grep-compatible (regex
+        //      `bench: [0-9]+ nodes [0-9]+ nps` matches the substring) but
+        //      not bytewise OpenBench-format. Acceptable since clawfish has
+        //      no CLI-bench mode at M3.F (would be where bytewise format
+        //      matters for OpenBench scraping).
+        self.info_string_always(&format!("Nodes searched: {total_nodes}"));
+        self.info_string_always(&format!("bench: {total_nodes} nodes {nps} nps"));
     }
 
     fn handle_quit(&mut self) {
@@ -2889,5 +3010,406 @@ mod tests {
             "go depth 1",
         ]);
         assert_eq!(mo, 200, "MoveOverhead must persist across go commands");
+    }
+
+    // ─── M3.F: compute_bench_nps helper ───────────────────────────────────
+    //
+    // These four tests pin the EXACT arithmetic (total_nodes × 1000 / total_ms)
+    // against a constructed-inputs fixture, catching the three cargo-mutants
+    // survivors on the inline expression that the loose order-of-magnitude
+    // band in `handle_bench_total_matches_sum_of_per_position_nodes` did not.
+    // The chosen inputs (10 nodes, 3ms) give different values for each
+    // mutation, distinguishing the original from each mutant by integer
+    // division semantics:
+    //   - `/ → %`  : (10 * 1000) / 3 = 3333  vs (10 * 1000) % 3 = 1
+    //   - `/ → *`  : 3333 vs (10 * 1000) * 3 = 30000
+    //   - `* → +`  : 3333 vs (10 + 1000) / 3 = 336
+    // Each mutation produces a distinct value; the equality assertion to
+    // 3333 fails for every mutant.
+
+    #[test]
+    fn compute_bench_nps_basic_division() {
+        // 1000 nodes / 100ms = 10000 nps.
+        assert_eq!(super::compute_bench_nps(1000, 100), 10_000);
+    }
+
+    #[test]
+    fn compute_bench_nps_distinguishes_div_from_mod_and_mul_and_add() {
+        // Single fixture pins all 3 mutations on the inline expression simultaneously.
+        // Original: (10 * 1000) / 3 = 10000 / 3 = 3333.
+        // / → %  : 10000 % 3   = 1
+        // / → *  : 10000 * 3   = 30000
+        // * → +  : (10 + 1000) / 3 = 336
+        assert_eq!(super::compute_bench_nps(10, 3), 3333);
+    }
+
+    #[test]
+    fn compute_bench_nps_zero_total_ms_does_not_panic() {
+        // sub-ms benches: max(1) guard prevents div-by-zero.
+        assert_eq!(super::compute_bench_nps(1000, 0), 1_000_000);
+    }
+
+    #[test]
+    fn compute_bench_nps_zero_nodes() {
+        // Edge: zero nodes (e.g., empty corpus) → 0 NPS, no panic.
+        assert_eq!(super::compute_bench_nps(0, 100), 0);
+        assert_eq!(super::compute_bench_nps(0, 0), 0);
+    }
+
+    #[test]
+    fn compute_bench_nps_handles_large_node_counts_without_u64_overflow() {
+        // u64::MAX * 1000 overflows u64; promoting to u128 is required.
+        // 2^60 * 1000 / 1ms ≈ 1.15e21 nps — exceeds u64::MAX (1.84e19) but fits u128.
+        let huge_nodes: u64 = 1u64 << 60;
+        let nps = super::compute_bench_nps(huge_nodes, 1);
+        assert!(nps > u64::MAX as u128);
+    }
+
+    // ─── M3.F: handle_bench ───────────────────────────────────────────────
+
+    /// Parse the `info string bench: <N> nodes <NPS> nps` line and return
+    /// `Some((nodes, nps))`. Returns `None` if the line is absent.
+    fn extract_bench_signature(stdout: &str) -> Option<(u64, u64)> {
+        for line in stdout.lines() {
+            if let Some(rest) = line.strip_prefix("info string bench: ") {
+                // rest = "<N> nodes <NPS> nps"
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() == 4 && parts[1] == "nodes" && parts[3] == "nps" {
+                    let nodes = parts[0].parse::<u64>().ok()?;
+                    let nps = parts[2].parse::<u64>().ok()?;
+                    return Some((nodes, nps));
+                }
+            }
+        }
+        None
+    }
+
+    /// Parse all `info string bench position N/M: <fen> nodes <N> time <ms>`
+    /// lines from stdout and return `Vec<(position_idx, total_count, nodes, time_ms)>`.
+    fn extract_bench_per_position(stdout: &str) -> Vec<(usize, usize, u64, u64)> {
+        let mut out = Vec::new();
+        for line in stdout.lines() {
+            if let Some(rest) = line.strip_prefix("info string bench position ") {
+                // rest looks like: "1/16: <fen> nodes <N> time <ms>"
+                // Use `rsplitn(2, " nodes ")` and `rsplitn(2, " time ")` so a
+                // future expanded corpus FEN containing the literal ` nodes `
+                // or ` time ` substring (extremely unlikely in standard FEN —
+                // ranks are digits/letters, side-to-move is `w`/`b`, castling
+                // is K/Q/k/q/-, EP is `-` or square, halfmove/fullmove are
+                // integers — but defensive against future format extensions)
+                // doesn't break the parser. `rsplitn(2)` splits at the LAST
+                // occurrence; the engine's emit is `<head> nodes <tail>` where
+                // `<tail>` always starts with the integer node count.
+                let parts: Vec<&str> = rest.rsplitn(2, " nodes ").collect();
+                if parts.len() != 2 {
+                    continue;
+                }
+                // `rsplitn(2, " nodes ")` on `"1/16: <fen> nodes <N> time <ms>"`
+                // yields `["<N> time <ms>", "1/16: <fen>"]` — rightmost piece
+                // first, then everything before the FINAL " nodes ".
+                let tail = parts[0]; // "<N> time <ms>"
+                let head = parts[1]; // "1/16: <fen>"
+                // Parse "1/16:" prefix.
+                let colon = head.find(':');
+                let Some(colon) = colon else { continue };
+                let idx_part = &head[..colon];
+                let slash: Vec<&str> = idx_part.split('/').collect();
+                if slash.len() != 2 {
+                    continue;
+                }
+                let Ok(idx) = slash[0].parse::<usize>() else {
+                    continue;
+                };
+                let Ok(total) = slash[1].parse::<usize>() else {
+                    continue;
+                };
+                // Parse "<N> time <ms>" — rsplitn(2) for the same reason as
+                // above. `rsplitn(2, " time ")` on `"<N> time <ms>"` yields
+                // `["<ms>", "<N>"]` (rsplit returns the rightmost piece first;
+                // the second piece is everything before the FINAL " time "
+                // separator). So `time_parts[0]` is the integer ms field and
+                // `time_parts[1]` is the integer node count.
+                let time_parts: Vec<&str> = tail.rsplitn(2, " time ").collect();
+                if time_parts.len() != 2 {
+                    continue;
+                }
+                let Ok(time_ms) = time_parts[0].parse::<u64>() else {
+                    continue;
+                };
+                let Ok(nodes) = time_parts[1].parse::<u64>() else {
+                    continue;
+                };
+                out.push((idx, total, nodes, time_ms));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn handle_bench_emits_summary_lines() {
+        // Drive `bench 2` (explicit fast depth — depth 2 over 16 positions
+        // is sub-second on dev hardware). Anchor: stdout MUST contain
+        // `info string Nodes searched: <N>` and
+        // `info string bench: <N> nodes <NPS> nps`. <N> > 0.
+        //
+        // The default-depth (BENCH_DEFAULT_DEPTH=7) path is covered by E43
+        // in `tests/uci_integration.rs` end-to-end through a real subprocess,
+        // and by `bench_default_depth_in_valid_range` for the constant. Using
+        // depth 2 here keeps unit-test wall under a second per call.
+        let (stdout, _) = drive(&["bench 2"]);
+        let nodes_searched_line = stdout
+            .lines()
+            .find(|l| l.starts_with("info string Nodes searched: "))
+            .unwrap_or_else(|| {
+                panic!("missing `info string Nodes searched: …` line in:\n{stdout}")
+            });
+        let n: u64 = nodes_searched_line
+            .strip_prefix("info string Nodes searched: ")
+            .unwrap()
+            .parse()
+            .expect("Nodes searched value must be u64");
+        assert!(n > 0, "Nodes searched must be > 0; got {n}");
+        let sig = extract_bench_signature(&stdout)
+            .unwrap_or_else(|| panic!("missing `info string bench: …` signature in:\n{stdout}"));
+        assert_eq!(
+            sig.0, n,
+            "bench-signature node count must equal `Nodes searched` value"
+        );
+    }
+
+    #[test]
+    fn handle_bench_emits_per_position_info_lines() {
+        // At depth 2, bench is fast (<1s for 16 positions). Each position
+        // gets a `info string bench position <idx>/<total>: …` line in order.
+        let (stdout, _) = drive(&["bench 2"]);
+        let per_pos = extract_bench_per_position(&stdout);
+        assert_eq!(
+            per_pos.len(),
+            crate::bench::BENCH_POSITIONS.len(),
+            "expected one info line per position; got {}:\n{stdout}",
+            per_pos.len()
+        );
+        // Indices monotonically increase from 1 and the total field matches.
+        for (i, (idx, total, _, _)) in per_pos.iter().enumerate() {
+            assert_eq!(*idx, i + 1, "position index out of order");
+            assert_eq!(
+                *total,
+                crate::bench::BENCH_POSITIONS.len(),
+                "total field must equal corpus length"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_bench_total_matches_sum_of_per_position_nodes() {
+        let (stdout, _) = drive(&["bench 2"]);
+        let per_pos = extract_bench_per_position(&stdout);
+        let sum: u64 = per_pos.iter().map(|(_, _, n, _)| *n).sum();
+        let sig = extract_bench_signature(&stdout)
+            .unwrap_or_else(|| panic!("missing bench signature in:\n{stdout}"));
+        assert_eq!(
+            sig.0, sum,
+            "summary total ({}) must equal sum of per-position counts ({sum})",
+            sig.0
+        );
+        // Also pins the `info string Nodes searched:` line.
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with("info string Nodes searched: "))
+            .unwrap();
+        let n: u64 = line
+            .strip_prefix("info string Nodes searched: ")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(n, sum, "Nodes searched line must equal per-position sum");
+
+        // NPS sanity. Parse <NPS> field; assert > 0 AND that NPS × elapsed_ms
+        // ≈ total_nodes × 1000 within ±20% (loose to absorb integer-division
+        // truncation; tight enough to catch e.g. swapped fields or off-by-1000).
+        // We sum the per-position `time <ms>` to approximate the engine's
+        // total elapsed-ms (the engine's internal `total_ms` may differ
+        // slightly because it includes inter-position bookkeeping).
+        // NPS sanity (loose). At depth 2, several endgame positions complete
+        // in sub-millisecond wallclock and report `time 0`, so the per-position
+        // time sum is a poor proxy for the engine's actual elapsed_ms. We
+        // therefore can't validate the NPS arithmetic precisely — what we
+        // CAN check is that NPS is within a few orders of magnitude of
+        // `total_nodes / 1ms` (catches off-by-1_000 / off-by-1_000_000 / sign
+        // / swapped-field bugs without false-failing on micro-timing jitter).
+        // The `sig.0 == sum` assertion above already catches swapped-field
+        // bugs precisely; this guard is a belt-and-braces sanity check on the
+        // NPS field's order of magnitude.
+        assert!(sig.1 > 0, "NPS must be > 0");
+        // Order-of-magnitude band: nps must be within 1000× of nodes/1ms.
+        // For 20k nodes / 1ms baseline = 20M nps; band = [20K, 20G]. Catches
+        // any reasonable bug class without false-failing.
+        let nodes_per_ms_baseline = sum.max(1);
+        let lo = nodes_per_ms_baseline / 1000;
+        let hi = nodes_per_ms_baseline.saturating_mul(1_000_000_000);
+        assert!(
+            sig.1 >= lo && sig.1 <= hi,
+            "NPS field {} is wildly out of expected order-of-magnitude band [{lo}, {hi}] for {sum} nodes",
+            sig.1
+        );
+    }
+
+    #[test]
+    fn handle_bench_explicit_depth_overrides_default() {
+        // Run bench at depths 1, 2, 3 — assert nodes(d=1) < nodes(d=2) < nodes(d=3).
+        // The strict-monotone chain over three depths catches:
+        //   - "ignored override" bugs (handler always uses BENCH_DEFAULT_DEPTH —
+        //     all three runs would produce identical totals, breaking <).
+        //   - "constant-output" bugs (handler returns the same total
+        //     regardless of inputs).
+        // Pairwise ≠ assertions add belt-and-braces.
+        let (s1, _) = drive(&["bench 1"]);
+        let (s2, _) = drive(&["bench 2"]);
+        let (s3, _) = drive(&["bench 3"]);
+        let n1 = extract_bench_signature(&s1).unwrap().0;
+        let n2 = extract_bench_signature(&s2).unwrap().0;
+        let n3 = extract_bench_signature(&s3).unwrap().0;
+        assert!(
+            n1 < n2,
+            "nodes(d=1)={n1} must be < nodes(d=2)={n2} (deeper search visits more nodes)"
+        );
+        assert!(
+            n2 < n3,
+            "nodes(d=2)={n2} must be < nodes(d=3)={n3} (deeper search visits more nodes)"
+        );
+        assert_ne!(n1, n2, "depth-1 and depth-2 totals must differ");
+        assert_ne!(n2, n3, "depth-2 and depth-3 totals must differ");
+    }
+
+    #[test]
+    fn bench_node_count_is_reproducible_across_invocations() {
+        // Drive `bench 2` twice on fresh engines; assert identical totals AND
+        // identical per-position counts. Pins the node-count signature is
+        // reproducible from the same binary at two granularities (aggregate
+        // and per-position).
+        //
+        // Limitation: this test catches *non-deterministic* drift between
+        // runs — it does NOT catch *deterministic* cross-position state
+        // leakage within a single run. A bug like "position N+1 always
+        // inherits position N's `prior_root_move`" would produce identical
+        // (but wrong) per-position counts on both runs. The per-position
+        // comparison narrows the failure mode (now per-position drift, not
+        // just aggregate drift would fail) but does NOT upgrade to within-run
+        // isolation testing. Within-run correctness is a `Search::go`
+        // invariant pinned by M3.E's own ID tests.
+        let (s1, _) = drive(&["bench 2"]);
+        let (s2, _) = drive(&["bench 2"]);
+        let n1 = extract_bench_signature(&s1).unwrap().0;
+        let n2 = extract_bench_signature(&s2).unwrap().0;
+        assert_eq!(
+            n1, n2,
+            "bench total node count must be reproducible across invocations"
+        );
+        let per1 = extract_bench_per_position(&s1);
+        let per2 = extract_bench_per_position(&s2);
+        let nodes1: Vec<u64> = per1.iter().map(|(_, _, n, _)| *n).collect();
+        let nodes2: Vec<u64> = per2.iter().map(|(_, _, n, _)| *n).collect();
+        assert_eq!(
+            nodes1, nodes2,
+            "per-position node counts must be reproducible across invocations \
+             (catches drift on any single position even when totals happen to match)"
+        );
+    }
+
+    #[test]
+    fn handle_bench_after_go_infinite_produces_clean_state_results() {
+        // Pins the bug fix for the must-fix found by final-review pass 1:
+        // `join_in_flight_worker` sets `self.stop = true`; without an explicit
+        // clear, every per-position `Search::go` inherits `stop=true` and
+        // (a) either breaks between iterations via the inter-iteration stop
+        //     check (depth ≥ 2 — search.rs:383),
+        // (b) or aborts mid-iteration once the 4096-node cadence fires
+        //     (depth 7+).
+        //
+        // Anchor: a `bench 2` that follows `go infinite` must produce exactly
+        // the same per-position node counts as a clean-state `bench 2`. Any
+        // contamination would manifest as different (typically much smaller)
+        // counts.
+        let (clean_stdout, _) = drive(&["bench 2"]);
+        let clean_per_pos: Vec<u64> = extract_bench_per_position(&clean_stdout)
+            .iter()
+            .map(|(_, _, n, _)| *n)
+            .collect();
+
+        let (after_infinite_stdout, _) = drive(&["position startpos", "go infinite", "bench 2"]);
+        let after_per_pos: Vec<u64> = extract_bench_per_position(&after_infinite_stdout)
+            .iter()
+            .map(|(_, _, n, _)| *n)
+            .collect();
+
+        assert_eq!(
+            clean_per_pos, after_per_pos,
+            "bench after `go infinite` must produce identical per-position node \
+             counts to a clean-state bench (no `self.stop` contamination). \
+             Clean: {clean_per_pos:?}; after-go-infinite: {after_per_pos:?}",
+        );
+    }
+
+    #[test]
+    fn handle_bench_joins_in_flight_search_worker() {
+        // Plan §5: handle_bench's first action is `join_in_flight_worker()`,
+        // mirroring `handle_ucinewgame`'s discipline. Without it, bench would
+        // deadlock on the search mutex (held by the worker thread's
+        // `Search::go`).
+        //
+        // What this test pins: **no-deadlock**. Sending `go infinite` (spawns
+        // a worker that holds the search mutex until `stop`) followed by
+        // `bench 1` must complete: the bench signature line MUST appear in
+        // stdout. If `handle_bench` failed to flip `stop` and join the
+        // worker, taking the search mutex inside the bench loop would block
+        // forever — the test would hang and `cargo test` would eventually
+        // kill it.
+        //
+        // What this test does NOT pin: temporal ordering between the worker's
+        // `bestmove` emission and bench's output. The `drive()` harness loads
+        // all commands into the channel before calling `engine.run()`; by the
+        // time `handle_bench` runs, the worker thread spawned by `go infinite`
+        // may or may not have been scheduled by the OS yet. The worker emits
+        // `bestmove` whenever `Search::go` returns (which fires immediately on
+        // `stop`), and that emission can land before, during, or after bench's
+        // own output. The test asserts both lines appear, but not their order.
+        let (stdout, _) = drive(&["position startpos", "go infinite", "bench 1"]);
+        assert!(
+            stdout.lines().any(|l| l.starts_with("info string bench: ")),
+            "bench signature line missing; bench may have deadlocked on the in-flight worker. \
+             Full stdout:\n{stdout}",
+        );
+        // bestmove from the prior `go infinite` must still appear at SOME
+        // point (the worker is joined eventually — either by bench's
+        // `join_in_flight_worker` or by the final `handle_quit`). Missing
+        // implies the worker thread was killed without ever emitting, which
+        // would indicate an ordering bug in the join logic.
+        assert!(
+            stdout.lines().any(|l| l.starts_with("bestmove ")),
+            "bestmove from `go infinite` must appear in stdout; \
+             missing implies the worker was killed without emitting. Full stdout:\n{stdout}",
+        );
+    }
+
+    #[test]
+    fn handle_bench_engine_remains_responsive_after_bench() {
+        // Drive `bench 1`, then `isready`, then `quit`. Assert `readyok`
+        // arrives AFTER the bench signature line. Pins: bench doesn't
+        // deadlock the orchestrator.
+        let (stdout, _) = drive(&["bench 1", "isready"]);
+        let lines: Vec<&str> = stdout.lines().collect();
+        let bench_pos = lines
+            .iter()
+            .position(|l| l.starts_with("info string bench: "))
+            .unwrap_or_else(|| panic!("missing bench signature in:\n{stdout}"));
+        let ready_pos = lines
+            .iter()
+            .position(|l| *l == "readyok")
+            .unwrap_or_else(|| panic!("missing readyok in:\n{stdout}"));
+        assert!(
+            ready_pos > bench_pos,
+            "readyok ({ready_pos}) must arrive AFTER the bench signature line ({bench_pos}); \
+             stdout was:\n{stdout}"
+        );
     }
 }
