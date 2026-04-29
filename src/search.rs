@@ -1335,7 +1335,7 @@ fn score_to_uci(score: i32) -> String {
 /// severs the repetition chain. The `history.len() - 1` cap is the
 /// safety bound — `halfmove_clock` is loaded from FEN and may exceed
 /// the history depth the engine has actually observed.
-pub(crate) fn is_repetition(history: &[u64], halfmove_clock: u8) -> bool {
+pub fn is_repetition(history: &[u64], halfmove_clock: u8) -> bool {
     let Some((&current, prior)) = history.split_last() else {
         return false;
     };
@@ -1492,7 +1492,7 @@ pub(crate) fn max_depth_from_limits(limits: &SearchLimits) -> u32 {
 /// always claim it, so the position is effectively a draw at the search
 /// horizon. The 75-move auto-draw (FIDE 9.6.2, 150 plies) is not
 /// separately handled; we cross the claim threshold first.
-pub(crate) fn is_fifty_move_draw(halfmove_clock: u8) -> bool {
+pub fn is_fifty_move_draw(halfmove_clock: u8) -> bool {
     halfmove_clock >= 100
 }
 
