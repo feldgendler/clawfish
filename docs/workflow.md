@@ -23,7 +23,7 @@ The cycle:
 9. **Pre-review mechanical checks.** Orchestrator runs `cargo fmt --check`, `cargo clippy`, `cargo llvm-cov`, `cargo mutants --in-diff` on the unit's diff. Triages each mutation survivor (caught / equivalent / deferred / catchable-by-adding-test) per "Pre-review mechanical checks" under "Final review loop" below. Surfaces the analysis in the reviewer's spawn prompt.
 10. **Final review loop on code + tests jointly.** Independent reviewer reads code + tests + plan + the orchestrator's mechanical-check analysis. Judges correctness, corner cases, code quality, readability, simplicity, performance considerations, AND whether the orchestrator's coverage-gap and mutation-survivor classifications are sound. Reviewer does NOT re-run cargo-mutants or cargo-llvm-cov — those are pre-review work. See "Final review loop" below.
 11. **Benchmark and profile.** Record results. Compare to previous baseline.
-12. **Commit.** Final step of the unit's loop. Conventional commit message describing what landed (e.g. `M1.A: project skeleton, square and bitboard primitives`). Stage only the files belonging to this unit; leave any unrelated in-flight work in the working tree alone. Do **not** push to remote — that's a separate explicit user action.
+12. **Commit + push.** Final step of the unit's loop. Conventional commit message describing what landed (e.g. `M1.A: project skeleton, square and bitboard primitives`). Stage only the files belonging to this unit; leave any unrelated in-flight work in the working tree alone. Push to `origin/main` after the commit lands; the project is on GitHub and the upstream branch tracks it.
 
 Skipping any review loop strips the project of its primary quality control (the user is no longer the per-step gate; the reviewers are). When the agent skips a step, it must justify in chat.
 
@@ -335,7 +335,7 @@ SPRT baselines are referenced by **annotated git tags**, not bare SHAs. A bare S
 - **Slug**: lowercase, hyphen-separated, describes the engine's *behavior* at the tagged commit — not the milestone the commit landed in. The behavior name is what makes the tag legible years later in an SPRT log; milestone numbers require cross-referencing the roadmap.
 - **Annotated, not lightweight** (`git tag -a`). The annotation explains what the tag marks: which behavior, when it was last in production, and why it's a useful reference point. Pre-formatted so `git tag -ln5 baseline/random-mover` reads cleanly without consulting the roadmap.
 - **Each tag is the commit when the named behavior was last in production** — i.e., the last commit on `main` before the next phase replaced it. Tagged once and never moved or deleted (immutable historical reference).
-- **Pushed to `origin` once the project has a remote** (currently no GitHub remote per the tooling backlog; tags live locally for now and will push on first `git push --tags`).
+- **Pushed to `origin`** (the project is on GitHub at `feldgendler/clawfish`; tags push via `git push --tags` after creation).
 
 Tags created so far:
 
