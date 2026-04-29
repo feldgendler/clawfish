@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M3.B complete; M3.C next — negamax + alpha-beta core.** Architectural commitments settled (see `docs/decisions/`).
+**Phase: M3.C complete; M3.D next — quiescence search.** Architectural commitments settled (see `docs/decisions/`).
 
 - M1: complete through M1.G (perft + criterion benchmark harness; 119 Mnps bulk on starting D4).
 - M2.A: complete — `Move::to_uci` + `Move::from_uci` + `UciMoveError`. Generate-and-match parsing.
@@ -15,14 +15,15 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 - M2.D: complete — `RandomMover` SplitMix64 random-mover + `Random_Seed` UCI option.
 - M2.E: complete — fastchess harness + `--compliance` 40/40 + 4 smoke games. M2 exit criterion met.
 - M3.A: complete — `eval` module + `GreedyMover` (depth-1 production search). PeSTO MG values, incremental `static_eval_white` per **ADR-0014**. Real `score cp` (e.g. `cp 36` from startpos).
-- M3.B: complete — `Engine::game_history: Vec<u64>` (full Polyglot Zobrist trajectory including current position; invariant `history.last() == position.zobrist()`); `SearchContext::history` cloned at `go`-spawn time; `pub(crate) is_repetition` + `is_fifty_move_draw` helpers in `src/search.rs`. Pure plumbing; GreedyMover unchanged; M3.C is the first consumer.
+- M3.B: complete — `Engine::game_history: Vec<u64>` + `is_repetition` + `is_fifty_move_draw` helpers in `src/search.rs`. Pure plumbing; first consumer is M3.C.
+- M3.C: complete — `AlphaBetaMover` replaces `GreedyMover`. Fail-soft negamax, `MATE = 30000`, mate-distance pruning, triangular PV, MVV-LVA, M3.B helpers consumed at `ply > 0`, 4096-node cancellation cadence + parallel `root_score` lockstep. **ADR-0013** codifies. **20-0 sweep** vs M3.A baseline at fixed depth 4. ~8.55 Mnps depth-8 from startpos.
 - Tooling/fuzzing: complete — `fuzz/` independent workspace + two `Arbitrary<String>` harnesses (`fuzz_fen`, `fuzz_uci`) + 35 fen + 30 uci hand-curated seed files + **ADR-0013**. Closes `docs/tooling-backlog.md` item #1. Saturation campaigns clean (2.28B + 0.89B execs, 0 unaddressed crashes). One real parser bug caught + fixed: `unreachable!()` in `parse_castling` for double-space inputs.
 
 For per-phase retrospectives ("what landed", implementation highlights, verification numbers), see `docs/milestones/`. The forward-looking milestone plan lives in `docs/roadmap.md`.
 
 ### What's next
 
-**M3.C — negamax + alpha-beta core.** Fail-soft negamax with `i32` scores. Mate scoring `MATE - ply` / `-(MATE - ply)`; UCI emit `score mate N` with full-moves conversion. Mate-distance pruning. Triangular PV table (~4 KB at MAX_PLY=64). MVV-LVA capture ordering; quiet moves in movegen order. Fixed depth via `go depth N` only (no ID, no time mgmt yet — single iteration). Calls `evaluate` at leaves (qsearch lands in M3.D). Replaces `GreedyMover` as the production `Search` impl; honors M3.B repetition / 50-move helpers at `ply > 0`. **ADR-0013** lands here. M3.C is the first phase to use the fastchess SPRT harness for change acceptance.
+**M3.D — quiescence search.** Stand-pat baseline (forbidden when in check). Captures + queen promotions extended at leaves (replaces M3.C's `depth == 0 → evaluate` short-circuit). In-check all-evasions. Terminal detection in qsearch (in-check + no-moves → mate). No delta pruning, no non-capture checks, no underpromotions (M4+ refinements). Restores tactical correctness past the search horizon. M3.D is also the chess-coder Sonnet+Opus parallel A/B calibration trigger (deferred from M3.C per the calibration log).
 
 ## How to pick up a new session
 

@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 0c32270988b848e356e2cf4de1fe21722537a58c7183f0062a2efbe396c7fa2b # shrinks to mut cmds = []
+cc cf48876cc7d6ca0ed20ac49d2571345b647e6db3de083d6960d378e88e21b750 # shrinks to mut cmds = [PonderHit, Go(GoParams { searchmoves: None, ponder: false, wtime: None, btime: None, winc: None, binc: None, movestogo: None, depth: None, nodes: None, mate: None, movetime: Some(1), infinite: false }), SetOption { name: "Il9ZC46jN_XOqEUJ2cL20Au", value: None }, Go(GoParams { searchmoves: None, ponder: false, wtime: None, btime: None, winc: None, binc: None, movestogo: None, depth: None, nodes: Some(97), mate: None, movetime: None, infinite: false }), SetOption { name: "Random_Seed", value: Some("583") }]

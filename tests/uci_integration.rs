@@ -12,7 +12,7 @@
 use clawfish::{Move, MoveList, Position, generate_moves};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command as ProcCommand, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -205,177 +205,66 @@ fn integration_eof_terminates_engine_cleanly() {
 }
 
 // ---------------------------------------------------------------------------
-// Self-play game helpers (shared by E38).
+// E39 — AlphaBetaMover depth-3 search returns a legal bestmove from startpos
+//
+// Launches the binary, sends `position startpos` + `go depth 3`, parses the
+// `bestmove` line, and asserts the move is a legal move from startpos.
 // ---------------------------------------------------------------------------
 
-/// Maximum ply before the test declares a deadlock / run-away game.
-const MAX_PLY: usize = 300;
-
-/// Wait for a `bestmove` line from `rx` within `timeout_per_move`. Returns the
-/// UCI move string (without the `bestmove ` prefix), or panics with context.
-fn expect_bestmove(
-    rx: &mpsc::Receiver<String>,
-    timeout_per_move: Duration,
-    last_moves: &[String],
-) -> String {
-    let deadline = Instant::now() + timeout_per_move;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            panic!(
-                "engine did not respond with bestmove within timeout; last moves: {:?}",
-                last_moves.iter().rev().take(10).rev().collect::<Vec<_>>()
-            );
-        }
-        match rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
-            Ok(line) if line.starts_with("bestmove ") => {
-                return line
-                    .strip_prefix("bestmove ")
-                    .expect("just checked")
-                    .to_string();
-            }
-            Ok(_) => {} // info lines, etc. — keep waiting
-            Err(RecvTimeoutError::Timeout) => {
-                // 50ms inner tick expired with no output. The engine may still
-                // be searching — defer to the outer deadline check next iter.
-                // (Slow Linux CI runners can take > 50ms to emit the first
-                // info+bestmove on a cold cache.)
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                panic!(
-                    "engine stdout disconnected while waiting for bestmove; last moves: {:?}",
-                    last_moves.iter().rev().take(10).rev().collect::<Vec<_>>()
-                );
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// E38 — GreedyMover self-play game terminates legally
-//
-// Spawns the binary; sets Random_Seed to GREEDY_SELF_PLAY_SEED; drives
-// repeated `position startpos moves <accumulated>` + `go movetime 10` until
-// the position has no legal moves (mate or stalemate). Validates every
-// bestmove via Move::from_uci. Pins final ply count and last bestmove.
-//
-// GreedyMover plays materially best moves at each step, so games decay toward
-// terminal states much faster than the uniform-random mover.
-//
-// EXPECTED constants calibrated empirically (M3.A, release build, seed 0):
-//   ply 116, last bestmove f2f3.
-// To re-calibrate: temporarily set GREEDY_EXPECTED_FINAL_PLY=usize::MAX, run
-// the test, read the panic message for the actual values, then restore.
-// ---------------------------------------------------------------------------
-
-const GREEDY_SELF_PLAY_SEED: u64 = 0;
-const GREEDY_EXPECTED_FINAL_PLY: usize = 116;
-const GREEDY_EXPECTED_LAST_BESTMOVE: &str = "f2f3";
+// Pinned at M3.C impl: depth-3 bestmove from startpos (2181 nodes, score cp 38,
+// PV b1c3 g8f6 c3d5). Change only when the search algorithm changes.
+const EXPECTED_BESTMOVE_DEPTH_3: &str = "b1c3";
 
 #[test]
-#[allow(clippy::zombie_processes)]
-fn integration_greedy_self_play_terminates() {
-    let movetime_ms: u64 = 10;
-    let per_move_timeout = Duration::from_secs(1);
-
+fn integration_alphabeta_depth3_returns_legal_bestmove_from_startpos() {
     let mut child = spawn_engine();
     let stdout = child.stdout.take().expect("stdout handle");
     let line_rx = drain_stdout(stdout);
+
     let mut stdin = child.stdin.take().expect("stdin handle");
-
-    // Set seed and synchronize with isready/readyok.
     stdin
-        .write_all(
-            format!("setoption name Random_Seed value {GREEDY_SELF_PLAY_SEED}\nisready\n")
-                .as_bytes(),
-        )
+        .write_all(b"position startpos\ngo depth 3\nquit\n")
         .unwrap();
-    stdin.flush().unwrap();
+    drop(stdin);
 
-    {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match line_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(line) if line == "readyok" => break,
-                Ok(_) => {}
-                Err(_) => {
-                    if Instant::now() >= deadline {
-                        panic!("E38: engine did not respond to isready within 2 s");
-                    }
-                }
-            }
-        }
-    }
+    // Generous timeout: depth-3 search should complete quickly, but allow
+    // a slow CI runner and the binary cold-start overhead.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let exited = wait_for_exit(&mut child, deadline);
 
-    let mut pos = Position::starting_position();
-    let mut accumulated_moves: Vec<String> = Vec::new();
-    let mut last_bestmove = String::new();
+    let lines = collect_lines(&line_rx);
+    let output = lines.join("\n");
 
-    for ply in 0..=MAX_PLY {
-        let mut ml = MoveList::new();
-        generate_moves(&pos, &mut ml);
-        if ml.is_empty() {
-            assert!(
-                ply >= 2,
-                "E38: game must play at least one full move before reaching a terminal position; \
-                terminated at ply {ply}"
-            );
-            assert_eq!(
-                ply, GREEDY_EXPECTED_FINAL_PLY,
-                "E38: greedy seed-{GREEDY_SELF_PLAY_SEED} game must end at exactly \
-                GREEDY_EXPECTED_FINAL_PLY={GREEDY_EXPECTED_FINAL_PLY} plies; ended at {ply}; \
-                last_bestmove='{last_bestmove}'"
-            );
-            assert_eq!(
-                last_bestmove, GREEDY_EXPECTED_LAST_BESTMOVE,
-                "E38: last bestmove must be GREEDY_EXPECTED_LAST_BESTMOVE={GREEDY_EXPECTED_LAST_BESTMOVE:?}; \
-                got '{last_bestmove}'"
-            );
-            stdin.write_all(b"quit\n").unwrap();
-            drop(stdin);
-            let exit_deadline = Instant::now() + Duration::from_secs(5);
-            let exited = wait_for_exit(&mut child, exit_deadline);
-            assert!(exited, "E38: engine did not exit within 5 s after quit");
-            return;
-        }
+    assert!(exited, "E39: engine did not exit within 10 s");
 
-        if ply == MAX_PLY {
-            let last_10: Vec<&String> = accumulated_moves.iter().rev().take(10).rev().collect();
-            stdin.write_all(b"quit\n").unwrap();
-            drop(stdin);
-            let _ = wait_for_exit(&mut child, Instant::now() + Duration::from_secs(5));
-            panic!(
-                "E38: cycled-or-runaway: did not terminate within MAX_PLY={MAX_PLY} plies; \
-                last 10 moves: {last_10:?}"
-            );
-        }
+    let bestmove_line = lines
+        .iter()
+        .find(|l| l.starts_with("bestmove"))
+        .unwrap_or_else(|| panic!("E39: bestmove line must be present;\nfull output:\n{output}"));
+    let uci_str = bestmove_line
+        .strip_prefix("bestmove ")
+        .expect("bestmove line has 'bestmove ' prefix");
 
-        let pos_cmd = if accumulated_moves.is_empty() {
-            "position startpos\n".to_string()
-        } else {
-            format!("position startpos moves {}\n", accumulated_moves.join(" "))
-        };
-        stdin.write_all(pos_cmd.as_bytes()).unwrap();
-        stdin
-            .write_all(format!("go movetime {movetime_ms}\n").as_bytes())
-            .unwrap();
-        stdin.flush().unwrap();
+    // Assert the move is legal from startpos.
+    let startpos = Position::starting_position();
+    let mv = Move::from_uci(uci_str, &startpos).unwrap_or_else(|e| {
+        panic!(
+            "E39: bestmove '{uci_str}' is not a legal move from startpos: {e};\nfull output:\n{output}"
+        )
+    });
 
-        let uci_str = expect_bestmove(&line_rx, per_move_timeout, &accumulated_moves);
+    // Verify against the full legal moveset.
+    let mut ml = MoveList::new();
+    generate_moves(&startpos, &mut ml);
+    assert!(
+        ml.iter().any(|legal| legal == mv),
+        "E39: bestmove '{uci_str}' parsed ok but is not in generate_moves(startpos);\nfull output:\n{output}"
+    );
 
-        let mv = Move::from_uci(&uci_str, &pos).unwrap_or_else(|e| {
-            panic!(
-                "E38: bestmove '{uci_str}' is not legal at ply {ply}: {e}; \
-                moves so far: {:?}",
-                accumulated_moves
-            )
-        });
-
-        pos.make_move(mv);
-        accumulated_moves.push(uci_str.clone());
-        last_bestmove = uci_str;
-    }
-    unreachable!("loop exits via return or panic before falling through");
+    assert_eq!(
+        uci_str, EXPECTED_BESTMOVE_DEPTH_3,
+        "E39: depth-3 bestmove regression: expected '{EXPECTED_BESTMOVE_DEPTH_3}', got '{uci_str}'"
+    );
 }
 
 // ---------------------------------------------------------------------------

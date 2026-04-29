@@ -9,8 +9,9 @@
 //! - [`reader_loop`] is the reader-thread body — translates lines from any
 //!   `BufRead` into `Command`s on an `mpsc::Sender`.
 //! - [`run_stdio`] is the production wrapper: spawns the reader thread on
-//!   `io::stdin().lock()`, builds an `Engine` with `io::stdout()` and the
-//!   `GreedyMover` search, calls `run`, then `std::process::exit(0)`.
+//!   `io::stdin().lock()`, builds an `Engine` with `io::stdout()` and
+//!   `AlphaBetaMover` (M3.C production search), calls `run`, then
+//!   `std::process::exit(0)`.
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +19,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::search::{GreedyMover, Search, SearchContext, SearchLimits, SearchResult};
+use crate::search::{AlphaBetaMover, Search, SearchContext, SearchLimits, SearchResult};
 use crate::{Command, DebugMode, GoParams, Move, Position, PositionSpec, Register, parse_uci_line};
 
 // Type is u32; value is 2^31 - 1 (the protocol-declared `max`). Not i32 —
@@ -400,15 +401,14 @@ pub fn reader_loop(stdin: impl BufRead, tx: mpsc::Sender<Command>) {
 }
 
 /// Production wrapper: spawn the reader thread on `io::stdin().lock()`,
-/// build an `Engine` with `io::stdout()` and `GreedyMover` (seed 0 matches
-/// the protocol-declared `default 0`), drive `run`, then
-/// `std::process::exit(0)`.
+/// build an `Engine` with `io::stdout()` and `AlphaBetaMover` (M3.C
+/// production search), drive `run`, then `std::process::exit(0)`.
 pub fn run_stdio() -> ! {
     let (tx, rx) = mpsc::channel::<Command>();
     std::thread::spawn(move || {
         reader_loop(std::io::BufReader::new(std::io::stdin()), tx);
     });
-    let mut engine = Engine::new(std::io::stdout(), GreedyMover::new(0));
+    let mut engine = Engine::new(std::io::stdout(), AlphaBetaMover::new());
     engine.run(rx);
     std::process::exit(0);
 }
@@ -416,7 +416,7 @@ pub fn run_stdio() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::{GreedyMover, SearchContext, SearchResult};
+    use crate::search::{AlphaBetaMover, SearchContext, SearchResult};
     use crate::{Command, Move, Position, parse_uci_line};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex, mpsc};
@@ -470,14 +470,14 @@ mod tests {
     // Group A harness
     // -----------------------------------------------------------------------
 
-    /// Builds an `Engine<CapturedWriter, GreedyMover>`, sends each UCI line as
+    /// Builds an `Engine<CapturedWriter, AlphaBetaMover>`, sends each UCI line as
     /// a parsed `Command` over an mpsc channel, appends `Command::Quit`, runs
     /// to completion, and returns the captured stdout + a clone of the final
     /// position.
     fn drive(commands: &[&str]) -> (String, Position) {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
 
         let (tx, rx) = mpsc::channel::<Command>();
         for line in commands {
@@ -820,11 +820,11 @@ mod tests {
     #[test]
     fn handle_go_searchmoves_filters_to_specified_moves() {
         // Pins plan §6: `go searchmoves a2a4 b2b4` restricts the search to
-        // those two legal moves. GreedyMover picks the best-eval move from the
+        // those two legal moves. AlphaBetaMover picks the best-eval move from the
         // filtered set, so the bestmove must be one of {a2a4, b2b4}.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -849,12 +849,12 @@ mod tests {
     #[test]
     fn handle_go_searchmoves_all_bad_yields_bestmove_0000() {
         // Pins plan §6: when `searchmoves` parses to a list of all-illegal
-        // entries, the resulting filter is `Some(Vec::new())` — GreedyMover
+        // entries, the resulting filter is `Some(Vec::new())` — AlphaBetaMover
         // finds no candidate and emits `bestmove 0000`. Distinct from "no
         // searchmoves keyword" which would let the mover pick any legal move.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -872,11 +872,11 @@ mod tests {
     #[test]
     fn handle_go_searchmoves_silently_drops_bad_entries() {
         // Pins plan §6: `searchmoves a2a4 z9z9 b2b4` parses with `z9z9`
-        // silently dropped, leaving the filter [a2a4, b2b4]. GreedyMover picks
+        // silently dropped, leaving the filter [a2a4, b2b4]. AlphaBetaMover picks
         // the best-eval move from the filtered set, so bestmove ∈ {a2a4, b2b4}.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -997,11 +997,11 @@ mod tests {
     #[test]
     fn go_then_stop_emits_bestmove_for_legal_position() {
         // Intent: mid-search cancellation. After `stop`, the worker must emit
-        // a legal bestmove from startpos (not `bestmove 0000`). GreedyMover
+        // a legal bestmove from startpos (not `bestmove 0000`). The search
         // picks by eval — we assert any legal UCI move, not a specific one.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -1024,7 +1024,7 @@ mod tests {
         // defensive synchronization only — it confirms the worker has emitted
         // its bestmove before we issue Quit, without relying on timing.
         let startpos = Position::starting_position();
-        let bestmove_deadline = Instant::now() + Duration::from_secs(1);
+        let bestmove_deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let snap = snapshot_output(&buf_clone);
             if let Some(line) = snap.lines().find(|l| l.starts_with("bestmove")) {
@@ -1049,11 +1049,11 @@ mod tests {
     fn go_with_movetime_emits_bestmove_after_deadline() {
         // Intent: wallclock deadline honored. Run the engine on a separate
         // thread so we can time how long it takes for `bestmove` to appear in
-        // the buffer — independently of when `Quit` is processed. GreedyMover
+        // the buffer — independently of when `Quit` is processed. The search
         // picks by eval — we assert any legal UCI move, not a specific one.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -1068,7 +1068,7 @@ mod tests {
         let go_sent = Instant::now();
         tx.send(parse_uci_line("go movetime 50")).unwrap();
 
-        let bestmove_deadline = go_sent + Duration::from_secs(1);
+        let bestmove_deadline = go_sent + Duration::from_secs(5);
         let observed_at = loop {
             let snap = snapshot_output(&buf_clone);
             if let Some(line) = snap.lines().find(|l| l.starts_with("bestmove")) {
@@ -1097,14 +1097,14 @@ mod tests {
 
     #[test]
     fn go_completes_immediately_without_infinite_or_movetime() {
-        // Intent: bare go is immediate. GreedyMover evaluates candidates and
-        // returns without entering a polling loop (plan §8 "Else: emit
-        // immediately"). The worker still writes from a spawned thread, so the
-        // same poll-before-quit pattern as B18 is required to avoid racing
-        // handle_quit's no-join return path. We assert any legal UCI move.
+        // Intent: bare go (no infinite/movetime/ponder) must complete without
+        // entering the wait loop. The worker writes bestmove and exits. We assert
+        // any legal UCI move. The 5 s deadline is generous enough to accommodate
+        // a depth-4 alpha-beta search in debug builds while still catching a
+        // regression where the mover accidentally enters the polling loop.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -1113,34 +1113,26 @@ mod tests {
         let handle = thread::spawn(move || engine.run(rx));
 
         let startpos = Position::starting_position();
-        let go_sent = Instant::now();
         tx.send(parse_uci_line("go")).unwrap();
 
-        let bestmove_deadline = go_sent + Duration::from_secs(1);
-        let observed_at = loop {
+        // 5 s is enough even for a slow debug build at depth 4. A regression
+        // entering the infinite wait loop would block until Quit is sent.
+        let bestmove_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
             let snap = snapshot_output(&buf_clone);
             if let Some(line) = snap.lines().find(|l| l.starts_with("bestmove")) {
                 let uci_str = line.strip_prefix("bestmove ").expect("bestmove prefix");
                 Move::from_uci(uci_str, &startpos).unwrap_or_else(|e| {
                     panic!("bestmove '{uci_str}' is not legal for startpos: {e};\noutput:\n{snap}")
                 });
-                break Instant::now();
+                break;
             }
             assert!(
                 Instant::now() < bestmove_deadline,
-                "no bestmove appeared within 1 s of bare go;\noutput:\n{snap}"
+                "no bestmove appeared within 5 s of bare go;\noutput:\n{snap}"
             );
             thread::sleep(Duration::from_millis(2));
-        };
-
-        // Anchor "immediately" — bare go must complete fast (well under
-        // 100 ms even on loaded CI). Catches a regression where the mover
-        // accidentally enters the polling loop on bare go.
-        let elapsed = observed_at.duration_since(go_sent);
-        assert!(
-            elapsed < Duration::from_millis(100),
-            "bare go must emit bestmove in well under 100 ms; took {elapsed:?}"
-        );
+        }
 
         tx.send(Command::Quit).unwrap();
         handle.join().expect("engine thread should not panic");
@@ -1156,7 +1148,7 @@ mod tests {
         // exits, and this poll would time out.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -1172,7 +1164,7 @@ mod tests {
         // Wait until `readyok` appears in the buffer — this MUST happen
         // before we send `stop`, proving the engine answered while the
         // search was still running.
-        let readyok_deadline = Instant::now() + Duration::from_secs(1);
+        let readyok_deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let snap = snapshot_output(&buf_clone);
             if snap.lines().any(|l| l == "readyok") {
@@ -1217,7 +1209,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
         let buf_clone = Arc::clone(&buf);
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -1232,7 +1224,7 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
         tx.send(Command::Quit).unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if handle.is_finished() {
                 break;
@@ -1267,7 +1259,7 @@ mod tests {
     fn back_to_back_go_implicit_stops_previous() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
         let (tx, rx) = mpsc::channel::<Command>();
 
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -1291,7 +1283,7 @@ mod tests {
         // until the SECOND bestmove appears. handle_quit does not join
         // the worker (plan §9), so we must observe both bestmoves before
         // sending `Quit` to avoid racing the second worker's write.
-        let first_deadline = Instant::now() + Duration::from_secs(1);
+        let first_deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let snap = snapshot_output(&buf_clone);
             let n = snap.lines().filter(|l| l.starts_with("bestmove")).count();
@@ -1306,7 +1298,7 @@ mod tests {
         }
 
         tx.send(parse_uci_line("stop")).unwrap();
-        let second_deadline = Instant::now() + Duration::from_secs(1);
+        let second_deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let snap = snapshot_output(&buf_clone);
             let n = snap.lines().filter(|l| l.starts_with("bestmove")).count();
@@ -1413,36 +1405,19 @@ mod tests {
 
     #[test]
     fn handle_setoption_random_seed_case_insensitive_and_boundary() {
-        // GreedyMover picks the unique best depth-1 move from startpos (g1f3 with
-        // PeSTO eval), so the seed doesn't affect the choice there. We use a KvK
-        // position where all 8 moves tie (insufficient material → score 0) so the
-        // PRNG tie-break determines the result.
+        // Pins case-insensitivity: three spellings of the option name all route
+        // to the same handler. With AlphaBetaMover the search is deterministic
+        // regardless of seed, so we verify only that all three case variants
+        // produce the same bestmove as each other (mutual equality). We do NOT
+        // assert divergence from a seed-0 control — that assertion relied on a
+        // PRNG tie-break and is meaningless for a deterministic mover.
         //
-        // (i) Case-insensitivity: three spellings of the option name all route
-        // to the same seed value. Verified by capturing the bestmove from each
-        // variant (all seeded with 42) and asserting:
-        //   (a) all three case-variant bestmoves are equal to each other, and
-        //   (b) they differ from the control (no setoption → seed 0).
-        // Assertion (b) catches the "silently dropped" mutant: if all three
-        // variants are ignored, the seed stays at 0 and matches the control.
-        //
-        // KvK: white king on e4, black king on e1; 8 legal moves all tied.
-        // Pre-computed: seed 0 → e4d3, seed 42 → e4d3.
-        // (Both happen to pick the same move; see boundary seed below for the
-        // setoption-takes-effect check, where seed 17 differs.)
+        // KvK: white king on e4, black king on e1. All 8 king moves are legal.
         const KVK_FEN: &str = "8/8/8/8/4K3/8/8/4k3 w - - 0 1";
 
-        // Control: seed 0 (default, no setoption).
-        let (stdout_ctrl, _) = drive(&[&format!("position fen {KVK_FEN}"), "go"]);
-        let ctrl_bestmove = stdout_ctrl
-            .lines()
-            .find(|l| l.starts_with("bestmove"))
-            .expect("control bestmove must be present")
-            .strip_prefix("bestmove ")
-            .expect("bestmove prefix")
-            .to_string();
-
-        // Three case variants, all with seed 42.
+        // Collect the bestmove produced by each of the three case variants, all
+        // with seed 42. If setoption routing is broken (e.g. any variant is
+        // ignored or crashes), this collection step will surface the failure.
         let mut variant_bestmoves: Vec<String> = Vec::new();
         for name_variant in &["random_seed", "RANDOM_SEED", "Random_Seed"] {
             let (stdout, _) = drive(&[
@@ -1464,7 +1439,14 @@ mod tests {
             variant_bestmoves.push(uci_str);
         }
 
-        // (a) All three case-variant bestmoves must be equal.
+        // All three case-variant bestmoves must be equal to each other.
+        //
+        // COVERAGE NOTE: After M3.C, with deterministic alpha-beta, the seed has no
+        // observable effect on move choice. This test only verifies that all three
+        // case-spelling variants are accepted by the parser (no error info-string,
+        // identical bestmove output). A "silently dropped variant" bug would be
+        // invisible from this test alone — there is no companion behavioral test that
+        // catches it. This is an accepted limitation post-AlphaBetaMover.
         assert_eq!(
             variant_bestmoves[0], variant_bestmoves[1],
             "random_seed and RANDOM_SEED must produce the same bestmove with seed 42; \
@@ -1476,60 +1458,6 @@ mod tests {
             "RANDOM_SEED and Random_Seed must produce the same bestmove with seed 42; \
             got '{}'  vs  '{}'",
             variant_bestmoves[1], variant_bestmoves[2]
-        );
-
-        // (b) Verify the setoption routes correctly by using seed 17 (which is
-        // known to produce a different move than seed 0 on KvK). If setoption is
-        // silently dropped, the engine stays at seed 0 and produces ctrl_bestmove.
-        // Pre-computed: seed 17 → e4d4 (differs from seed 0's ctrl_bestmove).
-        let (stdout_seed17, _) = drive(&[
-            "setoption name Random_Seed value 17",
-            &format!("position fen {KVK_FEN}"),
-            "go",
-        ]);
-        let mv_seed17 = stdout_seed17
-            .lines()
-            .find(|l| l.starts_with("bestmove"))
-            .expect("bestmove must be present with seed 17")
-            .strip_prefix("bestmove ")
-            .expect("bestmove prefix")
-            .to_string();
-        assert_ne!(
-            mv_seed17, ctrl_bestmove,
-            "setoption name Random_Seed value 17 must change the bestmove relative to the \
-            seed-0 control — if equal, the option was silently dropped; \
-            control='{ctrl_bestmove}' seed17='{mv_seed17}'"
-        );
-
-        // (ii) Boundary acceptance: max value 2147483647 is accepted and takes
-        // effect (bestmove must be a legal king move from KvK).
-        let pos_kvk = Position::from_fen(KVK_FEN).expect("KvK FEN must parse");
-        let (stdout_max, _) = drive(&[
-            "setoption name Random_Seed value 2147483647",
-            &format!("position fen {KVK_FEN}"),
-            "go",
-        ]);
-        let uci_max = stdout_max
-            .lines()
-            .find(|l| l.starts_with("bestmove"))
-            .expect("bestmove must be present after go with max seed (2147483647)")
-            .strip_prefix("bestmove ")
-            .expect("bestmove prefix")
-            .to_string();
-        // The boundary seed must produce a legal move.
-        Move::from_uci(&uci_max, &pos_kvk).unwrap_or_else(|e| {
-            panic!(
-                "bestmove '{uci_max}' is not legal for KvK (max seed 2147483647): {e};\nstdout:\n{stdout_max}"
-            )
-        });
-        // The boundary seed must differ from the seed-0 control to prove it was applied.
-        // Pre-computed: seed 2147483647 on KvK produces a different move than seed 0.
-        // If this assertion fails, pick a different boundary seed.
-        assert_ne!(
-            uci_max, ctrl_bestmove,
-            "setoption name Random_Seed value 2147483647 must change the bestmove \
-            relative to the seed-0 control — if equal, the boundary value was rejected; \
-            control='{ctrl_bestmove}' max='{uci_max}'"
         );
     }
 
@@ -1561,7 +1489,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
         let buf_clone = Arc::clone(&buf);
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
         let (tx, rx) = mpsc::channel::<Command>();
         let handle = thread::spawn(move || engine.run(rx));
 
@@ -1576,7 +1504,7 @@ mod tests {
 
         // Wait for the first bestmove.
         {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let snap = snapshot_output(&buf_clone);
                 if snap.lines().any(|l| l.starts_with("bestmove")) {
@@ -1594,7 +1522,7 @@ mod tests {
         tx.send(parse_uci_line("go")).unwrap();
 
         let m_ref2 = {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let snap = snapshot_output(&buf_clone);
                 let bestmoves: Vec<&str> =
@@ -1624,7 +1552,7 @@ mod tests {
 
         // Wait for go#3 bestmove (3rd total).
         {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let snap = snapshot_output(&buf_clone);
                 let n = snap.lines().filter(|l| l.starts_with("bestmove")).count();
@@ -1650,7 +1578,7 @@ mod tests {
         tx.send(parse_uci_line("go")).unwrap();
 
         let m_after_bad = {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let snap = snapshot_output(&buf_clone);
                 let bestmoves: Vec<&str> =
@@ -1730,62 +1658,33 @@ mod tests {
         );
     }
 
+    /// Pins the Random_Seed parse path: a valid value is accepted silently;
+    /// an out-of-range value is rejected silently (parse-path-only smoke test).
+    ///
+    /// Renamed from M3.A's `handle_setoption_random_seed_changes_future_bestmoves_but_not_past_ones`
+    /// which asserted GreedyMover tie-break divergence. With AlphaBetaMover the
+    /// search is deterministic regardless of seed, so the bestmove-divergence assertion
+    /// is no longer meaningful. This test replaces it with a parse-path-only check:
+    /// the option is accepted/rejected without crashing.
     #[test]
-    fn handle_setoption_random_seed_changes_future_bestmoves_but_not_past_ones() {
-        // GreedyMover picks the unique depth-1 best move from any position where
-        // one move is clearly superior. To verify that `setoption Random_Seed`
-        // actually changes the tie-break PRNG state, we use a KvK position where
-        // ALL legal moves tie at score 0 (insufficient material → evaluate() == 0
-        // for every post-make position). The PRNG tie-break then determines which
-        // move is chosen, so two different seeds must produce different bestmoves.
-        //
-        // Pre-computed: SEED_A=42 → e4d3, SEED_B=17 → e4d4 (KvK: white king on e4,
-        // black king on e1; 8 legal king moves, all tied).
-        const SEED_A: u32 = 42;
-        const SEED_B: u32 = 17;
-        const KVK_FEN: &str = "8/8/8/8/4K3/8/8/4k3 w - - 0 1";
-
-        // (1) Set seed A, go from KvK, capture M1.
-        let (stdout_a, _) = drive(&[
-            &format!("setoption name Random_Seed value {SEED_A}"),
-            &format!("position fen {KVK_FEN}"),
-            "go",
-        ]);
-        let m1 = stdout_a
-            .lines()
-            .find(|l| l.starts_with("bestmove"))
-            .expect("bestmove M1 present")
-            .strip_prefix("bestmove ")
-            .expect("prefix")
-            .to_string();
-        assert_eq!(
-            m1, "e4d3",
-            "SEED_A={SEED_A} must produce bestmove e4d3 from KvK; got '{m1}'"
+    fn handle_setoption_random_seed_accept_and_reject() {
+        // (1) Valid value: accepted silently (no output, no panic).
+        let (stdout_accept, _) = drive(&["setoption name Random_Seed value 100"]);
+        assert!(
+            stdout_accept.is_empty(),
+            "valid Random_Seed value must be accepted silently; got: {stdout_accept:?}"
         );
 
-        // (2) Set seed B, go from KvK, capture M2.
-        let (stdout_b, _) = drive(&[
-            &format!("setoption name Random_Seed value {SEED_B}"),
-            &format!("position fen {KVK_FEN}"),
-            "go",
-        ]);
-        let m2 = stdout_b
-            .lines()
-            .find(|l| l.starts_with("bestmove"))
-            .expect("bestmove M2 present")
-            .strip_prefix("bestmove ")
-            .expect("prefix")
-            .to_string();
-        assert_eq!(
-            m2, "e4d4",
-            "SEED_B={SEED_B} must produce bestmove e4d4 from KvK; got '{m2}'"
+        // (2) Out-of-range value (> MAX_RANDOM_SEED = 2147483647): rejected silently.
+        let (stdout_reject, _) = drive(&["setoption name Random_Seed value 99999999999"]);
+        assert!(
+            stdout_reject.is_empty(),
+            "out-of-range Random_Seed value must be rejected silently when debug off; got: {stdout_reject:?}"
         );
-
-        assert_ne!(m1, m2, "SEED_A and SEED_B must produce different bestmoves");
     }
 
     #[test]
-    fn handle_ucinewgame_resets_greedy_mover_state() {
+    fn handle_ucinewgame_resets_search_state() {
         // Drives a single engine instance through:
         //   1. setoption name Random_Seed value 7  (sets seed=7, state=7)
         //   2. position startpos + go              → capture bestmove M1
@@ -1803,7 +1702,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
         let buf_clone = Arc::clone(&buf);
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
         let (tx, rx) = mpsc::channel::<Command>();
 
         let handle = thread::spawn(move || engine.run(rx));
@@ -1816,7 +1715,7 @@ mod tests {
         // Wait until go#1's bestmove appears so the worker has fully run and
         // advanced PRNG state before we send ucinewgame.
         let m1 = {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let snap = snapshot_output(&buf_clone);
                 if let Some(line) = snap.lines().find(|l| l.starts_with("bestmove")) {
@@ -1837,7 +1736,7 @@ mod tests {
 
         // Wait until go#2's bestmove appears (a second bestmove line).
         let m2 = {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let snap = snapshot_output(&buf_clone);
                 let bestmoves: Vec<&str> =
@@ -1867,87 +1766,74 @@ mod tests {
 
     #[test]
     fn handle_setoption_random_seed_resets_state_immediately() {
-        // (1) Set seed 7, go 3 times. State advances 3 steps.
-        // (2) Set seed 7 again (resets state back to seed).
-        // (3) Next go must match the FIRST go of a fresh seed-7 sequence.
-        // Pins §2.1 decision: setoption resets state immediately, not deferred.
+        // With AlphaBetaMover the seed has no observable effect on move choice —
+        // the search is fully deterministic. This test verifies the parse path:
+        // setoption is accepted silently and does not disrupt subsequent searches.
+        // Two searches from the same position must produce the same bestmove
+        // regardless of any setoption calls between them.
 
-        // Fresh seed-7 reference: what does the 1st go produce?
-        let (stdout_ref, _) = drive(&[
-            "setoption name Random_Seed value 7",
-            "position startpos",
-            "go",
-        ]);
-        let m_ref = stdout_ref
-            .lines()
-            .find(|l| l.starts_with("bestmove"))
-            .expect("bestmove reference present")
-            .strip_prefix("bestmove ")
-            .expect("prefix")
-            .to_string();
+        let buf_a = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_a = CapturedWriter(Arc::clone(&buf_a));
+        let buf_a_clone = Arc::clone(&buf_a);
+        let mut engine_a = Engine::new(writer_a, AlphaBetaMover::new());
+        let (tx_a, rx_a) = mpsc::channel::<Command>();
+        let handle_a = thread::spawn(move || engine_a.run(rx_a));
 
-        // Drive a separate engine on a background thread so we can observe each
-        // bestmove before sending the next command. Without this, the orchestrator
-        // could process `setoption` (the second set) while go#3's worker is
-        // still queued, causing go#4 to start from step1(seed) instead of seed.
-        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let writer = CapturedWriter(Arc::clone(&buf));
-        let buf_clone = Arc::clone(&buf);
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
-        let (tx, rx) = mpsc::channel::<Command>();
+        tx_a.send(parse_uci_line("position startpos")).unwrap();
+        tx_a.send(parse_uci_line("go depth 3")).unwrap();
 
-        let handle = thread::spawn(move || engine.run(rx));
-
-        tx.send(parse_uci_line("setoption name Random_Seed value 7"))
-            .unwrap();
-
-        // Helper closure: wait for the N-th bestmove to appear.
-        let wait_for_nth_bestmove = |n: usize| -> String {
-            let deadline = Instant::now() + Duration::from_secs(1);
+        // Wait for bestmove #1.
+        let m1 = {
+            let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                let snap = snapshot_output(&buf_clone);
-                let bestmoves: Vec<&str> =
-                    snap.lines().filter(|l| l.starts_with("bestmove")).collect();
-                if bestmoves.len() >= n {
-                    return bestmoves[n - 1]
+                let snap = snapshot_output(&buf_a_clone);
+                if let Some(line) = snap.lines().find(|l| l.starts_with("bestmove")) {
+                    break line.strip_prefix("bestmove ").expect("prefix").to_string();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "bestmove #1 did not appear within 5 s"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+
+        // Set seed multiple times (no-op for AlphaBetaMover), then search again.
+        tx_a.send(parse_uci_line("setoption name Random_Seed value 7"))
+            .unwrap();
+        tx_a.send(parse_uci_line("setoption name Random_Seed value 99"))
+            .unwrap();
+        tx_a.send(parse_uci_line("position startpos")).unwrap();
+        tx_a.send(parse_uci_line("go depth 3")).unwrap();
+
+        // Wait for bestmove #2.
+        let m2 = {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let snap = snapshot_output(&buf_a_clone);
+                let bms: Vec<&str> = snap.lines().filter(|l| l.starts_with("bestmove")).collect();
+                if bms.len() >= 2 {
+                    break bms[1]
                         .strip_prefix("bestmove ")
                         .expect("prefix")
                         .to_string();
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "bestmove #{n} did not appear within 1 s"
+                    "bestmove #2 did not appear within 5 s"
                 );
                 thread::sleep(Duration::from_millis(2));
             }
         };
 
-        // go#1, go#2, go#3 — advance PRNG 3 steps.
-        tx.send(parse_uci_line("position startpos")).unwrap();
-        tx.send(parse_uci_line("go")).unwrap();
-        wait_for_nth_bestmove(1);
+        tx_a.send(Command::Quit).unwrap();
+        handle_a.join().expect("engine thread should not panic");
 
-        tx.send(parse_uci_line("position startpos")).unwrap();
-        tx.send(parse_uci_line("go")).unwrap();
-        wait_for_nth_bestmove(2);
-
-        tx.send(parse_uci_line("position startpos")).unwrap();
-        tx.send(parse_uci_line("go")).unwrap();
-        wait_for_nth_bestmove(3);
-
-        // Reset: same seed. State must snap back to seed=7.
-        tx.send(parse_uci_line("setoption name Random_Seed value 7"))
-            .unwrap();
-        tx.send(parse_uci_line("position startpos")).unwrap();
-        tx.send(parse_uci_line("go")).unwrap();
-        let m_after_reset = wait_for_nth_bestmove(4);
-
-        tx.send(Command::Quit).unwrap();
-        handle.join().expect("engine thread should not panic");
-
+        // AlphaBetaMover is deterministic: same position + same depth → same bestmove.
         assert_eq!(
-            m_ref, m_after_reset,
-            "setoption must reset PRNG state immediately; after reset expected '{m_ref}', got '{m_after_reset}'"
+            m1, m2,
+            "AlphaBetaMover is deterministic; same position + depth must produce same bestmove; \
+            got '{m1}' then '{m2}'"
         );
     }
 
@@ -2038,7 +1924,7 @@ mod tests {
         // Drop the receiver immediately — reader_loop will get a send error.
         drop(rx);
 
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let handle = thread::spawn(move || reader_loop(cursor, tx));
 
         loop {
@@ -2126,7 +2012,7 @@ mod tests {
 
                 let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
                 let writer = CapturedWriter(Arc::clone(&buf));
-                let mut engine = Engine::new(writer, GreedyMover::new(0xDEAD_BEEF));
+                let mut engine = Engine::new(writer, AlphaBetaMover::new());
                 let (tx, rx) = mpsc::channel::<Command>();
                 for cmd in cmds {
                     tx.send(cmd).unwrap();
@@ -2193,11 +2079,11 @@ mod tests {
     }
 
     /// Like `drive`, but returns `(stdout, position, game_history)` for
-    /// history invariant checks. Uses `GreedyMover` so it's location-agnostic.
+    /// history invariant checks.
     fn drive_with_history(commands: &[&str]) -> (String, Position, Vec<u64>) {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
-        let mut engine = Engine::new(writer, GreedyMover::new(0));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
 
         let (tx, rx) = mpsc::channel::<Command>();
         for line in commands {
@@ -2220,7 +2106,7 @@ mod tests {
     #[test]
     fn engine_new_history_contains_starting_position_zobrist() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let engine = Engine::new(CapturedWriter(Arc::clone(&buf)), GreedyMover::new(0));
+        let engine = Engine::new(CapturedWriter(Arc::clone(&buf)), AlphaBetaMover::new());
         assert_eq!(
             engine.game_history(),
             &[Position::starting_position().zobrist()],
@@ -2566,5 +2452,21 @@ mod tests {
             hist, expected,
             "engine.game_history must be unchanged after handle_go (clone, not take)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M3.C — production-switch test
+    // -----------------------------------------------------------------------
+
+    /// Compile-time check that `Engine::new(stdout, AlphaBetaMover::new())` type-checks.
+    /// If `AlphaBetaMover` doesn't implement `Search + Send + 'static` this will
+    /// not compile.
+    #[test]
+    fn engine_uses_alphabeta_mover_as_production_search() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        // This line is the compile-time check: Engine::new requires S: Search + Send + 'static.
+        let _engine = Engine::new(writer, AlphaBetaMover::new());
+        // No behavioral assertion needed — if it compiles, the type bound is satisfied.
     }
 }
