@@ -61,6 +61,36 @@ fn collect_lines(rx: &mpsc::Receiver<String>) -> Vec<String> {
     lines
 }
 
+/// Wait for a line starting with `prefix` to appear in `rx`, accumulating
+/// captured lines into `accum`. Returns when found; panics on timeout.
+///
+/// Used by M3.E integration tests: under ID, the engine emits multiple `info`
+/// lines per `go` and the test must wait for the terminating `bestmove` line
+/// before sending `quit`. Sending `quit` before `bestmove` arrives flips the
+/// inter-iteration `stop` flag and aborts the ID loop early — the test sees
+/// only iteration 1's snapshot rather than the full requested depth.
+fn wait_for_line_starting_with(
+    rx: &mpsc::Receiver<String>,
+    prefix: &str,
+    deadline: Instant,
+    accum: &mut Vec<String>,
+) {
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                let matched = line.starts_with(prefix);
+                accum.push(line);
+                if matched {
+                    return;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    let captured = accum.join("\n");
+    panic!("timed out waiting for line starting with {prefix:?}; captured:\n{captured}");
+}
+
 /// Poll `child.try_wait()` until the process exits or `deadline` is reached.
 /// Returns `true` if the process exited naturally; calls `child.kill()` and
 /// returns `false` on timeout.
@@ -214,11 +244,12 @@ fn integration_eof_terminates_engine_cleanly() {
 // `bestmove` line, and asserts the move is a legal move from startpos.
 // ---------------------------------------------------------------------------
 
-// Pinned at M3.D impl: depth-3 bestmove from startpos changed to d2d4 (queen's pawn
-// opening) now that qsearch resolves capture sequences at the horizon. The M3.C pin
-// was b1c3. d2d4 is a sensible, non-hanging move. Change only when the search
-// algorithm changes.
-const EXPECTED_BESTMOVE_DEPTH_3: &str = "d2d4";
+// Pinned at M3.E impl: depth-3 bestmove from startpos changed from d2d4 (M3.D) to
+// g1f3 (M3.E). M3.E's iterative-deepening prior-PV hint at iteration 3 (using
+// iteration 2's bestmove) shifts the alpha-beta cutoff order, surfacing a
+// different equally-strong choice at the same evaluation. g1f3 is sensible and
+// not hanging. Change only when the search algorithm changes again.
+const EXPECTED_BESTMOVE_DEPTH_3: &str = "g1f3";
 
 #[test]
 fn integration_alphabeta_depth3_returns_legal_bestmove_from_startpos() {
@@ -227,20 +258,26 @@ fn integration_alphabeta_depth3_returns_legal_bestmove_from_startpos() {
     let line_rx = drain_stdout(stdout);
 
     let mut stdin = child.stdin.take().expect("stdin handle");
-    stdin
-        .write_all(b"position startpos\ngo depth 3\nquit\n")
-        .unwrap();
+    // Send commands progressively and wait for `bestmove` BEFORE sending
+    // `quit`. M3.E ID inter-iteration `stop` check would otherwise abort
+    // mid-search and return only iteration 1's bestmove (g1f3) instead of
+    // the depth-3 d2d4.
+    stdin.write_all(b"position startpos\ngo depth 3\n").unwrap();
+
+    let mut lines: Vec<String> = Vec::new();
+    let bestmove_deadline = Instant::now() + Duration::from_secs(10);
+    wait_for_line_starting_with(&line_rx, "bestmove", bestmove_deadline, &mut lines);
+
+    // Now safe to quit: the search has emitted bestmove and unwound.
+    stdin.write_all(b"quit\n").unwrap();
     drop(stdin);
 
-    // Generous timeout: depth-3 search should complete quickly, but allow
-    // a slow CI runner and the binary cold-start overhead.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(2);
     let exited = wait_for_exit(&mut child, deadline);
-
-    let lines = collect_lines(&line_rx);
+    lines.extend(collect_lines(&line_rx));
     let output = lines.join("\n");
 
-    assert!(exited, "E39: engine did not exit within 10 s");
+    assert!(exited, "E39: engine did not exit within 2 s after quit");
 
     let bestmove_line = lines
         .iter()
@@ -309,4 +346,188 @@ fn integration_unknown_command_silently_ignored() {
         vec!["readyok".to_string()],
         "expected exactly one line of output, 'readyok'; got {lines:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// E40 — `go wtime/btime` triggers ID and emits bestmove within budget (M3.E)
+// ---------------------------------------------------------------------------
+
+/// `go wtime 1000 btime 1000` from startpos must:
+/// - Trigger iterative deepening (≥ 1 `info depth N` line emitted).
+/// - Emit a `bestmove <uci>` line within 2 seconds wallclock.
+/// - The bestmove must be a legal move from startpos.
+#[test]
+fn integration_go_wtime_btime_completes_within_budget_and_emits_bestmove() {
+    let mut child = spawn_engine();
+    let stdout = child.stdout.take().expect("stdout handle");
+    let line_rx = drain_stdout(stdout);
+
+    let mut stdin = child.stdin.take().expect("stdin handle");
+    // wtime/btime=1000 with default MoveOverhead=50: caps = (50ms, 150ms).
+    // Send go, wait for bestmove, then quit.
+    stdin
+        .write_all(b"position startpos\ngo wtime 1000 btime 1000\n")
+        .unwrap();
+
+    let mut lines: Vec<String> = Vec::new();
+    let bestmove_deadline = Instant::now() + Duration::from_secs(3);
+    wait_for_line_starting_with(&line_rx, "bestmove", bestmove_deadline, &mut lines);
+
+    stdin.write_all(b"quit\n").unwrap();
+    drop(stdin);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let exited = wait_for_exit(&mut child, deadline);
+    lines.extend(collect_lines(&line_rx));
+    let output = lines.join("\n");
+
+    assert!(exited, "E40: engine did not exit within 2 s after quit");
+
+    let info_lines: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("info depth"))
+        .collect();
+    assert!(
+        !info_lines.is_empty(),
+        "E40: ID must emit at least one info depth line;\nfull output:\n{output}"
+    );
+
+    let bestmove_line = lines
+        .iter()
+        .find(|l| l.starts_with("bestmove"))
+        .unwrap_or_else(|| panic!("E40: bestmove line must be present;\nfull output:\n{output}"));
+    let uci_str = bestmove_line
+        .strip_prefix("bestmove ")
+        .expect("bestmove line has 'bestmove ' prefix");
+
+    let startpos = Position::starting_position();
+    let mv = Move::from_uci(uci_str, &startpos)
+        .unwrap_or_else(|e| panic!("E40: bestmove '{uci_str}' is not legal from startpos: {e}"));
+    let mut ml = MoveList::new();
+    generate_moves(&startpos, &mut ml);
+    assert!(
+        ml.iter().any(|legal| legal == mv),
+        "E40: bestmove '{uci_str}' must be in generate_moves(startpos)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E41 — MoveOverhead UCI option observably changes search budget (M3.E)
+// ---------------------------------------------------------------------------
+
+/// Set MoveOverhead to 500, then drive `go movetime 1000`. The search budget
+/// is `max(1, 1000 - 500) = 500ms`. The bestmove line must arrive within
+/// `[400ms, 700ms]` — the lower bound is "engine must NOT return before the
+/// soft cap" (UCI: don't return early), the upper bound is "soft + slack
+/// for CI jitter".
+#[test]
+fn integration_moveoverhead_subtracts_from_movetime_budget() {
+    let mut child = spawn_engine();
+    let stdout = child.stdout.take().expect("stdout handle");
+    let line_rx = drain_stdout(stdout);
+
+    let mut stdin = child.stdin.take().expect("stdin handle");
+
+    // Send commands progressively, measuring the start-time AT THE MOMENT
+    // we send `go`. This excludes engine startup overhead from the timing
+    // window — what we measure is genuinely the search-budget elapsed time.
+    stdin
+        .write_all(
+            b"setoption name MoveOverhead value 500\n\
+              position startpos\n",
+        )
+        .unwrap();
+    let start = Instant::now();
+    stdin.write_all(b"go movetime 1000\n").unwrap();
+
+    let mut lines: Vec<String> = Vec::new();
+    let bestmove_deadline = start + Duration::from_secs(3);
+    wait_for_line_starting_with(&line_rx, "bestmove", bestmove_deadline, &mut lines);
+    let elapsed_to_bestmove = start.elapsed();
+
+    stdin.write_all(b"quit\n").unwrap();
+    drop(stdin);
+
+    let exit_deadline = Instant::now() + Duration::from_secs(2);
+    let _exited = wait_for_exit(&mut child, exit_deadline);
+    lines.extend(collect_lines(&line_rx));
+    let output = lines.join("\n");
+    let _bestmove_line = lines
+        .iter()
+        .find(|l| l.starts_with("bestmove"))
+        .unwrap_or_else(|| panic!("E41: bestmove must be present;\nfull output:\n{output}"));
+
+    let elapsed = elapsed_to_bestmove;
+    // Window distinguishes MoveOverhead=500 (~500ms search) from a broken
+    // implementation that ignores MoveOverhead (would use default 50ms,
+    // search ~950ms). Correct impl: 500ms search + ~150ms subprocess
+    // overhead ≈ 650ms total. Broken impl: 950ms + ~150ms ≈ 1100ms.
+    //
+    // Lower bound 400ms: rejects an impl that returns immediately
+    // (`MoveOverhead` not parsed correctly, defaulting to "no time" or
+    // similar). Upper bound 1200ms: 100ms margin above broken-impl 1100ms
+    // expected; rejects the common bug "ignore MoveOverhead, use default 50".
+    // CI jitter past 1200ms is rare on the dev machine; bump the bound if
+    // CI flake materializes.
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "E41: bestmove arrived too early ({elapsed:?}); MoveOverhead=500 must enforce ≥ ~500ms budget"
+    );
+    assert!(
+        elapsed <= Duration::from_millis(1200),
+        "E41: bestmove arrived too late ({elapsed:?}); MoveOverhead=500 should produce ~500ms search \
+         (~650ms total). >1200ms suggests MoveOverhead=500 was not applied (e.g. default 50ms used → \
+         ~950ms search → ~1100ms total). If this fires under non-flake conditions on a slow CI runner, \
+         bump the bound."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E42 — ID emits one info depth N line per completed iteration (M3.E)
+// ---------------------------------------------------------------------------
+
+/// `go depth 4` from startpos must emit info lines for depths 1, 2, 3, and 4
+/// in that order. Pins the per-iteration emission contract.
+#[test]
+fn integration_id_emits_one_info_per_iteration() {
+    let mut child = spawn_engine();
+    let stdout = child.stdout.take().expect("stdout handle");
+    let line_rx = drain_stdout(stdout);
+
+    let mut stdin = child.stdin.take().expect("stdin handle");
+    stdin.write_all(b"position startpos\ngo depth 4\n").unwrap();
+
+    let mut lines: Vec<String> = Vec::new();
+    let bestmove_deadline = Instant::now() + Duration::from_secs(10);
+    wait_for_line_starting_with(&line_rx, "bestmove", bestmove_deadline, &mut lines);
+
+    stdin.write_all(b"quit\n").unwrap();
+    drop(stdin);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let exited = wait_for_exit(&mut child, deadline);
+    lines.extend(collect_lines(&line_rx));
+    let output = lines.join("\n");
+
+    assert!(exited, "E42: engine did not exit within 2 s after quit");
+
+    // Find each `info depth N ...` for N = 1..=4 in increasing order.
+    let mut last_idx: Option<usize> = None;
+    for d in 1u32..=4 {
+        let prefix = format!("info depth {d} ");
+        let idx = lines
+            .iter()
+            .position(|l| l.starts_with(&prefix))
+            .unwrap_or_else(|| {
+                panic!("E42: missing 'info depth {d} …' line;\nfull output:\n{output}")
+            });
+        if let Some(prev) = last_idx {
+            assert!(
+                idx > prev,
+                "E42: 'info depth {d}' (line {idx}) must come after 'info depth {}' (line {prev})",
+                d - 1
+            );
+        }
+        last_idx = Some(idx);
+    }
 }
