@@ -164,6 +164,19 @@ const INF: i32 = 30_001;
 /// is a mate score.
 const MATE_IN_MAX_PLY: i32 = MATE - MAX_PLY as i32; // 29_936
 
+/// Negates and swaps the alpha/beta window for a recursive negamax/qsearch call.
+///
+/// Negamax's recursive contract: child sees `(child_alpha, child_beta) =
+/// (-parent_beta, -parent_alpha)`. Extracting this into a named helper means
+/// the bound-negation is unit-testable in isolation and the call sites become
+/// `self.search(pos, negate_window(alpha, beta), ply+1, ctx)` instead of
+/// open-coded `(-beta, -alpha)` — which is bug-prone (deleting either `-`
+/// silently corrupts the search and is hard to catch via end-to-end tests at
+/// shallow recursion depth).
+fn negate_window(alpha: i32, beta: i32) -> (i32, i32) {
+    (-beta, -alpha)
+}
+
 /// Triangular PV table. Holds the best line found at each ply.
 ///
 /// `moves[ply]` is a slot-array; `lengths[ply]` is how many moves are populated.
@@ -339,20 +352,29 @@ impl AlphaBetaMover {
         mut beta: i32,
         ctx: &SearchContext,
     ) -> i32 {
-        use crate::eval::evaluate;
         use crate::movegen::{MoveList, generate_moves, in_check};
 
-        // 1. Cancellation poll at 4096-node cadence.
+        // 1. Clear this ply's PV slot. Stays BEFORE the depth==0 delegation so
+        //    even leaves reset their slot — otherwise a prior subtree at the
+        //    same ply could leave lengths[ply] > 0, which qsearch wouldn't
+        //    touch, and the parent's pv.update would copy stale child PV moves.
+        self.pv.clear_ply(ply as usize);
+
+        // 2. Horizon: delegate to qsearch BEFORE incrementing self.nodes.
+        //    qsearch's own per-frame increment + cancellation poll covers the leaf.
+        //    Preserves M3.C's "1 leaf = 1 node" budget under `go nodes <N>`.
+        if depth == 0 {
+            return self.qsearch(pos, alpha, beta, ply, ctx);
+        }
+
+        // 3. Per-frame nodes increment + cancellation poll (non-leaf only).
         self.nodes += 1;
         if self.nodes & 4095 == 0 && ctx.should_abort(self.nodes) {
             self.aborted = true;
             return 0;
         }
 
-        // 2. Clear PV slot at this ply so a no-improving-move return leaves length 0.
-        self.pv.clear_ply(ply as usize);
-
-        // 3. Repetition + 50-move draw checks — only at ply > 0 (root must pick a move).
+        // 4. Repetition + 50-move draw checks — only at ply > 0 (root must pick a move).
         if ply > 0 {
             if is_fifty_move_draw(pos.halfmove_clock()) {
                 return 0;
@@ -362,7 +384,7 @@ impl AlphaBetaMover {
             }
         }
 
-        // 4. Mate-distance pruning.
+        // 5. Mate-distance pruning.
         let mating_value = MATE - ply as i32;
         if mating_value < beta {
             beta = mating_value;
@@ -376,11 +398,6 @@ impl AlphaBetaMover {
             if beta <= mated_value {
                 return mated_value;
             }
-        }
-
-        // 5. Horizon: call evaluate directly (qsearch is M3.D).
-        if depth == 0 {
-            return evaluate(pos);
         }
 
         // 6. Generate moves.
@@ -419,7 +436,8 @@ impl AlphaBetaMover {
         for mv in moves_vec {
             let undo = pos.make_move(mv);
             self.history.push(pos.zobrist());
-            let score = -self.negamax(pos, depth - 1, ply + 1, -beta, -alpha, ctx);
+            let (child_alpha, child_beta) = negate_window(alpha, beta);
+            let score = -self.negamax(pos, depth - 1, ply + 1, child_alpha, child_beta, ctx);
             self.history.pop();
             pos.unmake_move(mv, undo);
 
@@ -475,6 +493,163 @@ impl AlphaBetaMover {
     pub(super) fn pv_root_for_test(&self) -> Vec<Move> {
         self.pv.moves[0][..self.pv.lengths[0]].to_vec()
     }
+
+    /// Quiescence search: extends the leaf evaluation with captures and queen
+    /// promotions until the position is quiet, restoring tactical correctness
+    /// past the negamax horizon. Called by negamax at `depth == 0`.
+    ///
+    /// Stand-pat (static eval as lower bound) is used when not in check.
+    /// In check, all legal evasions are searched; no stand-pat (unsound in check).
+    /// Captures + queen promotions only outside of check; full move list in check.
+    fn qsearch(
+        &mut self,
+        pos: &mut Position,
+        mut alpha: i32,
+        mut beta: i32,
+        ply: u32,
+        ctx: &SearchContext,
+    ) -> i32 {
+        use crate::eval::evaluate;
+        use crate::movegen::{MoveList, generate_moves, in_check};
+
+        // 1. Per-frame nodes increment + cancellation poll. Negamax's depth==0
+        //    branch delegates to qsearch BEFORE its own increment, so this is the
+        //    sole counter for the depth==0 leaf — preserves M3.C's "1 leaf = 1
+        //    node" budget interpretation under `go nodes <N>`.
+        self.nodes += 1;
+        if self.nodes & 4095 == 0 && ctx.should_abort(self.nodes) {
+            self.aborted = true;
+            return 0;
+        }
+
+        // 2. Mate-distance pruning — may return mate-bound before stand-pat is
+        //    computed. Safe because mate-distance pruning narrows toward provable
+        //    mate scores only; if the window is already collapsed by a known mate,
+        //    no static eval or capture sequence at this depth can improve on it.
+        let mating_value = MATE - ply as i32;
+        if mating_value < beta {
+            beta = mating_value;
+            if alpha >= mating_value {
+                return mating_value;
+            }
+        }
+        let mated_value = -(MATE - ply as i32);
+        if mated_value > alpha {
+            alpha = mated_value;
+            if beta <= mated_value {
+                return mated_value;
+            }
+        }
+
+        // 3. In-check triage decides whether stand-pat is permitted and which
+        //    moves are searched. Stand-pat-in-check is unsound (engine would
+        //    "stand pat" while the king is being mated next ply — CPW).
+        let in_chk = in_check(pos);
+
+        // 4. Stand-pat lower-bound (only when NOT in check). Stand-pat =
+        //    side-to-move's static eval.
+        //     - >= beta: fail-soft beta cutoff, return stand-pat.
+        //     - > alpha: tighten alpha (we'll see if any capture beats it).
+        //    `best_init` is the seed for the move-loop's fail-soft accumulator
+        //    `best`. On the in-check branch, initialized to `-INF` so any
+        //    evasion's negated child score beats the seed and propagates up.
+        let best_init = if !in_chk {
+            let sp = evaluate(pos);
+            if sp >= beta {
+                return sp;
+            }
+            if sp > alpha {
+                alpha = sp;
+            }
+            sp
+        } else {
+            // In check: stand-pat forbidden; seed `best` to `-INF` so any
+            // evasion's negated child score beats the seed and propagates up.
+            -INF
+        };
+
+        // 5. Generate moves. In check: ALL legal moves (evasions). Otherwise:
+        //    captures + queen-promos only (filter from full list).
+        let mut ml = MoveList::new();
+        generate_moves(pos, &mut ml);
+        let mut moves_vec: Vec<Move> = if in_chk {
+            ml.iter().collect()
+        } else {
+            ml.iter().filter(|m| qsearch_move_filter(*m)).collect()
+        };
+
+        // 6. Terminal:
+        //    - In check + empty: mate (-(MATE - ply)).
+        //    - Not in check + empty: return stand-pat. The empty-after-filter
+        //      case does NOT mean stalemate — the position has many quiet moves.
+        //      Returning stand-pat avoids the false-stalemate bug (CPW §10.7).
+        if moves_vec.is_empty() {
+            if in_chk {
+                return -(MATE - ply as i32);
+            } else {
+                return best_init; // = stand_pat
+            }
+        }
+
+        // 7. Order: MVV-LVA descending. Reuses negamax's helper.
+        moves_vec.sort_by_cached_key(|&m| -mvv_lva_score(m, pos));
+
+        // 8. Recurse fail-soft.
+        let mut best = best_init;
+        for mv in moves_vec {
+            let undo = pos.make_move(mv);
+            self.history.push(pos.zobrist());
+            let (child_alpha, child_beta) = negate_window(alpha, beta);
+            let score = -self.qsearch(pos, child_alpha, child_beta, ply + 1, ctx);
+            self.history.pop();
+            pos.unmake_move(mv, undo);
+
+            // 9. Abort propagation: discard score; do not commit. The push/pop
+            //    above is balanced even on abort because the abort check runs
+            //    AFTER both `history.pop()` and `unmake_move`.
+            if self.aborted {
+                return 0;
+            }
+
+            if score > best {
+                best = score;
+                if score > alpha {
+                    alpha = score;
+                }
+                if alpha >= beta {
+                    break; // beta cutoff, fail-soft
+                }
+            }
+        }
+
+        best
+    }
+
+    /// Test-only entry point that forwards verbatim to `qsearch`. Mirrors
+    /// `negamax_for_test`. Production code never calls this.
+    #[cfg(test)]
+    pub(super) fn qsearch_for_test(
+        &mut self,
+        pos: &mut Position,
+        alpha: i32,
+        beta: i32,
+        ply: u32,
+        ctx: &SearchContext,
+    ) -> i32 {
+        self.qsearch(pos, alpha, beta, ply, ctx)
+    }
+}
+
+/// Returns true iff the move should be searched in qsearch (when not in check).
+/// Captures, EnPassant, and queen-promo variants (with or without capture).
+/// Excludes under-promotions and under-promo-captures (M3.D scope) and
+/// non-capture checks (M4+).
+fn qsearch_move_filter(mv: Move) -> bool {
+    use crate::mov::MoveFlag::*;
+    matches!(
+        mv.flag(),
+        Capture | EnPassant | QueenPromo | QueenPromoCapture
+    )
 }
 
 /// MVV-LVA move ordering score. Captures and promotions score > 0; quiets score 0.
@@ -1286,9 +1461,11 @@ mod tests {
         let (ctx_depth3, _stop) = non_aborting_ctx_at_depth(3);
         let result = go_alpha_beta_no_sink(&mut ab, &pos, &ctx_depth3);
         assert!(
-            result.nodes < 8000,
-            "depth-3 search from startpos must visit fewer than 8000 nodes (loose upper bound); \
-            visited {} nodes",
+            result.nodes < 30_000,
+            "depth-3 search from startpos must visit fewer than 30,000 nodes (loose upper bound \
+            for qsearch-extended search; observed M3.D count: ~2179, the bound is set well above \
+            so it catches a 'branching exploded' regression rather than tripping on minor \
+            ordering-shift fluctuations); visited {} nodes",
             result.nodes
         );
     }
@@ -1344,6 +1521,14 @@ mod tests {
         // 5000-node budget: enough for the first root move's depth-4 subtree at
         // startpos to complete (typically ~200–1000 nodes per root move), but
         // exhausted before all 20 root moves finish.
+        //
+        // M3.D note (plan §6.2): qsearch at the depth==0 horizon adds leaf
+        // nodes to the count. The 5000-node budget remains adequate because
+        // startpos qsearch leaves are mostly stand-pat returns (no captures
+        // in the early opening). The precondition `bestmove.is_some()`
+        // catches a vacuous-pass scenario; if a future eval/ordering shift
+        // pushes the first root move's subtree above 5000 nodes, that
+        // assertion fires with a helpful message.
         let pos = Position::starting_position();
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = SearchContext {
@@ -1458,6 +1643,922 @@ mod tests {
         assert!(
             line.contains(" pv "),
             "info line must contain 'pv'; got: {line:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // negate_window — unit test for the bound-flip helper.
+    //
+    // Pin both `-beta` and `-alpha` negations independently. Catches any
+    // `delete -` mutation on either operand of the helper's `(-beta, -alpha)`
+    // body (cargo-mutants generates one mutation per `-`). The helper is
+    // load-bearing for correctness in any deeper-than-shallow recursion (the
+    // M3.D residual-mutation analysis has full context); pinning it here as a
+    // pure-function test sidesteps the structural difficulty of catching the
+    // same bug at the qsearch / negamax integration level with shallow
+    // M3.D fixtures.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn negate_window_negates_both_bounds_and_swaps_them() {
+        // Asymmetric window — catches both `delete -` mutations independently.
+        // Correct: (-beta, -alpha) = (-200, -100).
+        // `delete -` on `-beta`:   (beta, -alpha)  = (200, -100). Mismatch.
+        // `delete -` on `-alpha`:  (-beta, alpha)  = (-200, 100). Mismatch.
+        assert_eq!(negate_window(100, 200), (-200, -100));
+
+        // Mate-window: ensure the helper handles the bound-collapse
+        // characteristic of mate-distance pruning correctly.
+        assert_eq!(
+            negate_window(MATE - 5, MATE - 1),
+            (-(MATE - 1), -(MATE - 5))
+        );
+
+        // Symmetric window centered on 0: a stub that returned `(0, 0)` would
+        // pass an `(alpha=-X, beta=X)` test trivially, so use a non-zero
+        // asymmetric case AND a symmetric case to defeat both stubs.
+        assert_eq!(negate_window(-50, 50), (-50, 50));
+    }
+
+    // -----------------------------------------------------------------------
+    // M3.D — quiescence search.
+    //
+    // Tests on the new `qsearch` private method (driven via `qsearch_for_test`
+    // forwarder) and on the negamax→qsearch integration. Per the M3.D plan
+    // (`docs/plans/m3.d.md`) §6.1.
+    // -----------------------------------------------------------------------
+
+    // ----- §6.1 row 1: filter accepts captures + queen promos. -----
+
+    /// `qsearch_move_filter` accepts `Capture`, `EnPassant`, `QueenPromo`,
+    /// `QueenPromoCapture`. Pins the move-flag inclusion list.
+    #[test]
+    fn qsearch_filter_accepts_captures_and_queen_promos() {
+        use crate::Square;
+        use crate::mov::MoveFlag::*;
+        let from = Square::new_unchecked(0);
+        let to = Square::new_unchecked(8);
+        for flag in [Capture, EnPassant, QueenPromo, QueenPromoCapture] {
+            let mv = Move::new(from, to, flag);
+            assert!(
+                qsearch_move_filter(mv),
+                "qsearch_move_filter must accept {flag:?}"
+            );
+        }
+    }
+
+    // ----- §6.1 row 2: filter rejects quiets + under-promos + under-promo-captures. -----
+
+    /// `qsearch_move_filter` rejects all non-capture / non-queen-promo flags.
+    /// Under-promos (Knight/Bishop/Rook) and under-promo-captures are excluded
+    /// despite the capture-promotion variants being captures — see plan §4.
+    #[test]
+    fn qsearch_filter_rejects_quiets_and_under_promos() {
+        use crate::Square;
+        use crate::mov::MoveFlag::*;
+        let from = Square::new_unchecked(0);
+        let to = Square::new_unchecked(8);
+        for flag in [
+            Quiet,
+            DoublePush,
+            KingCastle,
+            QueenCastle,
+            KnightPromo,
+            BishopPromo,
+            RookPromo,
+            KnightPromoCapture,
+            BishopPromoCapture,
+            RookPromoCapture,
+        ] {
+            let mv = Move::new(from, to, flag);
+            assert!(
+                !qsearch_move_filter(mv),
+                "qsearch_move_filter must reject {flag:?}"
+            );
+        }
+    }
+
+    // ----- §6.1 row 3: stand-pat returns evaluate(pos) when quiet + no captures. -----
+
+    /// Quiet position with no captures available, not in check, with a
+    /// non-zero `evaluate(pos)` (i.e., NOT an insufficient-material draw).
+    /// Empty-after-filter path returns stand-pat = `evaluate(pos)`.
+    ///
+    /// Fixture choice note: KvKB (one bishop) is an ADR-0014 §5 mandatory
+    /// `evaluate = 0` draw, which would make `assert_eq!(score, 0)`
+    /// vacuous against a stub returning 0. KvKR avoids the draw clause:
+    /// `evaluate(KvKR for white-to-move)` is solidly positive (~+477 cp +
+    /// PST), so the assertion meaningfully anchors qsearch's stand-pat
+    /// return value to the correct material-aware result.
+    #[test]
+    fn qsearch_stand_pat_returns_eval_when_quiet_position() {
+        use crate::eval::evaluate;
+        use crate::movegen::in_check;
+        // White K + R vs black K. No captures (R c1 attacks file c, rank 1;
+        // no black piece on those lines). Not in check. Not a draw.
+        let pos =
+            Position::from_fen("4k3/8/8/8/8/8/8/2R1K3 w - - 0 1").expect("KvKR FEN must parse");
+        // Fixture validation.
+        assert!(!in_check(&pos), "fixture must not be in check");
+        let expected = evaluate(&pos);
+        assert!(
+            expected > 200,
+            "fixture must have meaningfully nonzero evaluate (not a draw); \
+            got {expected} — if this fires, ADR-0014 may have changed"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 1, &ctx);
+
+        assert_eq!(
+            score, expected,
+            "qsearch must return stand-pat = evaluate(pos) when not in check and no captures available; \
+            got {score}, expected {expected}"
+        );
+    }
+
+    // ----- §6.1 row 4: extends capture to resolve hanging material. -----
+
+    /// White Q vs hanging black B (no defender). Qxd4 wins ~365 cp of material.
+    /// qsearch must extend the capture and return a score above stand-pat.
+    #[test]
+    fn qsearch_extends_capture_to_resolve_material() {
+        use crate::eval::evaluate;
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        // White: K e1, Q d1. Black: K e8, B d4 (hanging — black king h8-far is the only defender).
+        let pos = Position::from_fen("4k3/8/8/8/3b4/8/8/3QK3 w - - 0 1")
+            .expect("hanging-bishop FEN must parse");
+        // Fixture validation.
+        assert!(!in_check(&pos), "fixture must not be in check");
+        // Confirm Qxd4 is legal and is the only relevant capture (no other
+        // captures could distract from the test's assertion).
+        let qxd4 = Move::from_uci("d1d4", &pos).expect("Qxd4 must be legal in fixture");
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let captures: Vec<_> = ml.iter().filter(|m| m.is_capture()).collect();
+        assert_eq!(
+            captures.len(),
+            1,
+            "fixture must have exactly one capture (Qxd4) so the test exercises \
+            the single-capture-extends-then-returns path; found {captures:?}"
+        );
+        assert_eq!(captures[0], qxd4, "the single capture must be Qxd4");
+        // Confirm the bishop has no defenders by simulating Qxd4 and checking
+        // that black has no recapture (qsearch's recursion would otherwise
+        // search the recapture and the score would not reflect a clean material gain).
+        let mut pos_after = pos;
+        pos_after.make_move(qxd4);
+        let mut ml_after = MoveList::new();
+        generate_moves(&pos_after, &mut ml_after);
+        let recaptures: Vec<_> = ml_after
+            .iter()
+            .filter(|m| m.to_square().index() == qxd4.to_square().index())
+            .collect();
+        assert_eq!(
+            recaptures.len(),
+            0,
+            "bishop on d4 must be undefended (no black recapture on d4 after Qxd4); \
+            found {recaptures:?}"
+        );
+        let stand_pat = evaluate(&pos);
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 0, &ctx);
+
+        // Bishop value (PeSTO MG: 365). Loose bound to absorb PST swing from
+        // queen relocating d1→d4: assert at least +250 cp of gain.
+        assert!(
+            score >= stand_pat + 250,
+            "qsearch must capture the hanging bishop and improve score; \
+            stand_pat={stand_pat}, got {score}"
+        );
+    }
+
+    // ----- §6.1 row 5: does NOT stand-pat in check (differential shape). -----
+
+    /// In-check position where evaluate(pos) is favorable (white up material),
+    /// but the only legal evasion abandons the queen. qsearch must NOT
+    /// stand-pat — it must search evasions and return a score MUCH lower than
+    /// the rosy static eval.
+    ///
+    /// **Differential-shape assertion** (plan §6.1 row 5): `result < eval - 100`
+    /// proves the causal claim "qsearch did not stand-pat at this in-check
+    /// position" without pinning a specific score.
+    ///
+    /// Fixture: White K g1, Q d4, P f2/g2/h2. Black K h8, N e2 (forks K and Q).
+    /// White is in check from the knight on e2 (e2 attacks g1). White must
+    /// move the king (no capture of e2 available, knight check unblockable);
+    /// after Kf1 or Kh1, black plays Nxd4 winning the queen.
+    #[test]
+    fn qsearch_does_not_stand_pat_in_check() {
+        use crate::eval::evaluate;
+        use crate::movegen::in_check;
+        let pos = Position::from_fen("7k/8/8/8/3Q4/8/4nPPP/6K1 w - - 0 1")
+            .expect("knight-fork-of-king-and-queen FEN must parse");
+        // Fixture validation.
+        assert!(in_check(&pos), "fixture must be in check");
+        let eval = evaluate(&pos);
+        // Eval should be favorable for white (white still has Q + 3P vs black's lone N).
+        assert!(
+            eval > 500,
+            "fixture must have favorable eval for the in-check side (else differential is vacuous); \
+            got eval={eval}"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 0, &ctx);
+
+        assert!(
+            score < eval - 100,
+            "qsearch must NOT stand-pat at an in-check position; \
+            differential failed: eval={eval}, score={score}, expected score < {}",
+            eval - 100
+        );
+        // Lower-bound: the score must NOT be in the mate-score range (a
+        // stub returning -(MATE - ply) regardless of legal-moves status
+        // would otherwise pass the differential vacuously). The fixture
+        // has legal evasions (Kf1, Kh1) — qsearch must search them, not
+        // return the mate sentinel.
+        assert!(
+            score > -MATE_IN_MAX_PLY,
+            "qsearch score must not be in the mate-score range — fixture has legal \
+            evasions, not mate. Got {score}, expected score > -MATE_IN_MAX_PLY ({})",
+            -MATE_IN_MAX_PLY
+        );
+    }
+
+    // ----- §6.1 row 6: in-check evasions searched when no captures. -----
+
+    /// In-check position with only quiet evasions available (no captures).
+    /// Tests the in-check branch reaches the move-loop and returns a finite
+    /// score — NOT the mate sentinel (-(MATE-ply)) and NOT -INF.
+    ///
+    /// Fixture: white K a1 in check from black R a8 along a-file. White has
+    /// only the king; only legal evasions are Kb1 / Kb2 (both quiet). No
+    /// captures possible.
+    #[test]
+    fn qsearch_in_check_evasions_searched_when_no_captures() {
+        use crate::movegen::in_check;
+        let pos =
+            Position::from_fen("r6k/8/8/8/8/8/8/K7 w - - 0 1").expect("rook-check FEN must parse");
+        assert!(in_check(&pos), "fixture must be in check");
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 1, &ctx);
+
+        // Score must be finite — not the mate sentinel and not -INF.
+        assert!(
+            score > -(MATE - 100),
+            "qsearch must NOT misclassify a non-mate evasion as mate; got {score}"
+        );
+        assert!(
+            score > -INF + 100,
+            "qsearch must update best from -INF after at least one evasion; got {score}"
+        );
+        // Score must be in a sane range (white loses material since black has rook + king vs white king alone).
+        assert!(
+            (-2000..0).contains(&score),
+            "qsearch score must reflect material disadvantage from K-vs-KR; got {score}"
+        );
+    }
+
+    // ----- §6.1 row 7: in-check + no legal moves → mate score. -----
+
+    /// Mate position reached at qsearch leaf. In-check + empty move list →
+    /// `-(MATE - ply)`. Test calls qsearch with ply=2; expected score = -(MATE-2).
+    ///
+    /// Fixture: back-rank-style mate. White K g1, white pawns f2/g2/h2. Black
+    /// K h8, Q a1. Black queen on a1 checks white K g1 along rank 1; white K
+    /// has no escape (f1/h1 attacked along rank, f2/g2/h2 own pawns block);
+    /// no interposition (white has only K + pawns, no piece reaches the rank);
+    /// no capture (white K can't reach a1).
+    #[test]
+    fn qsearch_in_check_with_no_legal_moves_returns_mate() {
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        let pos = Position::from_fen("7k/8/8/8/8/8/5PPP/q5K1 w - - 0 1")
+            .expect("back-rank-mate FEN must parse");
+        // Fixture validation.
+        assert!(in_check(&pos), "fixture must be in check");
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        assert_eq!(
+            ml.iter().count(),
+            0,
+            "fixture must have no legal moves (mate)"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 2, &ctx);
+
+        assert_eq!(
+            score,
+            -(MATE - 2),
+            "qsearch must return mate-at-ply-2 sentinel = -(MATE - 2) = -{}; got {score}",
+            MATE - 2
+        );
+    }
+
+    // ----- §6.1 row 8: returns stand-pat for not-in-check + no captures (CPW pitfall). -----
+
+    /// Critical false-stalemate test (CPW pitfall §10.7). The starting
+    /// position has many quiet moves but no captures and no queen-promos.
+    /// qsearch's not-in-check + empty-after-filter path must return stand-pat
+    /// = `evaluate(pos)` — NOT `-(MATE - ply)`. Empty list under capture
+    /// filter does NOT mean stalemate.
+    #[test]
+    fn qsearch_returns_stand_pat_for_not_in_check_no_captures() {
+        use crate::eval::evaluate;
+        use crate::movegen::in_check;
+        let pos = Position::starting_position();
+        assert!(!in_check(&pos), "startpos must not be in check");
+        let expected = evaluate(&pos);
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 1, &ctx);
+
+        assert_eq!(
+            score, expected,
+            "qsearch must return stand-pat (not mate sentinel) at quiet not-in-check position; \
+            got {score}, expected {expected}"
+        );
+    }
+
+    // ----- §6.1 row 9: stand-pat triggers beta cutoff (early return). -----
+
+    /// Position with stand-pat >= beta. qsearch fires the beta cutoff before
+    /// any captures are searched.
+    ///
+    /// Fixture: KvKQ heavily favoring white-to-move (`evaluate(pos)` > +1000).
+    /// Set `beta = 10`; stand-pat overshoots by a wide margin → cutoff fires
+    /// immediately. Anchor: nodes increment by exactly 1 (only the qsearch
+    /// frame, no recursion) per plan §5's "1 leaf = 1 node" budget contract.
+    #[test]
+    fn qsearch_beta_cutoff_on_stand_pat() {
+        use crate::eval::evaluate;
+        use crate::movegen::in_check;
+        // White K+Q vs black K. White to move. No captures available.
+        let pos =
+            Position::from_fen("4k3/8/8/8/8/8/8/3QK3 w - - 0 1").expect("KQvK FEN must parse");
+        assert!(!in_check(&pos), "fixture must not be in check");
+        let stand_pat = evaluate(&pos);
+        assert!(
+            stand_pat > 500,
+            "fixture must have eval > 500 to overshoot beta=10; got {stand_pat}"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let nodes_before = ab.nodes;
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), 0, 10, 1, &ctx);
+
+        assert_eq!(
+            score, stand_pat,
+            "stand-pat beta cutoff must return stand_pat (fail-soft); got {score}, expected {stand_pat}"
+        );
+        let nodes_consumed = ab.nodes - nodes_before;
+        assert_eq!(
+            nodes_consumed, 1,
+            "stand-pat cutoff must fire before any recursive call; consumed {nodes_consumed} nodes"
+        );
+    }
+
+    // ----- §6.1 row 10: capture-driven beta cutoff (in-loop fail-soft). -----
+
+    /// Position where stand-pat is below beta but the first MVV-LVA capture
+    /// overshoots beta. The in-loop fail-soft cutoff fires after only the
+    /// first capture, distinct from the stand-pat early-cutoff path.
+    ///
+    /// Fixture per plan §6.1 row 10: white K e1, Q d1; black K e8, Q d4 (high
+    /// MVV target along d-file), B a4 (low MVV target on the d1-a4 diagonal).
+    /// White Q d1 attacks both. MVV-LVA orders Qxd4 first.
+    ///
+    /// Window: alpha = stand_pat - 50 (so stand-pat does NOT improve alpha);
+    /// beta = stand_pat + 100 (so stand-pat does NOT exceed beta — the
+    /// early-cutoff path is *not* taken); the queen capture's payoff is large
+    /// enough to overshoot beta in the move loop.
+    #[test]
+    fn qsearch_beta_cutoff_in_capture_loop() {
+        use crate::eval::evaluate;
+        use crate::movegen::in_check;
+        let pos = Position::from_fen("4k3/8/8/8/b2q4/8/8/3QK3 w - - 0 1")
+            .expect("two-hanging-targets FEN must parse");
+        assert!(!in_check(&pos), "fixture must not be in check");
+        let stand_pat = evaluate(&pos);
+        let alpha = stand_pat - 50;
+        let beta = stand_pat + 100;
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let nodes_before = ab.nodes;
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), alpha, beta, 1, &ctx);
+
+        // Fail-soft: cutoff returns the actual capture score, which is >= beta.
+        assert!(
+            score >= beta,
+            "in-loop beta cutoff must return score >= beta (fail-soft); got {score}, beta {beta}"
+        );
+        // Cutoff fires after first capture; tight node count.
+        //
+        // Expected node count derivation: top qsearch frame (+1 nodes via
+        // self.nodes increment) + recursive frame after Qxd4 (+1) = 2 nodes.
+        // Black qsearch after Qxd4 has no further captures available
+        // (black bishop a4 cannot reach white K e1 or white Q d4), so it
+        // returns stand-pat without recursion. White's loop then trips the
+        // beta cutoff and breaks, NOT iterating to Qxa4. A buggy qsearch
+        // that searches the second capture (Qxa4) would consume 3 nodes.
+        let nodes_consumed = ab.nodes - nodes_before;
+        assert_eq!(
+            nodes_consumed, 2,
+            "in-loop beta cutoff must fire after only Qxd4 — exactly 2 nodes \
+            (top frame + Qxd4-recursion frame). Found {nodes_consumed}: a buggy \
+            qsearch that also searches Qxa4 would consume 3 nodes"
+        );
+    }
+
+    // ----- §6.1 row 11: alpha improvement (stand-pat then capture). -----
+
+    /// Position where stand-pat is below alpha-after-stand-pat-update but a
+    /// capture improves further. Drive with a full window. The capture beats
+    /// stand-pat; result > evaluate(pos).
+    ///
+    /// Fixture: white K e1, R c1. Black K h8, N c3 (hanging — black king h8
+    /// far away, no defender). White Rxc3 wins ~337 cp of material.
+    #[test]
+    fn qsearch_alpha_improvement_from_stand_pat_then_capture() {
+        use crate::eval::evaluate;
+        use crate::movegen::in_check;
+        let pos = Position::from_fen("7k/8/8/8/8/2n5/8/2R1K3 w - - 0 1")
+            .expect("hanging-knight FEN must parse");
+        assert!(!in_check(&pos), "fixture must not be in check");
+        let stand_pat = evaluate(&pos);
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 1, &ctx);
+
+        // Capture must beat stand-pat. Loose threshold (200 cp) accommodates
+        // PST swing from the rook relocating c1→c3.
+        assert!(
+            score > stand_pat + 200,
+            "qsearch must capture the hanging knight and improve alpha; \
+            stand_pat={stand_pat}, got {score}"
+        );
+    }
+
+    // ----- §6.1 row 12: skips is_fifty_move_draw at threshold. -----
+
+    /// Pin the design choice: qsearch does NOT consult `is_fifty_move_draw`.
+    /// Fixture has `halfmove_clock=100` (`is_fifty_move_draw(100) == true`),
+    /// so a qsearch that *did* consult the helper would short-circuit to 0.
+    /// A qsearch that skips the helper computes stand-pat + the available
+    /// capture; returns a non-zero score.
+    #[test]
+    fn qsearch_skips_fifty_move_at_threshold() {
+        use crate::movegen::in_check;
+        // Same hanging-bishop fixture as row 4, but with halfmove_clock = 100.
+        let pos = Position::from_fen("4k3/8/8/8/3b4/8/8/3QK3 w - - 100 1")
+            .expect("FEN with halfmove=100 must parse");
+        // Fixture validation.
+        assert!(!in_check(&pos), "fixture must not be in check");
+        assert_eq!(pos.halfmove_clock(), 100, "fixture must have halfmove=100");
+        assert!(
+            is_fifty_move_draw(pos.halfmove_clock()),
+            "fixture's halfmove=100 must trigger is_fifty_move_draw if consulted"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 1, &ctx);
+
+        // qsearch must NOT return 0 (the 50-move-draw sentinel). The actual
+        // score is the stand-pat + capture-driven value, large and positive.
+        assert_ne!(
+            score, 0,
+            "qsearch must NOT consult is_fifty_move_draw at halfmove=100; \
+            got 0, indicating accidental short-circuit"
+        );
+        assert!(
+            score > 500,
+            "qsearch must compute stand-pat + capture; got {score}"
+        );
+    }
+
+    // ----- §6.1 row 13: skips is_repetition when current zobrist in history. -----
+
+    /// Pin the design choice: qsearch does NOT consult `is_repetition`.
+    /// Fixture: position whose zobrist appears earlier in `mover.history` at
+    /// a 2-ply stride that triggers `is_repetition` if consulted.
+    /// Validate the fixture by calling the helper directly first; assert it
+    /// would return true. Then assert qsearch returns a non-zero score.
+    #[test]
+    fn qsearch_skips_repetition_when_history_contains_current_position() {
+        use crate::movegen::in_check;
+        // Same hanging-bishop fixture as row 4, with halfmove=4 (enough for
+        // is_repetition to walk back 4 plies in 2-ply steps; below the
+        // 50-move threshold so is_fifty_move_draw is not a confounder).
+        let pos = Position::from_fen("4k3/8/8/8/3b4/8/8/3QK3 w - - 4 1")
+            .expect("FEN with halfmove=4 must parse");
+        assert!(!in_check(&pos), "fixture must not be in check");
+
+        // Construct mover.history that triggers is_repetition: current
+        // position's zobrist at a 2-ply distance from the end.
+        let z = pos.zobrist();
+        let other: u64 = 0xDEAD_BEEF_CAFE_FEED;
+        let history = vec![z, other, z];
+
+        // Fixture validation: confirm is_repetition WOULD return true.
+        assert!(
+            is_repetition(&history, pos.halfmove_clock()),
+            "fixture must trigger is_repetition if consulted (so the test \
+            actually distinguishes consult-vs-skip behavior)"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = history;
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 1, &ctx);
+
+        // qsearch must NOT return 0 (the repetition sentinel). The capture
+        // is still searched and the position's material asymmetry shows.
+        assert_ne!(
+            score, 0,
+            "qsearch must NOT consult is_repetition; got 0, indicating accidental short-circuit"
+        );
+        assert!(
+            score > 500,
+            "qsearch must compute stand-pat + capture; got {score}"
+        );
+    }
+
+    // ----- §6.1 row 14: negamax horizon delegates to qsearch (integration). -----
+
+    /// At depth==0, negamax must delegate to qsearch — not return evaluate(pos).
+    /// Tested via a fixture where the difference is observable: a depth-1
+    /// search where white's apparent winning capture (Qxd5) is a trap that
+    /// qsearch reveals via the recapture (Bxd5).
+    ///
+    /// Fixture: White K e1, Q d1, P b2. Black K e8, P d5, B e6.
+    /// - Without qsearch (M3.C: evaluate at leaf): negamax depth-1 picks
+    ///   Qxd5 (apparent +pawn ≈ +742 cp).
+    /// - With qsearch (M3.D): qsearch at the leaf sees Bxd5 winning the
+    ///   queen; white's depth-1 best is a quiet move (~+660 cp).
+    ///
+    /// Assertion: depth-1 score < 700 (catches the regression where negamax
+    /// still uses evaluate-at-leaf and would return ~+742).
+    #[test]
+    fn negamax_horizon_calls_qsearch_not_evaluate() {
+        use crate::eval::evaluate;
+        let pos = Position::from_fen("4k3/8/4b3/3p4/8/8/1P6/3QK3 w - - 0 1")
+            .expect("queen-trap FEN must parse");
+
+        // Fixture validation: confirm Qxd5 is legal AND Bxd5 is the
+        // recapture. Without these, the "trap" framing is unverified — see
+        // M3.C mate-in-2 fiasco lesson (plan §10).
+        let qxd5 = Move::from_uci("d1d5", &pos).expect("Qxd5 must be a legal capture in fixture");
+        let mut pos_after_qxd5 = pos;
+        pos_after_qxd5.make_move(qxd5);
+        Move::from_uci("e6d5", &pos_after_qxd5)
+            .expect("Bxd5 must be a legal recapture after Qxd5 (the trap)");
+        // Confirm the eval-at-leaf path WOULD recommend Qxd5: at the leaf
+        // (after Qxd5), evaluate from black's POV is heavily negative; negated
+        // for white is heavily positive. Without qsearch, white's depth-1
+        // search picks Qxd5 with this rosy score.
+        let leaf_eval_black_pov = evaluate(&pos_after_qxd5);
+        assert!(
+            -leaf_eval_black_pov > 700,
+            "fixture's evaluate-at-leaf path must yield > 700 cp (white winning a pawn) — \
+            otherwise the `score < 700` bound below does not catch the regression. \
+            Got -leaf_eval_black_pov = {} (eval-at-leaf negation)",
+            -leaf_eval_black_pov
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, &ctx);
+
+        assert!(
+            score < 700,
+            "negamax at depth-1 must use qsearch (not evaluate) at the leaf, \
+            avoiding the Qxd5 trap; with evaluate-at-leaf the score would be > 700 \
+            (white wins a pawn at face value), with qsearch ~+660 (white avoids Qxd5 \
+            because Bxd5 wins the queen). Got {score}"
+        );
+    }
+
+    // ----- §6.1 row 15: depth-4 startpos score within sane range. -----
+
+    // ----- §6.1 row 16 (added after test-suite-review pass 1): qsearch
+    // extends a queen promotion (filter→qsearch path, not just the filter). -----
+
+    /// qsearch must recurse on a queen promotion to discover the material
+    /// gain. The filter accepts `QueenPromo` (rows 1-2 pin that), but only
+    /// this test confirms the qsearch body actually generates and searches
+    /// the promotion.
+    ///
+    /// Fixture: white K e1, P a7. Black K h8. White can promote via a7-a8=Q
+    /// (quiet promotion, flag `QueenPromo`). After promotion: white K+Q vs
+    /// black K, score ~+1025 from white's POV. Stand-pat at root: white K+P
+    /// vs black K, score ~+82 (just the pawn). qsearch must extend the
+    /// promotion and return a score significantly above stand-pat.
+    #[test]
+    fn qsearch_extends_queen_promotion() {
+        use crate::eval::evaluate;
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        let pos = Position::from_fen("7k/P7/8/8/8/8/8/4K3 w - - 0 1")
+            .expect("white-pawn-on-7th-rank FEN must parse");
+        // Fixture validation.
+        assert!(!in_check(&pos), "fixture must not be in check");
+        Move::from_uci("a7a8q", &pos).expect("a7a8=Q must be a legal queen promotion");
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let captures: Vec<_> = ml.iter().filter(|m| m.is_capture()).collect();
+        assert_eq!(
+            captures.len(),
+            0,
+            "fixture must have no captures (only the queen promotion is the qsearch extension); \
+            got {captures:?}"
+        );
+        // Confirm `generate_moves` actually emits a QueenPromo for a7a8.
+        // Without this, a broken promotion-generator would let the test fail
+        // with a confusing `score <= stand_pat + 800` rather than a clear
+        // promotion-generation failure.
+        use crate::mov::MoveFlag;
+        let queen_promos: Vec<_> = ml
+            .iter()
+            .filter(|m| m.flag() == MoveFlag::QueenPromo)
+            .collect();
+        assert_eq!(
+            queen_promos.len(),
+            1,
+            "fixture must emit exactly one QueenPromo (a7a8=Q); got {queen_promos:?}"
+        );
+        let stand_pat = evaluate(&pos);
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 1, &ctx);
+
+        // Queen value (PeSTO MG: 1025). Loose bound to absorb PST contributions.
+        assert!(
+            score > stand_pat + 800,
+            "qsearch must extend the queen promotion and reflect the material gain; \
+            stand_pat={stand_pat}, got {score}"
+        );
+    }
+
+    // ----- §6.1 row 17 (added after test-suite-review pass 1): abort
+    // propagation inside qsearch. -----
+
+    /// Pin the post-recursion abort check (`if self.aborted { return 0; }`
+    /// in qsearch's move loop). Pre-set `ab.aborted = true` before the call;
+    /// qsearch should propagate by returning 0 from the post-recursion check
+    /// after the first capture's recursive call returns.
+    ///
+    /// Fixture: a position with at least one capture available (so qsearch
+    /// recurses) and with `evaluate(pos) < beta` so the stand-pat path does
+    /// NOT short-circuit before reaching the move loop. The full window
+    /// `(-INF, INF)` ensures stand-pat's beta cutoff does not pre-empt.
+    #[test]
+    fn qsearch_abort_propagates_from_post_recursion_check() {
+        // Hanging-bishop fixture: white Q d1 captures black B d4. Full window
+        // means stand-pat does not cut off — qsearch must enter the move
+        // loop, make Qxd4, recurse. After the recursion returns, the
+        // post-recursion `if self.aborted { return 0; }` fires.
+        let pos = Position::from_fen("4k3/8/8/8/3b4/8/8/3QK3 w - - 0 1")
+            .expect("hanging-bishop FEN must parse");
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        ab.aborted = true; // pre-set: simulate "an outer search has aborted"
+        let nodes_before = ab.nodes;
+        let (ctx, _stop) = non_aborting_ctx();
+        let pos_clone = pos;
+        let mut pos_search = pos;
+        let score = ab.qsearch_for_test(&mut pos_search, -INF, INF, 1, &ctx);
+
+        // Position must be restored even on abort — make/unmake balance.
+        assert_eq!(
+            pos_search, pos_clone,
+            "qsearch must restore position via balanced make/unmake even on abort"
+        );
+        // The move loop must have been entered: outer qsearch frame
+        // increments nodes (+1) and the recursive frame after Qxd4 increments
+        // nodes (+1) before the post-recursion abort check fires. A top-of-
+        // frame early abort guard (defensive variant) would leave nodes_consumed
+        // at 1 — the assertion below catches that variant and pins the
+        // post-recursion check as the load-bearing abort propagation point.
+        let nodes_consumed = ab.nodes - nodes_before;
+        assert_eq!(
+            nodes_consumed, 2,
+            "qsearch with pre-set aborted=true must enter the move loop and execute \
+            ONE make/unmake pair before the post-recursion abort check fires; \
+            consumed {nodes_consumed} nodes (expected 2: outer frame + Qxd4 recursive frame)"
+        );
+        // The post-recursion abort check returns 0. Stand-pat could not
+        // short-circuit (full window), so the move loop ran and the abort
+        // check fired.
+        assert_eq!(
+            score, 0,
+            "qsearch with pre-set aborted=true and full window must return 0 \
+            from the post-recursion abort propagation check; got {score}"
+        );
+    }
+
+    // ----- §6.1 row 18 (added after test-suite-review pass 1): mate-distance
+    // pruning fires inside qsearch. -----
+
+    /// Mate-distance pruning at the top of qsearch (plan §3 step 2) returns
+    /// a mate-bound score before stand-pat is computed when `alpha >=
+    /// mating_value`. Fixture: drive qsearch with `alpha = MATE - 5`,
+    /// `beta = MATE - 1`, `ply = 10`. Then `mating_value = MATE - 10`,
+    /// which is < beta (so beta tightens to MATE - 10), and `alpha (MATE - 5)
+    /// >= mating_value (MATE - 10)`, triggering the early return of
+    /// `mating_value`.
+    ///
+    /// The position itself doesn't matter — MD pruning fires before any
+    /// position-dependent logic. We use startpos for simplicity.
+    #[test]
+    fn qsearch_mate_distance_pruning_fires() {
+        let pos = Position::starting_position();
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+
+        // alpha >= mating_value (MATE - 10) so the upper-bound MD pruning fires.
+        let ply = 10;
+        let alpha = MATE - 5;
+        let beta = MATE - 1;
+        let mating_value = MATE - ply as i32;
+        assert!(
+            alpha >= mating_value,
+            "fixture preconditions: alpha={alpha}, mating_value={mating_value}; \
+            alpha must be >= mating_value to trigger upper-bound MD pruning"
+        );
+
+        let nodes_before = ab.nodes;
+        let score = ab.qsearch_for_test(&mut pos.clone(), alpha, beta, ply, &ctx);
+
+        assert_eq!(
+            score, mating_value,
+            "qsearch's MD pruning must return mating_value early when alpha >= mating_value; \
+            got {score}, expected {mating_value}"
+        );
+        // Per plan §3, step 1 is the node increment + cancellation poll;
+        // step 2 is MD pruning. If an implementation accidentally swaps the
+        // order (MD pruning before the increment), nodes would not change.
+        // Pin the step-1-then-step-2 ordering — load-bearing for the "1 leaf
+        // = 1 node" budget contract from plan §5.
+        let nodes_consumed = ab.nodes - nodes_before;
+        assert_eq!(
+            nodes_consumed, 1,
+            "MD pruning must fire AFTER the node increment (plan §3 step 1 → step 2); \
+            consumed {nodes_consumed} nodes (expected 1: only the qsearch frame's increment)"
+        );
+    }
+
+    // ----- §6.1 row 19 (added in final-review pass 1): MD-pruning
+    // lower-bound arm (`mated_value > alpha`). -----
+
+    /// Mate-distance pruning's lower-bound arm fires when `mated_value > alpha`.
+    /// Symmetric to the upper-bound test (row 18). The lower-bound MD-pruning
+    /// fires when the caller already knows we cannot do worse than `mated_value`,
+    /// i.e., `alpha < mated_value`, AND the new `beta = mated_value` collapses
+    /// the window if `beta <= mated_value`.
+    ///
+    /// Setup: ply=10 → mated_value = -(MATE - 10) = -29990.
+    /// alpha = -29995 (< mated_value).
+    /// beta = -29991 (<= mated_value, triggering the collapse).
+    /// Trigger: `mated_value > alpha` → alpha = mated_value = -29990. Then
+    /// `beta <= mated_value` → -29991 <= -29990 → true. Return mated_value.
+    #[test]
+    fn qsearch_mate_distance_pruning_lower_bound_fires() {
+        let pos = Position::starting_position();
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+
+        let ply = 10;
+        let alpha = -29995;
+        let beta = -29991;
+        let mated_value = -(MATE - ply as i32);
+        // Fixture preconditions for the lower-bound MD-pruning early-return.
+        assert!(
+            mated_value > alpha,
+            "fixture: mated_value ({mated_value}) > alpha ({alpha})"
+        );
+        assert!(
+            beta <= mated_value,
+            "fixture: beta ({beta}) <= mated_value ({mated_value})"
+        );
+
+        let score = ab.qsearch_for_test(&mut pos.clone(), alpha, beta, ply, &ctx);
+
+        assert_eq!(
+            score, mated_value,
+            "qsearch's MD-pruning lower-bound arm must return mated_value; \
+            got {score}, expected {mated_value}"
+        );
+    }
+
+    // ----- §6.1 row 20 (added in final-review pass 1): recursion increments
+    // ply. Catches the `ply + 1 → ply * 1` mutation. -----
+
+    /// Pin that qsearch's recursive call uses `ply + 1`, not a frozen `ply`.
+    /// Strategy: drive a fixture where qsearch's only capture leads directly
+    /// to checkmate. With correct `ply + 1`, the child frame at ply=N+1
+    /// detects mate and returns `-(MATE - (N+1))`; the parent negates to
+    /// `+(MATE - (N+1))`. With the broken `ply * 1` form, every recursive
+    /// frame stays at ply=N (root's ply), so the child returns `-(MATE - N)`,
+    /// parent returns `+(MATE - N)` — a strictly larger mate score that
+    /// the test catches via the exact equality check below.
+    ///
+    /// Fixture: white K f6, B c2, Q d2. Black K h8, R d8.
+    /// White's only capture in qsearch: Qxd8 (Q d2 captures R d8 along the
+    /// d-file). After Qxd8: Q on d8 attacks h8 along rank 8 (check); h7 is
+    /// covered by B c2 along the c2-h7 diagonal; g7 is covered by white K
+    /// f6; g8 is covered by Q d8 along rank 8. No interposition possible
+    /// (black has only K). No black capture of d8 (h8 to d8 too far). Mate.
+    ///
+    /// Drive `qsearch_for_test(pos, ..., ply=2, ...)`. Correct: returned
+    /// score = MATE - 3. Broken (`ply * 1`): returned score = MATE - 2.
+    #[test]
+    fn qsearch_recursive_ply_increments_for_mate_score() {
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        let pos = Position::from_fen("3r3k/8/5K2/8/8/8/2BQ4/8 w - - 0 1")
+            .expect("Qxd8-mate fixture FEN must parse");
+        // Fixture validation.
+        assert!(!in_check(&pos), "fixture must NOT be in check at root");
+        let qxd8 = Move::from_uci("d2d8", &pos).expect("Qxd8 must be a legal capture in fixture");
+        // Confirm Qxd8 leads to mate (post-move: black in check, no legal moves).
+        let mut pos_after = pos;
+        pos_after.make_move(qxd8);
+        assert!(
+            in_check(&pos_after),
+            "fixture: after Qxd8, black must be in check"
+        );
+        let mut ml_after = MoveList::new();
+        generate_moves(&pos_after, &mut ml_after);
+        assert_eq!(
+            ml_after.iter().count(),
+            0,
+            "fixture: after Qxd8, black must have no legal moves (mate)"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        // Drive at ply=2. Correct recursion enters child at ply=3, finds
+        // mate, returns -(MATE - 3); parent negates to MATE - 3.
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 2, &ctx);
+
+        assert_eq!(
+            score,
+            MATE - 3,
+            "qsearch must increment ply on recursion; correct returns MATE-3 = {}, \
+            broken `ply * 1` would return MATE-2 = {} (frozen ply)",
+            MATE - 3,
+            MATE - 2
+        );
+    }
+
+    // ----- §6.1 row 15: depth-4 startpos score within sane range. -----
+
+    /// Depth-4 search at startpos returns a score in `-100..=100` cp. Sane
+    /// balanced-startpos range. Regression guard, not a correctness check;
+    /// the M3.C value (`b1c3` at `cp 38`) may shift with qsearch-extended
+    /// leaves.
+    #[test]
+    fn alphabeta_strength_score_at_depth_4_within_sane_range() {
+        let pos = Position::starting_position();
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx_depth4, _stop) = non_aborting_ctx_at_depth(4);
+        let result = ab.go(&pos, &ctx_depth4, &|_| {});
+
+        let score = result.score_cp.expect("depth-4 search must return a score");
+        assert!(
+            (-100..=100).contains(&score),
+            "depth-4 startpos score must be in sane balanced range; got cp {score}"
         );
     }
 }

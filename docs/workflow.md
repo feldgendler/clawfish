@@ -19,10 +19,11 @@ The cycle:
 5. **Write tests** for the entire task scope, where the layer admits TDD (see TDD scope below). This includes both ordinary unit tests and property tests (via `proptest`) where the invariant is more compact than an enumeration — written and reviewed *together*, before implementation. Property tests do not replace specific unit tests; see "Property tests vs. unit tests" below. Parallelizable across coding agents per the plan.
 6. **Test-suite review loop.** Independent reviewer checks the test suite for correctness to spec, confirmation bias, adequate checks, corner case coverage. See "Test-suite review loop" below. Implementation does not begin until the test suite passes review.
 7. **Implement.** Parallelizable across coding agents per the plan.
-8. **All tests pass.** No final review or commit until they do.
-9. **Final review loop on code + tests jointly.** Independent reviewer checks correctness, corner cases, code quality, readability, simplicity, performance considerations. See "Final review loop" below.
-10. **Benchmark and profile.** Record results. Compare to previous baseline.
-11. **Commit.** Final step of the unit's loop. Conventional commit message describing what landed (e.g. `M1.A: project skeleton, square and bitboard primitives`). Stage only the files belonging to this unit; leave any unrelated in-flight work in the working tree alone. Do **not** push to remote — that's a separate explicit user action.
+8. **All tests pass.** No pre-review checks or commit until they do.
+9. **Pre-review mechanical checks.** Orchestrator runs `cargo fmt --check`, `cargo clippy`, `cargo llvm-cov`, `cargo mutants --in-diff` on the unit's diff. Triages each mutation survivor (caught / equivalent / deferred / catchable-by-adding-test) per "Pre-review mechanical checks" under "Final review loop" below. Surfaces the analysis in the reviewer's spawn prompt.
+10. **Final review loop on code + tests jointly.** Independent reviewer reads code + tests + plan + the orchestrator's mechanical-check analysis. Judges correctness, corner cases, code quality, readability, simplicity, performance considerations, AND whether the orchestrator's coverage-gap and mutation-survivor classifications are sound. Reviewer does NOT re-run cargo-mutants or cargo-llvm-cov — those are pre-review work. See "Final review loop" below.
+11. **Benchmark and profile.** Record results. Compare to previous baseline.
+12. **Commit.** Final step of the unit's loop. Conventional commit message describing what landed (e.g. `M1.A: project skeleton, square and bitboard primitives`). Stage only the files belonging to this unit; leave any unrelated in-flight work in the working tree alone. Do **not** push to remote — that's a separate explicit user action.
 
 Skipping any review loop strips the project of its primary quality control (the user is no longer the per-step gate; the reviewers are). When the agent skips a step, it must justify in chat.
 
@@ -89,22 +90,55 @@ Tests pass review **before** any implementation work begins. On reviewer converg
 
 ## Final review loop
 
-After implementation is complete and **all tests pass** (step 9 of the per-feature loop), the entire task scope (code + tests jointly) goes through a final blind-review loop. Same mechanics as the others (fresh subagent, blind to main-conversation context, `SendMessage` continuation, **chat-surfacing of every reviewer concern at each pass**, reviewer-determined convergence).
+After implementation is complete, **all tests pass** (step 8 of the per-feature loop), AND the orchestrator has run the mechanical pre-review checks (step 9, see "Pre-review mechanical checks" below), the entire task scope (code + tests jointly) goes through a final blind-review loop (step 10). Same mechanics as the others (fresh subagent, blind to main-conversation context, `SendMessage` continuation, **chat-surfacing of every reviewer concern at each pass**, reviewer-determined convergence).
 
-The reviewer reads the new/modified code, the tests, the plan that authorized the work, and any project context relevant to the unit.
+**Review is reading + judgment, not execution.** Reviewers do not run `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt`, `cargo llvm-cov`, `cargo mutants`, or any other mechanical check. Those are orchestrator-side work. The reviewer reads the artifact (code + tests + plan + the orchestrator's pre-review analysis) and applies judgment. Re-running tests duplicates effort, blocks the iteration cycle on long-running mechanism, and adds no signal — `cargo mutants` produces identical output regardless of who invokes it.
+
+The reviewer reads the new/modified code, the tests, the plan that authorized the work, the orchestrator's pre-review analysis (build/test/clippy/fmt status, coverage report, mutation-survivor list + per-survivor classification), and project context.
 
 The dimensions of final review:
 
 - **Correctness.** Does the code actually do what the tests claim it does? Are there situations the tests don't cover where the code would behave incorrectly?
 - **Corner cases.** Same dimension as test-suite review, now on the implementation side: are there situations not covered by tests that the code should handle? (If yes, write more tests, then re-implement to satisfy them.)
-- **Coverage.** Run `cargo llvm-cov --summary-only` (or `--html` for line-level detail) on the unit's tests. Inspect the report for newly-introduced code with uncovered lines or branches. Common cause: TDD pins the function's *contract* (defined by tests) before the implementation chooses internal paths — e.g. an implementation may introduce a separate fast path for even arguments after the tests were written, and if all tests happened to use even values, the odd path stays untested. For each meaningful gap, the agent either adds tests that exercise the path, proves the path unreachable and removes it, or documents in chat why the gap is intentional (e.g. a `panic!()` on impossible state, a debug-only assertion). No hard percentage threshold — judgment-based. Tool: `cargo-llvm-cov` (LLVM source-based instrumentation; works natively on Apple Silicon).
-- **Mutation testing.** Run `cargo mutants` on the unit's modules. Coverage answers "did the test execute this line"; mutation testing answers "would the test catch a bug here?" — it mutates `+` to `-`, `<` to `<=`, `|` to `^`, etc., and reports which mutants survive. Each survivor points at either a missing assertion, a genuinely-equivalent mutant (no input distinguishes the original from the mutated form), or a defensive branch unreachable for the actual inputs. For each survivor, the agent: (a) adds a test that catches it, (b) proves equivalence and adds an `exclude_re` rule to `.cargo/mutants.toml` with a comment explaining why, or (c) refactors the unreachable branch (e.g. via `unreachable!()`). Configuration lives in `.cargo/mutants.toml`. Tool: `cargo-mutants` (single-binary install, no nightly required). See "Mutation-testing scope" below for the per-unit `--in-diff` workflow.
+- **Coverage gap analysis.** Read the coverage report from the orchestrator's pre-review run. For each newly-introduced code path with uncovered lines or branches, judge whether the gap is acceptable: a missing-assertion gap (write more tests), a genuinely-unreachable branch (refactor via `unreachable!()`), or a documented intentional gap (e.g. a `panic!()` on impossible state). No hard percentage threshold — judgment-based.
+- **Mutation-survivor analysis.** Read the cargo-mutants survivor list + analysis from the orchestrator's pre-review run. For each surviving mutant: validate the orchestrator's classification (caught / equivalent-with-rationale / real-gap-with-deferred-detection-plan). The reviewer's role is *judging the analysis*, not running the tool. If a survivor's exclusion rationale doesn't hold up, push back; otherwise accept.
 - **Code quality.** Idiomatic Rust, error-handling style, no dead code, no premature abstractions, no commented-out blocks. **Provably-unreachable branches use `unreachable!("brief why")`** rather than silent defensive returns. The panic message documents the invariant the code relies on; if a future change breaks the invariant, the program fails loudly instead of returning a misleading error or silently miscomputing. Reserve plain `if`/`return Err(...)` for paths that *can* fire on bad input — these are validation, not defense. **Defensive checks** — invariants the contract guarantees, where re-asserting in release would just slow the hot path — use `unreachable!()` or `debug_assert!`/`debug_assert_eq!` and **compile in debug builds only** (gated by `cfg(debug_assertions)` or via the `debug_assert*!` macros). Release trusts the invariant. Push the validation up to the boundary that creates the invariant (e.g. extend the FEN parser's `validate_post_parse`) rather than re-checking on every consumer call.
 - **Readability.** Clear naming, sensible structure, comments only where the *why* is non-obvious. A future reader (including a future Claude session) should be able to follow the code without consulting the conversation that produced it.
 - **Simplicity.** Anything overengineered? Anything that could be cut, merged, or deferred without loss?
 - **Performance considerations.** Any obvious algorithmic, data-layout, or hot-path inefficiencies that should be flagged now? (Concrete optimization happens at the benchmark step that follows; review just flags candidates.)
 
-The final review's purpose is to catch what the plan didn't anticipate and the tests didn't cover. On reviewer convergence, the agent proceeds directly to benchmarking and commit — no user-approval gate. The user can interject at any point during the loop by sending a message; absent intervention, the work commits when the loop terminates.
+The final review's purpose is to catch what the plan didn't anticipate and the tests didn't cover, and to validate the orchestrator's analysis of the mechanical-check output. On reviewer convergence, the agent proceeds directly to benchmarking and commit — no user-approval gate. The user can interject at any point during the loop by sending a message; absent intervention, the work commits when the loop terminates.
+
+### Pre-review mechanical checks
+
+Before invoking the final-reviewer, the orchestrator runs the mechanical checks itself and surfaces the results in the reviewer's spawn prompt. This division of labor exists because:
+
+- Mechanical checks are mechanical — `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt --check`, `cargo llvm-cov`, `cargo mutants` produce identical output regardless of who runs them. There's no judgment to be added by re-running.
+- Mechanical-check runtimes can be substantial (mutation testing in particular: hours on the M3+ surface). Bundling them into the reviewer's iteration cycle multiplies the cycle wallclock by N passes; the reviewer's actual value-add (correctness, code-quality, simplicity reasoning) is independent of the mechanical output.
+- Survivor triage iterates fastest with manual mutation + targeted tests (per "Triaging a single survivor" in "Mutation-testing scope" below). The orchestrator handles this loop directly, surfaces the residual analysis to the reviewer, and the reviewer judges whether the analysis is sound.
+
+The pre-review mechanical-check sequence:
+
+```sh
+cargo fmt --check                                                         # zero tolerance
+cargo clippy --all-targets -- -D warnings                                 # zero tolerance
+cargo test --release                                                       # all green; surface failures before review
+cargo llvm-cov --summary-only --lib --release                              # surface report to reviewer
+git add -N $(git ls-files --others --exclude-standard 'src/**/*.rs')      # see "Mutation-testing scope" — load-bearing for new files
+git diff HEAD -- 'src/**/*.rs' 'tests/**/*.rs' > /tmp/<unit>.diff
+cargo mutants --in-diff /tmp/<unit>.diff                                   # surface survivor list + per-survivor classification to reviewer
+```
+
+For each surviving mutant, the orchestrator triages BEFORE invoking the reviewer:
+
+1. **Caught (no action needed)** — re-run `cargo test --lib <test_name>` to confirm.
+2. **Equivalent mutant** — prove indistinguishability, add `exclude_re` rule to `.cargo/mutants.toml` with a comment explaining why no input distinguishes original from mutated form.
+3. **Real-bug, structurally undetectable at this milestone scope** — document with `exclude_re` rule and an explicit "deferred to M<X>" detection plan; surface in the milestone retrospective (`docs/milestones/<unit>.md`) for the milestone where it should be re-validated.
+4. **Real-bug, catchable by adding a test** — add the test, re-run, return to step 1.
+
+The reviewer then verifies the orchestrator's classifications are sound, checks the residual analysis aligns with the test surface, and judges whether the deferred-detection plan is reasonable. The reviewer does NOT re-run cargo-mutants.
+
+(One downstream simplification: the cost-quality calibration of having the reviewer be Opus is also less load-bearing now, since Opus's value-add was largely in the judgment dimensions, not in running tools. The model-tier choice for final-reviewer should be re-evaluated next time the role's calibration is checked.)
 
 ## Running a match
 
@@ -127,9 +161,9 @@ See ADR-0012 for layout details, adjudication parameters, and the fresh-clone bo
 
 Standing checks that complement the review loops. The review loops catch reasoning errors; these catch mechanical drift.
 
-### Per-unit (final-review step)
+### Per-unit (pre-review step)
 
-- **`cargo mutants`** — see "Mutation testing" under final review above, and "Mutation-testing scope" below for the `--in-diff` workflow that keeps the run bounded.
+- **`cargo mutants`** — orchestrator runs at the pre-review mechanical-checks step (loop step 9), surfaces survivor list + classification in the reviewer's spawn prompt. Reviewer judges the classification, doesn't re-run. See "Pre-review mechanical checks" under "Final review loop" above for the orchestrator's triage protocol; "Mutation-testing scope" below for the `--in-diff` invocation details.
 
 ### Fuzzing
 
@@ -151,7 +185,7 @@ Mutation testing runtime grows roughly linearly with codebase size. A full-repo 
 
 ### Default per-unit run: `--in-diff`
 
-`cargo mutants --in-diff <FILE>` accepts a unified diff and only generates mutants on lines the diff touches. At the final-review step, the unit's work is in the working tree (uncommitted — the commit lands at step 11), so the invocation is:
+`cargo mutants --in-diff <FILE>` accepts a unified diff and only generates mutants on lines the diff touches. At the pre-review step, the unit's work is in the working tree (uncommitted — the commit lands at step 12), so the invocation is:
 
 ```sh
 git add -N $(git ls-files --others --exclude-standard 'src/**/*.rs')   # see note
@@ -184,6 +218,10 @@ The `--in-diff` runs do not exercise mutants on lines that haven't changed since
 ### File-glob fallback: `--file`
 
 `-f <GLOB>` limits to a fixed file set, ignoring git history. Useful when the relevant scope is known but a diff isn't (e.g. mutation-testing a single module while debugging it). Not part of the standard per-unit workflow, but available.
+
+### Tactical guidance: see `.cargo/mutants.toml`
+
+Cargo-mutants-specific tips — survivor triage technique (manual mutation + targeted test instead of re-running the suite), `exclude_re` anti-patterns (line-number anchors are fragile; prefer structural refactor) — live as comments in `.cargo/mutants.toml` itself, where they're seen when editing exclusion rules. This file scopes the workflow-level pieces (when to run, where in the loop, full-suite cadence); the config-file scopes the in-the-weeds tactics.
 
 ### Continuously enforced (pre-commit hook)
 
@@ -330,7 +368,7 @@ Subagents inherit the orchestrator's model unless their definition specifies oth
 | Main orchestrator | (no file — inherited) | Opus | Holds full conversation context; coordinates all subagents. |
 | Plan reviewer | `plan-reviewer.md` | Opus | Originally tiered to Sonnet; M2.C calibration found Sonnet missed two must-fix items Opus caught (Box<dyn Search> non-movability into `thread::spawn`; reader EOF / channel-disconnect dead code). Reverted to Opus per the stop-loss. |
 | Test-suite reviewer | `test-suite-reviewer.md` | Sonnet | Drops cleanly on confirmation-bias and corner-case dimensions. Haiku too risky on "would this pass against a stub?" reasoning. |
-| Final reviewer | `final-reviewer.md` | Opus | Last gate before commit; absorbs cascade from cheaper plan/test reviewers. Cheap insurance — typically converges in 1 pass. |
+| Final reviewer | `final-reviewer.md` | Opus | Last gate before commit; absorbs cascade from cheaper plan/test reviewers. Cheap insurance — typically converges in 1 pass. See watchlist re Sonnet re-eval after the M3.D scope-narrowing. |
 | Research subagent | `chess-researcher.md` | Sonnet | Cross-source synthesis still needs reasoning. Output is reviewed downstream by the user reading chat and by the plan reviewer. |
 | Coder (default) | `chess-coder.md` | Sonnet | Plans here are prescriptive (signatures, test names, order spelled out). Transcription is largely model-independent. |
 | Coder (architecturally tricky) | (override via `Agent` tool's `model: opus`) | Opus | Plan flags which subtasks need it. See "When to flag a coder slice for Opus" below. Opt-in at spawn time. |
@@ -379,9 +417,21 @@ The calibration pass is one-time per role. Re-run if the workflow changes shape 
     - Stale `TODO M3.A impl` comment on `Undo::prior_static_eval` after the field was populated.
     - **Outcome (no tier change):** all four caught by final-review (Opus); cascade worked. Workflow updated with "When to flag a coder slice for Opus" criteria covering parallel-precedent application, project-discipline application across modules, and qualitative-behavior-shift anticipation. Plans for M3.B+ should explicitly flag any slice meeting these criteria for `model: opus`. **Stop-loss not triggered** — these are should-fix items caught by review, not must-fix items shipped.
 
-**Watchlist** (tiers without calibration data — next time the role fires, run Sonnet + Opus in parallel before relying on the cheaper tier):
+- **2026-04-29 — chess-coder (M3.D, parallel Sonnet+Opus A/B).** First clean parallel A/B for the chess-coder tier (deferred from M3.A and M3.C). Both agents spawned with `isolation: "worktree"` from the M3.C-end commit (`4d8917e`), with identical implementation prompt (plan §3 + §4 + §5 + verification checklist). Mostly converged outcome; coder-only signal partially compromised by a workflow surprise.
+    - **Worktree-isolation surprise.** The orchestrator's pre-A/B temp commit (`ebd2691 WIP M3.D: test suite + plan + qsearch stubs`) on main was NOT picked up by the worktree spawn — both worktrees materialized at the parent commit (`4d8917e`). Both coders therefore wrote tests AND impl from scratch following plan §6.1 verbatim. The A/B is coder-AND-test-author, not coder-only. Useful but with reduced signal compared to a clean test-suite-shared A/B.
+    - **Both produced near-identical implementations** matching plan §3 step ordering exactly. Differences:
+        - Sonnet bumped `node_count_is_below_branching_bound` from 8000 to 10_000; Opus kept at 8000 (Sonnet observed 2179 nodes, mine ~30000 in the merged result).
+        - Both re-pinned E39 from `b1c3` to `d2d4`.
+        - Sonnet patched `integration_position_with_moves_then_go` to `go depth 2`; Opus to `go depth 3`.
+        - Both wrote 18 tests; both passed all gates; both clean clippy + fmt; both produced sound code.
+    - **Outcome.** Sonnet's diff applied to main per workflow.md's cheaper-model default rule. **chess-coder Sonnet tier confirmed for prescriptive-plan slices** — M3.D's plan §3 was unusually prescriptive thanks to the 3-pass plan-review iteration, and Sonnet handled it cleanly. The categorical "novel invariants" risks the calibration trigger flagged (false-stalemate trap, stand-pat-in-check, mate detection inside qsearch, move-flag filter discipline) were all correctly handled by both Sonnet and Opus; the prescriptive plan body left no room for either to drift.
+    - **Future watchlist.** Confirm Sonnet handles less-prescriptive slices comparably; otherwise re-trigger calibration. The next logical trigger is when a coder slice's plan §3 body is *intentionally* less detailed (e.g. an exploratory feature where the plan can't pre-specify the impl shape) — those are the cases where pattern-matching tendency would manifest.
+    - **Final-review's mutation gap closed via refactor.** The `delete - in AlphaBetaMover::qsearch` recursive-bound mutation at the open-coded `(-beta, -alpha)` survived v2's 18 M3.D tests. Manual verification (apply mutation + re-run targeted tests in seconds — the user's mid-flight nudge to skip full cargo-mutants iteration cycles) confirmed the mutation was structurally undetectable at M3.D scope at the call site: 1–2 plies of qsearch recursion in unit-test fixtures are too shallow to manifest the broken's degenerate child window's effect on returned scores. Initial proposal to document the gap via `.cargo/mutants.toml` `exclude_re` was rejected after the user pointed out that line-number-anchored regexes are fragile (any unrelated edit shifts the line, the rule silently breaks). v4 fix: extract `(-beta, -alpha)` into a module-level `negate_window(alpha, beta) -> (i32, i32)` helper. The mutation moves to the helper's body, where it's directly catchable by `negate_window_negates_both_bounds_and_swaps_them` (asymmetric + symmetric window cases, both `delete -` mutations verified to fire the assertion). Not a stop-loss trigger; the original gap was a code-shape issue, not a coder-tier issue.
 
-- **chess-coder.** Three observational data points so far (M2.E clean, M3.A 4 should-fixes caught by final-review, M3.C 2 must-fixes caught by final-review). Never had a parallel A/B. The M3.C calibration trigger fired but was **deferred to M3.D** because the worktree-isolation A/B was incompatible with the uncommitted-test-slice state at impl time (threading the test diff into both agent prompts would have inlined ~1000 lines of patch). M3.D is the next clean post-commit slice with similar novel-invariant character (qsearch — stand-pat + capture extensions + in-check evasions + terminal detection). The M3.C single-Sonnet-coder run produced two final-review-prescribed must-fix items (debug-build `cargo test` timeouts calibrated for depth-1 latency vs depth-4 default; aborted-search root score contamination not caught by the test suite) — both subtle bugs that the test suite did not pre-pin. Whether Opus catches them pre-impl is the M3.D A/B question. **Trigger: M3.D**. Spawn Sonnet + Opus on the same slice; compare diffs and final-review feedback.
+**Watchlist** (tiers without further calibration data — next time the role fires, consider running Sonnet + Opus in parallel before relying on the cheaper tier):
+
+- **chess-coder.** M3.D parallel A/B confirmed Sonnet for prescriptive plans. Re-watch when a coder slice's plan §3 is intentionally less prescriptive.
+- **final-reviewer (re-eval Sonnet).** M3.D narrowed the role's surface: cargo-mutants, cargo-llvm-cov, and other mechanical checks moved from the reviewer's job into the orchestrator's pre-review step. The reviewer is now reading + judgment only — no execution. Opus's empirical-probe ability (a load-bearing factor in the original 2026-04-27 calibration) no longer applies. **Trigger: next final-review run.** Spawn Sonnet + Opus in parallel on the same v1 artifact; compare critiques. If Sonnet matches Opus's must-fix coverage on the narrowed surface, drop the tier to Sonnet and update the model-assignment table.
 
 ### Stop-loss
 
