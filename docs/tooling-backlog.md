@@ -40,21 +40,23 @@ Industry-best-practice items surfaced during the 2026-04-27 workflow review but 
 
 **Why not `go nodes <N>`** — both clawfish and Stockfish support it, and it's hardware-invariant. But `go nodes` ties the budget to the engine's *internal* node count, which is engine-version-coupled: a future change like a smarter-but-slower eval, or more aggressive pruning per node, shifts what "N nodes" means even at fixed hardware. Different engine versions at the same N nodes aren't directly comparable. So `go nodes` is suitable for *one specific engine version vs Stockfish at fixed UCI_Elo* (a single rating snapshot), but not for cross-version SPRT (the project's primary use case from M4 onward). Skip it.
 
-**The right metric is CPU time** — invariant to both hardware AND engine internals. The engine gets a fixed CPU-time budget; what it does with those cycles (slower eval, smarter ordering, deeper recursion at lower nps, whatever) is its own choice. Strength comparison is meaningful across versions because each version got the same compute resource.
+**The right metric is CPU cycle / instruction count** — invariant to hardware (cores, clocks, thermal state), invariant to OS scheduling, AND meaningful across engine versions because each version got the same compute resource. CPU-time (`CLOCK_THREAD_CPUTIME_ID`) is a partial fix — it removes preemption and background-load noise but still varies with core type (P vs E core at different clock rates), in-core frequency scaling (boost vs throttled), and memory-bandwidth-induced stalls. Cycle / instruction counts via PMU are the rigorous answer.
 
-**`VirtualClock` UCI extension** — a clawfish-private option that replaces wallclock with thread CPU time inside `compute_caps`.
+**`VirtualClock` UCI extension** — a clawfish-private option that replaces wallclock with a hardware-invariant work metric inside `compute_caps`. Two implementation tiers:
 
-- New UCI option `option name VirtualClock type check default false`. When `true`, time-management code path substitutes `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` (POSIX) / `mach_thread_info(THREAD_BASIC_INFO)` (macOS) for `Instant::now()` in `compute_caps` and the deadline checks.
-- Effect: thermal throttling reduces clock speed → the engine processes fewer instructions per wall-second → but the same number of CPU-time-seconds, so the engine's TC budget is unchanged in CPU-time units. Strength is wallclock-invariant.
-- Background load: same idea. Other process steals CPU → engine's CLOCK_THREAD_CPUTIME_ID doesn't tick during preemption → engine's budget is unaffected. Only the wallclock duration of the game grows, not its strength.
-- **Limitation: only works for clawfish-vs-clawfish (internal SPRT).** Stock Stockfish doesn't support this option; for external matches, fall back to `go nodes` or accept wallclock variance.
-- Implementation surface: ~50 LOC inside `src/search.rs::compute_caps` (substitute the time source) plus the UCI-option plumbing in `src/engine.rs::handle_setoption` (mirroring `MoveOverhead`). Plus a test that pins the option's effect on a deterministic CPU-time fixture.
+**Tier B — preferred: PMU-based cycle / retired-instruction count.** Counting retired instructions gives a perfectly reproducible "work" metric. Cycles are noisier (vary with frequency scaling) but acceptable on hardware without aggressive DVFS. Per-thread instruction count solves all three residual variances that thread-CPU-time leaves: core-type asymmetry (work-per-cycle is roughly stable across cores at the same ISA; instruction count is even more invariant), frequency scaling, and memory-bandwidth stalls (a stall doesn't retire instructions, so it doesn't consume budget).
 
-**Even sharper: instruction count or cycle count via PMU.** macOS exposes performance-monitoring counters via `mach/processor_info.h` and Linux via `perf_event_open`. Counting retired instructions (or hardware cycles, but cycles also throttle) gives a perfectly reproducible "work" metric.
+- macOS: `mach/processor_info.h` PMU access; possibly via `kperf` framework. Apple Silicon supports per-thread instruction-count via `kpc_get_thread_counters` (semi-private API); modern macOS may require entitlements for unprivileged access. Apple's `Instruments.app` uses these counters extensively.
+- Linux: `perf_event_open(PERF_COUNT_HW_INSTRUCTIONS)` with `attr.inherit = 1` for thread-scoped counting; available unprivileged with `kernel.perf_event_paranoid <= 2` (default on most distros).
+- Implementation surface: ~150 LOC platform-specific code under `src/search/cycles.rs` with `cfg(target_os)` arms, plus the same UCI option plumbing as Tier A.
+- Test: deterministic instruction-count fixture — same negamax invocation should produce identical instruction count across two runs on the same binary.
 
-- Substantially more complex to integrate (platform-specific, may require entitlements on macOS, may need root on Linux).
-- Useful if the `CLOCK_THREAD_CPUTIME_ID` approach proves insufficient — at very-high CPU load, kernel scheduling can briefly "credit" the engine with CPU time it didn't get, biasing CPU-time-based TC.
-- Defer until thread-CPU-time is empirically inadequate.
+**Tier A — fallback: thread CPU time.** Substitute `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` (POSIX) / `mach_thread_info(THREAD_BASIC_INFO)` (macOS) for `Instant::now()` in `compute_caps` and the deadline checks. Faster to ship (~50 LOC); removes the dominant noise (preemption + background load) but leaves core-type and frequency-scaling variance. Useful as a stepping stone or as the option enabled by default if PMU access proves restricted on the dev box.
+
+**Single UCI option** `option name VirtualClock type combo default off var off var cputime var cycles var instructions`. Default `off` = standard `Instant::now()` wallclock. Options surface both tiers; `cputime` is Tier A; `cycles` / `instructions` are Tier B variants.
+
+- **Limitation: only works for clawfish-vs-clawfish (internal SPRT).** Stock Stockfish doesn't support this option; for external matches, fall back to wallclock TC and accept the variance.
+- The custom in-process Elo-iteration harness above must propagate `setoption name VirtualClock value <variant>` to clawfish at session start.
 
 **Synthesis: core-type invariance.** With hardware-invariant TC (`go nodes` or `VirtualClock`), core speed only affects the test's wallclock duration, never the Elo comparison. Fast cores → test finishes sooner. Slow cores → identical Elo measurement, just takes longer. The entire QoS-pinning / P-vs-E-core scheduling question that motivates the M3.F harness setup disappears: any thread can run anywhere on any core, and the rating result is reproducible to within sample noise. This is the load-bearing reason the two mechanisms together are *more* than just "less wallclock variance" — they make the measurement environment-independent.
 

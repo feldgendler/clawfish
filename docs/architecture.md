@@ -45,11 +45,13 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 | UCI command parser | `parse_uci_line(&str) -> Command`; total function (no panics) | `docs/plans/m2.b.md` |
 | UCI engine I/O loop | Reader thread → mpsc → orchestrator + per-`go` worker; `Arc<AtomicBool>` cancellation | ADR-0011 |
 | Search trait | `Search` trait + `SearchContext` + `SearchLimits` + `SearchResult` (unchanged since M2.C) | ADR-0011; "Search v1" below |
-| UCI options | `Random_Seed` (M2.D); preserved as no-op under M3.C+ alpha-beta | `docs/plans/m2.d.md` |
+| UCI options | `Random_Seed` (M2.D), `MoveOverhead` (M3.E), `Hash` (M4.A) | `docs/plans/m2.d.md`, ADR-0017, ADR-0018 |
 | Evaluation v1 | PeSTO MG material + PST in a precomputed `PSQT[color][kind][square]` const table | "Evaluation v1" below; ADR-0014 |
-| Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D) + ID outer loop with soft/hard caps (M3.E + ADR-0017); `bench` regression baseline (M3.F) | "Search v1" below; ADR-0016, ADR-0017 |
+| Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D) + ID + caps (M3.E) + TT (M4.A); `bench` regression baseline (M3.F) | "Search v1" below; ADR-0016, ADR-0017, ADR-0018 |
+| Transposition table (M4.A) | `TranspositionTable` in `src/tt.rs`: `UnsafeCell<Vec<TtEntry>>` + `AtomicUsize` mask + `AtomicU8` generation; depth-preferred + age-bias replacement; full 64-bit Zobrist key; mate-score depth-adjustment; bound-aware probe with cutoffs at non-PV nodes only; `Hash` UCI option (default 16 MiB, range 1–4096) | "Transposition table" below; ADR-0018 |
 | Game history + draw helpers | `Engine::game_history: Vec<u64>` + `is_repetition` + `is_fifty_move_draw` | "Game history and draw-detection helpers" below |
-| Bench command (M3.F) | `Command::Bench { depth: Option<u32> }` + `Engine::handle_bench`; `compute_bench_nps` helper extracted for direct mutation-test coverage | "Bench command" below |
+| Bench command (M3.F) | `Command::Bench { depth: Option<u32> }` + `Engine::handle_bench`; per-position `reset_for_new_game()` (M4.A) preserves determinism with TT in play | "Bench command" below |
+| Per-game state lifecycle (M4.A) | `Engine::reset_for_new_game()` clears TT + position + game_history + Search-internal state. Called by `handle_ucinewgame` and per-position inside `handle_bench` | ADR-0018 §14 |
 
 ## Position layout
 
@@ -139,7 +141,9 @@ See `decisions/0014-eval-material-pst.md` and `docs/research/m3-eval-material-ps
 
 **`MoveOverhead` UCI option (M3.E)**: `Engine::move_overhead: u64` field, default 50 ms, valid `[0, 5000]`. Threaded into `compute_caps` at every `handle_go`. Latency hedge subtracted from clock-derived caps.
 
-**`prior_root_move` ordering hint (M3.E)**: `AlphaBetaMover::prior_root_move: Option<Move>` field. Set after each completed ID iteration to that iteration's bestmove. Consumed by `negamax` at `ply == 0` only — after MVV-LVA sort, prepend the prior move via `remove(idx) + insert(0)` (preserves the rest of MVV-LVA order). Resets to `None` at top of each `go`.
+**`prior_root_move` ordering hint (M3.E, REMOVED in M4.A)**: superseded by the TT — every completed iteration's bestmove is stored at the position's TT entry; the next iteration's TT probe at the root extracts and reorders it via the TT-move-first discipline (see "Transposition table" below). Removal preserved by the M4.A replacement-scheme + abort-skip + end-of-loop-only-store invariants documented in ADR-0018 §1, §11, §13.
+
+**Transposition table (M4.A)**: `Engine::tt: Arc<TranspositionTable>` shared with the search worker via `SearchContext::tt`. `AlphaBetaMover::tt: Option<Arc<TranspositionTable>>` populated at top of `Search::go`; `tt.new_search()` advances the per-search generation counter. `negamax` now threads an `is_pv: bool` parameter (root = `true`; child = `parent_is_pv && i == 0` where `i` is the post-reorder recursion index). Per-node prologue order: `original_alpha = alpha` capture (BEFORE MDP) → rep/50-move → MDP → TT probe (cutoffs at non-PV nodes only, ordering-only at PV) → moves → TT-move-first reorder → recurse → store on completion (skip on abort, end-of-loop only). See "Transposition table" subsection and ADR-0018.
 
 **`Search::go` body sketch** (M3.E, full detail in ADR-0017 §2):
 
@@ -195,6 +199,38 @@ Per ADR-0017 §2, mid-iteration aborts go through `should_abort` (the hard-cap p
 **Why no ID at M3.D.** Plan keeps M3.D narrow: qsearch as a leaf-evaluation refinement, not a search-depth refinement. M3.E adds iterative deepening + soft/hard time-management (wraps `negamax` in an outer ID loop; qsearch unaffected).
 
 See `docs/plans/m3.c.md`, `docs/plans/m3.d.md`, `docs/decisions/0016-search-structure.md`, `bench/m3.md` (M3.C and M3.D sections).
+
+## Transposition table (M4.A)
+
+**Public surface (within crate).** `src/tt.rs` exposes:
+
+- `pub(crate) enum TtBound { Exact, Lower, Upper }` — `#[repr(u8)]`, packed into 2 bits.
+- `pub(crate) struct TtEntry` — 16-byte packed: `key: u64`, `score: i16`, `depth: u8`, `age_and_bound: u8` (6 bits age + 2 bits bound), `best_move: u16`, `_pad: u16`. `_pad` is logically zero.
+- `pub(crate) struct TtData` — input bundle to `store`.
+- `pub(crate) struct TranspositionTable` — `UnsafeCell<Vec<TtEntry>>` + `AtomicUsize` mask + `AtomicU8` generation. `unsafe impl Sync` with single-mutator discipline anchored to ADR-0011.
+- `pub(crate) fn score_to_tt(score: i32, ply: i32) -> i32` and `pub(crate) fn score_from_tt(score: i32, ply: i32) -> i32` — mate-aware adjustments via threshold `MATE_IN_MAX_PLY = 29936`.
+
+**API.** `new(size_mib)` / `resize(size_mib)` / `clear()` / `new_search()` / `probe(key)` / `store(key, data)` / `entry_count()` / `generation()` / `index_for(key)`.
+
+**Replacement scheme (depth-preferred + age-bias).** Replace if old entry is empty OR `old.age != current_gen` OR `old.depth <= new.depth`. Best-move preserved when new entry has `best_move == 0` AND the slot's existing entry has the same key with a non-zero best_move.
+
+**Mate-score adjustment.** On store: positive mate gets `+ply` added; negative mate gets `-ply` subtracted. On probe: inverse. Threshold: `|score| > MATE_IN_MAX_PLY` (29936 with `MATE = 30000`, `MAX_PLY = 64`).
+
+**Lifecycle.** Engine owns the canonical `Arc<TranspositionTable>`; cloned into each `SearchContext` at `handle_go` / `handle_bench` time. `new_search()` is called once per `go` to advance the generation counter — entries from prior `go`s are freely replaceable. `clear()` zeros all entries AND resets generation to 0; called via `Engine::reset_for_new_game()` from `handle_ucinewgame` and per-bench-position from `handle_bench`. `Hash` UCI option mid-session resize: `setoption name Hash value <N>` joins any in-flight worker, then calls `tt.resize(N)` (allocates new Vec, zero-init).
+
+**PV-node vs non-PV-node discipline.** TT cutoffs are scoped to non-PV nodes only. `is_pv: bool` parameter threaded through `negamax` (root = `true`; child = `parent_is_pv && i == 0` where `i` is the post-reorder recursion index). Under fail-soft pure alpha-beta `is_pv` is a synthetic ordering predicate; PVS at M4.D will replace it with `beta - alpha == 1`.
+
+**Per-node prologue ordering.** `original_alpha = alpha` capture (BEFORE MDP, BEFORE TT probe — load-bearing for bound classification) → rep/50-move check → MDP → TT probe (with score-from-TT mate adjustment) → bound comparison vs post-MDP window → cutoff or fall-through with TT move kept as ordering hint.
+
+**Store discipline.** Store fires after the move loop returns; skipped if `self.aborted`. Bound classified as: `best >= beta → Lower`, `best > original_alpha → Exact`, else `Upper`. Best-move: cutoff move on Lower; `pv[ply][0]` on Exact; 0 on Upper (replacement preserves slot's existing best_move on same-key).
+
+**`Hash` UCI option.** `option name Hash type spin default 16 min 1 max 4096`. Default 16 MiB ÷ 16-byte entries = 1,048,576 entries. Allocation rounds DOWN to nearest power of two (mask-based indexing).
+
+**Graph-history-interaction.** Option 1 ("live with it") — repetition check runs BEFORE the TT probe in the prologue, neutralizing the most common GHI manifestation (draw-by-repetition mis-scoring). 50-move-boundary GHI is acknowledged and deferred. ADR-0018 §10.
+
+**Per-game state inventory.** `Engine::reset_for_new_game()` clears: TT entries (zero), TT generation (0), position (startpos), game_history (`vec![startpos.zobrist()]`), Search-internal state (via `Search::reset`). Called from `handle_ucinewgame` AND per-position inside `handle_bench` for deterministic bench across positions.
+
+See `decisions/0018-transposition-table.md` and `docs/research/m4-transposition-table.md`.
 
 ## Game history and draw-detection helpers
 

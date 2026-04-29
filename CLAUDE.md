@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M3 complete (M3.F closed); M4 — search basics (TT, killer/history, PVS, aspiration windows) is next.** Architectural commitments settled (see `docs/decisions/`).
+**Phase: M4.A complete (TT landed); M4.B — killer moves — is next.** Architectural commitments settled (see `docs/decisions/`).
 
 | Phase | Status | One-line summary |
 |---|---|---|

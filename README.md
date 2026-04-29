@@ -4,21 +4,24 @@ A Rust chess engine, written from scratch and grown incrementally toward
 GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 
 > **Status: early.** Fail-soft alpha-beta with quiescence search,
-> iterative deepening, MVV-LVA + prior-PV ordering, mate-distance pruning,
-> PeSTO middlegame piece-square tables, and `compute_caps`-driven time
-> management. `bench` UCI command for deterministic node-count regression
-> baselines. No transposition table yet. The rest of the strength path
-> (TT, killer/history, PVS, aspiration; eval improvements; NNUE) is tracked in
-> [`docs/roadmap.md`](docs/roadmap.md).
+> iterative deepening, transposition table (Zobrist-keyed, 16 MiB default),
+> MVV-LVA + TT-move-first ordering, mate-distance pruning, PeSTO middlegame
+> piece-square tables, and `compute_caps`-driven time management. `bench` UCI
+> command for deterministic node-count regression baselines. The rest of the
+> strength path (killer/history, PVS, aspiration; eval improvements; NNUE) is
+> tracked in [`docs/roadmap.md`](docs/roadmap.md).
 >
-> **Current strength: ~2114 Elo at tc=10+0.1** (Apple M4 P-cores, single
-> thread, no pondering, anchored to Stockfish UCI_Elo / CCRL 40/4
-> calibration). ±35 Elo CI from 120-game online iteration. Measured at
-> M3.F end. Methodology + caveats: [`bench/sprt/2026-04-29-online-elo-iteration.md`](bench/sprt/2026-04-29-online-elo-iteration.md).
+> **Current strength: ~2396 Elo at tc=10+0.1** (chained estimate: M3.F's
+> ~2114 anchor + M4.A's measured Δ +282 vs `baseline/alpha-beta-no-tt`).
+> Apple M4 P-cores, single thread, no pondering, ±~70 Elo combined
+> uncertainty. Direct rating-estimate run deferred to M4.D close.
+> Methodology + caveats: [`bench/sprt/2026-04-29-m4.a-vs-no-tt.md`](bench/sprt/2026-04-29-m4.a-vs-no-tt.md).
 >
-> **Current bench:** `bench: 172312700 nodes 11489045 nps` at default depth 7
-> (M3.F end). Run `printf 'bench\nquit\n' | ./target/release/clawfish` to
-> reproduce.
+> **Current bench:** `bench: 39964046 nodes <NPS> nps` at default depth 7
+> (M4.A end; node count is deterministic, NPS is wallclock-dependent). Down
+> from M3.F's 172,312,700 nodes — ~77% reduction from TT participation. Run
+> `printf 'bench\nquit\n' | ./target/release/clawfish` to reproduce the node
+> count.
 
 ## Build
 

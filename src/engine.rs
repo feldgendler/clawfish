@@ -36,6 +36,16 @@ const MAX_RANDOM_SEED: u32 = 2_147_483_647;
 /// `option name MoveOverhead …` line emitted by `handle_uci`.
 const MAX_MOVE_OVERHEAD: u64 = 5_000;
 
+/// Default `Hash` table size in MiB. Industry consensus (Stockfish et al.).
+/// Must match the `default` in the `option name Hash …` line emitted by `handle_uci`.
+pub(crate) const DEFAULT_HASH_MIB: usize = 16;
+/// Maximum `Hash` table size in MiB. Realistic ceiling for Apple Silicon dev boxes.
+/// Must match the `max` in the `option name Hash …` line emitted by `handle_uci`.
+pub(crate) const MAX_HASH_MIB: usize = 4096;
+/// Minimum `Hash` table size in MiB. Must match the `min` in the
+/// `option name Hash …` line emitted by `handle_uci`.
+pub(crate) const MIN_HASH_MIB: usize = 1;
+
 /// Default `MoveOverhead` value (M3.E). 50 ms matches the research §6 default
 /// and is a safer hedge than Stockfish's 10 ms default for typical macOS
 /// scheduling jitter.
@@ -76,13 +86,26 @@ pub struct Engine<W: Write + Send + 'static, S: Search + Send + 'static> {
     /// from clock-derived caps in `compute_caps`. Default 50; valid range
     /// `[0, MAX_MOVE_OVERHEAD]`.
     move_overhead: u64,
+    /// Engine-owned transposition table. `Arc::clone`d into each `SearchContext`
+    /// at `handle_go` / `handle_bench` time. Resized via `setoption name Hash`;
+    /// cleared via `handle_ucinewgame` and per-position inside `handle_bench`.
+    /// Single-mutator invariant per ADR-0011 + ADR-0018 §2: orchestrator mutates
+    /// only after `join_in_flight_worker()` returns; search worker is the only
+    /// reader/writer during `Search::go`.
+    tt: Arc<crate::tt::TranspositionTable>,
+    /// Current `Hash` UCI option value in MiB. Default `DEFAULT_HASH_MIB`,
+    /// valid `[MIN_HASH_MIB, MAX_HASH_MIB]`. Tracked separately from the TT
+    /// for setoption echo / debugging; not used in hot paths.
+    hash_mib: usize,
 }
 
 impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
     /// Build an engine. Position starts at `Position::starting_position()`,
-    /// `debug` off, no search in flight, `move_overhead` at default.
+    /// `debug` off, no search in flight, `move_overhead` at default, TT at
+    /// `DEFAULT_HASH_MIB`.
     pub fn new(stdout: W, search: S) -> Self {
         let position = Position::starting_position();
+        let tt = Arc::new(crate::tt::TranspositionTable::new(DEFAULT_HASH_MIB));
         Self {
             game_history: vec![position.zobrist()],
             position,
@@ -92,6 +115,8 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
             search: Arc::new(Mutex::new(search)),
             search_handle: None,
             move_overhead: DEFAULT_MOVE_OVERHEAD,
+            tt,
+            hash_mib: DEFAULT_HASH_MIB,
         }
     }
 
@@ -150,6 +175,9 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         self.write_line("id author Alex Feldgendler");
         self.write_line("option name Random_Seed type spin default 0 min 0 max 2147483647");
         self.write_line("option name MoveOverhead type spin default 50 min 0 max 5000");
+        self.write_line(&format!(
+            "option name Hash type spin default {DEFAULT_HASH_MIB} min {MIN_HASH_MIB} max {MAX_HASH_MIB}"
+        ));
         self.write_line("uciok");
     }
 
@@ -158,15 +186,7 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
     }
 
     fn handle_ucinewgame(&mut self) {
-        // Signal and join any in-flight worker before mutating state or
-        // acquiring the search mutex. A `go infinite` still running when
-        // `ucinewgame` arrives would otherwise hold the lock for the full
-        // polling duration, blocking the orchestrator and preventing it from
-        // ever processing the inevitable `stop`. ADR-0011 v3.
-        self.join_in_flight_worker();
-        self.position = Position::starting_position();
-        self.game_history = vec![self.position.zobrist()];
-        self.search.lock().unwrap().reset();
+        self.reset_for_new_game();
     }
 
     fn handle_position(&mut self, spec: PositionSpec, moves: Vec<String>) {
@@ -261,6 +281,7 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
             start: now,
             limits,
             history: self.game_history.clone(),
+            tt: Some(Arc::clone(&self.tt)),
         };
 
         let handle = std::thread::spawn(move || {
@@ -356,6 +377,32 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
             return;
         }
 
+        if name.eq_ignore_ascii_case("hash") {
+            let parsed: Option<usize> = value
+                .as_deref()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| (MIN_HASH_MIB..=MAX_HASH_MIB).contains(&n));
+            match parsed {
+                Some(n) => {
+                    // Resize requires no in-flight worker (the search would observe
+                    // a Vec swap mid-probe). Mirrors `random_seed` discipline.
+                    self.join_in_flight_worker();
+                    self.tt.resize(n);
+                    self.hash_mib = n;
+                    // Clear stop after join so any subsequent go starts fresh.
+                    self.stop.store(false, Ordering::Relaxed);
+                }
+                None => {
+                    let msg = match value.as_deref() {
+                        Some(v) => format!("Hash: rejected value '{v}'"),
+                        None => "Hash: rejected (no value given)".to_string(),
+                    };
+                    self.info_string_debug(&msg);
+                }
+            }
+            return;
+        }
+
         // Unknown option — preserve M2.C behavior: silent if debug off, info
         // string if debug on. Do NOT emit Stockfish's bare "No such option:"
         // line (research §1.4, §2.5). Idiom mirrors existing M2.C handler:
@@ -409,15 +456,11 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         // `handle_ucinewgame`'s discipline — bench is synchronous on the
         // orchestrator thread, so the dispatch loop is blocked until bench
         // returns; commands like `isready`/`stop` queue in mpsc until then.
+        // `join_in_flight_worker` sets stop=true; clear it after so the
+        // initial per-position reset doesn't immediately re-dirty the flag
+        // (reset_for_new_game clears stop internally, so this is belt-and-
+        // braces).
         self.join_in_flight_worker();
-        // Clear `stop` after the join. `join_in_flight_worker` sets stop=true
-        // to signal the worker to exit; if we leave it set, every per-position
-        // `Search::go` below would inherit `stop=true` and either abort
-        // mid-iteration via the 4096-node cadence (production depth 7+) or
-        // break between iterations via the inter-iteration stop check (any
-        // depth ≥ 2). Bench results would be massively contaminated.
-        // Same discipline as `handle_go` line ~214: clear stop before
-        // constructing per-go SearchContext.
         self.stop.store(false, Ordering::Relaxed);
 
         let depth = depth_override.unwrap_or(BENCH_DEFAULT_DEPTH);
@@ -426,6 +469,15 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         let mut total_nodes: u64 = 0;
 
         for (idx, fen) in BENCH_POSITIONS.iter().enumerate() {
+            // Reset per-game state before each position: clears TT entries,
+            // game_history, and search-side state. This is the ADR-0018 §14
+            // discipline; without it the TT carries scores from position N into
+            // position N+1, breaking bench determinism across corpus order.
+            // reset_for_new_game also resets position to startpos, which is
+            // immediately overwritten by the FEN parse below — a harmless
+            // extra assignment.
+            self.reset_for_new_game();
+
             // FEN parse failure is unreachable for the vendored corpus
             // (`bench_positions_all_parse_via_from_fen` is the anchor), but
             // a defensive skip keeps `bench` robust over future expansions.
@@ -440,10 +492,6 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
                 }
             };
 
-            // No per-position `reset()`. `AlphaBetaMover::reset()` only
-            // clears `self.history`; `Search::go`'s top-of-go reset clears
-            // everything else (nodes, pv, prior_root_move, …) on every call.
-
             let limits = SearchLimits {
                 depth: Some(depth),
                 ..SearchLimits::default()
@@ -456,6 +504,7 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
                 start: pos_start,
                 limits,
                 history: vec![pos.zobrist()],
+                tt: Some(Arc::clone(&self.tt)),
             };
 
             // Synchronous-on-orchestrator-thread invocation. info_sink is a
@@ -513,17 +562,46 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
 
     /// Signal stop and join the in-flight search worker, if any.
     ///
-    /// Used by `handle_go` (back-to-back go), `handle_ucinewgame`, and
-    /// `handle_setoption`'s `Random_Seed` success path — anything that needs
-    /// to mutate engine state or hold the search mutex for a non-trivial
-    /// duration. ADR-0011 v3 guarantees the worker exits within ≤ 1 ms (its
-    /// cancellation-poll cadence). The caller must clear `self.stop` afterward
-    /// when a new search is about to begin (only `handle_go` does this).
+    /// Used by `handle_go` (back-to-back go), `reset_for_new_game`, and
+    /// `handle_setoption`'s `Random_Seed` / `Hash` success paths — anything
+    /// that needs to mutate engine state or hold the search mutex for a
+    /// non-trivial duration. ADR-0011 v3 guarantees the worker exits within
+    /// ≤ 1 ms (its cancellation-poll cadence). The caller must clear
+    /// `self.stop` afterward when a new search is about to begin.
     fn join_in_flight_worker(&mut self) {
         if let Some(h) = self.search_handle.take() {
             self.stop.store(true, Ordering::Relaxed);
             let _ = h.join();
         }
+    }
+
+    /// Reset all per-game state. Called from `handle_ucinewgame` AND from
+    /// `handle_bench` per position. Single source of truth for game-boundary
+    /// state lifecycle (ADR-0018 §14). Order:
+    ///   1. Join any in-flight worker (defensive; orchestrator-thread call).
+    ///   2. Reset position + game_history to startpos.
+    ///   3. Clear the TT (zeros entries, resets generation to 0).
+    ///   4. Call Search::reset for any search-side per-game state.
+    ///   5. Clear stop so subsequent go does not inherit a stale true.
+    fn reset_for_new_game(&mut self) {
+        self.join_in_flight_worker();
+        self.position = Position::starting_position();
+        self.game_history = vec![self.position.zobrist()];
+        self.tt.clear();
+        self.search.lock().unwrap().reset();
+        self.stop.store(false, Ordering::Relaxed);
+    }
+
+    /// Test-only accessor for the engine's transposition table.
+    #[cfg(test)]
+    pub(crate) fn tt(&self) -> &Arc<crate::tt::TranspositionTable> {
+        &self.tt
+    }
+
+    /// Test-only accessor for the current `hash_mib` value.
+    #[cfg(test)]
+    pub(crate) fn hash_mib(&self) -> usize {
+        self.hash_mib
     }
 
     /// Lock stdout, write the line + `\n`, flush. All protocol-relevant
@@ -896,27 +974,27 @@ mod tests {
         // when debug is on for unknown options. Catches a mutant where the body
         // is replaced with `()`. Also pins both the `Some(value)` and `None`
         // arms of the `details` formatter.
-        // (iii) Random_Seed with valid value under debug on: must be SILENT on
-        // success (not echoed — different from unknown options).
+        // (iii) Random_Seed + Hash with valid values under debug on: must be
+        // SILENT on success (not echoed — different from unknown options).
+        // M4.A: `setoption name Hash value 16` is now a known option (handled
+        // before the unknown-option fallback) — its success path is silent
+        // under debug on (mirrors `random_seed` precedent). Only `Clear` (truly
+        // unknown) still echoes.
         let (stdout, _) = drive(&[
             "debug on",
             "setoption name Hash value 16",
             "setoption name Clear",
             "setoption name Random_Seed value 42",
         ]);
-        // (i) Unknown options still echo under debug on — count must still be 2.
+        // Only the unknown option `Clear` echoes; Hash and Random_Seed are silent on success.
         let info_lines: Vec<&str> = stdout
             .lines()
             .filter(|l| l.starts_with("info string setoption received:"))
             .collect();
         assert_eq!(
             info_lines.len(),
-            2,
-            "expected 2 setoption info-string lines (Hash + Clear only); got:\n{stdout}"
-        );
-        assert!(
-            info_lines.iter().any(|l| l.contains("name Hash value 16")),
-            "expected `name Hash value 16` in setoption info string;\nlines: {info_lines:?}",
+            1,
+            "expected 1 setoption info-string line (Clear only; Hash is now a known option); got:\n{stdout}"
         );
         assert!(
             info_lines
@@ -924,9 +1002,16 @@ mod tests {
                 .any(|l| l.contains("name Clear") && !l.contains("value")),
             "expected `name Clear` (no value) in setoption info string;\nlines: {info_lines:?}",
         );
-        // (iv) Explicit assertion: Random_Seed success must produce zero
-        // Random_Seed-mentioning info lines. Catches a mutant that swaps the
-        // success branch to echo.
+        // Hash success must produce zero Hash-mentioning info lines.
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|l| l.contains("name Hash value 16"))
+                .count(),
+            0,
+            "setoption name Hash value 16 must not produce any Hash info lines under debug on; got:\n{stdout}",
+        );
+        // Explicit assertion: Random_Seed success must produce zero info lines.
         assert_eq!(
             stdout.lines().filter(|l| l.contains("Random_Seed")).count(),
             0,
@@ -1117,7 +1202,8 @@ mod tests {
             "setoption name Random_Seed value 42 must produce zero output when debug is off; got: {stdout_seed:?}",
         );
 
-        // (ii) Unknown option — preserved M2.C behavior. Silent on debug off.
+        // (ii) Hash with valid value — known option, success path. Silent on debug off.
+        // M4.A: Hash is now a recognized option; valid values are accepted silently.
         let (stdout_hash, _) = drive(&["setoption name Hash value 16"]);
         assert!(
             stdout_hash.is_empty(),
@@ -3410,6 +3496,266 @@ mod tests {
             ready_pos > bench_pos,
             "readyok ({ready_pos}) must arrive AFTER the bench signature line ({bench_pos}); \
              stdout was:\n{stdout}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M4.A — engine-level TT tests (E_a–E_f + E_b2)
+    // -----------------------------------------------------------------------
+
+    // Helper: build an engine, run commands, return (stdout, engine) so tests
+    // can inspect engine state after the run. Unlike `drive`, this does NOT
+    // append Quit — the caller controls the channel lifetime.
+    #[allow(clippy::type_complexity)]
+    fn build_engine_with_channel() -> (
+        Arc<Mutex<Vec<u8>>>,
+        Engine<CapturedWriter, AlphaBetaMover>,
+        mpsc::Sender<Command>,
+        mpsc::Receiver<Command>,
+    ) {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let engine = Engine::new(writer, AlphaBetaMover::new());
+        let (tx, rx) = mpsc::channel::<Command>();
+        (buf, engine, tx, rx)
+    }
+
+    /// E_a: `handle_uci` emits the `option name Hash …` line.
+    #[test]
+    fn handle_uci_emits_hash_option_line() {
+        let (stdout, _) = drive(&["uci"]);
+        let lines: Vec<&str> = stdout.lines().collect();
+
+        let opt_line = lines
+            .iter()
+            .find(|l| l.starts_with("option name Hash"))
+            .copied()
+            .expect("option name Hash line must be present in uci output");
+        assert_eq!(
+            opt_line, "option name Hash type spin default 16 min 1 max 4096",
+            "Hash option line text must match exactly"
+        );
+
+        // Ordering: must appear before uciok.
+        let hash_idx = lines
+            .iter()
+            .position(|l| l.starts_with("option name Hash"))
+            .unwrap();
+        let uciok_idx = lines.iter().position(|l| *l == "uciok").unwrap();
+        assert!(
+            hash_idx < uciok_idx,
+            "option name Hash (line {hash_idx}) must precede uciok (line {uciok_idx})"
+        );
+    }
+
+    /// E_b: `setoption name Hash` resizes the table in both directions.
+    #[test]
+    fn setoption_hash_valid_resizes_table() {
+        let (buf, mut engine, tx, rx) = build_engine_with_channel();
+
+        // Default: 16 MiB → 1_048_576 entries.
+        assert_eq!(
+            engine.tt().entry_count(),
+            16 * 1024 * 1024 / 16,
+            "default TT entry count must be 1_048_576"
+        );
+
+        tx.send(parse_uci_line("setoption name Hash value 32"))
+            .unwrap();
+        tx.send(Command::Quit).unwrap();
+        engine.run(rx);
+
+        let expected_32 = 32 * 1024 * 1024 / 16;
+        assert_eq!(
+            engine.tt().entry_count(),
+            expected_32,
+            "after setoption Hash 32, entry_count must be {} (32 MiB / 16 bytes)",
+            expected_32
+        );
+        assert_eq!(
+            engine.hash_mib(),
+            32,
+            "hash_mib field must track the resize"
+        );
+
+        // Now shrink: build a fresh engine and send Hash 4.
+        let (_, mut engine2, tx2, rx2) = build_engine_with_channel();
+        tx2.send(parse_uci_line("setoption name Hash value 4"))
+            .unwrap();
+        tx2.send(Command::Quit).unwrap();
+        engine2.run(rx2);
+        drop(buf);
+
+        let expected_4 = 4 * 1024 * 1024 / 16;
+        assert_eq!(
+            engine2.tt().entry_count(),
+            expected_4,
+            "after setoption Hash 4, entry_count must be {} (4 MiB / 16 bytes)",
+            expected_4
+        );
+        assert_eq!(
+            engine2.hash_mib(),
+            4,
+            "hash_mib field must track the shrink"
+        );
+    }
+
+    /// E_b2: `setoption name Hash` followed by `isready` then `go depth 2`
+    /// runs to completion (proves stop=true from join_in_flight_worker is
+    /// cleared before the subsequent go).
+    ///
+    /// Uses the background-thread pattern (not `drive`) so that Quit does not
+    /// race with the in-flight depth-2 search: we poll for `info depth 2`
+    /// before sending Quit.
+    #[test]
+    fn setoption_hash_followed_by_isready_then_go_does_not_stop_early() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
+        let (tx, rx) = mpsc::channel::<Command>();
+
+        let buf_clone = Arc::clone(&buf);
+        let handle = thread::spawn(move || engine.run(rx));
+
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("setoption name Hash value 32"))
+            .unwrap();
+        tx.send(parse_uci_line("isready")).unwrap();
+        tx.send(parse_uci_line("go depth 2")).unwrap();
+
+        // Poll for bestmove (which implies depth 2 completed).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = snapshot_output(&buf_clone);
+            if snap.lines().any(|l| l.starts_with("bestmove ")) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bestmove did not appear within 5s after go depth 2;\nstdout:\n{snap}"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        tx.send(Command::Quit).unwrap();
+        handle.join().expect("engine thread should not panic");
+
+        let stdout = snapshot_output(&buf_clone);
+        // A depth-2 search that was stopped early (stop=true contamination from
+        // setoption's join_in_flight_worker) would emit only `info depth 1`
+        // and no `info depth 2` line.
+        assert!(
+            stdout.lines().any(|l| l.starts_with("info depth 2 ")),
+            "go depth 2 after setoption Hash must reach depth 2; \
+             stop=true contamination would prevent this.\nstdout:\n{stdout}"
+        );
+    }
+
+    /// E_c: `setoption name Hash value 0` (below min=1) is rejected silently.
+    #[test]
+    fn setoption_hash_zero_rejected_silently() {
+        let (buf, mut engine, tx, rx) = build_engine_with_channel();
+        let initial_count = engine.tt().entry_count();
+
+        tx.send(parse_uci_line("setoption name Hash value 0"))
+            .unwrap();
+        tx.send(Command::Quit).unwrap();
+        engine.run(rx);
+
+        let stdout = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        // TT size unchanged.
+        assert_eq!(
+            engine.tt().entry_count(),
+            initial_count,
+            "Hash value 0 must be rejected; TT size unchanged"
+        );
+        // Silent when debug off.
+        assert!(
+            stdout.is_empty(),
+            "rejected Hash value must produce no output when debug is off; got: {stdout:?}"
+        );
+    }
+
+    /// E_d: `setoption name Hash value 99999` (above max=4096) is rejected silently.
+    #[test]
+    fn setoption_hash_above_max_rejected_silently() {
+        let (buf, mut engine, tx, rx) = build_engine_with_channel();
+        let initial_count = engine.tt().entry_count();
+
+        tx.send(parse_uci_line("setoption name Hash value 99999"))
+            .unwrap();
+        tx.send(Command::Quit).unwrap();
+        engine.run(rx);
+
+        let stdout = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        // TT size unchanged.
+        assert_eq!(
+            engine.tt().entry_count(),
+            initial_count,
+            "Hash value 99999 > MAX must be rejected; TT size unchanged"
+        );
+        // Silent when debug off.
+        assert!(
+            stdout.is_empty(),
+            "rejected Hash value must produce no output when debug is off; got: {stdout:?}"
+        );
+    }
+
+    /// E_e: `ucinewgame` clears TT entries populated by a prior search.
+    #[test]
+    fn ucinewgame_clears_tt() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
+        let (tx, rx) = mpsc::channel::<Command>();
+
+        // Run a depth-2 search from startpos; this should populate TT entries.
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("go depth 2")).unwrap();
+        tx.send(Command::Quit).unwrap();
+        engine.run(rx);
+
+        // After the search, probe the startpos key — it should be in the TT.
+        let startpos_key = Position::starting_position().zobrist();
+        let hit_before = engine.tt().probe(startpos_key);
+        assert!(
+            hit_before.is_some(),
+            "TT must have an entry for startpos after a depth-2 search"
+        );
+
+        // Now reset for a new game; this should clear the TT.
+        engine.reset_for_new_game();
+
+        let hit_after = engine.tt().probe(startpos_key);
+        assert!(
+            hit_after.is_none(),
+            "TT must be empty for startpos after ucinewgame (reset_for_new_game clears all entries)"
+        );
+    }
+
+    /// E_f: `bench` is deterministic run-to-run with TT in play.
+    #[test]
+    fn bench_clears_tt_between_positions_for_determinism() {
+        // Run bench twice at depth 2; verify identical per-position node counts.
+        // If the TT leaked between positions (no per-position clear), counts
+        // would differ between run 1 and run 2 because run 2's TT is cold while
+        // run 1's carries entries from position N into N+1.
+        let (s1, _) = drive(&["bench 2"]);
+        let (s2, _) = drive(&["bench 2"]);
+        let per1 = extract_bench_per_position(&s1);
+        let per2 = extract_bench_per_position(&s2);
+        let nodes1: Vec<u64> = per1.iter().map(|(_, _, n, _)| *n).collect();
+        let nodes2: Vec<u64> = per2.iter().map(|(_, _, n, _)| *n).collect();
+        assert_eq!(
+            nodes1, nodes2,
+            "bench per-position node counts must be identical across two runs (TT cleared per position).\n\
+             run1: {nodes1:?}\nrun2: {nodes2:?}"
+        );
+        let n1 = extract_bench_signature(&s1).unwrap().0;
+        let n2 = extract_bench_signature(&s2).unwrap().0;
+        assert_eq!(
+            n1, n2,
+            "bench total node count must be identical across two runs; got {n1} vs {n2}"
         );
     }
 }

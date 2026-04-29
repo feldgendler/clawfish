@@ -4,9 +4,9 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1 complete; M2 complete; M3 complete (M3.A–M3.F all landed); M4 next — search basics (TT, ordering, PVS, aspiration).**
+**M1 complete; M2 complete; M3 complete; M4.A complete — TT landed. M4.B (killer moves) next.**
 
-For per-phase retrospectives (what landed, implementation highlights, verification numbers), see [`milestones/`](milestones/). The latest landed phase is [M3.F](milestones/m3.f.md) (2026-04-29) — closes M3.
+For per-phase retrospectives (what landed, implementation highlights, verification numbers), see [`milestones/`](milestones/). The latest landed phase is [M4.A](milestones/m4.a.md) (2026-04-29) — Zobrist-keyed transposition table integrated.
 
 - Bench signature: `bench: 172312700 nodes 11489045 nps` at default depth 7.
 - SPRT vs `baseline/random-mover`: 148-0-0 (LLR=2.95 H1 accepted in 148 games / 3m35s).
@@ -16,7 +16,7 @@ For per-phase retrospectives (what landed, implementation highlights, verificati
 
 ### What's next
 
-**M4 — search basics.** See the M4 section below. Transposition table (Zobrist-keyed) + move ordering refinements (PV move, killer moves, history heuristic) + aspiration windows + PVS. Each addition gated by SPRT against `baseline/alpha-beta-no-tt`.
+**M4.B — killer moves.** Two killer slots per ply, updated on quiet-move beta cutoff, ordering after TT move + captures, before history. SPRT-gated against `baseline/alpha-beta-tt` (the tag landing at M4.A's commit).
 
 ## Milestones
 
@@ -163,7 +163,7 @@ ADR numbers allocated at landing time; numeric slots may slide if other ADRs lan
 
 | Phase | Scope | Approx size |
 |---|---|---|
-| **M4.A** — Transposition table | TT entry (Zobrist key + score + depth + bound type + best move + age); shared backing `Vec<TtEntry>`; bound-aware probe with cutoff at non-PV nodes; store at every negamax node returning a real (non-aborted) bound; mate-score depth-adjustment on store/probe; `Hash` UCI option; TT move first in move ordering at every negamax ply. Detail bullets follow the table. | ~1000 (largest M4 unit; rationale below) |
+| **M4.A** ✓ — Transposition table | `TranspositionTable` (`UnsafeCell<Vec<TtEntry>>` + 16-byte entry: 64-bit Zobrist key + i16 score + u8 depth + 6-bit age + 2-bit bound + u16 move + 2 bytes pad); depth-preferred + age-bias replacement; bound-aware probe with cutoffs at non-PV nodes only; store at every negamax node on completed bound (skip on abort, end-of-loop only); mate-score depth-adjustment on store/probe; `Hash` UCI option (default 16 MiB, range 1–4096); TT move first in move ordering at every negamax ply. `prior_root_move` removed (TT subsumes). `Engine::reset_for_new_game()` consolidated; called from `handle_ucinewgame` + per-bench-position. Bench signature: `bench: 39964046 nodes <NPS> nps` at default depth 7 (77% node reduction vs M3.F). ADR-0018. Retrospective: [`milestones/m4.a.md`](milestones/m4.a.md). | ~1000 |
 | **M4.B** — Killer moves | Two killer slots per ply (`[Option<Move>; 2]` per ply); update on quiet-move beta cutoff; ordering: after TT move and after captures (sorted by MVV-LVA), before history. Inter-iteration policy (clear at the start of each ID iteration vs. persist with aging; relevant under M4.D's aspiration re-searches) is an open M4.B-plan question; tentative default is *clear between iterations* per CPW guidance. | ~350 |
 | **M4.C** — History heuristic | History counter table indexed by piece-and-to (or from-and-to; chosen at ADR landing — see open questions); depth-weighted increment on quiet-move beta cutoff; matching decrement on quiet moves that failed to cut at the same node; aging-or-saturation discipline (chosen at ADR landing); ordering tiebreaker among non-killer quiets. | ~450 |
 | **M4.D** — Aspiration windows | ID outer-loop wrapper consuming the prior iteration's score from `last_complete: Option<(depth, bestmove, score)>` (already plumbed by M3.E). Detail bullets follow the table. | ~350 |
