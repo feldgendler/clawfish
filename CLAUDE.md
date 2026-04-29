@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M3.D complete; M3.E next — iterative deepening + time management.** Architectural commitments settled (see `docs/decisions/`).
+**Phase: M3.E complete; M3.F next — `bench` UCI command + SPRT validation.** Architectural commitments settled (see `docs/decisions/`).
 
 | Phase | Status | One-line summary |
 |---|---|---|
@@ -16,13 +16,14 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 | M3.B | ✓ | `Engine::game_history` + `is_repetition` + `is_fifty_move_draw` helpers (plumbing only). |
 | M3.C | ✓ | `AlphaBetaMover` (fail-soft negamax + triangular PV + MVV-LVA + mate-distance pruning) per ADR-0016; 20-0 vs `baseline/material-greedy` at depth 4; 8.55 Mnps depth-8 startpos. |
 | M3.D | ✓ | Quiescence search at the negamax horizon; `negate_window` helper closes a structural mutation gap; 10.87 Mnps depth-8 startpos (+27% vs M3.C). |
+| M3.E | ✓ | Iterative deepening + time management per ADR-0017; `compute_caps` pure function; `MoveOverhead` UCI option; `prior_root_move` ordering hint at ply==0; `aborted_fallback_result` helper. |
 | Tooling/fuzzing | ✓ | `cargo-fuzz` harnesses for FEN + UCI (ADR-0013); 3.17B execs aggregate across saturation + smoke campaigns, one real parser bug found and fixed. |
 
 For per-phase detail (what landed, verification numbers, lessons), see [`docs/milestones/`](docs/milestones/). The forward-looking milestone plan lives in [`docs/roadmap.md`](docs/roadmap.md).
 
 ### What's next
 
-**M3.E — iterative deepening + time management.** ID outer loop wraps M3.C/M3.D's negamax + qsearch with abort-between-iterations discipline; prior-iteration root PV tried first; new `compute_caps` time-management function + `MoveOverhead` UCI option. A new ADR (next free number — expected `0017`; `0015` is taken by phantom-EP sanitization, `0016` by search structure) lands here. Detail in [`docs/roadmap.md`](docs/roadmap.md).
+**M3.F — `bench` UCI command + SPRT validation.** Closes M3. UCI `bench` command for deterministic node-count regression baseline; SPRT match vs RandomMover via the M2.E fastchess harness; first rating estimate; `scripts/sprt.sh` wrapper. No new ADR expected. Detail in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## How to pick up a new session
 

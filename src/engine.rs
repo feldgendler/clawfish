@@ -19,7 +19,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::search::{AlphaBetaMover, Search, SearchContext, SearchLimits, SearchResult};
+use crate::search::{
+    AlphaBetaMover, Search, SearchContext, SearchLimits, SearchResult, compute_caps,
+};
 use crate::{Command, DebugMode, GoParams, Move, Position, PositionSpec, Register, parse_uci_line};
 
 // Type is u32; value is 2^31 - 1 (the protocol-declared `max`). Not i32 —
@@ -27,6 +29,17 @@ use crate::{Command, DebugMode, GoParams, Move, Position, PositionSpec, Register
 // Must match the `max` in the `option name Random_Seed …` line emitted by
 // `handle_uci`.
 const MAX_RANDOM_SEED: u32 = 2_147_483_647;
+
+/// Maximum value for the `MoveOverhead` UCI option (M3.E). 5000 ms matches
+/// the value recommended by `docs/research/m3-time-management.md` §6 and is
+/// adequate for fastchess CI runners. Must match the `max` in the
+/// `option name MoveOverhead …` line emitted by `handle_uci`.
+const MAX_MOVE_OVERHEAD: u64 = 5_000;
+
+/// Default `MoveOverhead` value (M3.E). 50 ms matches the research §6 default
+/// and is a safer hedge than Stockfish's 10 ms default for typical macOS
+/// scheduling jitter.
+const DEFAULT_MOVE_OVERHEAD: u64 = 50;
 
 /// UCI orchestrator. Owns engine state, dispatches parsed `Command`s to
 /// per-command handlers, drives the search worker thread.
@@ -40,11 +53,15 @@ pub struct Engine<W: Write + Send + 'static, S: Search + Send + 'static> {
     stdout: Arc<Mutex<W>>,
     search: Arc<Mutex<S>>,
     search_handle: Option<JoinHandle<()>>,
+    /// `MoveOverhead` UCI option value (M3.E). Latency hedge in ms subtracted
+    /// from clock-derived caps in `compute_caps`. Default 50; valid range
+    /// `[0, MAX_MOVE_OVERHEAD]`.
+    move_overhead: u64,
 }
 
 impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
     /// Build an engine. Position starts at `Position::starting_position()`,
-    /// `debug` off, no search in flight.
+    /// `debug` off, no search in flight, `move_overhead` at default.
     pub fn new(stdout: W, search: S) -> Self {
         let position = Position::starting_position();
         Self {
@@ -55,7 +72,16 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
             stdout: Arc::new(Mutex::new(stdout)),
             search: Arc::new(Mutex::new(search)),
             search_handle: None,
+            move_overhead: DEFAULT_MOVE_OVERHEAD,
         }
+    }
+
+    /// Test-only access to `move_overhead` (M3.E). Required for Slice A's
+    /// `MoveOverhead` UCI option tests to verify the option's effect without
+    /// depending on Slice B's `compute_caps` integration.
+    #[cfg(test)]
+    pub(crate) fn move_overhead(&self) -> u64 {
+        self.move_overhead
     }
 
     /// Drive the engine. Returns when `Quit` is received from `rx`.
@@ -103,6 +129,7 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         self.write_line(&format!("id name clawfish {}", env!("CARGO_PKG_VERSION")));
         self.write_line("id author Alex Feldgendler");
         self.write_line("option name Random_Seed type spin default 0 min 0 max 2147483647");
+        self.write_line("option name MoveOverhead type spin default 50 min 0 max 5000");
         self.write_line("uciok");
     }
 
@@ -190,11 +217,13 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
             searchmoves,
         };
 
-        // (4) Compute deadline from movetime. movetime=0 → deadline=now → the
-        // worker's first should_abort check fires immediately.
-        let deadline = params
-            .movetime
-            .map(|ms| Instant::now() + Duration::from_millis(ms.max(0) as u64));
+        // (4) Compute soft + hard time caps via `compute_caps` (M3.E). The
+        // `Duration::MAX` sentinel for "no cap" must be guarded — `now +
+        // Duration::MAX` panics on `Instant` overflow.
+        let now = Instant::now();
+        let caps = compute_caps(&limits, self.position.side_to_move(), self.move_overhead);
+        let deadline = (caps.hard != Duration::MAX).then(|| now + caps.hard);
+        let soft_deadline = (caps.soft != Duration::MAX).then(|| now + caps.soft);
 
         // (5) Spawn the worker. Always threaded — the orchestrator must remain
         // responsive to `isready`, `stop`, and `quit` while the search is in
@@ -208,7 +237,8 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         let ctx = SearchContext {
             stop: Arc::clone(&self.stop),
             deadline,
-            start: Instant::now(),
+            soft_deadline,
+            start: now,
             limits,
             history: self.game_history.clone(),
         };
@@ -276,6 +306,29 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
                     let msg = match value.as_deref() {
                         Some(v) => format!("Random_Seed: rejected value '{v}'"),
                         None => "Random_Seed: rejected (no value given)".to_string(),
+                    };
+                    self.info_string_debug(&msg);
+                }
+            }
+            return;
+        }
+
+        if name.eq_ignore_ascii_case("moveoverhead") {
+            let parsed: Option<u64> = value
+                .as_deref()
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|&n| n <= MAX_MOVE_OVERHEAD);
+            match parsed {
+                Some(n) => {
+                    // No need to join the in-flight worker — `move_overhead` is
+                    // read at the top of `handle_go` to build the next
+                    // SearchContext, not by the worker mid-search.
+                    self.move_overhead = n;
+                }
+                None => {
+                    let msg = match value.as_deref() {
+                        Some(v) => format!("MoveOverhead: rejected value '{v}'"),
+                        None => "MoveOverhead: rejected (no value given)".to_string(),
                     };
                     self.info_string_debug(&msg);
                 }
@@ -1047,10 +1100,17 @@ mod tests {
 
     #[test]
     fn go_with_movetime_emits_bestmove_after_deadline() {
-        // Intent: wallclock deadline honored. Run the engine on a separate
-        // thread so we can time how long it takes for `bestmove` to appear in
-        // the buffer — independently of when `Quit` is processed. The search
-        // picks by eval — we assert any legal UCI move, not a specific one.
+        // Intent: wallclock deadline honored. M3.E semantics: `compute_caps`
+        // applies `MoveOverhead` to `movetime` (research §10 pitfall fix).
+        // With default `MoveOverhead=50`, `movetime=300` produces caps =
+        // (250ms, 250ms). The bestmove arrives at ~250ms. Anchor: ≥ 200ms
+        // (catches a mover that ignores movetime), ≤ 5s (catches a stuck
+        // mover). The bound was chosen so that:
+        //   - `MoveOverhead=50, movetime=300` → search budget 250ms → pass.
+        //   - A buggy mover that ignores movetime → searches default depth-4
+        //     to completion (≈ ms scale on a fast machine, but variable) →
+        //     could pass too. The lower bound primarily catches "returned
+        //     immediately" bugs (e.g. `compute_caps` returning (1ms, 1ms)).
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CapturedWriter(Arc::clone(&buf));
         let mut engine = Engine::new(writer, AlphaBetaMover::new());
@@ -1061,12 +1121,9 @@ mod tests {
         let buf_clone = Arc::clone(&buf);
         let handle = thread::spawn(move || engine.run(rx));
 
-        // Time from when we send `go movetime 50` until `bestmove` is in
-        // the buffer. Anchor: must take >= 40 ms (catches a mover that
-        // ignores movetime). Must complete well within 1 s.
         let startpos = Position::starting_position();
         let go_sent = Instant::now();
-        tx.send(parse_uci_line("go movetime 50")).unwrap();
+        tx.send(parse_uci_line("go movetime 300")).unwrap();
 
         let bestmove_deadline = go_sent + Duration::from_secs(5);
         let observed_at = loop {
@@ -1080,15 +1137,20 @@ mod tests {
             }
             assert!(
                 Instant::now() < bestmove_deadline,
-                "no bestmove appeared within 1 s of go movetime 50;\noutput:\n{snap}"
+                "no bestmove appeared within 5 s of go movetime 300;\noutput:\n{snap}"
             );
             thread::sleep(Duration::from_millis(2));
         };
 
         let elapsed = observed_at.duration_since(go_sent);
+        // Lower bound 200 ms: with default MoveOverhead=50 and movetime=300,
+        // the search budget is 250 ms; the bestmove must arrive at ~250 ms,
+        // not significantly earlier. Catches a regression where movetime is
+        // not honored at all.
         assert!(
-            elapsed >= Duration::from_millis(40),
-            "go movetime 50 → bestmove must take >= 40 ms; took {elapsed:?} (mover may be ignoring movetime)"
+            elapsed >= Duration::from_millis(200),
+            "go movetime 300 → bestmove must take >= 200 ms (movetime - default MoveOverhead 50 = 250ms); \
+             took {elapsed:?}"
         );
 
         tx.send(Command::Quit).unwrap();
@@ -2468,5 +2530,364 @@ mod tests {
         // This line is the compile-time check: Engine::new requires S: Search + Send + 'static.
         let _engine = Engine::new(writer, AlphaBetaMover::new());
         // No behavioral assertion needed — if it compiles, the type bound is satisfied.
+    }
+
+    // -----------------------------------------------------------------------
+    // M3.E — `MoveOverhead` UCI option tests.
+    //
+    // Per `docs/plans/m3.e.md` §8.3. Tests verify the option's parse path,
+    // boundary handling, case-insensitivity, and the `Engine::move_overhead()`
+    // accessor. Slice A's tests do NOT depend on Slice B's `compute_caps`
+    // integration.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an Engine with captured stdout, run the given commands,
+    /// and return both the captured output AND the final move_overhead value.
+    fn drive_capturing_move_overhead(commands: &[&str]) -> (String, u64) {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
+
+        let (tx, rx) = mpsc::channel::<Command>();
+        for line in commands {
+            tx.send(parse_uci_line(line)).unwrap();
+        }
+        tx.send(Command::Quit).unwrap();
+        engine.run(rx);
+
+        let bytes = buf.lock().unwrap().clone();
+        let stdout = String::from_utf8(bytes).expect("output must be valid UTF-8");
+        (stdout, engine.move_overhead())
+    }
+
+    #[test]
+    fn engine_default_move_overhead_is_50() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let engine = Engine::new(writer, AlphaBetaMover::new());
+        assert_eq!(
+            engine.move_overhead(),
+            50,
+            "fresh engine must default move_overhead to 50 ms"
+        );
+    }
+
+    #[test]
+    fn handle_uci_emits_moveoverhead_option_after_random_seed() {
+        let (stdout, _) = drive(&["uci"]);
+        let lines: Vec<&str> = stdout.lines().collect();
+
+        let opt_line = lines
+            .iter()
+            .find(|l| l.starts_with("option name MoveOverhead"))
+            .copied()
+            .expect("option name MoveOverhead line must be present in uci output");
+        assert_eq!(
+            opt_line, "option name MoveOverhead type spin default 50 min 0 max 5000",
+            "MoveOverhead option line text must match exactly"
+        );
+
+        // Position: after id author and Random_Seed, before uciok.
+        let id_author_idx = lines
+            .iter()
+            .position(|l| l.starts_with("id author"))
+            .expect("id author line present");
+        let random_seed_idx = lines
+            .iter()
+            .position(|l| l.starts_with("option name Random_Seed"))
+            .expect("Random_Seed option line present");
+        let move_overhead_idx = lines
+            .iter()
+            .position(|l| l.starts_with("option name MoveOverhead"))
+            .expect("MoveOverhead option line present");
+        let uciok_idx = lines
+            .iter()
+            .position(|l| *l == "uciok")
+            .expect("uciok line present");
+        assert!(
+            id_author_idx < random_seed_idx,
+            "id author must come before Random_Seed"
+        );
+        assert!(
+            random_seed_idx < move_overhead_idx,
+            "Random_Seed must come before MoveOverhead"
+        );
+        assert!(
+            move_overhead_idx < uciok_idx,
+            "MoveOverhead must come before uciok"
+        );
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_accepts_min() {
+        let (_stdout, mo) = drive_capturing_move_overhead(&["setoption name MoveOverhead value 0"]);
+        assert_eq!(mo, 0, "value 0 (min) must be accepted");
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_accepts_default() {
+        let (_stdout, mo) =
+            drive_capturing_move_overhead(&["setoption name MoveOverhead value 50"]);
+        assert_eq!(mo, 50, "value 50 (default) must be accepted");
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_accepts_max() {
+        let (_stdout, mo) =
+            drive_capturing_move_overhead(&["setoption name MoveOverhead value 5000"]);
+        assert_eq!(mo, 5000, "value 5000 (max) must be accepted");
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_accepts_in_range() {
+        let (_stdout, mo) =
+            drive_capturing_move_overhead(&["setoption name MoveOverhead value 100"]);
+        assert_eq!(mo, 100, "value 100 (in-range) must be accepted");
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_rejects_above_max() {
+        let (_stdout, mo) =
+            drive_capturing_move_overhead(&["setoption name MoveOverhead value 5001"]);
+        assert_eq!(
+            mo, 50,
+            "5001 > MAX_MOVE_OVERHEAD must be rejected; default preserved"
+        );
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_rejects_huge_value() {
+        let (_stdout, mo) =
+            drive_capturing_move_overhead(&["setoption name MoveOverhead value 99999999999999"]);
+        assert_eq!(mo, 50, "huge value must be rejected; default preserved");
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_rejects_negative() {
+        let (_stdout, mo) =
+            drive_capturing_move_overhead(&["setoption name MoveOverhead value -1"]);
+        assert_eq!(mo, 50, "negative value must be rejected (u64 parse fails)");
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_rejects_unparseable() {
+        let (_stdout, mo) =
+            drive_capturing_move_overhead(&["setoption name MoveOverhead value foo"]);
+        assert_eq!(mo, 50, "unparseable value must be rejected");
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_rejects_missing_value() {
+        let (_stdout, mo) = drive_capturing_move_overhead(&["setoption name MoveOverhead"]);
+        assert_eq!(mo, 50, "missing value must be rejected; default preserved");
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_case_insensitive_name() {
+        for variant in &[
+            "moveoverhead",
+            "MOVEOVERHEAD",
+            "MoveOverhead",
+            "mOvEoVeRhEaD",
+        ] {
+            let (_stdout, mo) =
+                drive_capturing_move_overhead(&[&format!("setoption name {variant} value 100")]);
+            assert_eq!(
+                mo, 100,
+                "case variant {variant:?} must be accepted via case-insensitive match"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_above_max_silent_when_debug_off() {
+        let (stdout, mo) =
+            drive_capturing_move_overhead(&["setoption name MoveOverhead value 5001"]);
+        assert_eq!(mo, 50, "rejected; default preserved");
+        assert!(
+            !stdout
+                .lines()
+                .any(|l| l.starts_with("info string MoveOverhead")),
+            "no info string should leak when debug is off; got stdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_unparseable_silent_when_debug_off() {
+        let (stdout, mo) =
+            drive_capturing_move_overhead(&["setoption name MoveOverhead value foo"]);
+        assert_eq!(mo, 50, "unparseable rejected; default preserved");
+        assert!(
+            !stdout
+                .lines()
+                .any(|l| l.starts_with("info string MoveOverhead")),
+            "no info string should leak when debug is off; got stdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_missing_value_silent_when_debug_off() {
+        let (stdout, mo) = drive_capturing_move_overhead(&["setoption name MoveOverhead"]);
+        assert_eq!(mo, 50, "missing-value rejected; default preserved");
+        assert!(
+            !stdout
+                .lines()
+                .any(|l| l.starts_with("info string MoveOverhead")),
+            "no info string should leak when debug is off; got stdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_invalid_value_emits_info_when_debug_on() {
+        // Reject path with debug on: an `info string MoveOverhead: rejected ...`
+        // line emits, mirroring the `Random_Seed` precedent.
+        let (stdout, mo) =
+            drive_capturing_move_overhead(&["debug on", "setoption name MoveOverhead value 5001"]);
+        assert_eq!(mo, 50, "rejected; default preserved");
+        let info_line = stdout
+            .lines()
+            .find(|l| l.starts_with("info string MoveOverhead:"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected 'info string MoveOverhead: rejected ...' under debug=on; \
+                     got stdout:\n{stdout}"
+                )
+            });
+        assert!(
+            info_line.contains("rejected"),
+            "info string must mention rejection; got {info_line:?}"
+        );
+    }
+
+    #[test]
+    fn handle_go_with_wtime_btime_reaches_depth_3_on_kiwipete() {
+        // Kiwipete (high branching) iter-3 visits ~26k nodes (debug) /
+        // ~few-k nodes (release), exceeding the 4096 cancellation cadence
+        // either way. With wtime=20000 + default MoveOverhead=50, compute_caps
+        // produces (soft, hard) ≈ (950ms, 2850ms). Under correct
+        // `now + caps.hard` impl, the hard deadline lands in the future at
+        // ~2850ms, well past iter-3's wallclock (~400ms in debug, < 50ms in
+        // release). Iter 3 completes; soft check at 950ms then fires
+        // post-iter-3 in debug (and post-iter-N for some N in release).
+        //
+        // Under the `now + caps.hard` → `now - caps.hard` MUTATION, the hard
+        // deadline lands in the past. Iter 3's first 4096-aligned cadence poll
+        // fires `should_abort = true`, aborts iter 3 mid-flight,
+        // last_complete = (2, ...). Test observes no depth-3 info line.
+        //
+        // Pin: a `depth 3` info line must be emitted. Catches the hard-deadline
+        // `+ → -` mutation on engine.rs:225. wtime is large enough to fit iter 3
+        // in debug too (where the search is ~5x slower).
+        const KIWIPETE_FEN: &str =
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
+        let (tx, rx) = mpsc::channel::<Command>();
+        tx.send(parse_uci_line(&format!("position fen {KIWIPETE_FEN}")))
+            .unwrap();
+        tx.send(parse_uci_line("go wtime 20000 btime 20000"))
+            .unwrap();
+
+        let buf_clone = Arc::clone(&buf);
+        let handle = std::thread::spawn(move || engine.run(rx));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = String::from_utf8(buf_clone.lock().unwrap().clone())
+                .expect("output is valid UTF-8");
+            if snap.lines().any(|l| l.starts_with("bestmove")) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bestmove did not arrive within 5s;\noutput so far:\n{snap}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        tx.send(Command::Quit).unwrap();
+        handle.join().expect("engine thread");
+
+        let snap =
+            String::from_utf8(buf_clone.lock().unwrap().clone()).expect("output is valid UTF-8");
+        let depth_3_present = snap.lines().any(|l| l.starts_with("info depth 3 "));
+        assert!(
+            depth_3_present,
+            "depth-3 info line must be emitted on Kiwipete with wtime=20000 — \
+             a hard-deadline mutation that puts the deadline in the past would \
+             abort iter 3 (~26k nodes > 4096 cadence) before it completes;\noutput:\n{snap}"
+        );
+    }
+
+    #[test]
+    fn handle_go_with_wtime_btime_reaches_at_least_depth_2() {
+        // Drive `go wtime 5000 btime 5000` through `handle_go` (the
+        // production path that wires `compute_caps` and constructs
+        // `now + caps.hard` / `now + caps.soft`). compute_caps with wtime=5000,
+        // mo=50 returns soft = 5000/20 + 0/2 - 50 = 200ms, hard = min(600, 4950)
+        // = 600ms. Iteration 2 from startpos completes well within 200ms.
+        //
+        // Pin: at least 2 `info depth` lines emitted, proving the deadlines
+        // were constructed in the FUTURE (not the past). Catches the
+        // `now + caps.hard` → `now - caps.hard` mutation (and the soft variant)
+        // in `handle_go`. Under that mutation, the deadline lands in the past;
+        // iteration 1 completes (~20 nodes, no cadence poll), then the
+        // inter-iteration soft check fires and breaks. Result: exactly 1 info
+        // depth line.
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
+        let (tx, rx) = mpsc::channel::<Command>();
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("go wtime 5000 btime 5000")).unwrap();
+
+        // Run on a separate thread so we can wait for bestmove from the
+        // captured buffer.
+        let buf_clone = Arc::clone(&buf);
+        let handle = std::thread::spawn(move || engine.run(rx));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = String::from_utf8(buf_clone.lock().unwrap().clone())
+                .expect("output is valid UTF-8");
+            if snap.lines().any(|l| l.starts_with("bestmove")) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bestmove did not arrive within 5s;\noutput so far:\n{snap}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        tx.send(Command::Quit).unwrap();
+        handle.join().expect("engine thread");
+
+        let snap =
+            String::from_utf8(buf_clone.lock().unwrap().clone()).expect("output is valid UTF-8");
+        let info_depth_lines = snap
+            .lines()
+            .filter(|l| l.starts_with("info depth "))
+            .count();
+        assert!(
+            info_depth_lines >= 2,
+            "ID must reach at least depth 2 with wtime=5000 + default MoveOverhead=50 \
+             (soft cap ≈ 200ms, easily fits depth-2 from startpos); got {info_depth_lines} \
+             info lines:\n{snap}"
+        );
+    }
+
+    #[test]
+    fn handle_setoption_moveoverhead_persists_across_searches() {
+        // Set MoveOverhead, then run several `go` commands, and verify the
+        // value is unchanged at the end. Pins that the option is sticky
+        // across commands (matches `Random_Seed` precedent).
+        let (_stdout, mo) = drive_capturing_move_overhead(&[
+            "setoption name MoveOverhead value 200",
+            "position startpos",
+            "go depth 1",
+            "isready",
+            "go depth 1",
+        ]);
+        assert_eq!(mo, 200, "MoveOverhead must persist across go commands");
     }
 }

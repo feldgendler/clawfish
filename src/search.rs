@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::{Move, Position};
+use crate::{Color, Move, Position};
 
 /// Parsed `go` parameters routed into search. Constructed by `handle_go` from
 /// `GoParams`; `searchmoves` is already validated against the current
@@ -59,9 +59,17 @@ pub struct SearchContext {
     /// `should_abort`. Cleared by the orchestrator at the start of each
     /// `go`. See plan §7 for the cleared-then-spawned ordering.
     pub stop: Arc<AtomicBool>,
-    /// Wallclock cap, computed from `movetime` (M2.D / M3 will compute
-    /// from `wtime`/`btime`/`winc` etc.). `None` = no time cap.
+    /// Hard-cap wallclock deadline. M3.D semantics: computed from `movetime`.
+    /// M3.E semantics: computed from the time-management `compute_caps` hard-cap
+    /// path. `None` = no hard cap. Polled by `should_abort`.
     pub deadline: Option<Instant>,
+    /// Soft-cap wallclock deadline (M3.E). Polled by the iterative-deepening
+    /// outer loop in `Search::go` BETWEEN iterations only — never inside
+    /// `should_abort` (which remains the hard-cap path). When the soft cap has
+    /// elapsed at the end of an iteration, the ID loop exits before starting
+    /// the next iteration. `None` = no soft cap (e.g. `go infinite`,
+    /// `go depth N`, `go nodes N`).
+    pub soft_deadline: Option<Instant>,
     /// `Instant::now()` at the moment `handle_go` built the context. Used
     /// by future `info time` emission (M3+).
     pub start: Instant,
@@ -164,6 +172,30 @@ const INF: i32 = 30_001;
 /// is a mate score.
 const MATE_IN_MAX_PLY: i32 = MATE - MAX_PLY as i32; // 29_936
 
+/// Construct the "iteration-1 aborted before any root improvement" fallback
+/// result for `Search::go` (M3.E).
+///
+/// Returns `(depth=0, bestmove, score)` where bestmove comes from `pv[0][0]`
+/// if the in-progress aborted iteration populated it, else `None`; score
+/// comes from `root_score.unwrap_or(0)` (the lockstep root-score field set
+/// by negamax when alpha was improved at ply 0).
+///
+/// **Why an extracted helper.** The fallback path is structurally unreachable
+/// at M3.E scope: iteration 1 from any chess position visits fewer than 4096
+/// nodes (startpos depth-1: ~20; Kiwipete depth-1: ~100; max board branching
+/// 218 « 4096), so the in-iteration cancellation cadence (`nodes & 4095 ==
+/// 0`) never fires during iteration 1. Iteration 1 therefore always completes
+/// and sets `last_complete = Some(...)`, so the inline call site never
+/// executes. Mutations on the inline `pv.lengths[0] > 0` expression cannot be
+/// killed by any chess fixture. Extracting into a named helper makes the
+/// helper's body directly unit-testable with synthetic `PvTable` fixtures —
+/// same precedent as M3.D's `negate_window` extraction.
+fn aborted_fallback_result(pv: &PvTable, root_score: Option<i32>) -> (u32, Option<Move>, i32) {
+    let bm = (pv.lengths[0] > 0).then(|| pv.moves[0][0]);
+    let sc = root_score.unwrap_or(0);
+    (0, bm, sc)
+}
+
 /// Negates and swaps the alpha/beta window for a recursive negamax/qsearch call.
 ///
 /// Negamax's recursive contract: child sees `(child_alpha, child_beta) =
@@ -233,6 +265,14 @@ pub(crate) struct AlphaBetaMover {
     /// the search aborts mid-root the reported score reflects the best fully
     /// explored subtree rather than the aborted return value of 0.
     root_score: Option<i32>,
+    /// Best root move from the prior completed iterative-deepening iteration
+    /// (M3.E). Consumed by `negamax` at `ply == 0` to prepend it ahead of the
+    /// MVV-LVA-sorted root move list. Reset to `None` at the start of each
+    /// `go` (so iteration 1 has no prior hint); set to `Some(bestmove)` at the
+    /// end of each fully-completed iteration. Mid-iteration aborts do NOT
+    /// clear it. After a `go` returns, the field's stale state is overwritten
+    /// by the next `go`'s top-of-`go` reset.
+    prior_root_move: Option<Move>,
 }
 
 impl AlphaBetaMover {
@@ -244,7 +284,25 @@ impl AlphaBetaMover {
             nodes: 0,
             aborted: false,
             root_score: None,
+            prior_root_move: None,
         }
+    }
+
+    /// Test-only access to `prior_root_move` (M3.E). Production code never reads
+    /// this — the field is internal to the ID outer loop and `negamax` ply==0
+    /// reorder. Tests inspect it to verify the prior-PV hint plumbing.
+    #[cfg(test)]
+    pub(super) fn prior_root_move_for_test(&self) -> Option<Move> {
+        self.prior_root_move
+    }
+
+    /// Test-only setter for `prior_root_move` (M3.E). Production code never sets
+    /// this directly; the ID outer loop sets it from the prior iteration's PV.
+    /// Tests use this to construct fixtures where the hint is pre-set, then
+    /// drive `negamax_for_test` directly to observe the reorder behavior.
+    #[cfg(test)]
+    pub(super) fn set_prior_root_move_for_test(&mut self, mv: Option<Move>) {
+        self.prior_root_move = mv;
     }
 }
 
@@ -260,65 +318,100 @@ impl Search for AlphaBetaMover {
         self.nodes = 0;
         self.aborted = false;
         self.root_score = None;
+        self.prior_root_move = None;
         for i in 0..MAX_PLY {
             self.pv.lengths[i] = 0;
         }
 
-        // Determine target depth. Default 4 when `go` did not specify depth.
-        let depth = ctx.limits.depth.unwrap_or(4).min(MAX_PLY as u32 - 1);
-
-        // Single-iteration negamax. Position is cloned for mutation; make/unmake
-        // are balanced by the recursion.
+        let max_depth = max_depth_from_limits(&ctx.limits);
         let mut pos_clone = *position;
-        let returned_score = self.negamax(&mut pos_clone, depth, 0, -INF, INF, ctx);
 
-        // Position must be restored by balanced make/unmake.
+        // Last fully completed iteration's snapshot. None until iteration 1
+        // finishes; preserved across mid-iteration aborts.
+        let mut last_complete: Option<(u32, Option<Move>, i32)> = None;
+
+        for depth in 1..=max_depth {
+            // Per-iteration reset (subset of per-go reset). `nodes` is NOT
+            // reset — it accumulates across iterations. `prior_root_move` is
+            // NOT reset — it carries iteration N's hint into iteration N+1.
+            self.aborted = false;
+            self.root_score = None;
+            for i in 0..MAX_PLY {
+                self.pv.lengths[i] = 0;
+            }
+
+            let returned = self.negamax(&mut pos_clone, depth, 0, -INF, INF, ctx);
+
+            if self.aborted {
+                // Mid-iteration abort: discard partial PV/score; preserve prior
+                // last_complete snapshot.
+                break;
+            }
+
+            // Iteration completed. Snapshot.
+            let bestmove = (self.pv.lengths[0] > 0).then(|| self.pv.moves[0][0]);
+            last_complete = Some((depth, bestmove, returned));
+            self.prior_root_move = bestmove;
+
+            // Single Instant::now() reused for both the elapsed-ms field and
+            // the soft-cap check below — avoids a duplicate syscall and keeps
+            // the two reads coherent.
+            let now = Instant::now();
+            let elapsed_ms = (now - ctx.start).as_millis();
+            let pv_str = if self.pv.lengths[0] == 0 {
+                "0000".to_string()
+            } else {
+                self.pv.moves[0][..self.pv.lengths[0]]
+                    .iter()
+                    .map(|m| m.to_uci())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            info_sink(&format!(
+                "info depth {depth} score {} nodes {} time {elapsed_ms} pv {pv_str}",
+                score_to_uci(returned),
+                self.nodes,
+            ));
+
+            if depth >= max_depth {
+                break;
+            }
+            // Stop check between iterations is load-bearing: per-iteration
+            // `aborted` is reset at the top of the loop, so a `stop` flipped
+            // between iterations would otherwise be missed until the next
+            // 4096-cadence poll inside negamax.
+            if ctx.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Some(soft) = ctx.soft_deadline
+                && now >= soft
+            {
+                break;
+            }
+        }
+
         debug_assert_eq!(
             pos_clone, *position,
             "negamax must restore position via balanced make/unmake"
         );
 
-        // When the search aborts mid-root, `returned_score` is the 0 sentinel
-        // propagated up from the abort point — it does not reflect any completed
-        // subtree. Use `root_score` instead: it is updated in lockstep with the PV
-        // at ply 0 and therefore always reflects the score of the last fully
-        // explored root-move subtree. If no root move completed before the abort,
-        // `root_score` is `None` and we fall back to 0 (matching the `pv.lengths[0]
-        // == 0 → bestmove None` case).
-        let score = if self.aborted {
-            self.root_score.unwrap_or(0)
-        } else {
-            returned_score
+        // Pick final result. Prefer the last completed iteration's snapshot;
+        // fall back via `aborted_fallback_result` to whatever the aborted
+        // iteration left in `pv` (covers the pathological "iteration 1
+        // aborted before any root move improved alpha" case where
+        // `last_complete` is None). The fallback is extracted into a named
+        // helper so its `pv.lengths[0] > 0` mutations are directly
+        // unit-testable — the structural-undetectability gap that motivated
+        // M3.D's `negate_window` extraction applies here too: the fallback
+        // is unreachable at M3.E scope (iter-1 from any position visits <
+        // 4096 nodes, below the cadence poll), so mutations on the inline
+        // expression can't be killed by any chess fixture.
+        let (final_depth, final_bestmove, final_score) = match last_complete {
+            Some((d, bm, sc)) => (d, bm, sc),
+            None => aborted_fallback_result(&self.pv, self.root_score),
         };
 
-        // bestmove comes from pv[0][0] if any move improved alpha; otherwise None.
-        let bestmove = if self.pv.lengths[0] > 0 {
-            Some(self.pv.moves[0][0])
-        } else {
-            None
-        };
-
-        // Emit info line BEFORE the wait loop.
-        let elapsed_ms = ctx.start.elapsed().as_millis();
-        let pv_str = if self.pv.lengths[0] == 0 {
-            "0000".to_string()
-        } else {
-            self.pv.moves[0][..self.pv.lengths[0]]
-                .iter()
-                .map(|m| m.to_uci())
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        info_sink(&format!(
-            "info depth {} score {} nodes {} time {} pv {}",
-            depth,
-            score_to_uci(score),
-            self.nodes,
-            elapsed_ms,
-            pv_str
-        ));
-
-        // Honor infinite/movetime/ponder wait loop. Same shape as prior movers.
+        // Honor infinite/movetime/ponder wait loop (unchanged from M3.D).
         let wait = ctx.limits.infinite || ctx.limits.movetime.is_some() || ctx.limits.ponder;
         if wait {
             while !ctx.should_abort(self.nodes) {
@@ -327,9 +420,9 @@ impl Search for AlphaBetaMover {
         }
 
         SearchResult {
-            bestmove,
-            depth,
-            score_cp: Some(score),
+            bestmove: final_bestmove,
+            depth: final_depth,
+            score_cp: Some(final_score),
             nodes: self.nodes,
             ponder: None,
         }
@@ -430,6 +523,20 @@ impl AlphaBetaMover {
 
         // 8. Order: MVV-LVA descending.
         moves_vec.sort_by_cached_key(|&m| -mvv_lva_score(m, pos));
+
+        // 8a. Root reorder hint (M3.E): try the prior ID iteration's best move
+        //     first. `remove(idx) + insert(0)` (vs `swap`) preserves the
+        //     relative MVV-LVA order of the rest of the list — only the
+        //     prior-PV move moves to the front. `idx != 0` skips the no-op
+        //     case (prior already first).
+        if ply == 0
+            && let Some(pm) = self.prior_root_move
+            && let Some(idx) = moves_vec.iter().position(|m| *m == pm)
+            && idx != 0
+        {
+            let prior = moves_vec.remove(idx);
+            moves_vec.insert(0, prior);
+        }
 
         // 9. Recurse fail-soft.
         let mut best = -INF;
@@ -744,6 +851,141 @@ pub(crate) fn is_repetition(history: &[u64], halfmove_clock: u8) -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// M3.E — Time management: TimeCaps + compute_caps pure function.
+// ---------------------------------------------------------------------------
+
+/// Soft + hard time caps for a single `go` invocation. Returned by
+/// [`compute_caps`].
+///
+/// - `soft` — "Don't start the next iterative-deepening iteration past this
+///   point." Polled by `Search::go` BETWEEN iterations only.
+/// - `hard` — "Abort the current iteration immediately past this point."
+///   Polled by `SearchContext::should_abort` via the deadline path.
+/// - `Duration::MAX` is the "no cap" sentinel for either field. Wiring code
+///   that converts caps to `Instant`s must guard with
+///   `(cap != Duration::MAX).then(|| now + cap)` — `now + Duration::MAX`
+///   panics on overflow.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TimeCaps {
+    pub soft: Duration,
+    pub hard: Duration,
+}
+
+/// Compute soft + hard time caps from `go` parameters and a per-engine
+/// `move_overhead` (latency hedge) value. **Pure function**; no clock reads,
+/// no engine state — same inputs always give same outputs.
+///
+/// Implementation per `docs/plans/m3.e.md` §4 and `docs/research/m3-time-management.md`
+/// §1, §3, §6, §9 test table. ADR-0017 binds the formulas.
+///
+/// Headline shapes:
+/// - Non-time limits (`infinite` / `ponder` / `depth` / `nodes` / `mate`) → `(MAX, MAX)`.
+/// - `movetime N`: `soft = hard = max(1, N - move_overhead)`.
+/// - Clock-based: `soft = remaining/denom + increment/2 - move_overhead`,
+///   `hard = min(3 × soft, remaining - move_overhead)`. `denom = movestogo`
+///   when present and > 0; 20 (sudden death) otherwise.
+/// - Increment-only TC (`rem == 0`, `inc > 0`): hard = `3 × soft`, no forfeit
+///   clamp (research §5).
+/// - Very low time (`rem == 0`, `inc == 0`): `(1ms, 1ms)`.
+pub(crate) fn compute_caps(
+    limits: &SearchLimits,
+    side_to_move: Color,
+    move_overhead: u64,
+) -> TimeCaps {
+    // Non-time limits → no cap.
+    if limits.infinite
+        || limits.ponder
+        || limits.depth.is_some()
+        || limits.nodes.is_some()
+        || limits.mate.is_some()
+    {
+        return TimeCaps {
+            soft: Duration::MAX,
+            hard: Duration::MAX,
+        };
+    }
+
+    // movetime overrides clock-based: soft = hard = movetime - move_overhead.
+    if let Some(mt) = limits.movetime {
+        let v = (mt.max(0) as u64).saturating_sub(move_overhead).max(1);
+        let d = Duration::from_millis(v);
+        return TimeCaps { soft: d, hard: d };
+    }
+
+    // Clock-based.
+    let (rem_signed, inc_opt) = match side_to_move {
+        Color::White => (limits.wtime, limits.winc),
+        Color::Black => (limits.btime, limits.binc),
+    };
+    let Some(rem_signed) = rem_signed else {
+        // No movetime, no clock — degenerate `go` with no time information.
+        return TimeCaps {
+            soft: Duration::MAX,
+            hard: Duration::MAX,
+        };
+    };
+
+    let rem = rem_signed.max(0) as u64;
+    let inc = inc_opt.unwrap_or(0);
+
+    // Very-low-time floor: both clock and increment zero → emit immediately.
+    if rem == 0 && inc == 0 {
+        let d = Duration::from_millis(1);
+        return TimeCaps { soft: d, hard: d };
+    }
+
+    let denom: u64 = match limits.movestogo {
+        None => 20,
+        Some(0) => 1, // spec violation; defensive fallback
+        Some(n) => n as u64,
+    };
+
+    let raw_soft = rem / denom + inc / 2;
+    let soft_unclamped = raw_soft.saturating_sub(move_overhead);
+
+    // Increment-only TC (rem == 0 with inc > 0): forfeit guard does NOT apply
+    // because the increment refills the clock after the move (research §5).
+    if rem == 0 {
+        let soft = Duration::from_millis(soft_unclamped.max(1));
+        let hard = Duration::from_millis(soft_unclamped.saturating_mul(3).max(1));
+        return TimeCaps { soft, hard };
+    }
+
+    // Forfeit guard: soft and hard both clamped to (rem - move_overhead).max(1).
+    let max_clamp = rem.saturating_sub(move_overhead).max(1);
+    let soft_ms = soft_unclamped.min(max_clamp).max(1);
+    let hard_ms = soft_ms.saturating_mul(3).min(max_clamp).max(1);
+    TimeCaps {
+        soft: Duration::from_millis(soft_ms),
+        hard: Duration::from_millis(hard_ms),
+    }
+}
+
+/// Resolve the iterative-deepening loop's max depth from `SearchLimits` (M3.E).
+///
+/// - `Some(d)`: clamp to `MAX_PLY - 1 = 63`.
+/// - Time-bounded `go` (any of `infinite`, `ponder`, `movetime`, `nodes`, `mate`,
+///   `wtime`, `btime`): `MAX_PLY - 1 = 63`.
+/// - Bare `go` (no fields set): legacy fallback `4`.
+pub(crate) fn max_depth_from_limits(limits: &SearchLimits) -> u32 {
+    if let Some(d) = limits.depth {
+        return d.min(MAX_PLY as u32 - 1);
+    }
+    let any_other_limit = limits.infinite
+        || limits.ponder
+        || limits.movetime.is_some()
+        || limits.nodes.is_some()
+        || limits.mate.is_some()
+        || limits.wtime.is_some()
+        || limits.btime.is_some();
+    if any_other_limit {
+        (MAX_PLY as u32) - 1
+    } else {
+        4
+    }
+}
+
 /// 50-move rule: returns true at `halfmove_clock >= 100`.
 ///
 /// 100 plies = 50 full moves without a pawn move or capture; this is the
@@ -771,6 +1013,7 @@ mod tests {
         let ctx = SearchContext {
             stop: Arc::clone(&stop),
             deadline: None,
+            soft_deadline: None,
             start: Instant::now(),
             limits: SearchLimits::default(),
             history: Vec::new(),
@@ -803,6 +1046,7 @@ mod tests {
             let ctx = SearchContext {
                 stop: Arc::clone(&stop),
                 deadline: None,
+                soft_deadline: None,
                 start: Instant::now(),
                 limits: SearchLimits::default(),
                 history: Vec::new(),
@@ -819,6 +1063,7 @@ mod tests {
             let ctx = SearchContext {
                 stop: Arc::clone(&stop),
                 deadline: Some(expired),
+                soft_deadline: None,
                 start: Instant::now(),
                 limits: SearchLimits::default(),
                 history: Vec::new(),
@@ -835,6 +1080,7 @@ mod tests {
             let ctx = SearchContext {
                 stop: Arc::clone(&stop),
                 deadline: None,
+                soft_deadline: None,
                 start: Instant::now(),
                 limits: SearchLimits {
                     nodes: Some(500),
@@ -1415,6 +1661,7 @@ mod tests {
                 let ctx = SearchContext {
                     stop: Arc::clone(&stop),
                     deadline: None,
+                    soft_deadline: None,
                     start: std::time::Instant::now(),
                     limits: SearchLimits {
                         depth: Some(3),
@@ -1472,8 +1719,14 @@ mod tests {
 
     /// With `stop` pre-set before `go`, the search must abort promptly.
     ///
-    /// The pre-set abort fires at the first 4096-node poll, before any root move
-    /// improves alpha → `bestmove` is always `None` and `score_cp` is the 0 sentinel.
+    /// **M3.E semantics** (per plan §5): the inter-iteration stop check breaks
+    /// the ID loop AFTER iteration 1 completes (small startpos position visits
+    /// ~20 nodes; well below the 4096-node in-iteration cadence). The result
+    /// reflects iteration 1's snapshot — `bestmove = Some(<iter-1 best>)`,
+    /// `depth = 1`. This differs from M3.D's "no root completes → bestmove=None"
+    /// because M3.D had no inter-iteration check (single-pass negamax). The
+    /// node-count bound (≤ 5000) still holds: iteration 1 from startpos at
+    /// depth 1 completes in ~20 nodes total.
     #[test]
     fn alphabeta_search_aborts_on_should_abort() {
         let pos = Position::starting_position();
@@ -1481,6 +1734,7 @@ mod tests {
         let ctx = SearchContext {
             stop: Arc::clone(&stop),
             deadline: None,
+            soft_deadline: None,
             start: std::time::Instant::now(),
             limits: SearchLimits {
                 depth: Some(10), // would be slow without early abort
@@ -1491,49 +1745,63 @@ mod tests {
         let mut ab = AlphaBetaMover::new();
         let result = ab.go(&pos, &ctx, &|_| {});
 
-        // Cancellation poll cadence is `if self.nodes & 4095 == 0` (every 4096 nodes).
+        // Iteration 1 completes (only ~20 nodes; below 4096 cadence), the
+        // inter-iteration stop check then fires, breaking the loop. Total
+        // nodes stay well under 5000.
         assert!(
             result.nodes <= 5000,
             "early abort must not search a large node count: got {} \
-            (cadence 4096; first abort fires at nodes=4096)",
+            (cadence 4096; iteration 1 < 100 nodes; inter-iteration stop check fires)",
             result.nodes
         );
 
-        // Pre-set abort fires before any root move can complete.
+        // Inter-iteration abort: iteration 1 produces a bestmove + non-zero
+        // score from a fully-completed depth-1 search. The depth==1 result
+        // proves the loop broke between iterations 1 and 2.
         assert_eq!(
-            result.bestmove, None,
-            "pre-set abort fires before any root move can complete"
+            result.depth, 1,
+            "inter-iteration stop must break after iteration 1; got depth {}",
+            result.depth
         );
-        assert_eq!(
-            result.score_cp,
-            Some(0),
-            "abort sentinel score must be 0 when no root move completed"
+        assert!(
+            result.bestmove.is_some(),
+            "iteration 1 completed before stop check fired → bestmove = Some"
         );
     }
 
-    /// When the search aborts AFTER the first root move's subtree completes,
-    /// `bestmove` must be `Some` and `score_cp` must reflect the completed
-    /// subtree score — NOT the 0 abort sentinel.
+    /// When the ID search aborts mid-iteration via the `nodes` cap,
+    /// `bestmove` must be `Some` and `score_cp` must reflect the LAST
+    /// COMPLETED iteration's snapshot — NOT the 0 abort sentinel.
     ///
-    /// This is a regression test for must-fix #2 (aborted-search score contamination).
+    /// **M3.E semantics** (per ADR-0017 §2): the ID outer loop snapshots
+    /// `last_complete = Some((depth, bestmove, score))` at the end of each
+    /// completed iteration. A mid-iteration abort discards the partial
+    /// state; `Search::go`'s final result returns the prior iteration's
+    /// snapshot. With `nodes: Some(5000)` from startpos, iterations 1–3
+    /// complete (cumulative ~3,800 nodes); iteration 4 (~13k nodes) aborts
+    /// at the next 4096-aligned cadence past the cap. Result reflects
+    /// iteration 3.
+    ///
+    /// Originally a regression test for the M3.C must-fix #2 score-
+    /// contamination path; the M3.E ID outer loop preserves the same
+    /// invariant via `last_complete` (no contamination from the aborted
+    /// iteration's state).
     #[test]
     fn alphabeta_partial_completion_under_abort_returns_partial_pv_and_score() {
-        // 5000-node budget: enough for the first root move's depth-4 subtree at
-        // startpos to complete (typically ~200–1000 nodes per root move), but
-        // exhausted before all 20 root moves finish.
+        // 5000-node budget: with M3.E ID, iterations 1–3 from startpos
+        // complete cumulatively (~50 + ~135 + ~1657 ≈ 3800 nodes); iteration
+        // 4 (~13k nodes) aborts at the next 4096-aligned cadence past the
+        // 5000 cap. last_complete is iteration 3's snapshot.
         //
-        // M3.D note (plan §6.2): qsearch at the depth==0 horizon adds leaf
-        // nodes to the count. The 5000-node budget remains adequate because
-        // startpos qsearch leaves are mostly stand-pat returns (no captures
-        // in the early opening). The precondition `bestmove.is_some()`
-        // catches a vacuous-pass scenario; if a future eval/ordering shift
-        // pushes the first root move's subtree above 5000 nodes, that
-        // assertion fires with a helpful message.
+        // The precondition `bestmove.is_some()` catches a vacuous-pass
+        // scenario; if a future eval/ordering shift pushes iter-3 cumulative
+        // above 5000, the assertion fires with a helpful message.
         let pos = Position::starting_position();
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = SearchContext {
             stop: Arc::clone(&stop),
             deadline: None,
+            soft_deadline: None,
             start: std::time::Instant::now(),
             limits: SearchLimits {
                 depth: Some(4),
@@ -1587,6 +1855,7 @@ mod tests {
         let ctx = SearchContext {
             stop: Arc::clone(&stop),
             deadline: None,
+            soft_deadline: None,
             start: std::time::Instant::now(),
             limits: SearchLimits {
                 depth: Some(3),
@@ -1606,8 +1875,12 @@ mod tests {
         );
     }
 
-    /// After `go depth 2` from startpos, exactly one `info` line must be emitted,
-    /// starting with `info depth 2 score ...` and containing a `pv` token.
+    /// After `go depth 2` from startpos, the engine emits one info line per
+    /// completed iteration (M3.E: 2 lines for depths 1 and 2). The LAST
+    /// info line must start with `info depth 2 score …` and contain a
+    /// `pv` token followed by a real UCI move (NOT the `0000` null sentinel).
+    /// The real-move check catches the `pv.lengths[0] == 0` mutation flip:
+    /// inverting that conditional would emit `pv 0000` for a non-empty PV.
     #[test]
     fn alphabeta_emits_info_line_with_score_and_pv() {
         let pos = Position::starting_position();
@@ -1615,6 +1888,7 @@ mod tests {
         let ctx = SearchContext {
             stop: Arc::clone(&stop),
             deadline: None,
+            soft_deadline: None,
             start: std::time::Instant::now(),
             limits: SearchLimits {
                 depth: Some(2),
@@ -1629,20 +1903,29 @@ mod tests {
         });
         let info_lines = info_lines.into_inner();
 
+        // M3.E: per-iteration emission. Depth 2 → 2 info lines.
         assert_eq!(
             info_lines.len(),
-            1,
-            "exactly one info line must be emitted; got: {info_lines:?}"
+            2,
+            "ID must emit one info line per completed iteration; got: {info_lines:?}"
         );
-        let line = &info_lines[0];
+        let last = info_lines
+            .last()
+            .expect("at least one info line must be emitted");
         assert!(
-            line.starts_with("info depth 2 score cp ")
-                || line.starts_with("info depth 2 score mate "),
-            "info line must start with 'info depth 2 score cp ...' or 'info depth 2 score mate ...'; got: {line:?}"
+            last.starts_with("info depth 2 score cp ")
+                || last.starts_with("info depth 2 score mate "),
+            "last info line must start with 'info depth 2 score cp ...' or 'info depth 2 score mate ...'; got: {last:?}"
         );
         assert!(
-            line.contains(" pv "),
-            "info line must contain 'pv'; got: {line:?}"
+            last.contains(" pv "),
+            "last info line must contain 'pv'; got: {last:?}"
+        );
+        // Real-move pin: catches the `pv.lengths[0] == 0` mutation that flips
+        // the conditional and emits `pv 0000` for a populated PV.
+        assert!(
+            !last.contains(" pv 0000"),
+            "non-empty PV must emit real moves, NOT the '0000' null sentinel; got: {last:?}"
         );
     }
 
@@ -1658,6 +1941,58 @@ mod tests {
     // same bug at the qsearch / negamax integration level with shallow
     // M3.D fixtures.
     // -----------------------------------------------------------------------
+
+    /// Directly unit-test the `aborted_fallback_result` helper extracted from
+    /// `Search::go`'s `None` arm. The helper's `pv.lengths[0] > 0` is the
+    /// mutation point; we drive each input case (empty PV, populated PV,
+    /// `root_score = None`, `root_score = Some(value)`) and pin the output.
+    /// Catches the `> 0` → `==`, `<`, `>=` mutations on this helper's body
+    /// independently of whether the fallback path is reachable from
+    /// `Search::go`.
+    #[test]
+    fn aborted_fallback_returns_none_when_pv_empty_and_zero_score() {
+        let pv = PvTable::new();
+        let result = aborted_fallback_result(&pv, None);
+        assert_eq!(result, (0, None, 0));
+    }
+
+    #[test]
+    fn aborted_fallback_returns_pv0_move_when_pv_populated() {
+        let mut pv = PvTable::new();
+        // Use a non-default move so the assertion distinguishes Some(default) from Some(real).
+        let pos = Position::starting_position();
+        let e2e4 = Move::from_uci("e2e4", &pos).expect("e2e4 is legal");
+        pv.moves[0][0] = e2e4;
+        pv.lengths[0] = 1;
+        let result = aborted_fallback_result(&pv, None);
+        assert_eq!(result, (0, Some(e2e4), 0));
+    }
+
+    #[test]
+    fn aborted_fallback_uses_root_score_when_set() {
+        let pv = PvTable::new();
+        let result = aborted_fallback_result(&pv, Some(123));
+        assert_eq!(result, (0, None, 123));
+    }
+
+    #[test]
+    fn aborted_fallback_distinguishes_pv_lengths_zero_from_one() {
+        // Catches the `> 0` → `>= 0` (always true) mutation: with empty PV,
+        // the mutated form would return Some(default Move), not None.
+        let pv_empty = PvTable::new();
+        let result_empty = aborted_fallback_result(&pv_empty, None);
+        assert_eq!(result_empty.1, None, "empty PV → bestmove None");
+
+        // Catches the `> 0` → `== 0` mutation: with populated PV, the mutated
+        // form would return None, not Some(real_move).
+        let mut pv_full = PvTable::new();
+        let pos = Position::starting_position();
+        let g1f3 = Move::from_uci("g1f3", &pos).expect("g1f3 is legal");
+        pv_full.moves[0][0] = g1f3;
+        pv_full.lengths[0] = 1;
+        let result_full = aborted_fallback_result(&pv_full, None);
+        assert_eq!(result_full.1, Some(g1f3), "populated PV → bestmove Some");
+    }
 
     #[test]
     fn negate_window_negates_both_bounds_and_swaps_them() {
@@ -2560,5 +2895,961 @@ mod tests {
             (-100..=100).contains(&score),
             "depth-4 startpos score must be in sane balanced range; got cp {score}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M3.E — `compute_caps` pure-function unit tests.
+    //
+    // Per `docs/research/m3-time-management.md` §9 test table and
+    // `docs/plans/m3.e.md` §8.1. Each test is a pure-function check: build a
+    // `SearchLimits`, call `compute_caps(&limits, side, mo)`, assert the
+    // returned `(soft, hard)` durations.
+    // -----------------------------------------------------------------------
+
+    /// Build a `SearchLimits` with only the named `f` field overridden from
+    /// the default. Saves boilerplate in the per-row tests below.
+    fn limits_with(f: impl FnOnce(&mut SearchLimits)) -> SearchLimits {
+        let mut l = SearchLimits::default();
+        f(&mut l);
+        l
+    }
+
+    /// `Duration::MAX` shorthand for the "no cap" sentinel.
+    fn nocap() -> Duration {
+        Duration::MAX
+    }
+
+    /// Convenience: assert both soft and hard equal the given `Duration`.
+    fn assert_caps_eq(caps: TimeCaps, soft: Duration, hard: Duration) {
+        assert_eq!(caps.soft, soft, "soft cap mismatch");
+        assert_eq!(caps.hard, hard, "hard cap mismatch");
+    }
+
+    #[test]
+    fn compute_caps_no_time_limits_depth_returns_max_max() {
+        let l = limits_with(|l| l.depth = Some(5));
+        assert_caps_eq(compute_caps(&l, Color::White, 50), nocap(), nocap());
+    }
+
+    #[test]
+    fn compute_caps_no_time_limits_nodes_returns_max_max() {
+        let l = limits_with(|l| l.nodes = Some(100_000));
+        assert_caps_eq(compute_caps(&l, Color::White, 50), nocap(), nocap());
+    }
+
+    #[test]
+    fn compute_caps_no_time_limits_mate_returns_max_max() {
+        let l = limits_with(|l| l.mate = Some(3));
+        assert_caps_eq(compute_caps(&l, Color::White, 50), nocap(), nocap());
+    }
+
+    #[test]
+    fn compute_caps_no_time_limits_infinite_returns_max_max() {
+        let l = limits_with(|l| l.infinite = true);
+        assert_caps_eq(compute_caps(&l, Color::White, 50), nocap(), nocap());
+    }
+
+    #[test]
+    fn compute_caps_no_time_limits_ponder_returns_max_max() {
+        let l = limits_with(|l| l.ponder = true);
+        assert_caps_eq(compute_caps(&l, Color::White, 50), nocap(), nocap());
+    }
+
+    #[test]
+    fn compute_caps_infinite_with_clock_returns_max_priority_check() {
+        // `go infinite wtime 1000 btime 1000` per UCI must be infinite —
+        // the non-time flag wins over the clock. Pins that `compute_caps`
+        // checks `infinite` BEFORE the clock branch.
+        let l = limits_with(|l| {
+            l.infinite = true;
+            l.wtime = Some(1000);
+            l.btime = Some(1000);
+        });
+        assert_caps_eq(compute_caps(&l, Color::White, 50), nocap(), nocap());
+    }
+
+    #[test]
+    fn compute_caps_depth_with_clock_returns_max_priority_check() {
+        // `go depth 5 wtime 10000` must return (MAX, MAX) — depth-only
+        // limits trump the clock. Pins the same priority order.
+        let l = limits_with(|l| {
+            l.depth = Some(5);
+            l.wtime = Some(10_000);
+        });
+        assert_caps_eq(compute_caps(&l, Color::White, 50), nocap(), nocap());
+    }
+
+    #[test]
+    fn compute_caps_nodes_with_clock_returns_max_priority_check() {
+        let l = limits_with(|l| {
+            l.nodes = Some(100_000);
+            l.wtime = Some(10_000);
+        });
+        assert_caps_eq(compute_caps(&l, Color::White, 50), nocap(), nocap());
+    }
+
+    #[test]
+    fn compute_caps_movetime_with_clock_uses_movetime_path() {
+        // `go movetime 1000 wtime 60000` — movetime wins (it's an explicit
+        // override). caps = (950, 950). NOT (3000, 9000) from the clock path.
+        let l = limits_with(|l| {
+            l.movetime = Some(1000);
+            l.wtime = Some(60_000);
+        });
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(caps, Duration::from_millis(950), Duration::from_millis(950));
+    }
+
+    #[test]
+    fn compute_caps_movetime_subtracts_move_overhead() {
+        let l = limits_with(|l| l.movetime = Some(1000));
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(caps, Duration::from_millis(950), Duration::from_millis(950));
+    }
+
+    #[test]
+    fn compute_caps_movetime_floors_at_1ms_when_overhead_exceeds_movetime() {
+        let l = limits_with(|l| l.movetime = Some(10));
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(caps, Duration::from_millis(1), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn compute_caps_movetime_zero_floors_at_1ms() {
+        let l = limits_with(|l| l.movetime = Some(0));
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(caps, Duration::from_millis(1), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn compute_caps_movetime_negative_floors_at_1ms() {
+        let l = limits_with(|l| l.movetime = Some(-200));
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(caps, Duration::from_millis(1), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn compute_caps_sudden_death_white() {
+        // Research §9 row: wtime=10000 winc=100 mo=50 → soft=500, hard=1500.
+        let l = limits_with(|l| {
+            l.wtime = Some(10_000);
+            l.winc = Some(100);
+        });
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(
+            caps,
+            Duration::from_millis(500),
+            Duration::from_millis(1500),
+        );
+    }
+
+    #[test]
+    fn compute_caps_sudden_death_black_uses_btime_binc() {
+        // Mirror image: btime=10000 binc=100 mo=50, side=Black → soft=500, hard=1500.
+        let l = limits_with(|l| {
+            l.btime = Some(10_000);
+            l.binc = Some(100);
+        });
+        let caps = compute_caps(&l, Color::Black, 50);
+        assert_caps_eq(
+            caps,
+            Duration::from_millis(500),
+            Duration::from_millis(1500),
+        );
+    }
+
+    #[test]
+    fn compute_caps_white_side_does_not_consult_btime_binc() {
+        // Confirms side selection is not swapped: white-side caps must derive
+        // from wtime/winc only. With wtime=20000 winc=0 and btime=999999999,
+        // the white-side soft is 20000/20 = 1000ms — NOT some huge value
+        // computed from btime.
+        let l = limits_with(|l| {
+            l.wtime = Some(20_000);
+            l.winc = Some(0);
+            l.btime = Some(999_999_999);
+            l.binc = Some(999_999);
+        });
+        let caps = compute_caps(&l, Color::White, 0);
+        // soft = 20000/20 + 0/2 - 0 = 1000 ms; hard = 3000 ms.
+        assert_caps_eq(
+            caps,
+            Duration::from_millis(1000),
+            Duration::from_millis(3000),
+        );
+    }
+
+    #[test]
+    fn compute_caps_sudden_death_default_n_is_20() {
+        // wtime=20000 winc=0 mo=0: soft = 20000/20 + 0/2 = 1000 ms.
+        // Pin BOTH soft (the N=20 constant) AND hard = 3 × soft = 3000 ms
+        // (the hard = 3 × soft rule at a clean fixture).
+        let l = limits_with(|l| {
+            l.wtime = Some(20_000);
+            l.winc = Some(0);
+        });
+        let caps = compute_caps(&l, Color::White, 0);
+        assert_caps_eq(
+            caps,
+            Duration::from_millis(1000),
+            Duration::from_millis(3000),
+        );
+    }
+
+    #[test]
+    fn compute_caps_classical_tc() {
+        // Research §9 row: wtime=600000 movestogo=40 mo=50 → soft=14950, hard=44850.
+        let l = limits_with(|l| {
+            l.wtime = Some(600_000);
+            l.movestogo = Some(40);
+        });
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(
+            caps,
+            Duration::from_millis(14_950),
+            Duration::from_millis(44_850),
+        );
+    }
+
+    #[test]
+    fn compute_caps_movestogo_1() {
+        // wtime=10000 movestogo=1 mo=50 → soft = 10000/1 + 0/2 - 50 = 9950 ms.
+        // hard = min(3 × 9950, 10000-50) = min(29850, 9950) = 9950 ms.
+        let l = limits_with(|l| {
+            l.wtime = Some(10_000);
+            l.movestogo = Some(1);
+        });
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(
+            caps,
+            Duration::from_millis(9950),
+            Duration::from_millis(9950),
+        );
+    }
+
+    #[test]
+    fn compute_caps_movestogo_zero_treated_as_one() {
+        // movestogo=0 is a UCI spec violation. Defensive fallback: treat as 1
+        // ("this move must be played within current budget"). Output matches
+        // movestogo=1 above.
+        let l = limits_with(|l| {
+            l.wtime = Some(10_000);
+            l.movestogo = Some(0);
+        });
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(
+            caps,
+            Duration::from_millis(9950),
+            Duration::from_millis(9950),
+        );
+    }
+
+    #[test]
+    fn compute_caps_increment_only_no_forfeit_clamp() {
+        // Research §9 row: wtime=0 winc=5000 mo=50 → soft=2450, hard=7350.
+        // The forfeit guard does NOT apply when rem == 0 (research §5: spend at
+        // most half the increment to stay afloat; the increment refills after
+        // the move).
+        let l = limits_with(|l| {
+            l.wtime = Some(0);
+            l.winc = Some(5000);
+        });
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(
+            caps,
+            Duration::from_millis(2450),
+            Duration::from_millis(7350),
+        );
+    }
+
+    #[test]
+    fn compute_caps_increment_dominates_clamps_to_remaining() {
+        // Research §9 row: wtime=100 winc=5000 mo=50 → forfeit guard clamps
+        // both soft and hard to (100-50).max(1) = 50 ms.
+        let l = limits_with(|l| {
+            l.wtime = Some(100);
+            l.winc = Some(5000);
+        });
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(caps, Duration::from_millis(50), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn compute_caps_low_time_floors_at_1ms() {
+        // wtime=50 winc=0 mo=50: rem-mo = 0; rem != 0 (rem=50 in 0-handling),
+        // so the regular branch fires; raw_soft = 2; soft_unclamped = 0;
+        // max_clamp = 1; soft floors at 1; hard = min(3, 1) = 1.
+        let l = limits_with(|l| {
+            l.wtime = Some(50);
+            l.winc = Some(0);
+        });
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(caps, Duration::from_millis(1), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn compute_caps_negative_clock_floors_at_1ms() {
+        // wtime=-200 winc=0 mo=50: rem clamped to 0, inc=0 → very-low-time path
+        // → (1ms, 1ms).
+        let l = limits_with(|l| {
+            l.wtime = Some(-200);
+            l.winc = Some(0);
+        });
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(caps, Duration::from_millis(1), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn compute_caps_no_clock_no_movetime_returns_max() {
+        // Degenerate `go` with no clock and no other time fields. Fall back to
+        // (MAX, MAX) (treat as infinite).
+        let l = SearchLimits::default();
+        let caps = compute_caps(&l, Color::White, 50);
+        assert_caps_eq(caps, nocap(), nocap());
+    }
+
+    #[test]
+    fn compute_caps_zero_move_overhead_does_not_subtract() {
+        // mo=0: soft = 10000/20 + 0/2 = 500 ms; hard = min(1500, 10000) = 1500.
+        let l = limits_with(|l| {
+            l.wtime = Some(10_000);
+            l.winc = Some(0);
+        });
+        let caps = compute_caps(&l, Color::White, 0);
+        assert_caps_eq(
+            caps,
+            Duration::from_millis(500),
+            Duration::from_millis(1500),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M3.E — Iterative-deepening outer-loop tests.
+    //
+    // Per `docs/plans/m3.e.md` §8.2. Tests drive `AlphaBetaMover::go` with
+    // constructed `SearchContext`s; they observe behavior via captured
+    // `info_sink` lines, `result.depth/bestmove/score_cp/nodes`, and the
+    // `prior_root_move_for_test` accessor.
+    // -----------------------------------------------------------------------
+
+    /// Build a `SearchContext` from a position with the given limits. Soft
+    /// and hard deadlines are `None`; stop is non-aborting.
+    fn ctx_for(pos: &Position, limits: SearchLimits) -> (SearchContext, Arc<AtomicBool>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            deadline: None,
+            soft_deadline: None,
+            start: Instant::now(),
+            limits,
+            history: vec![pos.zobrist()],
+        };
+        (ctx, stop)
+    }
+
+    /// Build a `SearchContext` with a soft deadline already in the past.
+    fn ctx_with_soft_in_past(
+        pos: &Position,
+        limits: SearchLimits,
+    ) -> (SearchContext, Arc<AtomicBool>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let now = Instant::now();
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            deadline: Some(now + Duration::from_secs(10)), // generous hard
+            soft_deadline: Some(now - Duration::from_millis(1)),
+            start: now,
+            limits,
+            history: vec![pos.zobrist()],
+        };
+        (ctx, stop)
+    }
+
+    /// Capture `info` lines emitted by `Search::go`.
+    fn capture_info<F>(f: F) -> (SearchResult, Vec<String>)
+    where
+        F: FnOnce(&dyn Fn(&str)) -> SearchResult,
+    {
+        let lines: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let sink = |s: &str| lines.borrow_mut().push(s.to_string());
+        let result = f(&sink);
+        (result, lines.into_inner())
+    }
+
+    /// Drive `mover.go` with a captured info_sink.
+    fn drive_go(
+        mover: &mut AlphaBetaMover,
+        pos: &Position,
+        ctx: &SearchContext,
+    ) -> (SearchResult, Vec<String>) {
+        capture_info(|sink| mover.go(pos, ctx, sink))
+    }
+
+    #[test]
+    fn id_completes_full_iteration_when_depth_caps_max_depth() {
+        let pos = Position::starting_position();
+        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(3)));
+        let mut ab = AlphaBetaMover::new();
+        let (result, infos) = drive_go(&mut ab, &pos, &ctx);
+
+        assert_eq!(result.depth, 3, "result.depth must equal requested depth");
+        assert!(
+            result.bestmove.is_some(),
+            "depth-3 search must return a bestmove"
+        );
+        // M3.E emits one info line per completed iteration.
+        assert_eq!(
+            infos.len(),
+            3,
+            "ID must emit one info line per completed iteration (1, 2, 3); got {} lines: {:?}",
+            infos.len(),
+            infos
+        );
+    }
+
+    #[test]
+    fn id_emits_info_lines_in_increasing_depth_order() {
+        let pos = Position::starting_position();
+        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(4)));
+        let mut ab = AlphaBetaMover::new();
+        let (_result, infos) = drive_go(&mut ab, &pos, &ctx);
+
+        assert_eq!(infos.len(), 4, "expected 4 info lines; got: {infos:?}");
+        for (i, line) in infos.iter().enumerate() {
+            let expected_prefix = format!("info depth {} ", i + 1);
+            assert!(
+                line.starts_with(&expected_prefix),
+                "info line {} must start with {expected_prefix:?}; got: {line:?}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn id_aborts_between_iterations_when_soft_deadline_passed() {
+        // Position: Kiwipete — high branching means iteration ~3-4 will exceed
+        // the 200ms soft. Generous hard deadline so the abort happens BETWEEN
+        // iterations (post-iteration soft check), not via mid-iteration
+        // hard-cap should_abort.
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("Kiwipete FEN must parse");
+        let stop = Arc::new(AtomicBool::new(false));
+        let now = Instant::now();
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            deadline: Some(now + Duration::from_secs(10)),
+            soft_deadline: Some(now + Duration::from_millis(200)),
+            start: now,
+            limits: limits_with(|l| l.depth = Some(20)),
+            history: vec![pos.zobrist()],
+        };
+        let mut ab = AlphaBetaMover::new();
+        let (result, infos) = drive_go(&mut ab, &pos, &ctx);
+
+        assert!(
+            !infos.is_empty(),
+            "ID must emit at least one info line before the soft check fires"
+        );
+        // Iteration 1 from Kiwipete completes well within 200ms; soft check
+        // fires AFTER it. We pin depth >= 1 (iteration 1 ran to completion)
+        // AND depth < 20 (loop broke before reaching the depth cap). Without
+        // the >= 1 lower bound, an iteration-1 abort (mid-iteration via hard
+        // cap or stop) would still produce empty info lines and a depth-0
+        // result, falsely passing the existing assertions.
+        assert!(
+            result.depth >= 1,
+            "iteration 1 must complete; got result.depth={}",
+            result.depth
+        );
+        assert!(
+            result.depth < 20,
+            "ID must break before reaching depth 20 due to soft cap; got depth {}",
+            result.depth
+        );
+        assert!(
+            result.bestmove.is_some(),
+            "soft-cap exit must preserve bestmove from last completed iteration"
+        );
+    }
+
+    #[test]
+    fn id_completes_iteration_1_unconditionally_even_if_soft_already_past() {
+        let pos = Position::starting_position();
+        let (ctx, _stop) = ctx_with_soft_in_past(&pos, limits_with(|l| l.depth = Some(20)));
+        let mut ab = AlphaBetaMover::new();
+        let (result, infos) = drive_go(&mut ab, &pos, &ctx);
+
+        // Iteration 1 must complete despite soft already past — the soft check
+        // fires AT END OF ITERATION, so iteration 1 always runs once.
+        assert_eq!(
+            result.depth, 1,
+            "iteration 1 must complete; soft check breaks before iteration 2; got depth {}",
+            result.depth
+        );
+        assert!(
+            result.bestmove.is_some(),
+            "iteration 1 must produce a bestmove"
+        );
+        assert_eq!(
+            infos.len(),
+            1,
+            "exactly one info line for the single iteration; got {infos:?}"
+        );
+    }
+
+    #[test]
+    fn id_returns_last_complete_iteration_on_mid_iteration_abort() {
+        // Calibration protocol per plan §8.2 row 4. Drive go depth N for
+        // N=2 and N=3 from startpos with no node cap; capture result.nodes.
+        // Pick K = n2 + (n3 - n2) / 2 — halfway through ID iteration 3 by
+        // node count. Use nodes: Some(K) as the cap. Expect result.depth == 2.
+        let pos = Position::starting_position();
+        let mut ab = AlphaBetaMover::new();
+        let (ctx2, _stop2) = ctx_for(&pos, limits_with(|l| l.depth = Some(2)));
+        let (r2, _) = drive_go(&mut ab, &pos, &ctx2);
+        let n2 = r2.nodes;
+
+        let mut ab2 = AlphaBetaMover::new();
+        let (ctx3, _stop3) = ctx_for(&pos, limits_with(|l| l.depth = Some(3)));
+        let (r3, _) = drive_go(&mut ab2, &pos, &ctx3);
+        let n3 = r3.nodes;
+
+        let iter3_size = n3 - n2;
+        // 4096-cadence safety: skip if iter-3 won't trigger a cadence-aligned
+        // poll inside the iteration.
+        if iter3_size < 4096 {
+            eprintln!("iter-3 size {iter3_size} < 4096; cadence wouldn't fire — test skipped");
+            return;
+        }
+        let k = n2 + iter3_size / 2;
+
+        let mut ab3 = AlphaBetaMover::new();
+        let (ctx, _stop) = ctx_for(
+            &pos,
+            limits_with(|l| {
+                l.depth = Some(20);
+                l.nodes = Some(k);
+            }),
+        );
+        let (result, _infos) = drive_go(&mut ab3, &pos, &ctx);
+
+        assert_eq!(
+            result.depth, 2,
+            "node cap halfway through iteration 3 must preserve iteration 2's snapshot; \
+             got depth {}",
+            result.depth
+        );
+        assert!(
+            result.bestmove.is_some(),
+            "last_complete snapshot must include a bestmove"
+        );
+        assert_ne!(
+            result.score_cp,
+            Some(0),
+            "score must be from completed iteration, not 0 abort sentinel"
+        );
+    }
+
+    #[test]
+    fn id_node_cap_aborts_iteration_n_plus_1_returns_iteration_n_snapshot() {
+        // Same calibration shape but for iteration 4: K = n3 + (n4 - n3) / 2.
+        // Asserts result.depth == 3.
+        let pos = Position::starting_position();
+        let mut ab3 = AlphaBetaMover::new();
+        let (ctx3, _) = ctx_for(&pos, limits_with(|l| l.depth = Some(3)));
+        let n3 = drive_go(&mut ab3, &pos, &ctx3).0.nodes;
+
+        let mut ab4 = AlphaBetaMover::new();
+        let (ctx4, _) = ctx_for(&pos, limits_with(|l| l.depth = Some(4)));
+        let n4 = drive_go(&mut ab4, &pos, &ctx4).0.nodes;
+
+        let iter4_size = n4 - n3;
+        if iter4_size < 4096 {
+            eprintln!("iter-4 size {iter4_size} < 4096; cadence wouldn't fire — test skipped");
+            return;
+        }
+        let k = n3 + iter4_size / 2;
+
+        let mut ab = AlphaBetaMover::new();
+        let (ctx, _stop) = ctx_for(
+            &pos,
+            limits_with(|l| {
+                l.depth = Some(20);
+                l.nodes = Some(k);
+            }),
+        );
+        let (result, _) = drive_go(&mut ab, &pos, &ctx);
+
+        assert_eq!(
+            result.depth, 3,
+            "node cap halfway through iteration 4 must preserve iteration 3's snapshot; \
+             got depth {}",
+            result.depth
+        );
+        assert!(result.bestmove.is_some());
+    }
+
+    #[test]
+    fn id_partial_pv_from_aborted_iteration_does_not_leak_into_result() {
+        // Same shape as id_returns_last_complete_iteration_on_mid_iteration_abort,
+        // additionally asserts that the bestmove specifically matches a
+        // FRESH depth-2 search's bestmove (NOT the aborted iteration-3's pv[0]).
+        let pos = Position::starting_position();
+
+        let mut ab2 = AlphaBetaMover::new();
+        let (ctx2, _) = ctx_for(&pos, limits_with(|l| l.depth = Some(2)));
+        let r2 = drive_go(&mut ab2, &pos, &ctx2).0;
+        let bm_at_depth_2 = r2.bestmove.expect("depth-2 search must have bestmove");
+        let n2 = r2.nodes;
+
+        let mut ab3 = AlphaBetaMover::new();
+        let (ctx3, _) = ctx_for(&pos, limits_with(|l| l.depth = Some(3)));
+        let n3 = drive_go(&mut ab3, &pos, &ctx3).0.nodes;
+        let iter3_size = n3 - n2;
+        if iter3_size < 4096 {
+            eprintln!("iter-3 size {iter3_size} < 4096; cadence wouldn't fire — test skipped");
+            return;
+        }
+        let k = n2 + iter3_size / 2;
+
+        let mut ab = AlphaBetaMover::new();
+        let (ctx, _stop) = ctx_for(
+            &pos,
+            limits_with(|l| {
+                l.depth = Some(20);
+                l.nodes = Some(k);
+            }),
+        );
+        let (result, _) = drive_go(&mut ab, &pos, &ctx);
+
+        assert_eq!(result.depth, 2);
+        assert_eq!(
+            result.bestmove,
+            Some(bm_at_depth_2),
+            "bestmove from a mid-iteration-3 abort must match the depth-2 snapshot"
+        );
+    }
+
+    #[test]
+    fn id_prior_root_move_is_iteration_n_bestmove_at_iteration_n_plus_1() {
+        // After driving go depth 3 from startpos, the mover's
+        // prior_root_move should equal the final iteration's bestmove.
+        let pos = Position::starting_position();
+        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(3)));
+        let mut ab = AlphaBetaMover::new();
+        let (result, _) = drive_go(&mut ab, &pos, &ctx);
+
+        let bm = result.bestmove.expect("depth-3 must have bestmove");
+        assert_eq!(
+            ab.prior_root_move_for_test(),
+            Some(bm),
+            "prior_root_move after go must equal final iteration's bestmove"
+        );
+    }
+
+    #[test]
+    fn id_prior_root_move_no_hint_when_not_in_movelist() {
+        // Pre-set prior_root_move to a move that is NOT in startpos's legal
+        // move list. `Move::default() == Move(0)` decodes as a1->a1 Quiet,
+        // which is never produced by movegen.
+        //
+        // To exercise the intended code path (negamax step 8a's
+        // `position()` lookup returning None, the `if let` guard skipping),
+        // we MUST bypass `Search::go`'s top-of-go reset that clears
+        // `prior_root_move` to None before iteration 1. Direct call to
+        // `negamax_for_test` is the bypass — it forwards verbatim to
+        // `negamax` without the per-go reset. Same pattern as
+        // `id_prior_root_move_reorders_root_movelist_before_search`.
+        let pos = Position::starting_position();
+        let mut ab = AlphaBetaMover::new();
+        ab.set_prior_root_move_for_test(Some(Move::default()));
+        let (ctx, _stop) = ctx_for(&pos, SearchLimits::default());
+        let mut pos_clone = pos;
+        // Call negamax_for_test directly — bypasses go's per-go reset of
+        // prior_root_move. The illegal hint reaches step 8a, the
+        // position() lookup returns None, the guard skips, and the search
+        // proceeds with standard MVV-LVA ordering. No panic; the score is
+        // a valid alpha-beta value.
+        let score = ab.negamax_for_test(&mut pos_clone, 2, 0, -INF, INF, &ctx);
+        assert!(
+            (-INF..=INF).contains(&score),
+            "score from non-aborted depth-2 search must be a finite alpha-beta value; got {score}"
+        );
+        // pv[0][0] must be set (depth-2 from startpos always has a best
+        // root move that improves alpha from -INF).
+        assert!(
+            !ab.pv_root_for_test().is_empty(),
+            "depth-2 negamax must populate pv[0]; got empty PV"
+        );
+    }
+
+    #[test]
+    fn id_prior_root_move_reorders_root_movelist_before_search() {
+        // Node-count differential pin: a correct reorder makes the hinted
+        // run search the prior move FIRST at root, which (when the prior is
+        // the eventual best) tightens alpha sooner and prunes more nodes.
+        // A stub that omits the reorder gets only MVV-LVA + movegen order,
+        // generally producing a different (typically larger) node count.
+        //
+        // Protocol:
+        // (1) Drive an unhinted go depth 3 from startpos via negamax_for_test
+        //     directly (bypass the ID outer loop and its iteration-2 hint
+        //     auto-set). Capture the natural bestmove + node count.
+        // (2) Drive the same depth 3 with prior_root_move pre-set to that
+        //     natural bestmove. The reorder moves it to position 0; alpha
+        //     tightens identically to the unhinted run for that first move,
+        //     but the hinted run is guaranteed to evaluate that move first
+        //     (the unhinted run only happens to evaluate it first if it is
+        //     also MVV-LVA-first or movegen-first).
+        // (3) Drive the same depth 3 with prior_root_move pre-set to a
+        //     DIFFERENT legal move (one that is unlikely to be the natural
+        //     best). The reorder moves it to position 0; alpha-beta will
+        //     evaluate it first, then the rest of the moves in MVV-LVA
+        //     order. Node count differs from the unhinted run.
+        //
+        // Pin: assert node count for run (3) ≠ node count for run (1).
+        // A complete deletion of the reorder code makes run (3) identical
+        // to run (1) (both fall through to MVV-LVA), which would fail the
+        // assertion. This is the only adversarial pin against the reorder.
+        let pos = Position::starting_position();
+
+        // Run (1): unhinted depth-3 via negamax_for_test (no ID auto-hint).
+        let (ctx, _stop) = ctx_for(&pos, SearchLimits::default());
+        let mut ab1 = AlphaBetaMover::new();
+        let mut pos_clone1 = pos;
+        let _ = ab1.negamax_for_test(&mut pos_clone1, 3, 0, -INF, INF, &ctx);
+        let nodes_unhinted = ab1.nodes;
+        let bestmove_unhinted = ab1
+            .pv_root_for_test()
+            .first()
+            .copied()
+            .expect("depth-3 unhinted must produce a PV");
+
+        // Run (3): hinted with a DIFFERENT move from the natural best.
+        // Critical: the alt move must NOT be movegen-first (i.e. the first
+        // legal move from `generate_moves`). Startpos quiets all have
+        // MVV-LVA score 0, so MVV-LVA sort is stable and the unhinted run
+        // searches movegen-first first. If we pick `alt_move = movegen-first
+        // (and bestmove_unhinted happens to be a different move)`, the
+        // reorder is a no-op (alt_move is already at index 0 in MVV-LVA
+        // order). To exercise the reorder, pick a move from the LAST
+        // position in the legal-move iterator — which is NEVER movegen-first
+        // for any non-trivial position. Skip if it equals the natural best
+        // (would also produce identical node counts: hinted and unhinted both
+        // see the natural best at index 0 of the searched moves).
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let all_moves: Vec<Move> = ml.iter().collect();
+        let alt_move = *all_moves
+            .iter()
+            .rev()
+            .find(|m| **m != bestmove_unhinted)
+            .expect("startpos has > 1 legal move; last-non-best must exist");
+        // Defensive: confirm the chosen alt is NOT the movegen-first move
+        // (otherwise the reorder is trivially a no-op and the test cannot
+        // distinguish reorder-correct from reorder-stub).
+        assert_ne!(
+            alt_move, all_moves[0],
+            "test fixture: alt_move must NOT be movegen-first; reorder would be a no-op"
+        );
+        let mut ab3 = AlphaBetaMover::new();
+        ab3.set_prior_root_move_for_test(Some(alt_move));
+        let mut pos_clone3 = pos;
+        let _ = ab3.negamax_for_test(&mut pos_clone3, 3, 0, -INF, INF, &ctx);
+        let nodes_hinted_alt = ab3.nodes;
+
+        // Adversarial pin: a stub that ignores prior_root_move would produce
+        // identical node counts (both fall through to MVV-LVA order). The
+        // reorder must change the search ORDER, which changes node count.
+        assert_ne!(
+            nodes_unhinted,
+            nodes_hinted_alt,
+            "prior_root_move reorder must change root search order, observable as node count delta; \
+             nodes_unhinted={nodes_unhinted}, nodes_hinted_alt={nodes_hinted_alt} (alt_move={})",
+            alt_move.to_uci()
+        );
+    }
+
+    #[test]
+    fn id_default_max_depth_for_bare_go_is_4() {
+        // Bare `go` (no fields set) → max_depth = 4 (legacy fallback).
+        let pos = Position::starting_position();
+        let (ctx, _stop) = ctx_for(&pos, SearchLimits::default());
+        let mut ab = AlphaBetaMover::new();
+        let (result, infos) = drive_go(&mut ab, &pos, &ctx);
+
+        assert_eq!(result.depth, 4, "bare go must default to depth 4");
+        assert_eq!(infos.len(), 4, "ID must emit 4 info lines for depth 4");
+    }
+
+    // Direct pure-function tests on `max_depth_from_limits`. These pin the
+    // function's contract without running an actual search.
+
+    #[test]
+    fn max_depth_from_limits_bare_returns_4() {
+        let l = SearchLimits::default();
+        assert_eq!(max_depth_from_limits(&l), 4);
+    }
+
+    #[test]
+    fn max_depth_from_limits_explicit_depth_caps_at_max_ply_minus_1() {
+        let l = limits_with(|l| l.depth = Some(100));
+        assert_eq!(max_depth_from_limits(&l), MAX_PLY as u32 - 1);
+    }
+
+    #[test]
+    fn max_depth_from_limits_explicit_depth_passes_through() {
+        let l = limits_with(|l| l.depth = Some(7));
+        assert_eq!(max_depth_from_limits(&l), 7);
+    }
+
+    #[test]
+    fn max_depth_from_limits_infinite_returns_max_ply_minus_1() {
+        let l = limits_with(|l| l.infinite = true);
+        assert_eq!(max_depth_from_limits(&l), MAX_PLY as u32 - 1);
+    }
+
+    #[test]
+    fn max_depth_from_limits_ponder_returns_max_ply_minus_1() {
+        let l = limits_with(|l| l.ponder = true);
+        assert_eq!(max_depth_from_limits(&l), MAX_PLY as u32 - 1);
+    }
+
+    #[test]
+    fn max_depth_from_limits_movetime_returns_max_ply_minus_1() {
+        let l = limits_with(|l| l.movetime = Some(1000));
+        assert_eq!(max_depth_from_limits(&l), MAX_PLY as u32 - 1);
+    }
+
+    #[test]
+    fn max_depth_from_limits_nodes_returns_max_ply_minus_1() {
+        let l = limits_with(|l| l.nodes = Some(100_000));
+        assert_eq!(max_depth_from_limits(&l), MAX_PLY as u32 - 1);
+    }
+
+    #[test]
+    fn max_depth_from_limits_mate_returns_max_ply_minus_1() {
+        let l = limits_with(|l| l.mate = Some(3));
+        assert_eq!(max_depth_from_limits(&l), MAX_PLY as u32 - 1);
+    }
+
+    #[test]
+    fn max_depth_from_limits_wtime_returns_max_ply_minus_1() {
+        let l = limits_with(|l| l.wtime = Some(1000));
+        assert_eq!(max_depth_from_limits(&l), MAX_PLY as u32 - 1);
+    }
+
+    #[test]
+    fn max_depth_from_limits_btime_returns_max_ply_minus_1() {
+        let l = limits_with(|l| l.btime = Some(1000));
+        assert_eq!(max_depth_from_limits(&l), MAX_PLY as u32 - 1);
+    }
+
+    #[test]
+    fn id_explicit_depth_100_does_not_panic_on_pv_indexing() {
+        // depth=Some(100) is clamped to MAX_PLY - 1 = 63 by max_depth_from_limits.
+        // A buggy clamp that lets depth exceed MAX_PLY-1 would index past the
+        // PV table array (size MAX_PLY) and panic. Use a tight nodes cap so
+        // the test exits within milliseconds; pure-function tests above pin
+        // the exact clamp value.
+        let pos = Position::starting_position();
+        let (ctx, _stop) = ctx_for(
+            &pos,
+            limits_with(|l| {
+                l.depth = Some(100);
+                l.nodes = Some(1000);
+            }),
+        );
+        let mut ab = AlphaBetaMover::new();
+        let (result, _) = drive_go(&mut ab, &pos, &ctx);
+        // No panic from PV-table OOB; result.depth >= 1 (iteration 1 fits).
+        assert!(result.depth >= 1);
+    }
+
+    #[test]
+    fn id_nodes_accumulate_across_iterations() {
+        let pos = Position::starting_position();
+        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(4)));
+        let mut ab = AlphaBetaMover::new();
+        let (result, infos) = drive_go(&mut ab, &pos, &ctx);
+
+        assert_eq!(infos.len(), 4);
+
+        // Parse `nodes` field from each info line; assert monotonic
+        // non-decreasing.
+        let parse_nodes = |line: &str| -> u64 {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            let i = toks
+                .iter()
+                .position(|t| *t == "nodes")
+                .expect("info line must contain `nodes`");
+            toks[i + 1].parse().expect("`nodes` value must be u64")
+        };
+        let counts: Vec<u64> = infos.iter().map(|s| parse_nodes(s)).collect();
+        for w in counts.windows(2) {
+            assert!(
+                w[1] >= w[0],
+                "nodes must accumulate (be monotonic non-decreasing) across iterations; got {counts:?}"
+            );
+        }
+
+        assert_eq!(
+            result.nodes,
+            *counts.last().unwrap(),
+            "result.nodes must equal the last info line's nodes"
+        );
+    }
+
+    #[test]
+    fn id_iteration_1_pv_clear_isolates_from_prior_iteration_state() {
+        // Drive `go depth 1` then `go depth 2` on the SAME mover (no reset()
+        // between). The depth 2 call's iteration 1 must NOT see leftover state.
+        let pos = Position::starting_position();
+        let mut ab = AlphaBetaMover::new();
+
+        let (ctx1, _) = ctx_for(&pos, limits_with(|l| l.depth = Some(1)));
+        let _ = drive_go(&mut ab, &pos, &ctx1);
+
+        let (ctx2, _) = ctx_for(&pos, limits_with(|l| l.depth = Some(2)));
+        let (r2, _) = drive_go(&mut ab, &pos, &ctx2);
+
+        assert_eq!(r2.depth, 2);
+        assert!(r2.bestmove.is_some());
+    }
+
+    #[test]
+    fn id_breaks_when_stop_flipped_between_iterations() {
+        // info_sink itself flips ctx.stop = true on the first call. The next
+        // `if ctx.stop.load(Relaxed) { break; }` check sees stop=true, breaks.
+        let pos = Position::starting_position();
+        let stop = Arc::new(AtomicBool::new(false));
+        let now = Instant::now();
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            deadline: None,
+            soft_deadline: None,
+            start: now,
+            limits: limits_with(|l| l.depth = Some(20)),
+            history: vec![pos.zobrist()],
+        };
+        let stop_flip = Arc::clone(&stop);
+        let infos: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let info_sink = |s: &str| {
+            infos.borrow_mut().push(s.to_string());
+            // Flip stop synchronously on first call (typically `info depth 1 …`).
+            stop_flip.store(true, Ordering::Relaxed);
+        };
+        let mut ab = AlphaBetaMover::new();
+        let result = ab.go(&pos, &ctx, &info_sink);
+        let infos = infos.into_inner();
+
+        assert_eq!(
+            result.depth, 1,
+            "loop must break after iteration 1 due to stop flip"
+        );
+        assert_eq!(infos.len(), 1, "exactly one info line emitted before stop");
+        assert!(result.bestmove.is_some());
     }
 }

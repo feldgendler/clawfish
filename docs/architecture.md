@@ -23,6 +23,7 @@ Current architectural state. Decisions and their rationale live in `docs/decisio
 | Perft oracle | Stockfish (Homebrew) is the sole external source for perft fixtures | ADR-0006 |
 | Benchmark baseline | `criterion 0.7` + per-machine `--save-baseline`; committed `bench/<milestone>.md` table | ADR-0010 |
 | Tournament harness | `fastchess` 1.8.0-alpha (pinned + SHA256-verified); `scripts/match.sh` wrapper | ADR-0012 |
+| Time management | `compute_caps` pure function (soft + hard caps); ID outer loop with abort-between-iterations + mid-iteration hard-cap abort; `MoveOverhead` UCI option (default 50 ms) | ADR-0017 |
 
 ## Current design surface
 
@@ -44,7 +45,7 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 | Search trait | `Search` trait + `SearchContext` + `SearchLimits` + `SearchResult` (unchanged since M2.C) | ADR-0011; "Search v1" below |
 | UCI options | `Random_Seed` (M2.D); preserved as no-op under M3.C+ alpha-beta | `docs/plans/m2.d.md` |
 | Evaluation v1 | PeSTO MG material + PST in a precomputed `PSQT[color][kind][square]` const table | "Evaluation v1" below; ADR-0014 |
-| Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D); 10.87 Mnps depth-8 startpos | "Search v1" below; ADR-0016 |
+| Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D) + ID outer loop with soft/hard caps (M3.E + ADR-0017) | "Search v1" below; ADR-0016, ADR-0017 |
 | Game history + draw helpers | `Engine::game_history: Vec<u64>` + `is_repetition` + `is_fifty_move_draw` | "Game history and draw-detection helpers" below |
 
 ## Position layout
@@ -127,15 +128,31 @@ See `decisions/0014-eval-material-pst.md` and `docs/research/m3-eval-material-ps
 
 **Public surface.** `Search` trait + `SearchContext` + `SearchLimits` + `SearchResult` in `src/search.rs` (unchanged trait signature since M2.C).
 
-**Production impl.** `AlphaBetaMover` in `src/search.rs` — replaces M3.A's `GreedyMover` with full alpha-beta recursion + qsearch leaf-extension. ADR-0016 codifies the structure. Algorithm:
+**Production impl.** `AlphaBetaMover` in `src/search.rs` — replaces M3.A's `GreedyMover` with full alpha-beta recursion + qsearch leaf-extension + iterative deepening. ADR-0016 codifies the search structure; ADR-0017 codifies the time-management + ID outer loop.
 
-1. Single-iteration negamax at the requested depth (`go depth N`; default 4 if no `depth` specified). Qsearch at depth==0 leaves (M3.D). No iterative deepening (M3.E), no transposition table (M4).
-2. Per-go reset: clone `ctx.history` into search-owned `self.history`, zero `nodes`, clear `aborted`, clear `pv.lengths[..]`, clear `root_score`.
-3. Build `pos_clone = *position` and call `negamax(pos_clone, depth, ply=0, -INF, INF, ctx)`. Balanced make/unmake restores `pos_clone` to the original; debug_assert verifies.
-4. After negamax returns: if `self.aborted`, use `self.root_score.unwrap_or(0)` as the score (the completed-subtree score, NOT the abort sentinel — see ADR-0016 §5 root-score lockstep). Otherwise use the negamax return value.
-5. `bestmove` from `pv.moves[0][0]` if `pv.lengths[0] > 0`, else `None`.
-6. Emit `info depth <N> score <cp|mate N> nodes <N> time <ms> pv <line>` BEFORE the wait loop. PV is the full triangular-table root line.
-7. If `infinite || movetime.is_some() || ponder`: sleep 1 ms while `!should_abort()`.
+**ID outer loop in `Search::go` (M3.E)**: iterates `for d in 1..=max_depth_from_limits(&ctx.limits)`. Per-iteration reset of `aborted` / `root_score` / `pv.lengths[..]`; `nodes` and `prior_root_move` are NOT reset between iterations. Mid-iteration aborts (hard cap fires via `should_abort` at the 4096-cadence) discard the partial PV/score; `last_complete` snapshot from the prior iteration becomes the reported result. Inter-iteration checks (post-emit): `depth >= max_depth` → break; `ctx.stop` → break; `ctx.soft_deadline` elapsed → break. Iteration 1 unconditionally runs once before the soft check fires. Final-result fallback when `last_complete = None` is extracted into a named `aborted_fallback_result(&PvTable, Option<i32>)` helper for direct unit-testability (M3.D `negate_window` precedent).
+
+**Time management (M3.E)**: `compute_caps(&SearchLimits, Color, u64) -> TimeCaps` pure function in `src/search.rs`, called from `handle_go`. Returns `(soft, hard)` durations with `Duration::MAX` as the "no cap" sentinel; caller in `handle_go` constructs `(deadline, soft_deadline) = ((now + caps.hard).then_if_not_max, (now + caps.soft).then_if_not_max)`. Formula tree per ADR-0017 §1.
+
+**`MoveOverhead` UCI option (M3.E)**: `Engine::move_overhead: u64` field, default 50 ms, valid `[0, 5000]`. Threaded into `compute_caps` at every `handle_go`. Latency hedge subtracted from clock-derived caps.
+
+**`prior_root_move` ordering hint (M3.E)**: `AlphaBetaMover::prior_root_move: Option<Move>` field. Set after each completed ID iteration to that iteration's bestmove. Consumed by `negamax` at `ply == 0` only — after MVV-LVA sort, prepend the prior move via `remove(idx) + insert(0)` (preserves the rest of MVV-LVA order). Resets to `None` at top of each `go`.
+
+**`Search::go` body sketch** (M3.E, full detail in ADR-0017 §2):
+
+1. Per-go reset: clone `ctx.history` into search-owned `self.history`; zero `nodes`; clear `aborted`, `root_score`, `prior_root_move`, `pv.lengths[..]`.
+2. `max_depth = max_depth_from_limits(&ctx.limits)` (depth-cap → clamped, time-bounded → 63, bare → 4).
+3. ID outer loop `for d in 1..=max_depth`:
+   - Per-iteration reset: `aborted = false`, `root_score = None`, `pv.lengths[..] = 0`. (NOT reset: `nodes`, `prior_root_move`.)
+   - `negamax(&mut pos_clone, d, 0, -INF, INF, ctx)`. Balanced make/unmake; debug_assert verifies.
+   - On `self.aborted`: break (mid-iteration abort discards partial state; `last_complete` from prior iteration preserved).
+   - Iteration completed: snapshot `last_complete = Some((d, bestmove, score))`; set `prior_root_move = bestmove` (consumed by next iteration's negamax at ply 0).
+   - Emit `info depth <d> score <cp|mate N> nodes <N> time <ms> pv <line>` per completed iteration (NOT just at the end).
+   - Inter-iteration breaks: `if depth >= max_depth { break; }`; `if ctx.stop.load(Relaxed) { break; }` (load-bearing — closes the per-iteration `aborted` reset gap); `if ctx.soft_deadline elapsed { break; }`.
+4. Final result: prefer `last_complete` snapshot; fall back via `aborted_fallback_result` for the pathological "iter 1 aborted before any root improvement" case (extracted helper, mutation-testable).
+5. If `infinite || movetime || ponder`: post-loop `while !ctx.should_abort(self.nodes) { sleep 1ms; }` — engine waits for stop / hard cap before emitting `bestmove`.
+
+Per ADR-0017 §2, mid-iteration aborts go through `should_abort` (the hard-cap path, polled at `nodes & 4095 == 0` inside negamax/qsearch). The inter-iteration `stop` check between iterations exists because per-iteration `aborted` reset would otherwise mask a `stop` flipped between iterations.
 
 **Negamax body** (`src/search.rs::AlphaBetaMover::negamax`, M3.D plan §5 restructure):
 
