@@ -17,7 +17,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 | M3.C | ✓ | `AlphaBetaMover` (fail-soft negamax + triangular PV + MVV-LVA + mate-distance pruning) per ADR-0016; 20-0 vs `baseline/material-greedy` at depth 4; 8.55 Mnps depth-8 startpos. |
 | M3.D | ✓ | Quiescence search at the negamax horizon; `negate_window` helper closes a structural mutation gap; 10.87 Mnps depth-8 startpos (+27% vs M3.C). |
 | M3.E | ✓ | Iterative deepening + time management per ADR-0017; `compute_caps` pure function; `MoveOverhead` UCI option; `prior_root_move` ordering hint at ply==0; `aborted_fallback_result` helper. |
-| M3.F | ✓ | `bench` UCI command (signature `bench: 172312700 nodes 11489045 nps`); `scripts/sprt.sh sprt\|match\|rating-estimate` wrapper; SPRT vs RandomMover **148-0-0 H1 accepted**; rating estimate vs Stockfish 1320 = **~1996 Elo** (196-4-0 of 200); `compute_bench_nps` helper closes 3 mutation gaps. Closes M3. |
+| M3.F | ✓ | `bench` UCI command (signature `bench: 172312700 nodes 11489045 nps`); `scripts/sprt.sh sprt\|match\|rating-estimate` wrapper + `scripts/elo-iterate.sh` online iterator; SPRT vs RandomMover **148-0-0 H1 accepted**; rating estimate via online Elo iteration converged to **~2114 Elo at tc=10+0.1** (±35 Elo, P-core pinned, 120 games); `compute_bench_nps` helper closes 3 mutation gaps. Closes M3. |
 | Tooling/fuzzing | ✓ | `cargo-fuzz` harnesses for FEN + UCI (ADR-0013); 3.17B execs aggregate across saturation + smoke campaigns, one real parser bug found and fixed. |
 
 For per-phase detail (what landed, verification numbers, lessons), see [`docs/milestones/`](docs/milestones/). The forward-looking milestone plan lives in [`docs/roadmap.md`](docs/roadmap.md).

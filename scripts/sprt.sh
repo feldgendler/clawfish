@@ -4,15 +4,17 @@
 # Subcommands:
 #   sprt <baseline-tag>      — SPRT match: HEAD vs baseline-tag (clawfish-vs-clawfish)
 #   match <baseline-tag>     — fixed-game-count match HEAD vs baseline-tag; 200 games default
-#   rating-estimate          — fixed-game-count match HEAD vs Stockfish UCI_Elo=1320; 200 games
-#                              default. No tag arg — Stockfish from PATH (brew install stockfish)
-#                              capped at the known-Elo setting (ADR-0012 reference point).
+#   rating-estimate          — fixed-game-count match HEAD vs Stockfish UCI_Elo=$STOCKFISH_ELO
+#                              (default 1320 — the ADR-0012 reference point); 200 games default.
+#                              No tag arg — Stockfish from PATH (brew install stockfish).
 #                              CAVEAT: Stockfish UCI_Elo is calibrated by Stockfish at slow TC
 #                              (typically 60+0.6 or 120+1.2). Running rating-estimate at the
 #                              default `tc=10+0.1` will produce a TC-specific point estimate,
 #                              not a direct CCRL-equivalent rating. SPRT_TC override available
 #                              if you want to bring the TC closer to Stockfish's calibration
-#                              reference at the cost of wallclock.
+#                              reference at the cost of wallclock. STOCKFISH_ELO is useful for
+#                              cross-validation: pit HEAD vs Stockfish at the engine's
+#                              hypothesized Elo and check the score is ~50%.
 #
 # Usage: scripts/sprt.sh sprt baseline/random-mover
 #        scripts/sprt.sh match baseline/random-mover
@@ -44,9 +46,10 @@ usage() {
     echo ""
     echo "  sprt <tag>           SPRT match (elo0=0, elo1=10, alpha=0.05, beta=0.05; up to 400 games)"
     echo "  match <tag>          fixed-game-count match (200 games default)"
-    echo "  rating-estimate      fixed-game-count match HEAD vs Stockfish UCI_Elo=1320 (200 games)"
+    echo "  rating-estimate      fixed-game-count match HEAD vs Stockfish UCI_Elo=\$STOCKFISH_ELO (200 games)"
     echo ""
     echo "Env vars:"
+    echo "  STOCKFISH_ELO        default 1320; rating-estimate cross-validation knob"
     echo "  SPRT_GAMES           default sprt=400, match=200, rating-estimate=200"
     echo "  SPRT_TC              default '10+0.1'"
     echo "  SPRT_CONCURRENCY     default '6'"
@@ -103,8 +106,9 @@ if [[ "$SUBCMD" == "rating-estimate" ]]; then
         exit 1
     fi
     STOCKFISH="$(command -v stockfish)"
+    STOCKFISH_ELO_VALUE="${STOCKFISH_ELO:-1320}"
     BASELINE_BINARY="$STOCKFISH"
-    BASELINE_LABEL="stockfish-1320"
+    BASELINE_LABEL="stockfish-${STOCKFISH_ELO_VALUE}"
     BASELINE_SLUG="$BASELINE_LABEL"
 else
     # Verify baseline tag exists.
@@ -174,7 +178,7 @@ ADJUDICATION=(-maxmoves 200 -resign movecount=3 score=600 -draw movenumber=34 mo
 if [[ "$SUBCMD" == "rating-estimate" ]]; then
     BASELINE_ENGINE_ARGS=(
         -engine cmd="$BASELINE_BINARY" name="$BASELINE_LABEL"
-        option.UCI_LimitStrength=true option.UCI_Elo=1320
+        option.UCI_LimitStrength=true "option.UCI_Elo=$STOCKFISH_ELO_VALUE"
     )
 else
     BASELINE_ENGINE_ARGS=(-engine cmd="$BASELINE_BINARY" name="$BASELINE_LABEL")
@@ -219,7 +223,7 @@ case "$SUBCMD" in
         GAMES="${SPRT_GAMES:-200}"
         ROUNDS=$((GAMES / 2))
         echo "Running rating-estimate match: tc=$TC, $GAMES games"
-        echo "  HEAD vs $BASELINE_LABEL (Stockfish UCI_Elo=1320)"
+        echo "  HEAD vs $BASELINE_LABEL (Stockfish UCI_Elo=$STOCKFISH_ELO_VALUE)"
         "$FASTCHESS" \
             "${COMMON[@]}" \
             -rounds "$ROUNDS"

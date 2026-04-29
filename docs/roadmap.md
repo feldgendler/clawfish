@@ -10,7 +10,8 @@ For per-phase retrospectives (what landed, implementation highlights, verificati
 
 - Bench signature: `bench: 172312700 nodes 11489045 nps` at default depth 7.
 - SPRT vs `baseline/random-mover`: 148-0-0 (LLR=2.95 H1 accepted in 148 games / 3m35s).
-- Rating estimate vs Stockfish UCI_Elo=1320: 196-4-0 over 200 games → logistic Elo ≈ **1996 at tc=10+0.1**.
+- Rating estimate (single 1320-anchor): 196-4-0 over 200 games → naive logistic Elo ≈ 1996 (saturated, unreliable).
+- Rating estimate (online iteration, P-core pinned, 120 games): converged to **~2114 Elo at tc=10+0.1** (±35 Elo). [Full log](bench/sprt/2026-04-29-online-elo-iteration.md).
 - The `baseline/alpha-beta-no-tt` annotated tag lands at the M3.F commit as the M4 SPRT reference point.
 
 ### What's next
