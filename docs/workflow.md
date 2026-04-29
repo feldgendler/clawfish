@@ -319,7 +319,7 @@ Sequential Probability Ratio Test. The standard for accepting/rejecting engine c
 The reference for any SPRT match is **a binary built from a prior git commit**, not a feature-flagged version of the current code. Build both binaries (current branch HEAD + the baseline commit's HEAD), pit them via fastchess, accept/reject on the SPRT bound.
 
 - **Why not feature flags.** A flag-per-prior-behavior approach grows linearly with milestone count and produces a code surface where every search/eval function carries a "circa-M3" / "circa-M4" / … parametrization. The field universally rejects this pattern (Stockfish/Fishtest, Komodo, Ethereal all use historical-commit builds). The codebase always reflects the *current* engine; prior behaviors live only in git history.
-- **Build flow** (will be wired into `scripts/sprt.sh` when M3.F lands; not yet implemented):
+- **Build flow** (wired in `scripts/sprt.sh` since M3.F):
   - `git worktree add target/sprt-baselines/<sha> <sha>` — isolated checkout so cargo's `target/` doesn't conflict.
   - `cargo build --release` in the worktree → cached binary at `target/sprt-baselines/<sha>/target/release/clawfish`.
   - `cargo build --release` in the working tree.
@@ -343,10 +343,10 @@ Tags created so far:
 |---|---|---|
 | `baseline/random-mover` | `08b980d` (M2.E end) | Last commit shipping uniform-random move selection as production search. The reference point for the M3 exit criterion ("beats the random mover ~100%"). |
 | `baseline/material-greedy` | M3.A end | Last commit shipping depth-1 best-eval (PeSTO MG material + PST) as production search. Reference point for any future SPRT match against the depth-1 greedy behavior. |
+| `baseline/alpha-beta-no-tt` | M3.F end | Last commit shipping alpha-beta + qsearch + ID + time-management without TT. Reference point for M4.A's SPRT (and M4.B–D thereafter). |
 
 Tags expected to be created at future milestone boundaries (illustrative — not commitments):
 
-- `baseline/alpha-beta-no-tt` — last commit shipping alpha-beta + qsearch + ID without TT (M3 end / M4 start).
 - `baseline/alpha-beta-tt` — last commit shipping the bare TT (M4.A end / M4.B start), etc.
 
 Not every commit gets a baseline tag. The criterion: tag a commit if a future SPRT might want to cite it as a fixed reference point (typically end-of-milestone or end-of-substantial-feature). Within-milestone refactors and intermediate sub-phase commits don't get tagged — they're just steps in the history.

@@ -4,21 +4,18 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1 complete; M2 complete; M3.A complete; M3.B complete; M3.C complete; M3.D complete; M3.E complete; M3.F next — `bench` command + SPRT validation.**
+**M1 complete; M2 complete; M3 complete (M3.A–M3.F all landed); M4 next — search basics (TT, ordering, PVS, aspiration).**
 
-For per-phase retrospectives (what landed, implementation highlights, verification numbers), see [`milestones/`](milestones/). The latest landed phase is [M3.E](milestones/m3.e.md) (2026-04-29).
+For per-phase retrospectives (what landed, implementation highlights, verification numbers), see [`milestones/`](milestones/). The latest landed phase is [M3.F](milestones/m3.f.md) (2026-04-29) — closes M3.
+
+- Bench signature: `bench: 172312700 nodes 11489045 nps` at default depth 7.
+- SPRT vs `baseline/random-mover`: 148-0-0 (LLR=2.95 H1 accepted in 148 games / 3m35s).
+- Rating estimate vs Stockfish UCI_Elo=1320: 196-4-0 over 200 games → logistic Elo ≈ **1996 at tc=10+0.1**.
+- The `baseline/alpha-beta-no-tt` annotated tag lands at the M3.F commit as the M4 SPRT reference point.
 
 ### What's next
 
-**M3.F — `bench` UCI command + SPRT validation.** Closes M3:
-
-- UCI `bench` command for deterministic node-count regression baseline.
-- SPRT match vs RandomMover via the M2.E fastchess harness (M3 exit criterion: beats RandomMover ~100%).
-- `scripts/sprt.sh` wrapper using historical-commit-baseline methodology per `docs/workflow.md` §SPRT.
-- First rating estimate against a known-strength reference.
-- `bench/sprt/<dated>.md` summary file.
-
-No new ADR expected — `scripts/sprt.sh` is concrete, not architectural.
+**M4 — search basics.** See the M4 section below. Transposition table (Zobrist-keyed) + move ordering refinements (PV move, killer moves, history heuristic) + aspiration windows + PVS. Each addition gated by SPRT against `baseline/alpha-beta-no-tt`.
 
 ## Milestones
 
@@ -118,7 +115,7 @@ First playing engine. Negamax with iterative deepening, quiescence search, simpl
 | **M3.C** ✓ — Negamax alpha-beta core | `AlphaBetaMover` (fail-soft negamax + triangular PV + MVV-LVA + mate-distance pruning + 4096-node cancellation cadence + `root_score` lockstep) per ADR-0016. 20-0 vs `baseline/material-greedy` at depth 4; 8.55 Mnps depth-8 startpos. Retrospective: [`milestones/m3.c.md`](milestones/m3.c.md). | ~700 (actual ~1700) |
 | **M3.D** ✓ — Quiescence search | `qsearch` at the negamax horizon (stand-pat + captures + queen-promos + in-check evasions + false-stalemate guard); `negate_window` helper closes a structural mutation gap. 10.87 Mnps depth-8 startpos (+27% vs M3.C). Retrospective: [`milestones/m3.d.md`](milestones/m3.d.md). | ~400 (actual ~600) |
 | **M3.E** ✓ — Iterative deepening + time management | `compute_caps(&SearchLimits, Color, u64) -> TimeCaps` pure function (26 unit tests pinning research §9 table); `max_depth_from_limits`; ID outer loop with mid-iteration hard-cap abort + between-iteration soft-cap and stop checks; `prior_root_move` ordering hint at ply==0; `MoveOverhead` UCI option (`spin default 50 min 0 max 5000`); `aborted_fallback_result` helper. ADR-0017. Retrospective: [`milestones/m3.e.md`](milestones/m3.e.md). | ~600 |
-| **M3.F** — `bench` command + SPRT validation | UCI `bench` for deterministic node-count regression baseline; SPRT match vs RandomMover via the M2.E fastchess harness; first rating estimate. `bench/m3.md` milestone summary. Closes M3. | ~300 |
+| **M3.F** ✓ — `bench` command + SPRT validation | `Command::Bench { depth: Option<u32> }` + `parse_bench` + `Engine::handle_bench` + 16-position vendored corpus in `src/bench.rs`; `compute_bench_nps` helper closes 3 mutation gaps on the inline arithmetic (M3.D `negate_window` precedent). `scripts/sprt.sh sprt\|match\|rating-estimate` wrapper using historical-commit baselines. SPRT vs `baseline/random-mover`: 148-0-0 H1 accepted (LLR=2.95, 3m35s). Rating estimate vs Stockfish UCI_Elo=1320: 196-4-0 of 200 → **~1996 Elo at tc=10+0.1** (logistic). Bench signature: `bench: 172312700 nodes 11489045 nps`. Closes M3. Retrospective: [`milestones/m3.f.md`](milestones/m3.f.md). | ~300 |
 
 A and B are independent and can be planned/executed in parallel. C–F are sequential.
 

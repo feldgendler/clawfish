@@ -66,6 +66,15 @@ pub enum Command {
     PonderHit,
     /// `quit`
     Quit,
+    /// `bench` or `bench <N>` — non-spec extension (M3.F). Drives a deterministic
+    /// node-count regression baseline by searching a vendored fixed-position
+    /// corpus at the given depth. `depth` is `None` for bare `bench` (handler
+    /// uses [`crate::bench::BENCH_DEFAULT_DEPTH`]); `Some(N)` overrides with a
+    /// caller-supplied depth in the range `1..=63`.
+    Bench {
+        /// Search depth override; `None` ⇒ engine default.
+        depth: Option<u32>,
+    },
     /// Empty line, unrecognized command, or required-arg parse failure.
     /// Carries no diagnostic — the original line is M2.C's responsibility.
     Unknown,
@@ -192,7 +201,24 @@ pub fn parse_uci_line(line: &str) -> Command {
         "register" => parse_register(rest),
         "position" => parse_position(rest),
         "go" => Command::Go(parse_go(rest)),
+        "bench" => parse_bench(rest),
         // Strict-first-token: first token must be a known keyword (§3.3).
+        _ => Command::Unknown,
+    }
+}
+
+/// `bench [<N>]` — non-spec extension. Bare `bench` → `Command::Bench { depth:
+/// None }`; `bench <N>` with `1 ≤ N ≤ 63` → `Some(N)`. Anything else → `Unknown`.
+/// Strict-on-extra-tokens (mirrors `parse_debug`): `bench 7 extra` is rejected.
+fn parse_bench(rest: &[&str]) -> Command {
+    if rest.is_empty() {
+        return Command::Bench { depth: None };
+    }
+    if rest.len() != 1 {
+        return Command::Unknown;
+    }
+    match rest[0].parse::<u32>() {
+        Ok(d) if (1..=63).contains(&d) => Command::Bench { depth: Some(d) },
         _ => Command::Unknown,
     }
 }
@@ -451,6 +477,60 @@ mod tests {
     #[test]
     fn parses_quit() {
         assert_eq!(parse_uci_line("quit"), Command::Quit);
+    }
+
+    // ─── bench ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_bench_no_arg_yields_default_depth() {
+        // Bare `bench` → depth: None. Handler picks BENCH_DEFAULT_DEPTH.
+        assert_eq!(parse_uci_line("bench"), Command::Bench { depth: None });
+    }
+
+    #[test]
+    fn parse_bench_with_explicit_depth() {
+        for d in [1u32, 7, 13, 63] {
+            assert_eq!(
+                parse_uci_line(&format!("bench {d}")),
+                Command::Bench { depth: Some(d) },
+                "bench {d} should yield Bench {{ depth: Some({d}) }}",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bench_rejects_zero_depth() {
+        // Depth 0 is out of valid range; protocol behavior: Unknown.
+        assert_eq!(parse_uci_line("bench 0"), Command::Unknown);
+    }
+
+    #[test]
+    fn parse_bench_rejects_above_max_depth() {
+        // 64 ≥ MAX_PLY (=64); reject.
+        assert_eq!(parse_uci_line("bench 64"), Command::Unknown);
+        assert_eq!(parse_uci_line("bench 999"), Command::Unknown);
+    }
+
+    #[test]
+    fn parse_bench_rejects_non_integer_arg() {
+        assert_eq!(parse_uci_line("bench foo"), Command::Unknown);
+        assert_eq!(parse_uci_line("bench 7a"), Command::Unknown);
+        assert_eq!(parse_uci_line("bench 7.5"), Command::Unknown);
+    }
+
+    #[test]
+    fn parse_bench_rejects_extra_tokens() {
+        // Strict-on-extra-tokens (mirrors `parse_debug`'s strict-exact-2-tokens
+        // discipline). `bench` is closer to `debug` than to `position` or `go`.
+        assert_eq!(parse_uci_line("bench 7 extra"), Command::Unknown);
+        assert_eq!(parse_uci_line("bench 7 8"), Command::Unknown);
+    }
+
+    #[test]
+    fn parse_bench_rejects_negative_depth() {
+        // `-1`.parse::<u32>() fails → Unknown.
+        assert_eq!(parse_uci_line("bench -1"), Command::Unknown);
+        assert_eq!(parse_uci_line("bench -7"), Command::Unknown);
     }
 
     // ─── debug ────────────────────────────────────────────────────────────
