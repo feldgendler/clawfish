@@ -4513,13 +4513,31 @@ mod tests {
             "pre-populated TT must reduce node count via non-PV-child cutoffs; \
              nodes_ref={nodes_ref}, nodes_with_tt={nodes_with_tt}"
         );
-        // Sanity: at least N - 1 children must have cut off (each cutoff
-        // saves an entire depth-2 subtree). The savings must be substantial.
-        let n_children = ml.iter().count() as u64;
+
+        // Tight assertion: under correct `child_is_pv = is_pv && i == 0`,
+        // exactly child[0] is PV (no TT cut) and children[1..] are non-PV
+        // (TT cut). So `nodes_with_tt` ≈ "1 root frame + 1 PV-child subtree
+        // + (N-1) cut frames" ≈ depth-2 subtree size. `nodes_ref` ≈
+        // "1 root + N PV-child subtrees" ≈ N × depth-2 subtree.
+        //
+        // Under the mutation `i != 0`, child[0] is non-PV (cuts) and
+        // children[1..] are PV (full recursion), so `nodes_with_tt` ≈
+        // (N-1) × subtree — close to `nodes_ref`, not far below it.
+        //
+        // Pin the ratio: under correct behavior, child[0] is the only
+        // child that recurses (others cut), so nodes_with_tt is ≈ one
+        // depth-2 subtree (~5-15% of nodes_ref). Under the mutation
+        // `i != 0`, child[0] cuts and children[1..] all recurse, so
+        // nodes_with_tt is ≈ (N-1) subtrees (~85-95% of nodes_ref).
+        // Threshold at nodes_ref / 2 cleanly separates the two regimes.
+        let max_allowed = nodes_ref / 2;
         assert!(
-            (nodes_ref - nodes_with_tt) >= (n_children - 1),
-            "savings must be at least (N-1) cut-off frames; \
-             nodes_ref={nodes_ref}, nodes_with_tt={nodes_with_tt}, n_children={n_children}"
+            nodes_with_tt < max_allowed,
+            "PV-only-on-child[0] discipline must save at least half the search; \
+             nodes_ref={nodes_ref}, nodes_with_tt={nodes_with_tt}, \
+             max_allowed={max_allowed}. \
+             Mutation `i != 0` would leave nodes_with_tt above nodes_ref/2 \
+             (only child[0] cut, all others recursed)."
         );
     }
 }

@@ -204,6 +204,15 @@ exclude_re = [
     "replace \\+ with - in build_knight_attacks",
     "replace \\+ with - in build_king_attacks",
 
+    # ---- TtEntry::pack_age_bound: `(age & 0x3F) << 2 | bound` disjoint ----
+    #
+    # `pack_age_bound(age, bound) = (age & 0x3F) << 2 | bound as u8`.
+    # The left operand lives in bits [7..2] (age, 6 bits), the right in
+    # bits [1..0] (bound, 2 bits). They have disjoint bit positions by
+    # construction, so `|` and `^` produce identical results for every
+    # input. Equivalent mutant; M4.A.
+    "replace \\| with \\^ in TtEntry::pack_age_bound",
+
     # ---- emit_*_moves: `capture_mask | push_mask` is disjoint -----
     #
     # The single-check / no-check / double-check formulas guarantee

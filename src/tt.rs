@@ -911,6 +911,62 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // T20c — Boundary case at exactly ±MATE_IN_MAX_PLY.
+    //
+    // The mate-score predicates use strict inequality: `score > MATE_IN_MAX_PLY`
+    // and `score < -MATE_IN_MAX_PLY`. The boundary case `score == ±MATE_IN_MAX_PLY`
+    // exactly is non-mate (centipawn) and must NOT be ply-adjusted. Without
+    // this test, mutations like `>` → `>=` (or `<` → `<=`) would survive — at
+    // the boundary value the mutated predicate flips, but no test in T17/T18/
+    // T19/T20/T20b/T19-proptest hits the exact boundary integer (proptest's
+    // i32 sampling has ~1/2^32 chance of hitting it).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn score_to_tt_boundary_at_mate_in_max_ply_is_no_op() {
+        // score == MATE_IN_MAX_PLY is the largest non-mate cp score.
+        // Must not be ply-adjusted regardless of ply.
+        assert_eq!(score_to_tt(MATE_IN_MAX_PLY, 0), MATE_IN_MAX_PLY);
+        assert_eq!(score_to_tt(MATE_IN_MAX_PLY, 5), MATE_IN_MAX_PLY);
+        assert_eq!(score_to_tt(MATE_IN_MAX_PLY, 32), MATE_IN_MAX_PLY);
+        // Symmetric negative-boundary case.
+        assert_eq!(score_to_tt(-MATE_IN_MAX_PLY, 0), -MATE_IN_MAX_PLY);
+        assert_eq!(score_to_tt(-MATE_IN_MAX_PLY, 5), -MATE_IN_MAX_PLY);
+        assert_eq!(score_to_tt(-MATE_IN_MAX_PLY, 32), -MATE_IN_MAX_PLY);
+    }
+
+    #[test]
+    fn score_from_tt_boundary_at_mate_in_max_ply_is_no_op() {
+        // Symmetric to score_to_tt: probe-side adjustment must also leave
+        // the boundary unchanged.
+        assert_eq!(score_from_tt(MATE_IN_MAX_PLY, 0), MATE_IN_MAX_PLY);
+        assert_eq!(score_from_tt(MATE_IN_MAX_PLY, 5), MATE_IN_MAX_PLY);
+        assert_eq!(score_from_tt(MATE_IN_MAX_PLY, 32), MATE_IN_MAX_PLY);
+        assert_eq!(score_from_tt(-MATE_IN_MAX_PLY, 0), -MATE_IN_MAX_PLY);
+        assert_eq!(score_from_tt(-MATE_IN_MAX_PLY, 5), -MATE_IN_MAX_PLY);
+        assert_eq!(score_from_tt(-MATE_IN_MAX_PLY, 32), -MATE_IN_MAX_PLY);
+    }
+
+    #[test]
+    fn score_to_tt_just_above_mate_in_max_ply_does_adjust() {
+        // The point just above the boundary IS a mate score and must be adjusted.
+        // This pins that we adjust at MATE_IN_MAX_PLY + 1, not at MATE_IN_MAX_PLY.
+        assert_eq!(score_to_tt(MATE_IN_MAX_PLY + 1, 5), MATE_IN_MAX_PLY + 1 + 5);
+        assert_eq!(
+            score_from_tt(MATE_IN_MAX_PLY + 1, 5),
+            MATE_IN_MAX_PLY + 1 - 5
+        );
+        assert_eq!(
+            score_to_tt(-(MATE_IN_MAX_PLY + 1), 5),
+            -(MATE_IN_MAX_PLY + 1) - 5
+        );
+        assert_eq!(
+            score_from_tt(-(MATE_IN_MAX_PLY + 1), 5),
+            -(MATE_IN_MAX_PLY + 1) + 5
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // T21 — TtEntry is exactly 16 bytes
     // -----------------------------------------------------------------------
 
