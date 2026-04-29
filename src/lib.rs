@@ -5,6 +5,7 @@
 //! See `docs/architecture.md` and `docs/roadmap.md` for the project's
 //! current architectural state and milestone plan.
 
+pub mod bench;
 pub mod bitboard;
 pub mod engine;
 pub mod eval;

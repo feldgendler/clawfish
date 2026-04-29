@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M3.E complete; M3.F next — `bench` UCI command + SPRT validation.** Architectural commitments settled (see `docs/decisions/`).
+**Phase: M3 complete (M3.F closed); M4 — search basics (TT, killer/history, PVS, aspiration windows) is next.** Architectural commitments settled (see `docs/decisions/`).
 
 | Phase | Status | One-line summary |
 |---|---|---|
@@ -17,13 +17,14 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 | M3.C | ✓ | `AlphaBetaMover` (fail-soft negamax + triangular PV + MVV-LVA + mate-distance pruning) per ADR-0016; 20-0 vs `baseline/material-greedy` at depth 4; 8.55 Mnps depth-8 startpos. |
 | M3.D | ✓ | Quiescence search at the negamax horizon; `negate_window` helper closes a structural mutation gap; 10.87 Mnps depth-8 startpos (+27% vs M3.C). |
 | M3.E | ✓ | Iterative deepening + time management per ADR-0017; `compute_caps` pure function; `MoveOverhead` UCI option; `prior_root_move` ordering hint at ply==0; `aborted_fallback_result` helper. |
+| M3.F | ✓ | `bench` UCI command (signature `bench: 172312700 nodes 11489045 nps`); `scripts/sprt.sh sprt\|match\|rating-estimate` wrapper; SPRT vs RandomMover **148-0-0 H1 accepted**; rating estimate vs Stockfish 1320 = **~1996 Elo** (196-4-0 of 200); `compute_bench_nps` helper closes 3 mutation gaps. Closes M3. |
 | Tooling/fuzzing | ✓ | `cargo-fuzz` harnesses for FEN + UCI (ADR-0013); 3.17B execs aggregate across saturation + smoke campaigns, one real parser bug found and fixed. |
 
 For per-phase detail (what landed, verification numbers, lessons), see [`docs/milestones/`](docs/milestones/). The forward-looking milestone plan lives in [`docs/roadmap.md`](docs/roadmap.md).
 
 ### What's next
 
-**M3.F — `bench` UCI command + SPRT validation.** Closes M3. UCI `bench` command for deterministic node-count regression baseline; SPRT match vs RandomMover via the M2.E fastchess harness; first rating estimate; `scripts/sprt.sh` wrapper. No new ADR expected. Detail in [`docs/roadmap.md`](docs/roadmap.md).
+**M4 — search basics.** Transposition table (Zobrist), move ordering refinements (PV move, killer moves, history heuristic), aspiration windows, PVS. Each addition gated by SPRT against `baseline/alpha-beta-no-tt` (the tag added at M3.F end). Detail in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## How to pick up a new session
 

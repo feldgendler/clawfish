@@ -24,6 +24,8 @@ Current architectural state. Decisions and their rationale live in `docs/decisio
 | Benchmark baseline | `criterion 0.7` + per-machine `--save-baseline`; committed `bench/<milestone>.md` table | ADR-0010 |
 | Tournament harness | `fastchess` 1.8.0-alpha (pinned + SHA256-verified); `scripts/match.sh` wrapper | ADR-0012 |
 | Time management | `compute_caps` pure function (soft + hard caps); ID outer loop with abort-between-iterations + mid-iteration hard-cap abort; `MoveOverhead` UCI option (default 50 ms) | ADR-0017 |
+| Bench regression baseline | `bench` UCI command iterates a 16-position vendored corpus (`src/bench.rs::BENCH_POSITIONS`) at default depth 7; sums node counts; emits `info string bench: <N> nodes <NPS> nps` signature line. M3.F end signature: `bench: 172312700 nodes 11489045 nps`. | M3.F |
+| SPRT runner | `scripts/sprt.sh sprt\|match\|rating-estimate` builds baseline binary in `git worktree`-isolated checkout; runs fastchess SPRT or fixed-game match. Field-standard historical-commit-baseline methodology. | `docs/workflow.md` §SPRT |
 
 ## Current design surface
 
@@ -45,8 +47,9 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 | Search trait | `Search` trait + `SearchContext` + `SearchLimits` + `SearchResult` (unchanged since M2.C) | ADR-0011; "Search v1" below |
 | UCI options | `Random_Seed` (M2.D); preserved as no-op under M3.C+ alpha-beta | `docs/plans/m2.d.md` |
 | Evaluation v1 | PeSTO MG material + PST in a precomputed `PSQT[color][kind][square]` const table | "Evaluation v1" below; ADR-0014 |
-| Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D) + ID outer loop with soft/hard caps (M3.E + ADR-0017) | "Search v1" below; ADR-0016, ADR-0017 |
+| Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D) + ID outer loop with soft/hard caps (M3.E + ADR-0017); `bench` regression baseline (M3.F) | "Search v1" below; ADR-0016, ADR-0017 |
 | Game history + draw helpers | `Engine::game_history: Vec<u64>` + `is_repetition` + `is_fifty_move_draw` | "Game history and draw-detection helpers" below |
+| Bench command (M3.F) | `Command::Bench { depth: Option<u32> }` + `Engine::handle_bench`; `compute_bench_nps` helper extracted for direct mutation-test coverage | "Bench command" below |
 
 ## Position layout
 
@@ -226,6 +229,30 @@ See `docs/plans/m3.c.md`, `docs/plans/m3.d.md`, `docs/decisions/0016-search-stru
 **Consumer.** None at M3.B. M3.C's negamax is the first consumer; the helpers' signatures are intentionally `&[u64]` / `u8` so the data's exact storage location (inside `SearchContext`, in a `Cell`, or as a separate `&mut Vec<u64>` parameter) is a deferred M3.C decision.
 
 See `docs/plans/m3.b.md` and `docs/research/m3-search-basics.md` §8–§9.
+
+## Bench command (M3.F)
+
+**Public surface (within crate).** `src/bench.rs` exposes `BENCH_POSITIONS: [&str; 16]` (vendored FEN corpus, 3 opening / 8 middlegame / 5 endgame) and `BENCH_DEFAULT_DEPTH: u32 = 7`. Module-scope `const _: () = assert!(...)` invariant ties the constant to the parser's `1..=63` accept range — failing the build, not just `cargo test`, on out-of-range edits.
+
+**Public surface (UCI).** `Command::Bench { depth: Option<u32> }`, parsed by `parse_bench` in `src/uci.rs`. Bare `bench` → `depth: None` (handler picks default); `bench <N>` for `N ∈ 1..=63` → `Some(N)`. Strict-on-extra-tokens, mirrors `parse_debug` discipline.
+
+**Handler.** `Engine::handle_bench` (synchronous on orchestrator thread) iterates `BENCH_POSITIONS`, drives `Search::go` at fixed depth on each with a no-op `info_sink`, sums node counts, emits per-position `info string bench position N/16: <fen> nodes <X> time <ms>` lines plus a final `info string Nodes searched: <N>` and `info string bench: <N> nodes <NPS> nps` summary. The signature line is OpenBench-grep-compatible (substring regex `bench: \d+ nodes \d+ nps` matches the `info string`-prefixed form).
+
+**`stop` discipline.** `handle_bench`'s first action is `join_in_flight_worker()` (mirrors `handle_ucinewgame`), followed immediately by `self.stop.store(false, Ordering::Relaxed)` — same pattern as `handle_go`. Without the explicit clear, a `[go infinite, bench]` sequence would inherit `stop=true` from the join, contaminating per-position `Search::go` invocations: at default depth 7, the inter-iteration stop check (search.rs:383) breaks the ID loop after iter 1, producing tens of nodes per position instead of millions. Pinned by `handle_bench_after_go_infinite_produces_clean_state_results`.
+
+**`compute_bench_nps` helper.** `pub(crate) fn compute_bench_nps(total_nodes: u64, total_ms: u128) -> u128` extracted from `handle_bench`'s body. Returns `(total_nodes × 1000) / max(total_ms, 1)`. Three cargo-mutants survivors on the inline expression (`/ → %`, `/ → *`, `* → +`) were structurally undetectable at the integration-test layer (the order-of-magnitude NPS sanity band is too wide to catch precise arithmetic mutations), so the helper is unit-tested directly with `(10, 3)` fixtures that distinguish each mutation. Same precedent as M3.D's `negate_window` and M3.E's `aborted_fallback_result`.
+
+**Determinism scope.** The node-count signature is deterministic across runs from the same binary; per-position `time {ms}` and aggregate `<NPS>` are wallclock-dependent and explicitly excluded from the regression signature. Pinned by `bench_node_count_is_reproducible_across_invocations`. Within-run cross-position state isolation is a `Search::go` invariant (per-go reset at line 321 of `src/search.rs`) — already pinned by M3.E's ID tests.
+
+**SPRT runner.** `scripts/sprt.sh` wraps fastchess with three subcommands:
+
+- `sprt <baseline-tag>` — SPRT match HEAD vs baseline-tag (clawfish-vs-clawfish), bounds `elo0=0, elo1=10, alpha=0.05, beta=0.05`, up to 400 games default. M3 exit-criterion gate.
+- `match <baseline-tag>` — fixed-game-count match (200 games default), no SPRT termination.
+- `rating-estimate` — fixed-game-count match HEAD vs Stockfish UCI_Elo=1320 (200 games default; ADR-0012 reference point).
+
+The script builds the baseline binary in a `git worktree`-isolated checkout (`target/sprt-baselines/<tag-slug>/`), caches it across runs, and probes the result with `printf 'uci\nquit\n' | <bin> | grep '^uciok$'` before fastchess starts (catches stale-toolchain rebuilds). `SPRT_REBUILD=1` forces a fresh worktree. Forward-compatible with the historical `chess` → `clawfish` package rename: reads the package name from the baseline's `Cargo.toml` to derive the binary path.
+
+See `docs/plans/m3.f.md` and `bench/m3.md` M3.F section.
 
 ## Make / unmake
 
