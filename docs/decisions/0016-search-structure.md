@@ -1,6 +1,6 @@
-# ADR-0013 — Search structure: fail-soft negamax + triangular PV + ply-adjusted mate scores + mate-distance pruning
+# ADR-0016 — Search structure: fail-soft negamax + triangular PV + ply-adjusted mate scores + mate-distance pruning
 
-Status: accepted (M3.C, 2026-04-28).
+Status: accepted (M3.C, 2026-04-28). Originally numbered ADR-0013; renumbered to ADR-0016 to resolve a collision with the earlier ADR-0013 (fuzzing strategy).
 
 ## Context
 

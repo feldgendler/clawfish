@@ -3,9 +3,10 @@
 A Rust chess engine, written from scratch and grown incrementally toward
 GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 
-> **Status: early.** Currently a depth-1 greedy mover with PeSTO middlegame
-> piece-square tables. Alpha-beta search, transposition tables, quiescence,
-> and the rest of the strength path are tracked in
+> **Status: early.** Fail-soft alpha-beta with quiescence search, MVV-LVA
+> ordering, mate-distance pruning, and PeSTO middlegame piece-square tables.
+> No iterative deepening, no transposition table yet. Time management,
+> transposition tables, and the rest of the strength path are tracked in
 > [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Build
@@ -20,8 +21,8 @@ cleanly but are not regularly exercised.
 ## Run
 
 clawfish speaks the [UCI protocol](https://backscattering.de/chess/uci/) over
-stdin/stdout. Point any UCI-compatible chess GUI (Cute Chess, En Croissant,
-Arena) at the binary:
+stdin/stdout. Point any UCI-compatible chess GUI (Banksia GUI — `brew install
+banksiagui` on macOS — En Croissant, Arena) at the binary:
 
 ```sh
 ./target/release/clawfish

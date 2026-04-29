@@ -4,7 +4,7 @@
 
 ## Context
 
-NNUE is a planned milestone (M8), not a maybe. NNUE is *not* a drop-in eval function — it is an incrementally updated accumulator that requires hooks in `make_move` and `unmake_move`. Retrofitting these hooks into a search that has open-coded move-application logic at every call site is painful.
+NNUE is a planned milestone (M9 per `docs/roadmap.md`), not a maybe. NNUE is *not* a drop-in eval function — it is an incrementally updated accumulator that requires hooks in `make_move` and `unmake_move`. Retrofitting these hooks into a search that has open-coded move-application logic at every call site is painful.
 
 The user's guidance is that NNUE-readiness should "exist or be easy to add" from the start.
 
