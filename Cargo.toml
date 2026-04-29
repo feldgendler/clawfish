@@ -16,6 +16,10 @@ proptest = "1.11"
 # Used by `benches/perft.rs` and `benches/movegen.rs`.
 criterion = { version = "0.7", features = ["html_reports"] }
 
+[[bin]]
+name = "elo-iterate"
+path = "src/bin/elo-iterate.rs"
+
 [[bench]]
 name = "perft"
 harness = false
