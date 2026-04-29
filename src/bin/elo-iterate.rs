@@ -358,6 +358,35 @@ mod cli {
         }
 
         #[test]
+        fn parse_args_default_watchdog_ms_pins_formula() {
+            // Pins the formula `watchdog_ms = max(60_000, 2*tc.initial_ms + 30_000)`.
+            // For --tc 10+0.1 → tc.initial_ms = 10_000, so the inner term is
+            // 2*10_000 + 30_000 = 50_000; max(60_000, 50_000) = 60_000.
+            // Mutations `+ → -` and `* → /` on the inner formula collapse the
+            // value either to the floor (60_000) or below it; the assertion
+            // would still pass for tc=10+0.1.
+            //
+            // Use --tc 60+0 → tc.initial_ms = 60_000, inner = 2*60_000 + 30_000 = 150_000;
+            // max(60_000, 150_000) = 150_000. Mutations: + → - gives 90_000;
+            // * → / gives 30_030; * → + gives 60_062. None equal 150_000.
+            let argv = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/clawfish".into(),
+                "--tc".into(),
+                "60+0".into(),
+                "--max-games".into(),
+                "2".into(),
+            ];
+            let args = parse_args(argv).expect("parse_args ok");
+            assert_eq!(
+                args.watchdog_ms, 150_000,
+                "watchdog_ms must be 2*60_000 + 30_000 = 150_000 for tc=60+0"
+            );
+        }
+
+        #[test]
         fn parse_args_engine_option_repeatable() {
             // --engine-option can appear multiple times.
             let argv = vec![
@@ -893,6 +922,74 @@ mod driver {
             assert!(info.score.is_none());
             assert!(info.time_ms.is_none());
             assert!(info.pv.is_none());
+        }
+
+        #[test]
+        fn parse_info_line_pins_time_field() {
+            // Catches `delete match arm "time"` survivor: if "time" arm is
+            // dropped, the next two tokens get consumed by the catch-all and
+            // info.time_ms stays None.
+            let info = parse_info_payload("depth 5 time 250");
+            assert_eq!(info.time_ms, Some(250), "time field must populate");
+        }
+
+        #[test]
+        fn parse_info_line_pins_score_cp() {
+            // Catches `delete match arm "score"` and `delete match arm ("cp", Ok(n))`:
+            // both regressions leave info.score == None for a `score cp X` line.
+            let info = parse_info_payload("depth 5 score cp 35");
+            assert_eq!(
+                info.score,
+                Some(Score::Cp(35)),
+                "score cp must populate as Cp"
+            );
+        }
+
+        #[test]
+        fn parse_info_line_pins_score_mate() {
+            // Catches `delete match arm ("mate", Ok(n))`: leaves score==None
+            // for `score mate N`.
+            let info = parse_info_payload("depth 8 score mate 3");
+            assert_eq!(
+                info.score,
+                Some(Score::Mate(3)),
+                "score mate must populate as Mate"
+            );
+        }
+
+        #[test]
+        fn parse_info_line_pins_pv_field() {
+            // Catches `delete match arm "pv"`: leaves info.pv == None for a
+            // `pv <moves...>` line.
+            let info = parse_info_payload("depth 3 pv e2e4 e7e5 g1f3");
+            assert_eq!(
+                info.pv.as_deref(),
+                Some("e2e4 e7e5 g1f3"),
+                "pv field must populate with the full move list"
+            );
+        }
+
+        #[test]
+        fn parse_engine_line_distinguishes_bestmove_from_other() {
+            // Catches `replace == with !=` in parse_engine_line: a misclassified
+            // `bestmove ...` line would route to EngineLine::Other, not
+            // EngineLine::Bestmove. Test pins routing behaviour distinctly.
+            assert!(matches!(
+                parse_engine_line("bestmove e2e4"),
+                EngineLine::Bestmove { .. }
+            ));
+            assert!(matches!(
+                parse_engine_line("info depth 5"),
+                EngineLine::Info(_)
+            ));
+            assert!(matches!(
+                parse_engine_line("uciok"),
+                EngineLine::Other(ref s) if s == "uciok"
+            ));
+            assert!(matches!(
+                parse_engine_line("bestmovexyz e2e4"),
+                EngineLine::Other(_)
+            ));
         }
 
         #[test]
@@ -1435,6 +1532,94 @@ mod adjudicate {
             );
         }
 
+        #[test]
+        fn not_insufficient_kbnk_vs_lone_king() {
+            // K + B + N vs K — two minors on one side. Mateable per FIDE
+            // (KBN-vs-K is the classic technique).
+            //
+            // Pins the `+` → `-` mutation on `white_minors = white_bishops.count()
+            // + white_knights.count()`. Under correct +: white_minors = 1+1 = 2,
+            // black_minors = 0; match (2,0) falls to `_ => false`. Under buggy -:
+            // white_minors = 1-1 = 0, black_minors = 0; match (0,0) returns true
+            // (FALSELY declares insufficient). The existing 1-or-0-minor tests
+            // don't distinguish + from -.
+            let pos = Position::from_fen("8/8/8/4k3/8/4K3/8/3BN3 w - - 0 1").unwrap();
+            assert!(
+                !is_insufficient_material(&pos),
+                "K+B+N vs K should NOT be insufficient (KBNK is a forced mate per FIDE)"
+            );
+        }
+
+        #[test]
+        fn not_insufficient_kbk_vs_kn_one_each() {
+            // K + B (white) vs K + N (black) — one minor each, but DIFFERENT
+            // kinds. Pins the first `&&` → `||` mutation on the (1,1) match
+            // arm guard `white_bishops.count() == 1 && black_bishops.count() == 1
+            // && white_knights.is_empty() && black_knights.is_empty()`.
+            //
+            // Under correct &&: guard is false (black_bishops != 1) → falls to
+            // `_ => false`. Position is mateable in cooperation; not insufficient.
+            //
+            // Under buggy `||` on first conjunct: `1==1 || 0==1 && 0==0 && 1==0`
+            // = `true || (...)` = true. Body runs `black_bishops.lsb()` which is
+            // None (no black bishop) → `expect("count==1 guarantees a set bit")`
+            // panics. Test catches the mutation via the panic.
+            let pos = Position::from_fen("8/8/8/3nk3/8/4K3/8/2B5 w - - 0 1").unwrap();
+            assert!(
+                !is_insufficient_material(&pos),
+                "KBvKN with one minor each side should NOT be insufficient (different kinds)"
+            );
+        }
+
+        #[test]
+        fn not_insufficient_kn_vs_kb_one_each() {
+            // K + N (white) vs K + B (black) — mirror of the above. Pins the
+            // THIRD `&&` → `||` mutation on the (1,1) guard.
+            //
+            // Original guard for white_bishops=0,black_bishops=1,white_knights=1,
+            // black_knights=0:
+            //   `0==1 && 1==1 && 1==0 && 0==0` = false (first false short-circuits).
+            //   Falls to `_ => false`. Returns false.
+            //
+            // Mutation #3 (third `&&` → `||`): `0==1 && 1==1 && 1==0 || 0==0`.
+            // Per Rust precedence (`&&` tighter than `||`):
+            //   `(0==1 && 1==1 && 1==0) || (0==0)` = `false || true` = TRUE.
+            // Mutated guard fires → enters body → `let w_sq = white_bishops.lsb()`
+            // is None (no white bishop) → `expect("count==1 guarantees a set bit")`
+            // panics. Test catches via panic.
+            //
+            // Note: mutations #1 and #2 are also tested implicitly here.
+            // #1 (`0==1 || 1==1 && 1==0 && 0==0`) = `false || (true && false && true)` = false → SAME as original. Not caught.
+            // #2 (`0==1 && 1==1 || 1==0 && 0==0`) = `false || false` = false → SAME. (Equivalent — see mutants.toml.)
+            // Only #3 differs and is caught here.
+            let pos = Position::from_fen("8/8/8/3bk3/8/4K3/8/2N5 w - - 0 1").unwrap();
+            assert!(
+                !is_insufficient_material(&pos),
+                "KNvKB with one minor each side should NOT be insufficient (different kinds)"
+            );
+        }
+
+        #[test]
+        fn not_insufficient_k_vs_kbn_pins_black_side_minor_count() {
+            // Mirror of `not_insufficient_kbnk_vs_lone_king`: black has K+B+N,
+            // white has only K. Pins the BLACK-SIDE `+` → `-` mutation on
+            // `let black_minors = black_bishops.count() + black_knights.count()`.
+            //
+            // Under correct +: black_minors = 1 + 1 = 2; white_minors = 0;
+            // match (0, 2) → `_ => false` (correct: KBN-vs-K is not insufficient).
+            //
+            // Under buggy -: black_minors = 1 - 1 = 0 (wrapping or saturating);
+            // match (0, 0) → returns true (FALSELY declares insufficient).
+            //
+            // The white-side analogue is pinned by `not_insufficient_kbnk_vs_lone_king`;
+            // this test catches the symmetric black-side mutation.
+            let pos = Position::from_fen("3bn3/8/4k3/8/4K3/8/8/8 w - - 0 1").unwrap();
+            assert!(
+                !is_insufficient_material(&pos),
+                "K vs K+B+N should NOT be insufficient (KBN can mate per FIDE)"
+            );
+        }
+
         // These two tests specifically target the bishop-colour parity bug
         // where `index % 2` (file parity only) differs from `(file+rank) % 2`
         // (true square colour). a2 and b1 have different file parities (0 vs 1)
@@ -1895,6 +2080,71 @@ mod pgn {
                 "no move comment expected when last_info is None"
             );
         }
+
+        #[test]
+        fn pgn_odd_move_count_emits_trailing_white_move_no_black() {
+            // Pins the move-pair iteration boundary: odd-length move list
+            // emits the trailing white move WITHOUT a black follow-up.
+            // Catches `replace < with > in format_pgn`, `replace < with <= in
+            // format_pgn`, `replace < with == in format_pgn`, and
+            // `replace += with -=` / `*=` mutations on the move-index step.
+            let header = base_header("1-0");
+            let moves = vec![
+                PgnMove {
+                    uci: "e2e4".into(),
+                    last_info: None,
+                },
+                PgnMove {
+                    uci: "e7e5".into(),
+                    last_info: None,
+                },
+                PgnMove {
+                    uci: "g1f3".into(),
+                    last_info: None,
+                },
+            ];
+            let pgn = format_pgn(&header, &moves);
+            // Move 1 has both white and black; move 2 has only white.
+            assert!(pgn.contains("1. e2e4 e7e5"), "missing 1. e2e4 e7e5: {pgn}");
+            assert!(pgn.contains("2. g1f3"), "missing 2. g1f3: {pgn}");
+            // The third move's UCI must NOT be followed by a non-numbered token
+            // (i.e., it stands alone without a black reply).
+            let g1f3_pos = pgn.find("2. g1f3").expect("missing 2. g1f3");
+            let after = &pgn[g1f3_pos + "2. g1f3".len()..];
+            // After "2. g1f3", the only valid content is the result marker
+            // (preceded by a single space) and a trailing newline.
+            assert!(
+                after.trim_end() == " 1-0",
+                "expected only ' 1-0' after '2. g1f3'; got: {after:?}"
+            );
+        }
+
+        #[test]
+        fn pgn_single_move_emits_one_white_only() {
+            // Boundary: 1-move list should emit "1. <move> <result>".
+            // Catches the `i + 1 < moves.len()` predicate boundary at the
+            // first iteration when moves.len() == 1.
+            let header = base_header("1-0");
+            let moves = vec![PgnMove {
+                uci: "e2e4".into(),
+                last_info: None,
+            }];
+            let pgn = format_pgn(&header, &moves);
+            assert!(pgn.contains("1. e2e4"), "missing '1. e2e4': {pgn}");
+            assert!(!pgn.contains("e7e5"), "should not contain e7e5: {pgn}");
+            assert!(pgn.trim_end().ends_with("1-0"), "missing result: {pgn}");
+        }
+
+        #[test]
+        fn pgn_empty_moves_omits_body_but_keeps_result() {
+            // Edge: empty move list — header + result only.
+            let header = base_header("1/2-1/2");
+            let pgn = format_pgn(&header, &[]);
+            assert!(pgn.contains(r#"[Result "1/2-1/2"]"#));
+            assert!(pgn.trim_end().ends_with("1/2-1/2"));
+            // No move tokens, no comments.
+            assert!(!pgn.contains('{'), "no comments for empty body");
+        }
     }
 }
 
@@ -2289,6 +2539,36 @@ mod match_loop {
                 !update.forfeited,
                 "negative-but-within-grace must not forfeit"
             );
+        }
+
+        #[test]
+        fn forfeit_boundary_exactly_negative_grace_does_not_forfeit() {
+            // Pin the strict-less-than nature of the forfeit comparison.
+            // remaining=50, elapsed=100, inc=0, grace=50
+            // new_remaining = 50 - 100 + 0 = -50
+            // Original: `-50 < -50` is false → no forfeit. Boundary equality.
+            // `<` → `<=` mutation: `-50 <= -50` is true → forfeit (BUG).
+            let prior = clock(50, 0);
+            let (t_go, t_bm) = synthetic_instants(100);
+            let update = pure_apply_move_clock_update(prior, t_go, t_bm, 50);
+            assert_eq!(update.new_clock.remaining_ms, -50);
+            assert!(
+                !update.forfeited,
+                "exact -grace boundary must NOT forfeit (strict less-than); a < → <= mutation would falsely forfeit here"
+            );
+        }
+
+        #[test]
+        fn forfeit_boundary_one_below_grace_forfeits() {
+            // Companion to forfeit_boundary_exactly_negative_grace: one step
+            // beyond the boundary must forfeit.
+            // remaining=49, elapsed=100, inc=0, grace=50 → -51
+            // -51 < -50 → forfeit.
+            let prior = clock(49, 0);
+            let (t_go, t_bm) = synthetic_instants(100);
+            let update = pure_apply_move_clock_update(prior, t_go, t_bm, 50);
+            assert_eq!(update.new_clock.remaining_ms, -51);
+            assert!(update.forfeited, "one ms below boundary must forfeit");
         }
 
         #[test]

@@ -268,4 +268,56 @@ exclude_re = [
     # precedent — also untreated by an exclusion since no test distinguishes).
     "replace & with \\^ in AlphaBetaMover::qsearch",
 
+    # ---- ELOH.A: integration-only paths — smoke-test exercised ----------
+    #
+    # The Elo-iteration harness (`src/bin/elo-iterate.rs`) has substantial
+    # surface that is structurally only reachable through `main()` orchestrating
+    # real subprocess pairs over stdin/stdout pipes. Unit tests cover the
+    # pure helpers (CLI parser, adjudicate, PGN formatter, time-clock
+    # arithmetic, parser line-by-line) — but `main`, `play_one_game`, the
+    # post-handshake `wait_for_uciok`/`wait_for_readyok` drains, the `shutdown`
+    # subprocess teardown, `send_line` writeline-with-flush, and
+    # `append_summary_line` file-IO are exercised end-to-end by the
+    # `#[ignore]`-gated `e2e_smoke::end_to_end_clawfish_self_play_4_games`
+    # plus the manual back-test (200 games vs Stockfish UCI_Elo=1320 archived
+    # in `docs/research/tooling-elo-harness-validation.md`).
+    #
+    # Mutating any of these to a degenerate `Ok(())` / no-op / sign-flip is
+    # caught by the smoke test (which the integration coverage gate runs
+    # manually before each ELOH milestone closure) but NOT by `cargo test`.
+    # `cargo mutants --in-diff` therefore reports them as missed under the
+    # default test invocation. Excluding them here documents the structural
+    # gap explicitly. The complementary tests remain the smoke + manual
+    # back-test; ELOH.B is expected to add a non-ignored mini-smoke (one
+    # 2-game self-play) to close part of this gap.
+    "in match_loop::play_one_game",
+    "in main$",
+    "in driver::wait_for_uciok",
+    "in driver::wait_for_readyok",
+    "in driver::shutdown$",
+    "in driver::send_line",
+    "<impl Drop for EngineHandle>",
+    "in summary::append_summary_line",
+    "in get_hostname",
+    "in cli::<impl std::fmt::Display for CliError>::fmt",
+
+    # ---- ELOH.A: documentation comment, NOT a regex rule -----------------
+    #
+    # `adjudicate::is_insufficient_material`'s (1,1) match arm guard is
+    #   `bishops_w == 1 && bishops_b == 1 && knights_w_empty && knights_b_empty`
+    # — four conjuncts. cargo-mutants generates three `&&` → `||` mutations.
+    # The SECOND `&&` mutation is **provably equivalent** under all (1,1)
+    # configurations: reaching (1,1) means each side has exactly one minor,
+    # so `(bishops==1) == knights_empty` per side. Enumeration:
+    #   - KB vs KB: original=T, mutated=(T&&T)||(T&&T)=T. SAME.
+    #   - KB vs KN: original=F, mutated=(T&&F)||(T&&F)=F. SAME.
+    #   - KN vs KB: original=F, mutated=(F&&T)||(F&&T)=F. SAME.
+    #   - KN vs KN: original=F, mutated=(F&&F)||(F&&F)=F. SAME.
+    # No regex rule is added because a function-anchored exclusion would
+    # over-cover the FIRST and THIRD mutations (which ARE caught by
+    # `not_insufficient_kbk_vs_kn_one_each` and `not_insufficient_kn_vs_kb_one_each`),
+    # and a line-anchored exclusion would violate the project convention
+    # against fragile line anchors. The second-mutant equivalent miss is
+    # accepted permanently with this comment as the audit trail.
+
 ]
