@@ -8,23 +8,21 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 **Phase: M3.D complete; M3.E next — iterative deepening + time management.** Architectural commitments settled (see `docs/decisions/`).
 
-- M1: complete through M1.G (perft + criterion benchmark harness; 119 Mnps bulk on starting D4).
-- M2.A: complete — `Move::to_uci` + `Move::from_uci` + `UciMoveError`. Generate-and-match parsing.
-- M2.B: complete — `uci` module: `Command` enum + `parse_uci_line(&str) -> Command`.
-- M2.C: complete — `engine` + `search` modules: orchestrator + reader thread + per-`go` worker per **ADR-0011**.
-- M2.D: complete — `RandomMover` SplitMix64 random-mover + `Random_Seed` UCI option.
-- M2.E: complete — fastchess harness + `--compliance` 40/40 + 4 smoke games. M2 exit criterion met.
-- M3.A: complete — `eval` module + `GreedyMover` (depth-1 production search). PeSTO MG values, incremental `static_eval_white` per **ADR-0014**. Real `score cp` (e.g. `cp 36` from startpos).
-- M3.B: complete — `Engine::game_history: Vec<u64>` + `is_repetition` + `is_fifty_move_draw` helpers in `src/search.rs`. Pure plumbing; first consumer is M3.C.
-- M3.C: complete — `AlphaBetaMover` replaces `GreedyMover`. Fail-soft negamax, `MATE = 30000`, mate-distance pruning, triangular PV, MVV-LVA, M3.B helpers consumed at `ply > 0`, 4096-node cancellation cadence + parallel `root_score` lockstep. **ADR-0013** codifies. **20-0 sweep** vs M3.A baseline at fixed depth 4. ~8.55 Mnps depth-8 from startpos.
-- M3.D: complete — `qsearch` private method on `AlphaBetaMover` replaces M3.C's `depth==0 → evaluate(pos)` short-circuit. Stand-pat (forbidden in check), captures + queen-promos filter, in-check all-evasions, terminal detection (in-check empty → mate; not-in-check empty → stand-pat per CPW false-stalemate guard). MVV-LVA reused. Negamax restructured: PV clear → depth==0 → qsearch delegation → nodes+poll (preserves "1 leaf = 1 node" budget). Recursive bound-negation extracted into `negate_window(alpha, beta) -> (i32, i32)` helper — unit-tested directly to close a v2 mutation gap that was structurally undetectable at the qsearch-integration level. **20-0 sweep** vs `baseline/material-greedy` at depth 4 (7 of 20 wins by mate detection — qsearch's mate-extension visible). **10.87 Mnps** depth-8 from startpos (+27% vs M3.C). Sonnet+Opus chess-coder A/B calibration ran (Sonnet impl applied per cheaper-model default).
-- Tooling/fuzzing: complete — `fuzz/` independent workspace + two `Arbitrary<String>` harnesses (`fuzz_fen`, `fuzz_uci`) + 35 fen + 30 uci hand-curated seed files + **ADR-0013**. Closes `docs/tooling-backlog.md` item #1. Saturation campaigns clean (2.28B + 0.89B execs, 0 unaddressed crashes). One real parser bug caught + fixed: `unreachable!()` in `parse_castling` for double-space inputs.
+| Phase | Status | One-line summary |
+|---|---|---|
+| M1.A–M1.G | ✓ | Bitboards, FEN, magic attacks, Zobrist, make/unmake, legal-direct movegen, perft (119 Mnps bulk D4). |
+| M2.A–M2.E | ✓ | UCI move encoding + parser + I/O loop (ADR-0011) + RandomMover + fastchess harness (compliance 40/40). |
+| M3.A | ✓ | `eval` module + `GreedyMover` depth-1 search; PeSTO MG values + incremental `static_eval_white` (ADR-0014). |
+| M3.B | ✓ | `Engine::game_history` + `is_repetition` + `is_fifty_move_draw` helpers (plumbing only). |
+| M3.C | ✓ | `AlphaBetaMover` (fail-soft negamax + triangular PV + MVV-LVA + mate-distance pruning) per ADR-0016; 20-0 vs `baseline/material-greedy` at depth 4; 8.55 Mnps depth-8 startpos. |
+| M3.D | ✓ | Quiescence search at the negamax horizon; `negate_window` helper closes a structural mutation gap; 10.87 Mnps depth-8 startpos (+27% vs M3.C). |
+| Tooling/fuzzing | ✓ | `cargo-fuzz` harnesses for FEN + UCI (ADR-0013); 3.17B execs aggregate across saturation + smoke campaigns, one real parser bug found and fixed. |
 
-For per-phase retrospectives ("what landed", implementation highlights, verification numbers), see `docs/milestones/`. The forward-looking milestone plan lives in `docs/roadmap.md`.
+For per-phase detail (what landed, verification numbers, lessons), see [`docs/milestones/`](docs/milestones/). The forward-looking milestone plan lives in [`docs/roadmap.md`](docs/roadmap.md).
 
 ### What's next
 
-**M3.E — iterative deepening + time management.** `compute_caps(GoParams, Color, latency) -> (soft, hard)` pure function with mocked-clock unit tests. Soft cap = `remaining/20 + increment/2`; hard cap = `min(3 × soft, remaining - latency)`. Iterative-deepening outer loop wraps M3.C/M3.D's negamax + qsearch; abort-between-iterations discipline (mid-iteration aborts discard partial result). Prior-iteration root PV move tried first as the only ordering hint without TT. New `MoveOverhead` UCI option (default 50 ms). ADR-0015 lands here.
+**M3.E — iterative deepening + time management.** ID outer loop wraps M3.C/M3.D's negamax + qsearch with abort-between-iterations discipline; prior-iteration root PV tried first; new `compute_caps` time-management function + `MoveOverhead` UCI option. A new ADR (next free number — expected `0017`; `0015` is taken by phantom-EP sanitization, `0016` by search structure) lands here. Detail in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## How to pick up a new session
 

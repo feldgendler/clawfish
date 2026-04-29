@@ -54,9 +54,9 @@ Operational decision: keep `-max_len=200` as the default for routine post-edit s
 ### crash-ad3313fd7ec85772df26cda530d51185d9751093 (fuzz_fen, 2026-04-28)
 
 - **Minimized input:** `4k2r/8/8/8/8/8/8/4K3 b  k- 0 1` (32 bytes; already minimal — the double space cannot be reduced further without changing the structural defect). No `cargo fuzz tmin` run needed.
-- **Root cause:** `parse_castling` at `src/fen.rs:218–222` had an `unreachable!()` predicated on the (false) assumption that an empty castling field requires a 7-token split and would have tripped `WrongFieldCount` upstream. In fact, `s.split(' ')` on an input with one double space produces 6 tokens with one empty middle token, so the gate doesn't fire.
-- **Fix commit:** `<this commit>` — `unreachable!()` → `return Err(FenError::BadCastlingRights(s.to_string()))`. Comment updated to reflect the actual behavior.
-- **Regression test:** `parse_rejects_empty_castling_field_via_double_space` (`src/fen.rs::tests` line ~688).
+- **Root cause:** `parse_castling` had an `unreachable!()` predicated on the (false) assumption that an empty castling field requires a 7-token split and would have tripped `WrongFieldCount` upstream. In fact, `s.split(' ')` on an input with one double space produces 6 tokens with one empty middle token, so the gate doesn't fire.
+- **Fix:** commit `fdbdbb9` — `unreachable!()` → `return Err(FenError::BadCastlingRights(s.to_string()))`.
+- **Regression test:** `parse_rejects_empty_castling_field_via_double_space` in `src/fen.rs::tests`.
 
 ## Notes on metric provenance
 

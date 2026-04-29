@@ -12,7 +12,7 @@ A guided line-by-line walkthrough discipline. The user is a casual chess player 
 - `/my-explain <target>` — walk through the target. Examples:
   - `/my-explain M3.C` → "In scope" of `docs/plans/m3.c.md`.
   - `/my-explain M3.C out-of-scope` → "Out of scope" (§1) of the same plan.
-  - `/my-explain ADR-0013` → settled-commitments list of `docs/decisions/0013-search-structure.md`.
+  - `/my-explain ADR-0016` → settled-commitments list of `docs/decisions/0016-search-structure.md`.
   - `/my-explain docs/decisions/0014-static-eval-white.md §3` → that specific section.
 - `/my-explain` (no argument) — walk through the **most recent assistant response in this conversation**, line-by-line. This is the "you just explained X; now I want to dig into your own bullets one at a time" mode.
 

@@ -8,7 +8,7 @@
 //!
 //! M3.C ships the [`AlphaBetaMover`] implementation: fail-soft negamax +
 //! alpha-beta with triangular PV recovery, MVV-LVA move ordering, and
-//! repetition/50-move draw detection. See ADR-0013 and plan docs/plans/m3.c.md.
+//! repetition/50-move draw detection. See ADR-0016 and plan docs/plans/m3.c.md.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -217,7 +217,7 @@ impl PvTable {
 /// Move ordering: MVV-LVA on captures + queen-promotion bonus; quiets in
 /// movegen order. Repetition and 50-move draw detection via M3.B helpers
 /// (at `ply > 0` only — root always picks a move). PV recovered via a
-/// triangular table. Mate scores are ply-adjusted (see ADR-0013 §3).
+/// triangular table. Mate scores are ply-adjusted (see ADR-0016 §3).
 pub(crate) struct AlphaBetaMover {
     pv: PvTable,
     /// Search-owned Zobrist trajectory. Cloned from `ctx.history` at go-start;
