@@ -11,6 +11,11 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > (TT, killer/history, PVS, aspiration; eval improvements; NNUE) is tracked in
 > [`docs/roadmap.md`](docs/roadmap.md).
 >
+> **Current strength: ~2114 Elo at tc=10+0.1** (Apple M4 P-cores, single
+> thread, no pondering, anchored to Stockfish UCI_Elo / CCRL 40/4
+> calibration). ±35 Elo CI from 120-game online iteration. Measured at
+> M3.F end. Methodology + caveats: [`bench/sprt/2026-04-29-online-elo-iteration.md`](bench/sprt/2026-04-29-online-elo-iteration.md).
+>
 > **Current bench:** `bench: 172312700 nodes 11489045 nps` at default depth 7
 > (M3.F end). Run `printf 'bench\nquit\n' | ./target/release/clawfish` to
 > reproduce.

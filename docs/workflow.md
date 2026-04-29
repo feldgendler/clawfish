@@ -483,6 +483,7 @@ When a session produces new decisions, update the relevant doc *before* stopping
 - Milestone progress or revision → update `docs/roadmap.md`.
 - New ground rule from user → update `CLAUDE.md`.
 - Prior-art research output → append to `docs/prior-art.md` under the relevant component section.
+- **New rating estimate or bench signature** → update **`README.md`'s Status block** alongside the per-milestone `bench/m<N>.md` and the milestone retrospective. The README is the externally-facing summary; out-of-date numbers there are misleading to readers who don't drill into `bench/`. Specifically: every milestone whose retrospective publishes a new bench signature or rating estimate must atomically update `README.md`'s "Current strength" / "Current bench" lines with the new numbers, the conditions (TC, hardware, anchor), and the methodology link.
 
 ## Documentation style
 
