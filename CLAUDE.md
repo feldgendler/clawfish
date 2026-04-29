@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M4.B complete pending SPRT — killer moves landed; M4.C — history heuristic — is next.** Architectural commitments settled (see `docs/decisions/`).
+**Phase: M4.B complete — killer moves landed and SPRT-validated; M4.C — history heuristic — is next.** Architectural commitments settled (see `docs/decisions/`).
 
 | Phase | Status | One-line summary |
 |---|---|---|
@@ -19,7 +19,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 | M3.E | ✓ | Iterative deepening + time management per ADR-0017; `compute_caps` pure function; `MoveOverhead` UCI option; `prior_root_move` ordering hint at ply==0; `aborted_fallback_result` helper. |
 | M3.F | ✓ | `bench` UCI command (signature `bench: 172312700 nodes 11489045 nps`); `scripts/sprt.sh sprt\|match\|rating-estimate` wrapper + `scripts/elo-iterate.sh` online iterator; SPRT vs RandomMover **148-0-0 H1 accepted**; rating estimate via online Elo iteration converged to **~2114 Elo at tc=10+0.1** (±35 Elo, P-core pinned, 120 games); `compute_bench_nps` helper closes 3 mutation gaps. Closes M3. |
 | M4.A | ✓ | Zobrist-keyed transposition table (`UnsafeCell<Vec<TtEntry>>` + 16-byte entry; depth-preferred + age-bias replacement; mate-score depth-adjustment); `Hash` UCI option; `Engine::reset_for_new_game` consolidated. ADR-0018. Bench: `bench: 39964046 nodes <NPS> nps` (-77% vs M3.F). SPRT vs `baseline/alpha-beta-no-tt`: +281.89 ± 55.64 Elo. |
-| M4.B | ✓ pending SPRT | Two killer slots per ply (`[[Move; 2]; MAX_PLY]` with `Move::default()` sentinel); `is_quiet`/`update_killers`/`negamax_move_order_score`/`order_moves`/`clear_killers` helpers extracted per the M3.D `negate_window` precedent; killers updated on quiet beta cutoffs and folded into negamax move ordering between captures and remaining quiets. Bench: `bench: 22237579 nodes <NPS> nps` (-44% vs M4.A). SPRT vs `baseline/alpha-beta-tt` deferred to merge-time. |
+| M4.B | ✓ | Two killer slots per ply (`[[Move; 2]; MAX_PLY]` with `Move::default()` sentinel); `is_quiet`/`update_killers`/`negamax_move_order_score`/`order_moves`/`clear_killers` helpers extracted per the M3.D `negate_window` precedent; killers updated on quiet beta cutoffs and folded into negamax move ordering between captures and remaining quiets. Bench: `bench: 22237579 nodes <NPS> nps` (-44% vs M4.A). SPRT vs `baseline/alpha-beta-tt`: 148-8-2 (94.30%), Δ Elo **+487.58 ± 125.42** in 158 games / 12m20s. |
 | Tooling/fuzzing | ✓ | `cargo-fuzz` harnesses for FEN + UCI (ADR-0013); 3.17B execs aggregate across saturation + smoke campaigns, one real parser bug found and fixed. |
 
 For per-phase detail (what landed, verification numbers, lessons), see [`docs/milestones/`](docs/milestones/). The forward-looking milestone plan lives in [`docs/roadmap.md`](docs/roadmap.md).
