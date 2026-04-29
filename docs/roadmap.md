@@ -123,9 +123,77 @@ First playing engine. Negamax with iterative deepening, quiescence search, simpl
 A and B are independent and can be planned/executed in parallel. C–F are sequential.
 
 ### M4 — Search basics
-Transposition table (Zobrist), move ordering (PV move, MVV-LVA, killer moves, history heuristic), aspiration windows.
+First efficiency layer over the M3 alpha-beta + qsearch + ID search. Cache search results across iterations (TT), stack good moves first (TT move, killer, history), tighten ID's outer-loop window (aspiration). Each piece individually SPRT-gated.
 
-**Exit criteria:** each addition justified by SPRT win.
+**M4 vs. M5 dividing line.** M4 is the *bookkeeping* layer — caches, ordering tables, window discipline. M5 is the *pruning / extension* layer — NMP, LMR, futility, singular extensions. The M5 techniques largely depend on having M4's infrastructure (TT-aware ordering, killer/history scores) already in place.
+
+**Exit criteria.**
+
+- Each phase commits its own SPRT-positive change vs. the prior phase's baseline tag, using `elo0=0, elo1=5` bounds at `tc=10+0.1` per `docs/workflow.md` §SPRT (or `elo0=-3, elo1=3` for marginal phases on a per-phase plan call).
+- Cumulative M4-vs-M3 result measured at M4.D close as a fixed-game match (~200 games at `tc=10+0.1`) against `baseline/alpha-beta-no-tt`, for rating-delta estimation. **Documentation, not a gate** — the per-phase SPRTs are the gates; M4 is closed when M4.D's SPRT accepts, regardless of the cumulative number. Investigation triggers: if cumulative is < 50 Elo, suspect a phase shipped an SPRT-positive change that doesn't compose cleanly with the others (typical cause: TT-move ordering interacting with history aging or aspiration re-searches); if cumulative is > 200 Elo (well above 4 × elo1=5 = 20 Elo floor), suspect either systematically conservative SPRT bounds or compounding interaction worth a research note before M5 planning.
+- `bench/m4.md` milestone summary per ADR-0010, recording deterministic `bench` node counts and SPRT / fixed-match deltas across A→D.
+
+**Status — prior-art research pending.** To be written before M4.A planning begins (and refined per phase as each is planned). Existing `docs/research/m3-search-basics.md` and `docs/prior-art.md` cover the relevant background at the M3 level only; M4-specific design surface (TT layout, replacement schemes, history aging) is *not* yet researched. The parameter-level numbers in the sub-phase table below (window-widening schedule, killer slot count, history indexing) are tentative starting points from CPW and will be confirmed or revised by the per-phase research notes.
+
+**ADRs likely to bind per-phase, as each lands.**
+
+- **TT layout + replacement + size policy.** Binds on M4.A.
+  - Open: replacement scheme (always-replace vs depth-preferred vs two-tier-bucket).
+  - Open: entry key discipline (full 64-bit Zobrist in entry vs partial-key + xor-trick).
+  - Open: per-entry packing.
+  - Open: `Hash` UCI option default + bounds.
+  - Open: mate-score depth-adjust on store/probe.
+  - Open: whether qsearch participates in TT (M4.A scope: probes negamax-only — see M4.A row; qsearch-in-TT deferred).
+  - Open: best-move preservation when overwriting an entry whose new bound has no best move (e.g. fail-low replacing a fail-high).
+  - Open: `ucinewgame` clears TT? `Hash` resize mid-session: rebuild-and-clear or rebuild-and-preserve?
+  - Open: age semantics — when is age incremented (per `go`? per ID iteration?), and how does it interact with the chosen replacement scheme?
+- **History heuristic indexing + aging.** Binds on M4.C.
+  - Open: indexing scheme (`(piece, to)` vs `(from, to)` vs `(side, from, to)`); table size follows from the choice.
+  - Open: increment formula (typically `depth²`).
+  - Open: aging vs. saturation strategy (literature is split; resolved at ADR landing).
+  - Open: signed vs. unsigned counters; over-/underflow discipline.
+- Killer moves and aspiration windows are parameter-level decisions, no ADR expected — defaults from the literature, tuned via SPRT.
+
+ADR numbers allocated at landing time; numeric slots may slide if other ADRs land sooner.
+
+**Sub-phases.** M4 is decomposed into four plan-and-execute cycles. Each phase gets its own plan-mode pass with the self-review loop, runs an SPRT match against the previous phase's baseline tag, and lands its own commit(s). Phases targeted at ~300–800 LOC per the workflow's typical-unit target. **M4.A is the milestone's largest unit and may overrun** (see scope note below).
+
+| Phase | Scope | Approx size |
+|---|---|---|
+| **M4.A** — Transposition table | TT entry (Zobrist key + score + depth + bound type + best move + age); shared backing `Vec<TtEntry>`; bound-aware probe with cutoff at non-PV nodes; store at every negamax node returning a real (non-aborted) bound; mate-score depth-adjustment on store/probe; `Hash` UCI option; TT move first in move ordering at every negamax ply. Detail bullets follow the table. | ~1000 (largest M4 unit; rationale below) |
+| **M4.B** — Killer moves | Two killer slots per ply (`[Option<Move>; 2]` per ply); update on quiet-move beta cutoff; ordering: after TT move and after captures (sorted by MVV-LVA), before history. Inter-iteration policy (clear at the start of each ID iteration vs. persist with aging; relevant under M4.D's aspiration re-searches) is an open M4.B-plan question; tentative default is *clear between iterations* per CPW guidance. | ~350 |
+| **M4.C** — History heuristic | History counter table indexed by piece-and-to (or from-and-to; chosen at ADR landing — see open questions); depth-weighted increment on quiet-move beta cutoff; matching decrement on quiet moves that failed to cut at the same node; aging-or-saturation discipline (chosen at ADR landing); ordering tiebreaker among non-killer quiets. | ~450 |
+| **M4.D** — Aspiration windows | ID outer-loop wrapper consuming the prior iteration's score from `last_complete: Option<(depth, bestmove, score)>` (already plumbed by M3.E). Detail bullets follow the table. | ~350 |
+
+**M4.A scope detail.**
+
+- **Probe + store in negamax only.** qsearch does not participate in TT in M4.A; deferred (see open questions).
+- **TT-clear discipline for `bench`.** `Engine::handle_bench` resets the TT between positions to preserve M3.F's deterministic-bench contract. The mechanism (direct `clear_tt()` helper vs. piggy-backing on a `ucinewgame`-equivalent reset) is decided in the M4.A plan jointly with the open question on `ucinewgame` / `Hash`-resize semantics.
+- **`prior_root_move` fate.** Three options to weigh in the M4.A plan, with M4.D's needs in view: (1) remove because TT subsumes it; (2) keep as a fallback when TT misses at root; (3) **always-populated mirror** of the prior iteration's bestmove regardless of TT, because under M4.D's aspiration re-searches the root TT entry may be absent or stored at a fail bound (an aborted aspiration iteration may not store a usable best-move at the root). Option (3) is the default given M4.D follows in the same milestone, unless the M4.A plan finds a reason to choose otherwise; M4.A revisits at M4.D landing if the choice no longer fits.
+- **Doc-delta.** `docs/architecture.md` Search-v1 subsection (line ~139) currently describes `prior_root_move`'s ply-0 reorder; whatever M4.A picks must update that prose atomically with the M4.A landing commit.
+
+**M4.A size rationale.** ~1000 LOC, exceeding the 300–800 typical-unit target. The phase couples TT data structure, probe-with-cutoffs, store, mate-score adjustment, `Hash` option, ordering integration, and `bench` adaptation. Splitting "plumbing then ordering" gives an artificial SPRT signal — TT cutoffs without TT-move ordering recover only a fraction of TT's Elo, so a "TT-cutoffs only" SPRT either fails (under-measuring) or passes weakly (giving the misleading impression that cutoffs alone are the value). Standard CPW guidance lands them together. The acknowledged size is the cost of a clean SPRT result.
+
+**M4.D scope detail.**
+
+- **Threshold gating.** Below a depth threshold (typical 4–6, picked in plan), search runs with full window — aspiration is a no-op at shallow iterations. Depth 1 trivially has no prior score; depths 2 to threshold-1 have a prior score but the score is too unstable to seed a narrow window.
+- **Widening schedule.** Tentative per CPW guidance: ±25 cp on first try → ±100 cp on re-search → full window `(-∞, +∞)` on second re-search. The "full window" step is the terminal fallback; no separate "if widening fails" guard is needed beyond the schedule's natural exhaustion.
+- **Care under fail-soft.** M3 returns fail-soft scores, so a prior-iteration score outside the prior aspiration window must trigger widening immediately on the next iteration rather than be re-used as a window center.
+- **SPRT regression risk.** Aspiration loses Elo when first-move ordering quality is low (fluctuating scores → repeated re-searches). M4.D depends on M4.A–C delivering tight ordering; if M4.D's SPRT fails, suspect ordering quality before aspiration logic. Specifically: if the M4.A `Hash` default is unusually small for the SPRT corpus's middlegame positions, raise it (e.g. 64 MB or 128 MB) and re-run before debugging M4.D widening.
+
+A → B → C → D is sequential. B and C are conceptually independent each (separate quiet-move ordering terms layered on TT-move-first), but landing them sequentially is load-bearing for D's SPRT signal: aspiration windows benefit measurably more when first-move quality is high, and killers + history are the first-move-quality boosters for quiet-move positions. So the sequential order isolates each phase's SPRT cleanly *and* gives D a stable foundation.
+
+**Baseline tags expected** (one per phase boundary; created at the close of the named phase, per `docs/workflow.md` §"Baseline tag naming convention"):
+
+| Tag | Marks |
+|---|---|
+| `baseline/alpha-beta-no-tt` | M3.F end. Reference for M4.A's SPRT. |
+| `baseline/alpha-beta-tt` | M4.A end. Reference for M4.B's SPRT. |
+| `baseline/alpha-beta-tt-killer` | M4.B end. Reference for M4.C's SPRT. |
+| `baseline/alpha-beta-tt-killer-history` | M4.C end. Reference for M4.D's SPRT. |
+| `baseline/alpha-beta-tt-killer-history-aspiration` | M4.D end. Reference for M5's first SPRT. |
+
+The descriptive slugs are long but consistent with the convention's behavior-descriptive rule; future readers parsing an SPRT log can read the engine's full search composition off the tag name without consulting the roadmap.
 
 ### M5 — Search advanced
 Null-move pruning, late move reductions, futility pruning, singular extensions, single-reply extension in qsearch (search the unique legal move when the not-in-check filter would otherwise return stand-pat — closes the M3.D horizon hole on legally-forced quiet moves), stalemate-conditional rook/bishop under-promotion in qsearch (after a queen-promo move, if the post-promo position has zero legal moves and is not in check, also search `RookPromo` / `BishopPromo` variants of the same move — closes the rare stalemate-avoidance under-promo case missed by M3.D's queen-only filter; knight-promo's fork-tactic motivation remains uncovered). Each gated by SPRT.
