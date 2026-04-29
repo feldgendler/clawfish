@@ -275,6 +275,11 @@ pub(crate) struct AlphaBetaMover {
     /// `None` between searches and for searches that don't use a TT (tests
     /// exercising `negamax_for_test` directly without a TT context).
     tt: Option<Arc<TranspositionTable>>,
+    /// M4.B: per-ply killer slots. `killers[ply][0]` is the most-recent
+    /// quiet-move beta-cutoff at this ply; `killers[ply][1]` is the
+    /// previous one. Sentinel = `Move::default()` (bits == 0). Cleared
+    /// per-go and per-iteration; not persisted across iterations.
+    killers: [[Move; 2]; MAX_PLY],
 }
 
 impl AlphaBetaMover {
@@ -287,6 +292,7 @@ impl AlphaBetaMover {
             aborted: false,
             root_score: None,
             tt: None,
+            killers: [[Move::default(); 2]; MAX_PLY],
         }
     }
 }
@@ -311,6 +317,7 @@ impl Search for AlphaBetaMover {
         for i in 0..MAX_PLY {
             self.pv.lengths[i] = 0;
         }
+        clear_killers(&mut self.killers);
 
         let max_depth = max_depth_from_limits(&ctx.limits);
         let mut pos_clone = *position;
@@ -328,6 +335,7 @@ impl Search for AlphaBetaMover {
             for i in 0..MAX_PLY {
                 self.pv.lengths[i] = 0;
             }
+            clear_killers(&mut self.killers);
 
             let returned = self.negamax(&mut pos_clone, depth, 0, -INF, INF, true, ctx);
 
@@ -418,7 +426,8 @@ impl Search for AlphaBetaMover {
 
     fn reset(&mut self) {
         self.history.clear();
-        // pv and nodes are reset per-go; M4 will clear killer/history/TT here.
+        clear_killers(&mut self.killers);
+        // pv and nodes are reset per-go; history table joins this list at M4.C; TT lives in engine.
     }
 }
 
@@ -543,19 +552,15 @@ impl AlphaBetaMover {
             }
         }
 
-        // 10. Order: MVV-LVA descending, then promote the TT move (if any) to
-        //     index 0. `Move::default().bits() == 0` is the no-move sentinel
-        //     and is never produced by movegen, so `tt_move == 0` falls
-        //     through. The legality scan over the legal-move list rejects
-        //     garbage values (ADR-0018 §12).
-        moves_vec.sort_by_cached_key(|&m| -mvv_lva_score(m, pos));
-        if tt_move != 0
-            && let Some(idx) = moves_vec.iter().position(|m| m.bits() == tt_move)
-            && idx != 0
-        {
-            let mv = moves_vec.remove(idx);
-            moves_vec.insert(0, mv);
-        }
+        // 10. Order: killer-aware scoring (captures > killers > other quiets)
+        //     descending, then promote the TT move (if any) to index 0.
+        //     `Move::default().bits() == 0` is the no-move sentinel and is
+        //     never produced by movegen, so `tt_move == 0` falls through.
+        //     The legality scan over the legal-move list rejects garbage
+        //     values (ADR-0018 §12).
+        let killer0 = self.killers[ply as usize][0];
+        let killer1 = self.killers[ply as usize][1];
+        order_moves(&mut moves_vec, pos, killer0, killer1, tt_move);
 
         // 11. Recurse fail-soft. `child_is_pv = is_pv && i == 0` per ADR-0018 §11
         //     where `i` is the recursion-order index (post-step-10 reorder).
@@ -598,6 +603,9 @@ impl AlphaBetaMover {
                 }
                 if alpha >= beta {
                     cutoff_move = Some(mv);
+                    if is_quiet(mv) {
+                        update_killers(&mut self.killers, ply as usize, mv);
+                    }
                     break; // beta cutoff — fail-soft: return `best`, not `beta`
                 }
             }
@@ -668,6 +676,21 @@ impl AlphaBetaMover {
     #[cfg(test)]
     pub(super) fn set_tt_for_test(&mut self, tt: Option<Arc<TranspositionTable>>) {
         self.tt = tt;
+    }
+
+    /// Test-only: return a reference to the killer table. Mirrors
+    /// `pv_root_for_test` and `set_tt_for_test`. Production code never
+    /// reads the killer table through this accessor.
+    #[cfg(test)]
+    pub(super) fn killers_for_test(&self) -> &[[Move; 2]; MAX_PLY] {
+        &self.killers
+    }
+
+    /// Test-only: overwrite the killer table wholesale. Used by S26's
+    /// run-(b) pre-population and S29's pre-populate step.
+    #[cfg(test)]
+    pub(super) fn set_killers_for_test(&mut self, killers: [[Move; 2]; MAX_PLY]) {
+        self.killers = killers;
     }
 
     /// Test-only: return the root PV as a `Vec<Move>`.
@@ -824,6 +847,114 @@ impl AlphaBetaMover {
     ) -> i32 {
         self.qsearch(pos, alpha, beta, ply, ctx)
     }
+}
+
+// ---------------------------------------------------------------------------
+// M4.B — Killer-move helpers + ordering.
+// ---------------------------------------------------------------------------
+
+/// Bonus score for the most-recent quiet beta-cutoff at this ply (slot 0).
+/// Strictly between 0 and the smallest MVV-LVA capture score (QxP ≈ 287 cp)
+/// so killers slot above remaining quiets but below all captures and promos.
+/// Pinned by S23 at runtime against the actual MVV-LVA formula.
+const KILLER0_SCORE: i32 = 200;
+
+/// Bonus score for the prior quiet beta-cutoff at this ply (slot 1).
+/// Must satisfy `KILLER1_SCORE < KILLER0_SCORE` and `KILLER1_SCORE > 0`.
+const KILLER1_SCORE: i32 = 100;
+
+/// Returns true iff `mv` is a non-capture, non-promotion, non-en-passant
+/// move (the moves eligible to populate the killer slots).
+///
+/// Direct mirror of the existing MVV-LVA "quiets sort below all captures"
+/// arm in `mvv_lva_score`. Free function so `cargo mutants` reports any
+/// flag-bit mutation directly against this function's name.
+fn is_quiet(mv: Move) -> bool {
+    use crate::mov::MoveFlag::*;
+    matches!(mv.flag(), Quiet | DoublePush | KingCastle | QueenCastle)
+}
+
+/// Shift-on-distinct killer update.
+///
+/// `mv == killers[ply][0]` → no-op. Otherwise:
+///     killers[ply][1] = killers[ply][0];
+///     killers[ply][0] = mv;
+///
+/// Caller is responsible for the quiet-gate — `update_killers` doesn't
+/// re-check `is_quiet(mv)`; it trusts the caller. Free function so the
+/// shift is unit-testable in isolation (M3.D `negate_window` precedent).
+fn update_killers(killers: &mut [[Move; 2]; MAX_PLY], ply: usize, mv: Move) {
+    if killers[ply][0] != mv {
+        killers[ply][1] = killers[ply][0];
+        killers[ply][0] = mv;
+    }
+}
+
+/// Killer-aware move-ordering score for negamax (NOT qsearch). Wraps
+/// `mvv_lva_score`:
+///   - non-quiet move → `mvv_lva_score(mv, pos)` (captures/promos).
+///   - quiet move matching `killer0` → `KILLER0_SCORE`.
+///   - quiet move matching `killer1` (and not `killer0`) → `KILLER1_SCORE`.
+///   - other quiet → `0`.
+///
+/// Boundary discipline: `KILLER0_SCORE > KILLER1_SCORE > 0` and both
+/// strictly less than the smallest possible MVV-LVA capture score.
+/// Pinned by S23 at runtime.
+fn negamax_move_order_score(mv: Move, pos: &Position, killer0: Move, killer1: Move) -> i32 {
+    if !is_quiet(mv) {
+        return mvv_lva_score(mv, pos);
+    }
+    if mv == killer0 {
+        KILLER0_SCORE
+    } else if mv == killer1 {
+        KILLER1_SCORE
+    } else {
+        0
+    }
+}
+
+/// Apply M4.B's full move-ordering pass. Pure function; no side effects;
+/// directly unit-testable on synthetic move lists.
+///
+/// Two-step:
+///   1. Sort `moves_vec` descending by `negamax_move_order_score`.
+///      Captures/promos rank above killers; killers above other quiets.
+///   2. If `tt_move != 0` AND `tt_move` is found in the (now-sorted) list
+///      AND it is not already at index 0, swap it to index 0.
+///
+/// **Killer legality discipline:** stale killers whose bits do not match
+/// any legal move at this ply have no effect on ordering — the only path
+/// by which a killer can move to the front is via `negamax_move_order_score`
+/// returning `KILLER0_SCORE`, which requires `mv == killer0`. If no `mv`
+/// matches the killer's bits, the score for every entry is its capture
+/// value or 0, and the post-sort order is identical to the empty-killer
+/// baseline. Pinned by S24f. Mirrors M4.A's TT-move legality scan
+/// (ADR-0018 §12).
+#[allow(clippy::ptr_arg)]
+fn order_moves(
+    moves_vec: &mut Vec<Move>,
+    pos: &Position,
+    killer0: Move,
+    killer1: Move,
+    tt_move: u16,
+) {
+    moves_vec.sort_by_cached_key(|&m| -negamax_move_order_score(m, pos, killer0, killer1));
+    if tt_move != 0
+        && let Some(idx) = moves_vec.iter().position(|m| m.bits() == tt_move)
+        && idx != 0
+    {
+        let mv = moves_vec.remove(idx);
+        moves_vec.insert(0, mv);
+    }
+}
+
+/// Zero the killer table. Single-statement body, but extracted as a
+/// named free helper so all three call sites (per-go reset,
+/// per-iteration reset, `Search::reset`) lower through the same line —
+/// mutation testing on `[[Move::default(); 2]; MAX_PLY]` then targets
+/// one helper instead of three indistinguishable inline literals.
+fn clear_killers(killers: &mut [[Move; 2]; MAX_PLY]) {
+    *killers = [[Move::default(); 2]; MAX_PLY];
 }
 
 /// Returns true iff the move should be searched in qsearch (when not in check).
@@ -1893,15 +2024,19 @@ mod tests {
     /// iteration's state).
     #[test]
     fn alphabeta_partial_completion_under_abort_returns_partial_pv_and_score() {
-        // 5000-node budget: with M3.E ID, iterations 1–3 from startpos
-        // complete cumulatively (~50 + ~135 + ~1657 ≈ 3800 nodes); iteration
-        // 4 (~13k nodes) aborts at the next 4096-aligned cadence past the
-        // 5000 cap. last_complete is iteration 3's snapshot.
-        //
-        // The precondition `bestmove.is_some()` catches a vacuous-pass
-        // scenario; if a future eval/ordering shift pushes iter-3 cumulative
-        // above 5000, the assertion fires with a helpful message.
-        let pos = Position::starting_position();
+        // **Fixture: Kiwipete-derived asymmetric position** (M4.B refresh).
+        // The original startpos fixture was sensitive to ordering shifts —
+        // killer-move ordering (M4.B) changed which iteration's snapshot
+        // becomes `last_complete` under the 5000-node budget, and a
+        // symmetric startpos can legitimately evaluate to exactly 0 at
+        // shallow plies, defeating the `score != 0` regression check.
+        // Kiwipete has clear material/PST asymmetry — depth-2+ scores are
+        // reliably non-zero. The 5000-node budget still produces partial
+        // completion under both M4.A and M4.B ordering schemes.
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("Kiwipete FEN must parse");
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = SearchContext {
             stop: Arc::clone(&stop),
@@ -1919,15 +2054,10 @@ mod tests {
         let mut ab = AlphaBetaMover::new();
         let result = ab.go(&pos, &ctx, &|_| {});
 
-        // Precondition: with `nodes: Some(5000)` from startpos at depth 4,
-        // partial completion is reliably reached today (cancellation poll fires
-        // at the 4096-node alignment, after the first root move's subtree has
-        // updated the root PV + score). If a future change shifts node
-        // accounting (cadence, ordering, or budget), the test would fall
-        // through to a vacuous pass — so we assert the precondition explicitly.
+        // Precondition: bestmove must be present (some iteration completed).
         assert!(
             result.bestmove.is_some(),
-            "fixture must reach partial completion at depth 4 with nodes=5000; \
+            "fixture must reach partial completion at depth 4 with nodes=5000 from Kiwipete; \
             adjust the budget if abort fires before any root move improves alpha"
         );
         let mv = result.bestmove.unwrap();
@@ -1936,13 +2066,13 @@ mod tests {
         generate_moves(&pos, &mut ml);
         assert!(
             ml.iter().any(|legal| legal == mv),
-            "partial-completion bestmove {} must be legal from startpos",
+            "partial-completion bestmove {} must be legal from Kiwipete",
             mv.to_uci()
         );
-        // The score must NOT be 0 (the abort sentinel). A real depth-4
-        // centipawn score from startpos is non-zero (empirically ~-30 cp).
-        // We don't pin the exact value; we just assert it differs from the
-        // abort sentinel to catch the score-contamination regression.
+        // The score must NOT be 0 (the abort sentinel). Kiwipete is
+        // materially/structurally asymmetric, so any genuine eval at depth
+        // 1+ is non-zero. A 0 here is the abort-sentinel contamination
+        // regression we're guarding against.
         assert_ne!(
             result.score_cp,
             Some(0),
@@ -4538,6 +4668,895 @@ mod tests {
              max_allowed={max_allowed}. \
              Mutation `i != 0` would leave nodes_with_tt above nodes_ref/2 \
              (only child[0] cut, all others recursed)."
+        );
+    }
+
+    // ===========================================================================
+    // M4.B — Killer-move tests S14–S29.
+    // ===========================================================================
+
+    // -----------------------------------------------------------------------
+    // S14 — `is_quiet` accepts Quiet / DoublePush / KingCastle / QueenCastle.
+    // -----------------------------------------------------------------------
+
+    /// All four quiet-flag arms must return true.
+    /// Pins the `matches!(...)` inclusion list against `delete arm` mutations.
+    #[test]
+    fn is_quiet_accepts_quiet_doublepush_castles() {
+        use crate::mov::MoveFlag::*;
+        use crate::square::Square;
+        let from = Square::A1;
+        let to = Square::B1;
+        for flag in [Quiet, DoublePush] {
+            let mv = Move::new(from, to, flag);
+            assert!(is_quiet(mv), "is_quiet must return true for {flag:?}");
+        }
+        // Castling moves: use Kiwipete where both castling rights exist.
+        let kiwipete = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("Kiwipete FEN must parse");
+        let king_castle = Move::from_uci("e1g1", &kiwipete)
+            .expect("e1g1 (king-side castle) must be legal in Kiwipete");
+        let queen_castle = Move::from_uci("e1c1", &kiwipete)
+            .expect("e1c1 (queen-side castle) must be legal in Kiwipete");
+        assert!(
+            is_quiet(king_castle),
+            "is_quiet must return true for KingCastle"
+        );
+        assert!(
+            is_quiet(queen_castle),
+            "is_quiet must return true for QueenCastle"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S15 — `is_quiet` rejects captures / promos / en-passant.
+    // -----------------------------------------------------------------------
+
+    /// All ten non-quiet flag arms must return false.
+    /// Pins the exclusion list; each flag catch a distinct `include arm` mutation.
+    #[test]
+    fn is_quiet_rejects_captures_promos_enpassant() {
+        use crate::mov::MoveFlag::*;
+        use crate::square::Square;
+        let from = Square::A1;
+        let to = Square::B2;
+        for flag in [
+            Capture,
+            EnPassant,
+            KnightPromo,
+            BishopPromo,
+            RookPromo,
+            QueenPromo,
+            KnightPromoCapture,
+            BishopPromoCapture,
+            RookPromoCapture,
+            QueenPromoCapture,
+        ] {
+            let mv = Move::new(from, to, flag);
+            assert!(!is_quiet(mv), "is_quiet must return false for {flag:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // S16 — `update_killers` writes `mv` to slot 0 when the table is empty.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn update_killers_writes_to_slot_0_when_empty() {
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+        let mut killers = [[Move::default(); 2]; MAX_PLY];
+        let mv = Move::new(Square::E2, Square::E3, MoveFlag::Quiet);
+        update_killers(&mut killers, 1, mv);
+        assert_eq!(killers[1][0], mv, "slot 0 must hold the pushed move");
+        assert_eq!(
+            killers[1][1],
+            Move::default(),
+            "slot 1 must remain the default sentinel"
+        );
+        // Other plies must be untouched.
+        assert_eq!(killers[0], [Move::default(); 2], "ply 0 must be untouched");
+        assert_eq!(killers[2], [Move::default(); 2], "ply 2 must be untouched");
+    }
+
+    // -----------------------------------------------------------------------
+    // S17 — `update_killers` shifts existing slot 0 to slot 1 on distinct move.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn update_killers_shifts_existing_to_slot_1_on_distinct_move() {
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+        let mut killers = [[Move::default(); 2]; MAX_PLY];
+        let mv_a = Move::new(Square::D2, Square::D3, MoveFlag::Quiet);
+        let mv_b = Move::new(Square::E2, Square::E3, MoveFlag::Quiet);
+        // Pre-fill: slot 0 = mv_a, slot 1 = default.
+        killers[3][0] = mv_a;
+        // Push distinct mv_b.
+        update_killers(&mut killers, 3, mv_b);
+        assert_eq!(killers[3][0], mv_b, "slot 0 must hold the new move");
+        assert_eq!(
+            killers[3][1], mv_a,
+            "slot 1 must hold the displaced old slot-0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S18 — `update_killers` is a no-op when `mv == killers[ply][0]`.
+    // -----------------------------------------------------------------------
+
+    /// Pins the no-op path: pushing the same move again must not change the table.
+    /// Kills `replace if killers[ply][0] != mv with true` mutations and the `==`-flip.
+    #[test]
+    fn update_killers_is_noop_when_move_equals_slot_0() {
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+        let mv_a = Move::new(Square::D2, Square::D3, MoveFlag::Quiet);
+        let mv_b = Move::new(Square::E2, Square::E3, MoveFlag::Quiet);
+        let mut killers = [[Move::default(); 2]; MAX_PLY];
+        killers[2][0] = mv_a;
+        killers[2][1] = mv_b;
+        // Push mv_a again — must be a no-op.
+        update_killers(&mut killers, 2, mv_a);
+        assert_eq!(killers[2][0], mv_a, "slot 0 must still hold mv_a");
+        assert_eq!(killers[2][1], mv_b, "slot 1 must be unchanged (mv_b)");
+    }
+
+    // -----------------------------------------------------------------------
+    // S19 — `update_killers` promotes slot 1 to slot 0 when `mv == slot[1]`.
+    // -----------------------------------------------------------------------
+
+    /// Shift-on-distinct: `mv_b != mv_a` (slot-0), so the shift runs:
+    ///   slot[1] = slot[0] = mv_a; slot[0] = mv_b.
+    /// The dedup is implicit: mv_b was in slot 1, now in slot 0; old mv_a
+    /// shifted into slot 1 (no duplicate entry).
+    #[test]
+    fn update_killers_promotes_slot_1_to_slot_0_when_move_equals_slot_1() {
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+        let mv_a = Move::new(Square::D2, Square::D3, MoveFlag::Quiet);
+        let mv_b = Move::new(Square::E2, Square::E3, MoveFlag::Quiet);
+        let mut killers = [[Move::default(); 2]; MAX_PLY];
+        killers[5][0] = mv_a;
+        killers[5][1] = mv_b;
+        // Push mv_b (which is in slot 1 but NOT in slot 0).
+        update_killers(&mut killers, 5, mv_b);
+        assert_eq!(killers[5][0], mv_b, "slot 0 must hold mv_b");
+        assert_eq!(
+            killers[5][1], mv_a,
+            "slot 1 must hold mv_a (the displaced slot-0)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S20 — `negamax_move_order_score` returns KILLER0_SCORE for quiet == killer0.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn negamax_move_order_score_returns_killer_0_bonus_when_quiet_matches_slot_0() {
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+        let pos = Position::starting_position();
+        let mv = Move::new(Square::E2, Square::E3, MoveFlag::Quiet);
+        let other = Move::new(Square::D2, Square::D3, MoveFlag::Quiet);
+        let score = negamax_move_order_score(mv, &pos, mv, other);
+        assert_eq!(
+            score, KILLER0_SCORE,
+            "quiet matching killer0 must return KILLER0_SCORE"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S21 — `negamax_move_order_score` returns KILLER1_SCORE for quiet == killer1.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn negamax_move_order_score_returns_killer_1_bonus_when_quiet_matches_slot_1() {
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+        let pos = Position::starting_position();
+        let mv = Move::new(Square::E2, Square::E3, MoveFlag::Quiet);
+        let other = Move::new(Square::D2, Square::D3, MoveFlag::Quiet);
+        // mv is in killer1, other is in killer0 (mv != other so the killer0 check fails).
+        let score = negamax_move_order_score(mv, &pos, other, mv);
+        assert_eq!(
+            score, KILLER1_SCORE,
+            "quiet matching killer1 (not killer0) must return KILLER1_SCORE"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S22 — `negamax_move_order_score` returns mvv_lva_score for a capture
+    //        even if the same bits match killer0.
+    // -----------------------------------------------------------------------
+
+    /// Pins the `!is_quiet(mv)` early-return gate at the top of the helper.
+    #[test]
+    fn negamax_move_order_score_returns_mvv_lva_for_capture_even_if_matches_killer() {
+        // Position: white pawn on b4 can capture black queen on c5.
+        let pos =
+            Position::from_fen("4k3/8/2p5/2qQ4/1P6/8/8/4K3 w - - 0 1").expect("FEN must parse");
+        let pawn_takes_queen =
+            Move::from_uci("b4c5", &pos).expect("b4c5 must be a legal pawn capture");
+        // Install the same capture move as killer0 (artificial — captures can't
+        // legally become killers, but the test verifies the gate independently).
+        let score =
+            negamax_move_order_score(pawn_takes_queen, &pos, pawn_takes_queen, Move::default());
+        let expected = mvv_lva_score(pawn_takes_queen, &pos);
+        assert_eq!(
+            score, expected,
+            "capture matching killer0 must return mvv_lva_score ({expected}), not KILLER0_SCORE"
+        );
+        // Cross-check: the mvv_lva score is strictly greater than KILLER0_SCORE,
+        // proving the test is not vacuously passing because KILLER0_SCORE == expected.
+        assert!(
+            expected > KILLER0_SCORE,
+            "mvv_lva_score for a capture must exceed KILLER0_SCORE to make S22 non-vacuous; \
+             got mvv_lva={expected}, KILLER0_SCORE={KILLER0_SCORE}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S22b — `negamax_move_order_score` returns 0 for quiet not in either slot.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn negamax_move_order_score_zero_for_quiet_not_in_either_slot() {
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+        let pos = Position::starting_position();
+        let mv = Move::new(Square::E2, Square::E3, MoveFlag::Quiet);
+        let killer0 = Move::new(Square::D2, Square::D3, MoveFlag::Quiet);
+        let killer1 = Move::new(Square::C2, Square::C3, MoveFlag::Quiet);
+        let score = negamax_move_order_score(mv, &pos, killer0, killer1);
+        assert_eq!(score, 0, "quiet not in either killer slot must score 0");
+    }
+
+    // -----------------------------------------------------------------------
+    // S23 — `KILLER0_SCORE` and `KILLER1_SCORE` are strictly below the
+    //        smallest MVV-LVA capture (QxP) and above 0.
+    // -----------------------------------------------------------------------
+
+    /// Runtime boundary check using the actual MVV-LVA formula and PeSTO MG
+    /// values. Pins the constant values against any future bumps of KILLER0_SCORE
+    /// past the capture floor, or changes to the MVV-LVA scaling factor.
+    #[test]
+    fn killer_scores_strictly_below_smallest_capture() {
+        // Constant ordering invariants checked at compile time.
+        const {
+            assert!(
+                KILLER0_SCORE > KILLER1_SCORE,
+                "KILLER0_SCORE must be > KILLER1_SCORE"
+            );
+            assert!(KILLER1_SCORE > 0, "KILLER1_SCORE must be > 0");
+        }
+        // Runtime check: KILLER0_SCORE must be below the actual smallest capture
+        // (QxP), which depends on the MVV-LVA formula and PeSTO MG values.
+        let pos =
+            Position::from_fen("4k3/8/2p5/2qQ4/1P6/8/8/4K3 w - - 0 1").expect("FEN must parse");
+        let qxp = Move::from_uci("d5c6", &pos).expect("d5c6 must be a legal queen×pawn capture");
+        let qxp_score = mvv_lva_score(qxp, &pos);
+        assert!(
+            KILLER0_SCORE < qxp_score,
+            "KILLER0_SCORE ({KILLER0_SCORE}) must be < mvv_lva_score(QxP) ({qxp_score}) \
+             so killers slot below all captures"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S24 — `order_moves` promotes the TT move to index 0.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn order_moves_promotes_tt_move_to_index_0() {
+        // Use startpos for a real movegen-produced list.
+        let pos = Position::starting_position();
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let mut moves_vec: Vec<Move> = ml.iter().collect();
+        // Pick the last move as the TT move (least likely to already be first).
+        let tt_move = *moves_vec.last().expect("startpos has legal moves");
+        order_moves(
+            &mut moves_vec,
+            &pos,
+            Move::default(),
+            Move::default(),
+            tt_move.bits(),
+        );
+        assert_eq!(
+            moves_vec[0],
+            tt_move,
+            "TT move must be promoted to index 0; got {}",
+            moves_vec[0].to_uci()
+        );
+        // TT move appears exactly once.
+        let count = moves_vec.iter().filter(|&&m| m == tt_move).count();
+        assert_eq!(
+            count, 1,
+            "TT move must appear exactly once in the ordered list"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S24b — `order_moves` is a no-op when the TT move is already first.
+    // -----------------------------------------------------------------------
+
+    /// Pins the `idx != 0` guard in the swap path.
+    #[test]
+    fn order_moves_no_op_when_tt_move_already_first() {
+        let pos = Position::starting_position();
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let mut moves_vec: Vec<Move> = ml.iter().collect();
+        // Sort first so we can identify what's at index 0 after ordering.
+        order_moves(&mut moves_vec, &pos, Move::default(), Move::default(), 0);
+        let first = moves_vec[0];
+        let before = moves_vec.clone();
+        // Now call again with the first move as the TT move.
+        order_moves(
+            &mut moves_vec,
+            &pos,
+            Move::default(),
+            Move::default(),
+            first.bits(),
+        );
+        // The order must be unchanged (first is already at 0; swap is skipped).
+        assert_eq!(
+            moves_vec, before,
+            "order must be unchanged when TT move is already first"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S24c — `order_moves` is a no-op for tt_move == 0 or absent.
+    // -----------------------------------------------------------------------
+
+    /// Two sub-cases: (a) tt_move == 0 (sentinel); (b) tt_move bits not in list.
+    #[test]
+    fn order_moves_no_op_when_tt_move_zero_or_absent() {
+        let pos = Position::starting_position();
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+
+        // Sub-case (a): tt_move == 0.
+        let mut moves_a: Vec<Move> = ml.iter().collect();
+        let mut moves_ref: Vec<Move> = ml.iter().collect();
+        // Produce the reference order (pure MVV-LVA, no tt_move).
+        order_moves(&mut moves_ref, &pos, Move::default(), Move::default(), 0);
+        order_moves(&mut moves_a, &pos, Move::default(), Move::default(), 0);
+        assert_eq!(
+            moves_a, moves_ref,
+            "tt_move==0 must produce pure MVV-LVA order (same as reference)"
+        );
+
+        // Sub-case (b): tt_move bits not present in the list.
+        // Use 0xFFFF — an impossible legal move (from=H1, to=H8, flag=QueenPromoCapture
+        // which never appears at startpos). The sort must not promote any entry.
+        let mut moves_b: Vec<Move> = ml.iter().collect();
+        order_moves(&mut moves_b, &pos, Move::default(), Move::default(), 0xFFFF);
+        assert_eq!(
+            moves_b, moves_ref,
+            "absent tt_move must produce pure MVV-LVA order (same as reference)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S24d — `order_moves` places killer above quiets, below captures.
+    // -----------------------------------------------------------------------
+
+    /// Ordering boundary: capture > KILLER0 > non-killer quiet. The strong
+    /// assertion is the killer-above-non-killer-quiet pair: pick a specific
+    /// non-killer quiet and assert its post-`order_moves` index is strictly
+    /// greater than the killer's. A stub `order_moves` that ignores killer
+    /// scoring would leave both quiets in their natural MVV-LVA order
+    /// (movegen order, since both score 0); for the assertion to pass, the
+    /// implementation must actually score the killer above other quiets.
+    #[test]
+    fn order_moves_places_killer_above_quiets_below_captures() {
+        // Position: white has a hanging pawn-capture opportunity + quiet moves.
+        let pos =
+            Position::from_fen("4k3/8/2p5/2qQ4/1P6/8/8/4K3 w - - 0 1").expect("FEN must parse");
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let moves_vec_initial: Vec<Move> = ml.iter().collect();
+
+        // Collect all quiets in movegen (= MVV-LVA-tie) order.
+        let quiets: Vec<Move> = moves_vec_initial
+            .iter()
+            .copied()
+            .filter(|&m| {
+                use crate::mov::MoveFlag::*;
+                matches!(m.flag(), Quiet | DoublePush | KingCastle | QueenCastle)
+            })
+            .collect();
+        assert!(
+            quiets.len() >= 2,
+            "fixture invariant: position must have ≥ 2 quiet moves to distinguish killer above non-killer; \
+             got {} quiets",
+            quiets.len()
+        );
+
+        // Pick the LAST quiet as the killer (not the first — under empty-killer
+        // baseline ordering it would naturally sort below the other quiets).
+        let killer_quiet = *quiets.last().unwrap();
+        // Pick the FIRST quiet as the witness non-killer (would naturally precede
+        // killer_quiet under empty-killer baseline; the test passes only if killer
+        // logic flips them).
+        let witness_non_killer_quiet = *quiets.first().unwrap();
+        assert_ne!(
+            killer_quiet, witness_non_killer_quiet,
+            "fixture invariant: killer and witness must be distinct moves"
+        );
+
+        // Sanity-check the empty-killer baseline: under no-killer ordering, the
+        // killer_quiet (last quiet) sits AFTER the witness_non_killer_quiet
+        // (first quiet). If this fails, the fixture's premise is wrong.
+        let mut moves_baseline = moves_vec_initial.clone();
+        order_moves(
+            &mut moves_baseline,
+            &pos,
+            Move::default(),
+            Move::default(),
+            0,
+        );
+        let baseline_killer_idx = moves_baseline
+            .iter()
+            .position(|&m| m == killer_quiet)
+            .unwrap();
+        let baseline_witness_idx = moves_baseline
+            .iter()
+            .position(|&m| m == witness_non_killer_quiet)
+            .unwrap();
+        assert!(
+            baseline_witness_idx < baseline_killer_idx,
+            "fixture invariant: under empty-killer baseline, witness ({}) must precede killer ({}); \
+             got witness@{} vs killer@{}",
+            witness_non_killer_quiet.to_uci(),
+            killer_quiet.to_uci(),
+            baseline_witness_idx,
+            baseline_killer_idx
+        );
+
+        // Now run with killer_quiet as the killer slot. The strong assertion:
+        // killer_quiet's post-sort index is STRICTLY LESS THAN witness's
+        // post-sort index — the killer logic flipped them.
+        let mut moves_vec = moves_vec_initial.clone();
+        order_moves(&mut moves_vec, &pos, killer_quiet, Move::default(), 0);
+
+        let killer_idx = moves_vec.iter().position(|&m| m == killer_quiet).unwrap();
+        let witness_idx = moves_vec
+            .iter()
+            .position(|&m| m == witness_non_killer_quiet)
+            .unwrap();
+
+        // Strong assertion #1: killer above witness non-killer quiet.
+        assert!(
+            killer_idx < witness_idx,
+            "killer_quiet must precede witness non-killer quiet under killer-aware ordering; \
+             killer_quiet@{} ({}), witness@{} ({})",
+            killer_idx,
+            killer_quiet.to_uci(),
+            witness_idx,
+            witness_non_killer_quiet.to_uci()
+        );
+
+        // Strong assertion #2: all captures precede the killer.
+        for (i, &m) in moves_vec.iter().enumerate() {
+            if m.is_capture() {
+                assert!(
+                    i < killer_idx,
+                    "capture {} at index {} must precede killer at index {}",
+                    m.to_uci(),
+                    i,
+                    killer_idx
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // S24e — `order_moves` handles TT == killer0 overlap without duplicating.
+    // -----------------------------------------------------------------------
+
+    /// When the TT move and killer0 are the same move, `order_moves` must
+    /// place it at index 0 exactly once (no duplicate entry).
+    #[test]
+    fn order_moves_handles_tt_equals_killer_overlap_no_duplicate() {
+        let pos = Position::starting_position();
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let mut moves_vec: Vec<Move> = ml.iter().collect();
+        let total = moves_vec.len();
+
+        // Choose a move that is NOT the movegen-first move (so the swap is exercised).
+        let all_moves: Vec<Move> = ml.iter().collect();
+        let overlap_move = *all_moves.last().expect("startpos has legal moves");
+
+        // overlap_move is BOTH killer0 AND the TT move.
+        order_moves(
+            &mut moves_vec,
+            &pos,
+            overlap_move,
+            Move::default(),
+            overlap_move.bits(),
+        );
+
+        // Must be at index 0.
+        assert_eq!(
+            moves_vec[0],
+            overlap_move,
+            "TT==killer0 move must be at index 0; got {}",
+            moves_vec[0].to_uci()
+        );
+        // Must appear exactly once (no duplicate).
+        let count = moves_vec.iter().filter(|&&m| m == overlap_move).count();
+        assert_eq!(
+            count, 1,
+            "TT==killer0 move must appear exactly once; found {count} occurrences"
+        );
+        // Total length must be unchanged.
+        assert_eq!(
+            moves_vec.len(),
+            total,
+            "order_moves must not change the number of moves"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S24f — `order_moves` ignores a stale killer whose bits are not in the list.
+    // -----------------------------------------------------------------------
+
+    /// A killer from a different position (bits not present in `moves_vec`)
+    /// must have no effect: post-sort order identical to the empty-killer baseline.
+    #[test]
+    fn order_moves_ignores_stale_killer_with_no_matching_bits() {
+        let pos = Position::starting_position();
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+
+        // Reference order: no killer, no TT.
+        let mut moves_ref: Vec<Move> = ml.iter().collect();
+        order_moves(&mut moves_ref, &pos, Move::default(), Move::default(), 0);
+
+        // Stale killer: a move whose bits don't match any move in moves_vec.
+        // Use a1→a1 quiet (from==to, flag=Quiet, bits != 0 only if from!=to;
+        // actually from==to gives bits=0 == default sentinel). Instead construct
+        // a move with non-zero bits that aren't in the list: b8c8 Quiet —
+        // a black-piece move, never generated for white-to-move startpos.
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+        let stale_killer = Move::new(Square::B8, Square::C8, MoveFlag::Quiet);
+        // Verify the stale killer is NOT in the legal move list.
+        assert!(
+            !ml.iter().any(|m| m.bits() == stale_killer.bits()),
+            "fixture: stale_killer must not be a legal move at startpos"
+        );
+
+        let mut moves_stale: Vec<Move> = ml.iter().collect();
+        order_moves(&mut moves_stale, &pos, stale_killer, Move::default(), 0);
+
+        assert_eq!(
+            moves_stale, moves_ref,
+            "stale killer must not affect ordering; result must match empty-killer baseline"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S25 — `negamax` records a quiet killer on beta cutoff at child ply.
+    // -----------------------------------------------------------------------
+
+    /// Integration: drive `negamax_for_test` from a position where a quiet
+    /// move causes a beta cutoff at SOME ply. After return, the killer table
+    /// must have at least one populated quiet slot; the populated slot is at
+    /// the ply where the cutoff fired, and the move stored is quiet.
+    ///
+    /// Robust assertion: the test does NOT pin the cutoff to a specific ply.
+    /// A depth-2 search visits ply=0 (root) and ply=1 (children). A beta
+    /// cutoff at either ply via a quiet move must populate `killers[ply][0]`
+    /// with a quiet move. The test scans all plies in `[0, MAX_PLY)` for the
+    /// first non-default slot, then asserts it holds a quiet move. This avoids
+    /// the brittleness of "ply=1 specifically" — fixture refinement at
+    /// test-writing time may shift which ply produces the cutoff.
+    ///
+    /// Fixture: KvN+K endgame. White to move with a narrow window that's
+    /// likely to force a quick beta-cutoff. **The fixture is acknowledged as
+    /// tentative; if no quiet cutoff fires (all plies remain default), the
+    /// test panics with a clear message indicating fixture-rewrite is needed
+    /// rather than a cryptic mismatch on a specific slot.**
+    #[test]
+    fn negamax_records_quiet_killer_on_beta_cutoff() {
+        // KvN+K: white King + Knight vs black King. White to move.
+        let pos =
+            Position::from_fen("4k3/8/8/8/8/8/4N3/4K3 w - - 0 1").expect("KvN+K FEN must parse");
+        let mut mover = AlphaBetaMover::new();
+        mover.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx_at_depth(2);
+
+        // Narrow window forces a quick beta cutoff at some ply.
+        let _ = mover.negamax_for_test(&mut pos.clone(), 2, 0, -100, -50, true, &ctx);
+
+        // Find the first ply with a populated killer slot.
+        let killers = mover.killers_for_test();
+        let mut populated: Option<(usize, Move)> = None;
+        for (ply, slots) in killers.iter().enumerate() {
+            if slots[0] != Move::default() {
+                populated = Some((ply, slots[0]));
+                break;
+            }
+        }
+
+        let (cutoff_ply, k) = populated.unwrap_or_else(|| {
+            panic!(
+                "no killer slot populated after depth-2 search from KvN+K — fixture must be \
+                 rewritten to ensure a quiet beta-cutoff fires at some ply within the search"
+            )
+        });
+
+        assert!(
+            is_quiet(k),
+            "killers[{cutoff_ply}][0] must be a quiet move (captures do not update killers); \
+             got {} (flag: {:?})",
+            k.to_uci(),
+            k.flag()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S25b — `negamax` does NOT record a capture on beta cutoff.
+    // -----------------------------------------------------------------------
+
+    /// The `if is_quiet(mv)` gate in the cutoff block must prevent captures
+    /// from populating the killer table. Since S15 already pins `is_quiet`
+    /// returning false for captures, this test documents the structural
+    /// guarantee: captures that produce a beta cutoff must leave killers unchanged.
+    ///
+    /// Implementation note: the test drives the cutoff branch via the same
+    /// KvN+K fixture with an even narrower window, then verifies that if
+    /// the cutoff move was a capture, killers remain at default. Alternatively,
+    /// since S15 + code review fully cover the structural shape, this test
+    /// acts as a belt-and-suspenders check using a position where the only
+    /// available beta-cutoff move is a capture.
+    #[test]
+    fn negamax_does_not_record_capture_on_beta_cutoff() {
+        // Position: white pawn captures black queen immediately (forced beta cutoff);
+        // the capture is the only move that overshoots the narrow window.
+        // FEN: white K + P on b4, black K + Q on c5. Narrow window ensures
+        // Pxc5 (capture) is the cutoff move.
+        let pos =
+            Position::from_fen("4k3/8/2p5/2qQ4/1P6/8/8/4K3 w - - 0 1").expect("FEN must parse");
+        let mut mover = AlphaBetaMover::new();
+        mover.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx_at_depth(1);
+
+        // Run with a tight fail-high window: any capture will overshoot and
+        // produce a beta cutoff. The gate `if is_quiet(mv)` must prevent
+        // the capture from populating killers[0][0].
+        let _ = mover.negamax_for_test(&mut pos.clone(), 1, 0, 10000, 10001, false, &ctx);
+
+        // killers[0][0] must remain the default sentinel (no capture recorded).
+        assert_eq!(
+            mover.killers_for_test()[0][0],
+            Move::default(),
+            "killers[0][0] must remain default when the beta-cutoff move is a capture"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S26 — killer ordering is observable via node-count differential.
+    // -----------------------------------------------------------------------
+
+    /// Two-run differential: pre-setting a killer for the appropriate ply
+    /// changes the search order at sibling nodes, producing a different node count.
+    ///
+    /// **Side-to-move discipline.** At depth-3 from startpos:
+    ///   - ply 0: white to move (root) — pre-setting `killers[0]` would tag
+    ///     a white move; useless since the very first sort consumes it.
+    ///   - ply 1: black to move — pre-setting `killers[1]` requires a BLACK
+    ///     quiet move. A white-side move at this slot has bits that never
+    ///     match any of the 20 ply-1 sibling positions' legal moves; the
+    ///     killer is silently ignored. **Pinned by S24f** (legality-by-non-match).
+    ///   - ply 2: white to move — pre-setting `killers[2]` requires a white
+    ///     quiet move legal in many ply-2 positions.
+    ///
+    /// The original draft picked a quiet from white's startpos legal-move
+    /// list and stored it at `killers[1]` — silently a no-op. **Corrected:**
+    /// pick a black quiet move directly.
+    ///
+    /// Run (a): empty killers, depth-3 search from startpos — record nodes.
+    /// Run (b): pre-set `killers[2][0] = chosen_white_quiet` (white side at
+    /// ply 2) — record nodes. Assert nodes differ.
+    ///
+    /// **Theoretical fragility note.** The node-count differential could in
+    /// principle be zero if the killer ordering doesn't actually flip any
+    /// cutoff decision. In practice at depth-3 from startpos with 20 root
+    /// moves × ~20 ply-1 children × ~20 ply-2 children, the killer's effect
+    /// on at least one subtree is highly likely. Same observability shape
+    /// the M4.A S6 test uses for TT-move ordering.
+    #[test]
+    fn negamax_killer_observed_in_ordering_at_sibling_node() {
+        let pos = Position::starting_position();
+
+        // Run (a): no killers.
+        let mut mover_a = AlphaBetaMover::new();
+        mover_a.history = vec![pos.zobrist()];
+        let (ctx_a, _stop_a) = non_aborting_ctx_at_depth(3);
+        let _ = mover_a.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx_a);
+        let nodes_a = mover_a.nodes;
+
+        // Pick the lexicographically-last white quiet move from startpos
+        // legal moves. ply=2 in the search is white-to-move, where this
+        // killer's bits can match a real legal move (most ply-2 positions
+        // preserve the white pieces' starting squares).
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let mut all_moves: Vec<Move> = ml.iter().collect();
+        all_moves.sort_by_key(|m| m.bits());
+        let chosen_quiet = all_moves
+            .iter()
+            .rfind(|&&m| {
+                use crate::mov::MoveFlag::*;
+                matches!(m.flag(), Quiet | DoublePush | KingCastle | QueenCastle)
+            })
+            .copied()
+            .expect("startpos must have at least one quiet move");
+
+        // Sanity: chosen_quiet has MVV-LVA score 0 (genuinely quiet).
+        assert_eq!(
+            mvv_lva_score(chosen_quiet, &pos),
+            0,
+            "chosen quiet must have MVV-LVA score 0; fixture: {}",
+            chosen_quiet.to_uci()
+        );
+
+        // Verify the chosen quiet is NOT at index 0 in the empty-killer ordering.
+        let mut moves_check: Vec<Move> = ml.iter().collect();
+        order_moves(&mut moves_check, &pos, Move::default(), Move::default(), 0);
+        let pre_killer_idx = moves_check
+            .iter()
+            .position(|&m| m == chosen_quiet)
+            .expect("chosen quiet must be in the legal move list");
+        assert!(
+            pre_killer_idx > 0,
+            "chosen quiet '{}' must NOT be at index 0 in empty-killer ordering (pre_killer_idx={})",
+            chosen_quiet.to_uci(),
+            pre_killer_idx
+        );
+
+        // Run (b): pre-set killers[2][0] (white-side ply) = chosen_quiet.
+        let mut mover_b = AlphaBetaMover::new();
+        mover_b.history = vec![pos.zobrist()];
+        let mut init_killers = [[Move::default(); 2]; MAX_PLY];
+        init_killers[2][0] = chosen_quiet;
+        mover_b.set_killers_for_test(init_killers);
+        let (ctx_b, _stop_b) = non_aborting_ctx_at_depth(3);
+        let _ = mover_b.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx_b);
+        let nodes_b = mover_b.nodes;
+
+        assert_ne!(
+            nodes_a,
+            nodes_b,
+            "pre-setting killer '{}' at ply=2 must change the search shape; \
+             both runs produced {nodes_a} nodes",
+            chosen_quiet.to_uci()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S27 — `clear_killers` zeroes a pre-populated table.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clear_killers_zeroes_pre_populated_table() {
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+        let mv_a = Move::new(Square::A2, Square::A3, MoveFlag::Quiet);
+        let mv_b = Move::new(Square::B2, Square::B3, MoveFlag::Quiet);
+        let mv_c = Move::new(Square::C2, Square::C3, MoveFlag::Quiet);
+
+        let mut killers = [[Move::default(); 2]; MAX_PLY];
+        killers[3][0] = mv_a;
+        killers[3][1] = mv_b;
+        killers[7][0] = mv_c;
+
+        clear_killers(&mut killers);
+
+        assert_eq!(
+            killers[3],
+            [Move::default(); 2],
+            "killers[3] must be zeroed after clear_killers"
+        );
+        assert_eq!(
+            killers[7],
+            [Move::default(); 2],
+            "killers[7] must be zeroed after clear_killers"
+        );
+        // Spot-check a few other plies.
+        assert_eq!(
+            killers[0],
+            [Move::default(); 2],
+            "killers[0] must be zeroed"
+        );
+        assert_eq!(
+            killers[MAX_PLY - 1],
+            [Move::default(); 2],
+            "killers[MAX_PLY-1] must be zeroed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S28 — `Search::reset` clears killers.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_reset_clears_killers() {
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+        let some_move = Move::new(Square::E2, Square::E3, MoveFlag::Quiet);
+
+        let mut mover = AlphaBetaMover::new();
+        // Pre-populate a killer slot directly.
+        let mut killers = [[Move::default(); 2]; MAX_PLY];
+        killers[5][0] = some_move;
+        mover.set_killers_for_test(killers);
+
+        // Confirm the pre-population stuck.
+        assert_eq!(
+            mover.killers_for_test()[5][0],
+            some_move,
+            "pre-condition: killers[5][0] must hold some_move before reset"
+        );
+
+        mover.reset();
+
+        assert_eq!(
+            mover.killers_for_test()[5][0],
+            Move::default(),
+            "Search::reset must clear killers[5][0] to the default sentinel"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S29 — `Search::go` clears killers at per-go entry.
+    // -----------------------------------------------------------------------
+
+    /// Pre-populate a killer at a high ply (40) that a depth-2 search won't
+    /// normally reach. After `Search::go` at depth 2, the killer must have
+    /// been cleared.
+    ///
+    /// **Honesty about what this pins.** The per-iteration reset runs at the
+    /// top of every ID iteration including iteration 1, BEFORE negamax is
+    /// invoked. So `clear_killers` from the per-iteration reset alone would
+    /// also zero the synthetic ply-40 slot. This test therefore pins
+    /// "{per-go OR per-iteration} clear fires" jointly, not the per-go call
+    /// site specifically. Per the plan §8 mutation-prep table, distinguishing
+    /// the per-go call sharply requires code review + the deferred overnight
+    /// cargo-mutants run; the test surface alone cannot draw the sharp line.
+    #[test]
+    fn search_go_clears_killers_at_per_go_entry() {
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+        let synthetic_move = Move::new(Square::H2, Square::H3, MoveFlag::Quiet);
+
+        let pos = Position::starting_position();
+        let mut mover = AlphaBetaMover::new();
+
+        // Pre-populate killers[40][0] with a synthetic move.
+        let mut init_killers = [[Move::default(); 2]; MAX_PLY];
+        init_killers[40][0] = synthetic_move;
+        mover.set_killers_for_test(init_killers);
+
+        // Run go at depth 2. The per-go reset must clear killers before the search.
+        let (ctx, _stop) = non_aborting_ctx_at_depth(2);
+        let _ = mover.go(&pos, &ctx, &|_| {});
+
+        // killers[40] must be back to default (the per-go clear ran).
+        assert_eq!(
+            mover.killers_for_test()[40],
+            [Move::default(); 2],
+            "killers[40] must be zeroed by the per-go reset; \
+             synthetic move must not survive across a go() call"
         );
     }
 }

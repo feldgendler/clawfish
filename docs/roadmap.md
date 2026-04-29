@@ -4,19 +4,18 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1 complete; M2 complete; M3 complete; M4.A complete — TT landed. M4.B (killer moves) next.**
+**M1 complete; M2 complete; M3 complete; M4.A complete; M4.B complete pending SPRT — killer moves landed. M4.C (history heuristic) next.**
 
-For per-phase retrospectives (what landed, implementation highlights, verification numbers), see [`milestones/`](milestones/). The latest landed phase is [M4.A](milestones/m4.a.md) (2026-04-29) — Zobrist-keyed transposition table integrated.
+For per-phase retrospectives (what landed, implementation highlights, verification numbers), see [`milestones/`](milestones/). The latest landed phase is [M4.B](milestones/m4.b.md) (2026-04-29) — two killer slots per ply, killer-aware move ordering between captures and quiets.
 
-- Bench signature: `bench: 172312700 nodes 11489045 nps` at default depth 7.
+- Bench signature: `bench: 22237579 nodes 11316834 nps` at default depth 7 (M4.B; -44% nodes vs M4.A's 39964046).
 - SPRT vs `baseline/random-mover`: 148-0-0 (LLR=2.95 H1 accepted in 148 games / 3m35s).
-- Rating estimate (single 1320-anchor): 196-4-0 over 200 games → naive logistic Elo ≈ 1996 (saturated, unreliable).
-- Rating estimate (online iteration, P-core pinned, 120 games): converged to **~2114 Elo at tc=10+0.1** (±35 Elo). [Full log](bench/sprt/2026-04-29-online-elo-iteration.md).
-- The `baseline/alpha-beta-no-tt` annotated tag lands at the M3.F commit as the M4 SPRT reference point.
+- Rating estimate (online iteration, P-core pinned, 120 games): converged to **~2114 Elo at tc=10+0.1** (±35 Elo) at M3.F. [Full log](bench/sprt/2026-04-29-online-elo-iteration.md). M4.A's SPRT gain: +281.89 ± 55.64 Elo. M4.B's SPRT deferred to merge-time.
+- The `baseline/alpha-beta-no-tt` annotated tag lands at the M3.F commit; `baseline/alpha-beta-tt` lands at M4.A's commit.
 
 ### What's next
 
-**M4.B — killer moves.** Two killer slots per ply, updated on quiet-move beta cutoff, ordering after TT move + captures, before history. SPRT-gated against `baseline/alpha-beta-tt` (the tag landing at M4.A's commit).
+**M4.C — history heuristic.** History counter table indexed by piece-and-to (or from-and-to; chosen at ADR landing). Depth-weighted increment on quiet-move beta cutoff; matching decrement on quiet moves that failed to cut at the same node; aging-or-saturation discipline. Ordering tiebreaker among non-killer quiets in `[0, 99]` below `KILLER1_SCORE = 100`. SPRT-gated against `baseline/alpha-beta-tt-killer` (the tag landing at M4.B's merge commit).
 
 ## Milestones
 
@@ -164,7 +163,7 @@ ADR numbers allocated at landing time; numeric slots may slide if other ADRs lan
 | Phase | Scope | Approx size |
 |---|---|---|
 | **M4.A** ✓ — Transposition table | `TranspositionTable` (`UnsafeCell<Vec<TtEntry>>` + 16-byte entry: 64-bit Zobrist key + i16 score + u8 depth + 6-bit age + 2-bit bound + u16 move + 2 bytes pad); depth-preferred + age-bias replacement; bound-aware probe with cutoffs at non-PV nodes only; store at every negamax node on completed bound (skip on abort, end-of-loop only); mate-score depth-adjustment on store/probe; `Hash` UCI option (default 16 MiB, range 1–4096); TT move first in move ordering at every negamax ply. `prior_root_move` removed (TT subsumes). `Engine::reset_for_new_game()` consolidated; called from `handle_ucinewgame` + per-bench-position. Bench signature: `bench: 39964046 nodes <NPS> nps` at default depth 7 (77% node reduction vs M3.F). ADR-0018. Retrospective: [`milestones/m4.a.md`](milestones/m4.a.md). | ~1000 |
-| **M4.B** — Killer moves | Two killer slots per ply (`[Option<Move>; 2]` per ply); update on quiet-move beta cutoff; ordering: after TT move and after captures (sorted by MVV-LVA), before history. Inter-iteration policy (clear at the start of each ID iteration vs. persist with aging; relevant under M4.D's aspiration re-searches) is an open M4.B-plan question; tentative default is *clear between iterations* per CPW guidance. | ~350 |
+| **M4.B** ✓ pending SPRT — Killer moves | Two killer slots per ply (`[[Move; 2]; MAX_PLY]`, `Move::default()` sentinel — 256 bytes); update on quiet-move beta cutoff via shift-on-distinct (`update_killers`); ordering via `negamax_move_order_score` between captures (MVV-LVA) and remaining quiets (`KILLER0_SCORE = 200`, `KILLER1_SCORE = 100`; QxP floor at 287). Inter-iteration policy: **clear between iterations** (research §7 default; M4.D may revisit for aspiration re-search persistence). Helpers `is_quiet`, `update_killers`, `negamax_move_order_score`, `order_moves`, `clear_killers` extracted as named free functions per the M3.D `negate_window` precedent. Bench signature: `bench: 22237579 nodes <NPS> nps` at default depth 7 (-44% nodes vs M4.A). SPRT vs `baseline/alpha-beta-tt` deferred to merge-time. cargo-mutants deferred to overnight campaign. Retrospective: [`milestones/m4.b.md`](milestones/m4.b.md). | ~250 |
 | **M4.C** — History heuristic | History counter table indexed by piece-and-to (or from-and-to; chosen at ADR landing — see open questions); depth-weighted increment on quiet-move beta cutoff; matching decrement on quiet moves that failed to cut at the same node; aging-or-saturation discipline (chosen at ADR landing); ordering tiebreaker among non-killer quiets. | ~450 |
 | **M4.D** — Aspiration windows | ID outer-loop wrapper consuming the prior iteration's score from `last_complete: Option<(depth, bestmove, score)>` (already plumbed by M3.E). Detail bullets follow the table. | ~350 |
 
