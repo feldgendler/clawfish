@@ -34,10 +34,26 @@ mod cli {
         pub engine_launch_prefix: Option<Vec<String>>,
         /// Optional launch prefix words for the opponent.
         pub opponent_launch_prefix: Option<Vec<String>>,
-        /// Time control string (e.g. "10+0.1").
-        pub tc: TimeControl,
+        /// Time control string (e.g. "10+0.1"). Exactly one of `tc` / `tc_sample` is Some.
+        pub tc: Option<TimeControl>,
         /// Override time control for the opponent. Defaults to `tc`.
         pub opponent_tc_override: Option<TimeControl>,
+        /// `--tc-sample <SPEC>` discrete weighted TC distribution for mixed-TC
+        /// SPRT and Δ(TC) regression (ELOH.D). Mutually exclusive with `--tc`.
+        ///
+        /// Under `--tc-sample` the resulting Elo number is "the rating of the
+        /// mixed game" (game outcomes are i.i.d. under the redefined "draw TC
+        /// from D, then play standard chess at that TC" framing — SPRT applies
+        /// to the aggregate). For per-TC ratings, run separate fixed-TC
+        /// sessions instead. See `docs/workflow.md` "Mixed-TC SPRT".
+        pub tc_sample: Option<super::tc_sample::TcDistribution>,
+        /// `--seed N` (decimal or `0x`-prefixed hex). When `None`, the harness
+        /// uses `prng::DEFAULT_SEED`. Currently consumed only by `--tc-sample`'s
+        /// per-pair sampler; runs without `--seed` are still bit-deterministic
+        /// at the sampler-output level (cross-run determinism in K-update
+        /// arrival order under N>1 concurrency depends on subprocess
+        /// scheduling regardless).
+        pub seed: Option<u64>,
         /// Total number of games to play. Must be even and ≥ 2.
         pub max_games: u32,
         /// Output directory.
@@ -113,7 +129,7 @@ mod cli {
     }
 
     /// Parsed time control: initial time + per-move increment.
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct TimeControl {
         /// Initial time in milliseconds.
         pub initial_ms: u32,
@@ -169,6 +185,20 @@ mod cli {
         })
     }
 
+    /// Parse a u64 seed from decimal or `0x`/`0X`-prefixed hex string.
+    ///
+    /// Existing `s.parse::<u64>()` is decimal-only; this helper adds hex support
+    /// for `--seed 0xDEADBEEF`. Rejects negative numbers (leading `-`) via both
+    /// branches failing to parse.
+    fn parse_u64_seed(s: &str) -> Result<u64, CliError> {
+        let v = if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            u64::from_str_radix(rest, 16)
+        } else {
+            s.parse::<u64>()
+        };
+        v.map_err(|_| CliError::InvalidValue(format!("--seed: not a valid u64: {s}")))
+    }
+
     /// Parse a `NAME=VALUE` option string into `(name, value)`.
     fn parse_option(s: &str) -> Result<(String, String), CliError> {
         if let Some((name, value)) = s.split_once('=') {
@@ -213,6 +243,10 @@ mod cli {
 
         // ELOH.C fields.
         let mut virtual_clock: bool = false;
+
+        // ELOH.D fields.
+        let mut tc_sample_raw: Option<super::tc_sample::TcDistribution> = None;
+        let mut seed_raw: Option<u64> = None;
 
         let mut i = 0usize;
         while i < argv.len() {
@@ -429,6 +463,17 @@ mod cli {
                 "--virtual-clock" => {
                     virtual_clock = true;
                 }
+                // ELOH.D: --tc-sample and --seed flags.
+                "--tc-sample" => {
+                    let s = next_val!();
+                    tc_sample_raw = Some(
+                        super::tc_sample::parse_tc_sample(s)
+                            .map_err(|e| CliError::InvalidValue(format!("--tc-sample: {e}")))?,
+                    );
+                }
+                "--seed" => {
+                    seed_raw = Some(parse_u64_seed(next_val!())?);
+                }
                 other => {
                     // Reject the --virtual-clock=VALUE form: the rest of the CLI uses
                     // no-equals conventions for boolean flags.
@@ -445,8 +490,23 @@ mod cli {
 
         let engine = engine.ok_or_else(|| CliError::MissingFlag("--engine".into()))?;
         let opponent = opponent.ok_or_else(|| CliError::MissingFlag("--opponent".into()))?;
-        let tc = tc.ok_or_else(|| CliError::MissingFlag("--tc".into()))?;
         let max_games = max_games.ok_or_else(|| CliError::MissingFlag("--max-games".into()))?;
+
+        let tc_sample = tc_sample_raw;
+        let seed = seed_raw;
+
+        // Post-loop mutex: exactly one of --tc / --tc-sample must be set.
+        match (tc.is_some(), tc_sample.is_some()) {
+            (true, true) => {
+                return Err(CliError::InvalidValue(
+                    "--tc and --tc-sample are mutually exclusive".into(),
+                ));
+            }
+            (false, false) => {
+                return Err(CliError::MissingFlag("one of --tc or --tc-sample".into()));
+            }
+            _ => {}
+        }
         let initial_elo =
             initial_elo.ok_or_else(|| CliError::MissingFlag("--initial-elo".into()))?;
 
@@ -462,7 +522,8 @@ mod cli {
 
         // Defaults computed here so parse_args returns a fully-resolved Args.
         let watchdog_ms = watchdog_ms.unwrap_or_else(|| {
-            let base = 2 * u64::from(tc.initial_ms) + 30_000;
+            let initial_ms = tc.map_or(10_000, |t| t.initial_ms);
+            let base = 2 * u64::from(initial_ms) + 30_000;
             base.max(60_000)
         });
         let out_dir = out_dir.unwrap_or_else(|| {
@@ -480,6 +541,8 @@ mod cli {
             opponent_launch_prefix,
             tc,
             opponent_tc_override,
+            tc_sample,
+            seed,
             max_games,
             out_dir,
             harness_overhead_ms,
@@ -921,6 +984,626 @@ mod cli {
             assert!(
                 matches!(err, CliError::InvalidValue(_)),
                 "expected InvalidValue for --virtual-clock=true, got {err:?}"
+            );
+        }
+
+        // ---- ELOH.D §6.3: --tc-sample, --seed CLI tests ----
+
+        /// Build a minimum valid argv with --tc-sample only (no --tc).
+        fn tc_sample_base_argv() -> Vec<String> {
+            vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc-sample".into(),
+                "10+0.1:1,20+0.2:1".into(),
+                "--max-games".into(),
+                "4".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+            ]
+        }
+
+        #[test]
+        fn parse_args_tc_sample_only_accepted() {
+            // --tc-sample with no --tc parses; args.tc.is_none() && args.tc_sample.is_some().
+            let result = parse_args(tc_sample_base_argv());
+            match result {
+                Ok(args) => {
+                    assert!(args.tc.is_none(), "tc must be None when --tc-sample is set");
+                    assert!(
+                        args.tc_sample.is_some(),
+                        "tc_sample must be Some when --tc-sample is set"
+                    );
+                }
+                Err(e) => panic!("expected Ok for --tc-sample only, got {e:?}"),
+            }
+        }
+
+        #[test]
+        fn parse_args_tc_only_accepted() {
+            // --tc only (no --tc-sample) parses; args.tc.is_some() && args.tc_sample.is_none().
+            // Pins backwards compatibility.
+            let result = parse_args(base_argv());
+            match result {
+                Ok(args) => {
+                    assert!(args.tc.is_some(), "tc must be Some when --tc is set");
+                    assert!(
+                        args.tc_sample.is_none(),
+                        "tc_sample must be None when only --tc is set"
+                    );
+                }
+                Err(e) => panic!("expected Ok for --tc only, got {e:?}"),
+            }
+        }
+
+        #[test]
+        fn parse_args_both_tc_and_tc_sample_rejected() {
+            // Both --tc and --tc-sample → Err(InvalidValue("--tc and --tc-sample are mutually exclusive")).
+            let mut argv = base_argv();
+            argv.extend(["--tc-sample".into(), "10+0.1:1".into()]);
+            let err = parse_args(argv).unwrap_err();
+            match &err {
+                CliError::InvalidValue(msg) => {
+                    assert!(
+                        msg.contains("mutually exclusive"),
+                        "error message must mention 'mutually exclusive'; got: {msg}"
+                    );
+                }
+                other => panic!("expected InvalidValue, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn parse_args_neither_tc_nor_tc_sample_rejected() {
+            // Neither --tc nor --tc-sample → Err(MissingFlag(_)).
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--max-games".into(),
+                "4".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+            ];
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::MissingFlag(_)),
+                "expected MissingFlag when neither --tc nor --tc-sample, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn parse_args_seed_default_none() {
+            // --seed omitted → args.seed.is_none().
+            let args = parse_args(base_argv()).expect("parse_args ok");
+            assert!(args.seed.is_none(), "seed must default to None");
+        }
+
+        #[test]
+        fn parse_args_seed_parses_decimal() {
+            // --seed 42 → Some(42).
+            let mut argv = base_argv();
+            argv.extend(["--seed".into(), "42".into()]);
+            let args = parse_args(argv).expect("--seed 42 should be accepted");
+            assert_eq!(args.seed, Some(42u64));
+        }
+
+        #[test]
+        fn parse_args_seed_parses_hex_with_0x() {
+            // --seed 0xDEADBEEF → Some(0xDEADBEEF).
+            let mut argv = base_argv();
+            argv.extend(["--seed".into(), "0xDEADBEEF".into()]);
+            let args = parse_args(argv).expect("--seed 0xDEADBEEF should be accepted");
+            assert_eq!(args.seed, Some(0xDEAD_BEEF_u64));
+        }
+
+        #[test]
+        fn parse_args_seed_rejects_negative_number() {
+            // --seed -1 → Err(InvalidValue) with message containing "not a valid u64".
+            let mut argv = base_argv();
+            argv.extend(["--seed".into(), "-1".into()]);
+            let err = parse_args(argv).unwrap_err();
+            match &err {
+                CliError::InvalidValue(msg) => {
+                    assert!(
+                        msg.contains("not a valid u64"),
+                        "error message must contain 'not a valid u64'; got: {msg}"
+                    );
+                }
+                other => panic!("expected InvalidValue for --seed -1, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn parse_args_tc_sample_invalid_grammar_rejected() {
+            // --tc-sample foo → Err (parser message surfaced).
+            let argv = base_argv();
+            // Remove --tc so we don't hit the mutex first
+            let argv_no_tc: Vec<String> = argv
+                .iter()
+                .filter(|&s| s != "--tc" && s != "10+0.1")
+                .cloned()
+                .collect();
+            let mut argv2 = argv_no_tc;
+            argv2.extend(["--tc-sample".into(), "foo".into()]);
+            let result = parse_args(argv2);
+            assert!(
+                result.is_err(),
+                "invalid --tc-sample grammar must be rejected"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mod prng  (NEW — ELOH.D)
+// ---------------------------------------------------------------------------
+
+mod prng {
+    //! SplitMix64 PRNG for `--seed`-driven TC-sampling reproducibility.
+    //!
+    //! ELOH.D uses a single u64 seed → single SplitMix64 stream consumed by
+    //! `tc_sample::TcDistribution::sample`. Hand-rolled (~20 LOC); no `rand`
+    //! crate dep. Mixer constants are pinned by a golden-fixture test
+    //! (`prng_seed_zero_first_three_words_golden`) so a transcription typo
+    //! fails at compile-time-of-test.
+
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct Prng(u64);
+
+    // Vigna 2014 / Steele-Lea-Flood 2014 SplitMix64 constants.
+    const GOLDEN_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+    const MIX_C1: u64 = 0xBF58_476D_1CE4_E5B9;
+    const MIX_C2: u64 = 0x94D0_49BB_1331_11EB;
+
+    impl Prng {
+        /// Construct from a u64 seed. Runs one SplitMix64 mix step so a seed
+        /// of 0 doesn't yield a 0-state pathology.
+        pub(crate) fn new(seed: u64) -> Self {
+            let mut p = Self(seed);
+            let _ = p.next_u64();
+            p
+        }
+
+        /// SplitMix64 next. Standard algorithm (Vigna 2014 / Steele-Lea-Flood 2014):
+        /// state += GOLDEN_GAMMA; z = state; z = (z ^ (z >> 30)) * MIX_C1;
+        /// z = (z ^ (z >> 27)) * MIX_C2; z ^ (z >> 31).
+        pub(crate) fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(GOLDEN_GAMMA);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(MIX_C1);
+            z = (z ^ (z >> 27)).wrapping_mul(MIX_C2);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// Default seed when `--seed` is absent. Intentionally non-zero. Documented
+    /// in `--help` so users know no-`--seed` runs are still bit-deterministic.
+    #[allow(dead_code)]
+    pub(crate) const DEFAULT_SEED: u64 = 0xC1AB_F15A_E10D_D000;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn prng_zero_seed_yields_nonzero_first_word() {
+            // The constructor's mix step ensures a 0 seed isn't a 0-state.
+            let mut rng = Prng::new(0);
+            assert_ne!(
+                rng.next_u64(),
+                0,
+                "Prng::new(0) first output must be non-zero"
+            );
+        }
+
+        #[test]
+        fn prng_deterministic_across_constructions() {
+            // Two Prng::new(42) instances must produce identical streams.
+            let mut a = Prng::new(42);
+            let mut b = Prng::new(42);
+            for _ in 0..100 {
+                assert_eq!(
+                    a.next_u64(),
+                    b.next_u64(),
+                    "two Prng::new(42) instances must produce identical u64 streams"
+                );
+            }
+        }
+
+        #[test]
+        fn prng_distinct_seeds_yield_distinct_streams() {
+            // Prng::new(42) and Prng::new(43) must produce different first 100 u64s.
+            let stream_a: Vec<u64> = {
+                let mut rng = Prng::new(42);
+                (0..100).map(|_| rng.next_u64()).collect()
+            };
+            let stream_b: Vec<u64> = {
+                let mut rng = Prng::new(43);
+                (0..100).map(|_| rng.next_u64()).collect()
+            };
+            assert_ne!(
+                stream_a, stream_b,
+                "distinct seeds must yield distinct u64 streams"
+            );
+        }
+
+        #[test]
+        fn prng_seed_zero_first_three_words_golden() {
+            // Golden fixture: pins the first three outputs from Prng::new(0) against
+            // values produced by the Vigna 2014 / Steele-Lea-Flood 2014 SplitMix64
+            // with GOLDEN_GAMMA=0x9E3779B97F4A7C15, MIX_C1=0xBF58476D1CE4E5B9,
+            // MIX_C2=0x94D049BB133111EB. Seed=0 → after one constructor mix step, the
+            // state is GOLDEN_GAMMA, then three further calls advance it to these values.
+            //
+            // Catches any mixer-constant transcription typo at compile-time-of-test.
+            let mut rng = Prng::new(0);
+            let w0 = rng.next_u64();
+            let w1 = rng.next_u64();
+            let w2 = rng.next_u64();
+            assert_eq!(
+                (w0, w1, w2),
+                (
+                    7_960_286_522_194_355_700_u64,
+                    487_617_019_471_545_679_u64,
+                    17_909_611_376_780_542_444_u64,
+                ),
+                "Prng::new(0) first three words must match SplitMix64 golden fixture"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mod tc_sample  (NEW — ELOH.D)
+// ---------------------------------------------------------------------------
+
+mod tc_sample {
+    //! `--tc-sample <SPEC>` parsing + cumulative-bucket sampling.
+    //!
+    //! Grammar: `<TC>:<weight>(,<TC>:<weight>)*`
+    //! Each `<TC>` parsed via `cli::parse_tc`; `<weight>` is a u32 in `1..=u32::MAX`.
+    //! At least one entry required. Empty input, zero weight, weight overflow on
+    //! summing, or repeated TC keys all yield Err.
+
+    /// Parsed `--tc-sample` distribution.
+    #[derive(Debug, Clone)]
+    #[allow(dead_code)]
+    pub(crate) struct TcDistribution {
+        /// Parsed (TC, weight) entries in input order. Weights are positive.
+        pub entries: Vec<(super::cli::TimeControl, u32)>,
+        /// Prefix sums of weights; len == entries.len(); strictly increasing;
+        /// last element == total.
+        cumulative: Vec<u32>,
+        /// Sum of all weights.
+        total: u32,
+    }
+
+    impl TcDistribution {
+        /// Sample one TC. Draw `r = rng.next_u64() % total`, find first cumulative
+        /// bucket strictly greater than `r`, return its TC. Linear scan — entries.len()
+        /// expected ≤ ~10 in practice.
+        ///
+        /// Modulo bias: total ≤ u32::MAX, so bias per bucket ≤ u32::MAX / 2^64 < 2^-32.
+        pub(crate) fn sample(&self, rng: &mut super::prng::Prng) -> super::cli::TimeControl {
+            let r = (rng.next_u64() % self.total as u64) as u32;
+            let idx = self
+                .cumulative
+                .iter()
+                .position(|&c| c > r)
+                .expect("cumulative invariant: r < total so some bucket strictly exceeds r");
+            self.entries[idx].0
+        }
+
+        /// Iterate (TC, weight) pairs in input-spec order.
+        pub(crate) fn iter(&self) -> impl Iterator<Item = &(super::cli::TimeControl, u32)> {
+            self.entries.iter()
+        }
+    }
+
+    /// Parse `<TC>:<weight>(,<TC>:<weight>)*`.
+    ///
+    /// Rejects empty input, zero weight, weight-sum overflow, and duplicate TC keys.
+    /// Duplicate TC keys likely indicate user confusion (e.g. `10+0.1:1,10+0.1:2`)
+    /// and fail loudly rather than silently merging.
+    pub(crate) fn parse_tc_sample(s: &str) -> Result<TcDistribution, super::cli::CliError> {
+        if s.is_empty() {
+            return Err(super::cli::CliError::InvalidValue(
+                "--tc-sample: empty spec".into(),
+            ));
+        }
+
+        let mut entries: Vec<(super::cli::TimeControl, u32)> = Vec::new();
+        let mut cumulative: Vec<u32> = Vec::new();
+        let mut total: u32 = 0;
+
+        for entry in s.split(',') {
+            let (tc_str, weight_str) = entry.split_once(':').ok_or_else(|| {
+                super::cli::CliError::InvalidValue(format!(
+                    "--tc-sample: each entry must be <TC>:<weight>, got: {entry}"
+                ))
+            })?;
+
+            let tc = super::cli::parse_tc(tc_str)
+                .map_err(|e| super::cli::CliError::InvalidValue(format!("--tc-sample: {e}")))?;
+
+            let weight: u32 = weight_str.parse().map_err(|_| {
+                super::cli::CliError::InvalidValue(format!(
+                    "--tc-sample: weight must be a positive integer, got: {weight_str}"
+                ))
+            })?;
+
+            if weight == 0 {
+                return Err(super::cli::CliError::InvalidValue(
+                    "--tc-sample: weight must be >= 1 (zero weight rejected)".into(),
+                ));
+            }
+
+            // Reject duplicate TC keys — likely a user typo.
+            if entries.iter().any(|(existing, _)| *existing == tc) {
+                return Err(super::cli::CliError::InvalidValue(format!(
+                    "--tc-sample: duplicate TC key {tc_str}"
+                )));
+            }
+
+            total = total.checked_add(weight).ok_or_else(|| {
+                super::cli::CliError::InvalidValue(
+                    "--tc-sample: total weight overflow (exceeds u32::MAX)".into(),
+                )
+            })?;
+
+            entries.push((tc, weight));
+            cumulative.push(total);
+        }
+
+        Ok(TcDistribution {
+            entries,
+            cumulative,
+            total,
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::cli::TimeControl;
+
+        fn tc(base_s: f64, inc_s: f64) -> TimeControl {
+            TimeControl {
+                initial_ms: (base_s * 1000.0).round() as u32,
+                increment_ms: (inc_s * 1000.0).round() as u32,
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // §6.2: parse_tc_sample tests
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn parse_single_entry() {
+            // "10+0.1:1" → entries [(10s+0.1s, 1)], total 1.
+            let dist = parse_tc_sample("10+0.1:1").expect("should parse");
+            assert_eq!(dist.entries.len(), 1);
+            assert_eq!(dist.entries[0], (tc(10.0, 0.1), 1));
+            assert_eq!(dist.total, 1);
+            assert_eq!(dist.cumulative, vec![1]);
+        }
+
+        #[test]
+        fn parse_four_entries_uniform() {
+            // "10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1" → four entries, total 4,
+            // cumulative [1,2,3,4].
+            let dist =
+                parse_tc_sample("10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1").expect("should parse");
+            assert_eq!(dist.entries.len(), 4);
+            assert_eq!(dist.total, 4);
+            assert_eq!(dist.cumulative, vec![1, 2, 3, 4]);
+        }
+
+        #[test]
+        fn parse_three_to_one_skewed() {
+            // "10+0.1:3,60+0.6:1" → entries [(10s+0.1s, 3), (60s+0.6s, 1)],
+            // cumulative [3, 4], total 4.
+            let dist = parse_tc_sample("10+0.1:3,60+0.6:1").expect("should parse");
+            assert_eq!(dist.entries.len(), 2);
+            assert_eq!(dist.entries[0], (tc(10.0, 0.1), 3));
+            assert_eq!(dist.entries[1], (tc(60.0, 0.6), 1));
+            assert_eq!(dist.cumulative, vec![3, 4]);
+            assert_eq!(dist.total, 4);
+        }
+
+        #[test]
+        fn parse_rejects_empty() {
+            // TDD-NOTE: passes trivially against the skeleton's blanket Err
+            // ("not yet implemented"); real impl must fail on this specific
+            // malformed input with a meaningful error, not just any Err.
+            assert!(
+                parse_tc_sample("").is_err(),
+                "empty string must be rejected"
+            );
+        }
+
+        #[test]
+        fn parse_rejects_zero_weight() {
+            // TDD-NOTE: passes trivially against the skeleton's blanket Err
+            // ("not yet implemented"); real impl must fail on this specific
+            // malformed input with a meaningful error, not just any Err.
+            assert!(
+                parse_tc_sample("10+0.1:0").is_err(),
+                "zero weight must be rejected"
+            );
+        }
+
+        #[test]
+        fn parse_rejects_repeated_tc() {
+            let err = parse_tc_sample("10+0.1:1,10+0.1:2").unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("duplicate") || msg.contains("repeated") || msg.contains("Duplicate"),
+                "error message for repeated TC must mention duplication; got: {msg}"
+            );
+        }
+
+        #[test]
+        fn parse_rejects_malformed_weight() {
+            // TDD-NOTE: passes trivially against the skeleton's blanket Err
+            // ("not yet implemented"); real impl must fail on this specific
+            // malformed input with a meaningful error, not just any Err.
+            assert!(
+                parse_tc_sample("10+0.1:abc").is_err(),
+                "non-numeric weight must be rejected"
+            );
+        }
+
+        #[test]
+        fn parse_rejects_missing_colon() {
+            // "10+0.1" with no colon → no weight → Err.
+            //
+            // TDD-NOTE: passes trivially against the skeleton's blanket Err
+            // ("not yet implemented"); real impl must fail on this specific
+            // malformed input with a meaningful error, not just any Err.
+            assert!(
+                parse_tc_sample("10+0.1").is_err(),
+                "missing colon (no weight) must be rejected"
+            );
+        }
+
+        #[test]
+        fn parse_rejects_weight_overflow() {
+            // Two entries each with u32::MAX/2 + 1 would overflow the total.
+            //
+            // TDD-NOTE: passes trivially against the skeleton's blanket Err
+            // ("not yet implemented"); real impl must surface a distinct
+            // overflow error path so this test stays meaningful — i.e. the
+            // implementation slice must NOT accept this input even after
+            // wiring the parser, and ideally surfaces a distinct CliError
+            // variant or message substring (e.g. "weight overflow").
+            let half_plus = u32::MAX / 2 + 1;
+            let spec = format!("10+0.1:{half_plus},20+0.2:{half_plus}");
+            assert!(
+                parse_tc_sample(&spec).is_err(),
+                "total weight overflow must be rejected"
+            );
+        }
+
+        #[test]
+        fn sample_single_entry_always_returns_it() {
+            // 1-entry distribution + 1000 draws → all draws return the single entry.
+            let dist = parse_tc_sample("10+0.1:1").expect("should parse");
+            let mut rng = super::super::prng::Prng::new(42);
+            for _ in 0..1000 {
+                let sampled = dist.sample(&mut rng);
+                assert_eq!(
+                    sampled,
+                    tc(10.0, 0.1),
+                    "single-entry dist must always return that entry"
+                );
+            }
+        }
+
+        #[test]
+        fn sample_skewed_3to1_at_seed_xfeed_yields_known_counts() {
+            // Back-validation gate Part 1.
+            // Distribution [(A=10+0.1, 3), (B=60+0.6, 1)]; seed 0xC1AB_FEED; 1000 draws.
+            // Exact counts produced by SplitMix64 with Vigna 2014 / Steele-Lea-Flood 2014 constants.
+            // chi2=0.533 (1 dof; 99% critical value 6.635) — well within expected range.
+            // If mixer constants or seed ever change, repin by observing the eprintln! output.
+            let dist = parse_tc_sample("10+0.1:3,60+0.6:1").expect("should parse");
+            let mut rng = super::super::prng::Prng::new(0xC1AB_FEED);
+            let mut count_a = 0u32;
+            let mut count_b = 0u32;
+            for _ in 0..1000 {
+                let s = dist.sample(&mut rng);
+                if s == tc(10.0, 0.1) {
+                    count_a += 1;
+                } else if s == tc(60.0, 0.6) {
+                    count_b += 1;
+                } else {
+                    panic!("unexpected TC sampled: {s:?}");
+                }
+            }
+            // Chi-squared as side observable (1 dof; critical value 6.635 at 99%).
+            let expected_a = 750.0f64;
+            let expected_b = 250.0f64;
+            let chi2 = (count_a as f64 - expected_a).powi(2) / expected_a
+                + (count_b as f64 - expected_b).powi(2) / expected_b;
+            eprintln!("sample_skewed_3to1: count_a={count_a} count_b={count_b} chi2={chi2:.3}");
+            assert!(
+                chi2 < 6.635,
+                "chi2={chi2:.3} exceeds 99% critical value 6.635 for 1 dof; distribution is biased"
+            );
+            assert_eq!(
+                (count_a, count_b),
+                (740, 260),
+                "exact seed-driven counts for Prng::new(0xC1AB_FEED) + 3:1 distribution"
+            );
+        }
+
+        #[test]
+        fn sample_uniform_4_bucket_at_seed_xfeed_yields_known_counts() {
+            // Back-validation gate Part 1 (4-bucket uniform shape).
+            // Distribution 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1; seed 0xC1AB_FEED; 1000 draws.
+            // Exact counts produced by SplitMix64 with Vigna 2014 / Steele-Lea-Flood 2014 constants.
+            // chi2=0.888 (3 dof; 99% critical value 11.345) — well within expected range.
+            // If mixer constants or seed ever change, repin by observing the eprintln! output.
+            let dist =
+                parse_tc_sample("10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1").expect("should parse");
+            let mut rng = super::super::prng::Prng::new(0xC1AB_FEED);
+            let tcs = [tc(10.0, 0.1), tc(20.0, 0.2), tc(40.0, 0.4), tc(60.0, 0.6)];
+            let mut counts = [0u32; 4];
+            for _ in 0..1000 {
+                let s = dist.sample(&mut rng);
+                let idx = tcs
+                    .iter()
+                    .position(|&t| t == s)
+                    .unwrap_or_else(|| panic!("unexpected TC sampled: {s:?}"));
+                counts[idx] += 1;
+            }
+            // Chi-squared as side observable (3 dof; critical value 11.345 at 99%).
+            let expected = 250.0f64;
+            let chi2: f64 = counts
+                .iter()
+                .map(|&c| (c as f64 - expected).powi(2) / expected)
+                .sum();
+            eprintln!("sample_uniform_4: counts={counts:?} chi2={chi2:.3}");
+            assert!(
+                chi2 < 11.345,
+                "chi2={chi2:.3} exceeds 99% critical value 11.345 for 3 dof; distribution is biased"
+            );
+            assert_eq!(
+                counts,
+                [250u32, 251, 239, 260],
+                "exact seed-driven counts for Prng::new(0xC1AB_FEED) + 4-bucket uniform distribution"
+            );
+        }
+
+        #[test]
+        fn sample_uniform_4_bucket_input_order_preserved_in_iter() {
+            // After parsing A:1,B:1,C:1,D:1, dist.iter() yields (A,1),(B,1),(C,1),(D,1).
+            let dist =
+                parse_tc_sample("10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1").expect("should parse");
+            let collected: Vec<_> = dist.iter().cloned().collect();
+            assert_eq!(
+                collected,
+                vec![
+                    (tc(10.0, 0.1), 1u32),
+                    (tc(20.0, 0.2), 1),
+                    (tc(40.0, 0.4), 1),
+                    (tc(60.0, 0.6), 1),
+                ],
+                "iter() must yield entries in input-spec order"
             );
         }
     }
@@ -3898,6 +4581,35 @@ mod pgn {
             // No move tokens, no comments.
             assert!(!pgn.contains('{'), "no comments for empty body");
         }
+
+        // ---- ELOH.D §6.6: pgn_time_control_tag_reflects_sampled_tc ----
+
+        #[test]
+        fn pgn_time_control_tag_reflects_sampled_tc() {
+            // Construct PgnHeader { time_control: Some("20+0.2"), .. }; format;
+            // assert the produced PGN contains exactly one [TimeControl "20+0.2"] line.
+            let header = PgnHeader {
+                event: "test".into(),
+                site: "localhost".into(),
+                date: "2026.04.30".into(),
+                round: 1,
+                white: "clawfish".into(),
+                black: "opponent".into(),
+                result: "1/2-1/2".into(),
+                time_control: Some("20+0.2".into()),
+                termination: None,
+                setup_fen: None,
+            };
+            let pgn = format_pgn(&header, &[]);
+            let tc_tag_count = pgn
+                .lines()
+                .filter(|l| *l == r#"[TimeControl "20+0.2"]"#)
+                .count();
+            assert_eq!(
+                tc_tag_count, 1,
+                "must contain exactly one [TimeControl \"20+0.2\"] line; got:\n{pgn}"
+            );
+        }
     }
 }
 
@@ -3922,6 +4634,39 @@ mod summary {
         pub plies: u32,
         /// Human-readable termination reason.
         pub termination: String,
+        /// NEW (ELOH.D). Format `<base>+<inc>` matching `format_tc`. `None` in
+        /// legacy ELOH.A/B/C fixtures; always `Some` when ELOH.D TC sampling is active.
+        pub tc: Option<String>,
+    }
+
+    /// Per-TC W/L/D bucket; ordered by input spec. Built incrementally in
+    /// the controller's drain loop alongside the global wins/losses/draws counters.
+    pub(crate) struct TcBucket {
+        pub tc: super::cli::TimeControl,
+        pub wins: u32,
+        pub losses: u32,
+        pub draws: u32,
+    }
+
+    /// Format per-TC summary line for `summary-by-tc:` emission.
+    ///
+    /// Output: `"summary-by-tc: 10+0.1: W=110 L=95 D=45 (250)  20+0.2: W=..."` —
+    /// two spaces between bucket entries. Emitted even for a single-bucket distribution
+    /// (degenerate single-TC mix) to preserve the invariant that `summary-by-tc:` is
+    /// present iff `--tc-sample` was active.
+    pub(crate) fn format_summary_by_tc(buckets: &[TcBucket]) -> String {
+        let parts: Vec<String> = buckets
+            .iter()
+            .map(|b| {
+                let tc_str = super::format_tc(b.tc);
+                let total = b.wins + b.losses + b.draws;
+                format!(
+                    "{tc_str}: W={} L={} D={} ({total})",
+                    b.wins, b.losses, b.draws
+                )
+            })
+            .collect();
+        format!("summary-by-tc: {}", parts.join("  "))
     }
 
     /// Append a summary line to `path` (tab-separated, one line per game).
@@ -3931,11 +4676,145 @@ mod summary {
         let mut f = OpenOptions::new().create(true).append(true).open(path)?;
         writeln!(
             f,
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            line.game_index, line.white, line.black, line.result, line.plies, line.termination
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            line.game_index,
+            line.white,
+            line.black,
+            line.result,
+            line.plies,
+            line.termination,
+            line.tc.as_deref().unwrap_or("-"),
         )?;
         f.flush()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // -----------------------------------------------------------------------
+        // §6.4 ELOH.D summary tests
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn summary_line_with_tc_appends_tab_separated() {
+            // Append a SummaryLine { tc: Some("10+0.1"), .. }; resulting line ends with \t10+0.1\n.
+            let dir = std::env::temp_dir().join("eloh_d_summary_tc_test");
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("summary_tc.txt");
+            let _ = std::fs::remove_file(&path);
+            let line = SummaryLine {
+                game_index: 1,
+                white: "engine".into(),
+                black: "opponent".into(),
+                result: "1-0".into(),
+                plies: 42,
+                termination: "normal".into(),
+                tc: Some("10+0.1".into()),
+            };
+            append_summary_line(&path, &line).expect("append_summary_line ok");
+            let content = std::fs::read_to_string(&path).expect("read ok");
+            assert!(
+                content.ends_with("\t10+0.1\n"),
+                "line must end with '\\t10+0.1\\n'; got: {content:?}"
+            );
+        }
+
+        #[test]
+        fn summary_line_without_tc_appends_dash() {
+            // tc: None → trailing \t-\n (sentinel for ELOH.A/B fixtures).
+            let dir = std::env::temp_dir().join("eloh_d_summary_notc_test");
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("summary_notc.txt");
+            let _ = std::fs::remove_file(&path);
+            let line = SummaryLine {
+                game_index: 1,
+                white: "engine".into(),
+                black: "opponent".into(),
+                result: "1/2-1/2".into(),
+                plies: 10,
+                termination: "adjudication: max moves".into(),
+                tc: None,
+            };
+            append_summary_line(&path, &line).expect("append_summary_line ok");
+            let content = std::fs::read_to_string(&path).expect("read ok");
+            assert!(
+                content.ends_with("\t-\n"),
+                "tc=None must emit '\\t-\\n'; got: {content:?}"
+            );
+        }
+
+        #[test]
+        fn format_summary_by_tc_two_buckets() {
+            // Buckets [(10+0.1, W=110, L=95, D=45), (20+0.2, W=105, L=90, D=55)] →
+            // exact string "summary-by-tc: 10+0.1: W=110 L=95 D=45 (250)  20+0.2: W=105 L=90 D=55 (250)".
+            let buckets = vec![
+                TcBucket {
+                    tc: super::super::cli::TimeControl {
+                        initial_ms: 10_000,
+                        increment_ms: 100,
+                    },
+                    wins: 110,
+                    losses: 95,
+                    draws: 45,
+                },
+                TcBucket {
+                    tc: super::super::cli::TimeControl {
+                        initial_ms: 20_000,
+                        increment_ms: 200,
+                    },
+                    wins: 105,
+                    losses: 90,
+                    draws: 55,
+                },
+            ];
+            let s = format_summary_by_tc(&buckets);
+            assert_eq!(
+                s, "summary-by-tc: 10+0.1: W=110 L=95 D=45 (250)  20+0.2: W=105 L=90 D=55 (250)",
+                "two-bucket format mismatch; got: {s:?}"
+            );
+        }
+
+        #[test]
+        fn format_summary_by_tc_single_bucket_emitted() {
+            // One-bucket input → still emits the full "summary-by-tc: 10+0.1: W=N L=N D=N (N)" line.
+            // Degenerate single-TC mix must still emit the summary-by-tc line — preserves the
+            // invariant that summary-by-tc is present iff --tc-sample was active.
+            let buckets = vec![TcBucket {
+                tc: super::super::cli::TimeControl {
+                    initial_ms: 10_000,
+                    increment_ms: 100,
+                },
+                wins: 7,
+                losses: 3,
+                draws: 2,
+            }];
+            let s = format_summary_by_tc(&buckets);
+            assert_eq!(
+                s, "summary-by-tc: 10+0.1: W=7 L=3 D=2 (12)",
+                "single-bucket format mismatch; got: {s:?}"
+            );
+        }
+
+        #[test]
+        fn format_summary_by_tc_zero_games_in_bucket() {
+            // A bucket with W=L=D=0 emits "... 30+0.3: W=0 L=0 D=0 (0)".
+            let buckets = vec![TcBucket {
+                tc: super::super::cli::TimeControl {
+                    initial_ms: 30_000,
+                    increment_ms: 300,
+                },
+                wins: 0,
+                losses: 0,
+                draws: 0,
+            }];
+            let s = format_summary_by_tc(&buckets);
+            assert!(
+                s.contains("W=0 L=0 D=0 (0)"),
+                "zero-game bucket must emit 'W=0 L=0 D=0 (0)'; got: {s:?}"
+            );
+        }
     }
 }
 
@@ -4562,6 +5441,12 @@ mod controller {
         PlayPair {
             pair_index: u32,
             opponent_uci_elo: u32,
+            /// Per-pair TC for the engine (clawfish). Sampled from
+            /// `--tc-sample` dist or equal to `args.tc` in fixed-TC mode.
+            engine_tc: super::cli::TimeControl,
+            /// Per-pair TC for the opponent. Equal to `engine_tc` when
+            /// `--opponent-tc-override` is absent; override value otherwise.
+            opponent_tc: super::cli::TimeControl,
         },
         /// Tell the worker to exit its recv loop and clean up.
         Quit,
@@ -4581,6 +5466,9 @@ mod controller {
             pgn_moves: Vec<super::pgn::PgnMove>,
             white_name: String,
             black_name: String,
+            /// The TC clawfish played at. Used for PGN TimeControl tag,
+            /// summary line, and per-TC W/L/D bucket lookup.
+            tc: super::cli::TimeControl,
         },
         /// Both games of the current pair are done; controller may dispatch next.
         PairComplete { worker_id: u32 },
@@ -4589,6 +5477,9 @@ mod controller {
     }
 
     /// Static configuration shared by all worker threads.
+    ///
+    /// Per-pair TCs are NOT stored here — they arrive per-pair via `WorkerCmd::PlayPair`.
+    /// This struct holds only static configuration that does not vary across pairs.
     #[derive(Clone, Debug)]
     pub(crate) struct WorkerConfig {
         #[allow(dead_code)]
@@ -4599,10 +5490,6 @@ mod controller {
         pub engine_options: Vec<(String, String)>,
         #[allow(dead_code)]
         pub opponent_options: Vec<(String, String)>,
-        #[allow(dead_code)]
-        pub tc: super::cli::TimeControl,
-        #[allow(dead_code)]
-        pub opponent_tc: super::cli::TimeControl,
         #[allow(dead_code)]
         pub mode: clawfish::MatchTimeMode,
         #[allow(dead_code)]
@@ -4808,6 +5695,8 @@ mod controller {
                 WorkerCmd::PlayPair {
                     pair_index,
                     opponent_uci_elo,
+                    engine_tc,
+                    opponent_tc,
                 } => {
                     // **INVARIANT (load-bearing per plan §4.4 + ADR-0020 §2):**
                     // `setoption UCI_Elo` MUST precede `ucinewgame` within a pair.
@@ -4863,10 +5752,11 @@ mod controller {
                         }
 
                         // Build per-color clocks. clawfish-white means engine is white.
+                        // engine_tc and opponent_tc are per-pair values from the cmd payload.
                         let (white_tc, black_tc) = if clawfish_white {
-                            (cfg.tc, cfg.opponent_tc)
+                            (engine_tc, opponent_tc)
                         } else {
-                            (cfg.opponent_tc, cfg.tc)
+                            (opponent_tc, engine_tc)
                         };
                         let white_clock = clawfish::PerSideClock {
                             remaining_ms: i64::from(white_tc.initial_ms),
@@ -4896,8 +5786,8 @@ mod controller {
                             white_engine_index,
                             engine: &mut engine,
                             opponent: &mut opponent,
-                            engine_tc: cfg.tc,
-                            opponent_tc: cfg.opponent_tc,
+                            engine_tc,
+                            opponent_tc,
                             harness_overhead_ms: cfg.harness_overhead_ms,
                             watchdog: cfg.watchdog,
                             mode: cfg.mode,
@@ -4919,6 +5809,7 @@ mod controller {
                             pgn_moves,
                             white_name,
                             black_name,
+                            tc: engine_tc,
                         });
                     }
 
@@ -4998,6 +5889,40 @@ mod controller {
         let games_dir = out_dir.join("games");
         let _ = std::fs::create_dir_all(&games_dir);
         let summary_path = out_dir.join("summary.txt");
+        // Start each run with a fresh summary.txt — run_iteration is a complete unit of work.
+        let _ = std::fs::remove_file(&summary_path);
+
+        // Pre-materialise all per-pair TCs indexed by pair_index. Sampler advances
+        // happen exclusively in this single-threaded up-front loop so the
+        // pair_index → engine_tc mapping is deterministic regardless of concurrency.
+        // Memory cost: 8 bytes per pair × total_pairs; negligible at 5000 pairs (40 KB).
+        let mut tc_rng = super::prng::Prng::new(args.seed.unwrap_or(super::prng::DEFAULT_SEED));
+        let pair_tcs: Vec<(super::cli::TimeControl, super::cli::TimeControl)> = (0..total_pairs)
+            .map(|_| {
+                let engine_tc = match &args.tc_sample {
+                    Some(dist) => dist.sample(&mut tc_rng),
+                    None => args
+                        .tc
+                        .expect("post-parse: exactly one of tc/tc_sample set"),
+                };
+                let opponent_tc = args.opponent_tc_override.unwrap_or(engine_tc);
+                (engine_tc, opponent_tc)
+            })
+            .collect();
+
+        // Build per-TC buckets (only under --tc-sample; skipped entirely in --tc mode).
+        let mut buckets: Vec<super::summary::TcBucket> = match &args.tc_sample {
+            Some(dist) => dist
+                .iter()
+                .map(|(tc, _w)| super::summary::TcBucket {
+                    tc: *tc,
+                    wins: 0,
+                    losses: 0,
+                    draws: 0,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
 
         // Bootstrap: dispatch up to one PlayPair per worker (or fewer if total_pairs < n_workers).
         for (worker_id, in_flight_slot) in pairs_in_flight.iter_mut().enumerate().take(n_workers) {
@@ -5005,10 +5930,13 @@ mod controller {
                 break;
             }
             let opp_elo = clamp_uci_elo(current_estimate);
+            let (engine_tc, opponent_tc) = pair_tcs[pairs_dispatched as usize];
             if pool.senders[worker_id]
                 .send(WorkerCmd::PlayPair {
                     pair_index: pairs_dispatched,
                     opponent_uci_elo: opp_elo,
+                    engine_tc,
+                    opponent_tc,
                 })
                 .is_err()
             {
@@ -5047,9 +5975,11 @@ mod controller {
                     pgn_moves,
                     white_name,
                     black_name,
+                    tc: report_tc,
                 } => {
                     // Persist PGN + summary line (best-effort; missing dirs in tests are tolerated).
                     let (result, termination_str) = super::outcome_to_pgn_result(&outcome);
+                    let tc_str = super::format_tc(report_tc);
                     let pgn_header = super::pgn::PgnHeader {
                         event: args.event_tag.clone(),
                         site: super::current_hostname(),
@@ -5058,7 +5988,7 @@ mod controller {
                         white: white_name.clone(),
                         black: black_name.clone(),
                         result: result.clone(),
-                        time_control: Some(super::format_tc(args.tc)),
+                        time_control: Some(tc_str.clone()),
                         termination: Some(termination_str.clone()),
                         setup_fen: None,
                     };
@@ -5073,8 +6003,22 @@ mod controller {
                         result,
                         plies: pgn_moves.len() as u32,
                         termination: super::outcome_to_termination_reason(&outcome),
+                        tc: Some(tc_str),
                     };
                     let _ = super::summary::append_summary_line(&summary_path, &summary_line);
+
+                    // Per-TC bucket aggregation (only under --tc-sample).
+                    if args.tc_sample.is_some()
+                        && let Some(idx) = buckets.iter().position(|b| b.tc == report_tc)
+                    {
+                        if (clawfish_score - 1.0).abs() < 1e-9 {
+                            buckets[idx].wins += 1;
+                        } else if clawfish_score.abs() < 1e-9 {
+                            buckets[idx].losses += 1;
+                        } else {
+                            buckets[idx].draws += 1;
+                        }
+                    }
 
                     // Robbins-Monro update.
                     let k = super::estimator::compute_k(t, args.k0, args.tau);
@@ -5142,10 +6086,13 @@ mod controller {
                     // Dispatch next pair on this worker if we still have budget.
                     if !terminating && pairs_dispatched < total_pairs && wid < pool.senders.len() {
                         let opp_elo = clamp_uci_elo(current_estimate);
+                        let (engine_tc, opponent_tc) = pair_tcs[pairs_dispatched as usize];
                         if pool.senders[wid]
                             .send(WorkerCmd::PlayPair {
                                 pair_index: pairs_dispatched,
                                 opponent_uci_elo: opp_elo,
+                                engine_tc,
+                                opponent_tc,
                             })
                             .is_ok()
                         {
@@ -5201,6 +6148,20 @@ mod controller {
         {
             use std::io::Write;
             let _ = writeln!(f, "{converged_str}");
+        }
+
+        // Emit summary-by-tc: line (only when --tc-sample was active).
+        if args.tc_sample.is_some() {
+            let by_tc_str = super::summary::format_summary_by_tc(&buckets);
+            println!("{by_tc_str}");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&summary_path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "{by_tc_str}");
+            }
         }
 
         Ok(IterationOutcome {
@@ -5283,6 +6244,7 @@ mod controller {
                                             game_index,
                                             opponent_uci_elo,
                                             clawfish_score,
+                                            tc,
                                             ..
                                         } => WorkerReport::GameComplete {
                                             game_index: *game_index,
@@ -5292,6 +6254,7 @@ mod controller {
                                             pgn_moves: vec![],
                                             white_name: "w".into(),
                                             black_name: "b".into(),
+                                            tc: *tc,
                                         },
                                     });
                                 }
@@ -5339,10 +6302,19 @@ mod controller {
                             WorkerCmd::PlayPair {
                                 pair_index,
                                 opponent_uci_elo,
+                                ..
                             } => {
                                 log.lock().unwrap().push(WorkerCmd::PlayPair {
                                     pair_index,
                                     opponent_uci_elo,
+                                    engine_tc: super::super::cli::TimeControl {
+                                        initial_ms: 10_000,
+                                        increment_ms: 100,
+                                    },
+                                    opponent_tc: super::super::cli::TimeControl {
+                                        initial_ms: 10_000,
+                                        increment_ms: 100,
+                                    },
                                 });
                                 // Emit one canned PairComplete (no GameComplete needed for
                                 // dispatch-only verification).
@@ -5479,6 +6451,10 @@ mod controller {
                     pgn_moves: vec![],
                     white_name: "clawfish".into(),
                     black_name: "stockfish".into(),
+                    tc: super::super::cli::TimeControl {
+                        initial_ms: 10_000,
+                        increment_ms: 100,
+                    },
                 },
                 WorkerReport::GameComplete {
                     game_index: 2,
@@ -5488,6 +6464,10 @@ mod controller {
                     pgn_moves: vec![],
                     white_name: "stockfish".into(),
                     black_name: "clawfish".into(),
+                    tc: super::super::cli::TimeControl {
+                        initial_ms: 10_000,
+                        increment_ms: 100,
+                    },
                 },
                 WorkerReport::PairComplete { worker_id: 0 },
             ];
@@ -5500,6 +6480,10 @@ mod controller {
                     pgn_moves: vec![],
                     white_name: "clawfish".into(),
                     black_name: "stockfish".into(),
+                    tc: super::super::cli::TimeControl {
+                        initial_ms: 10_000,
+                        increment_ms: 100,
+                    },
                 },
                 WorkerReport::GameComplete {
                     game_index: 4,
@@ -5509,6 +6493,10 @@ mod controller {
                     pgn_moves: vec![],
                     white_name: "stockfish".into(),
                     black_name: "clawfish".into(),
+                    tc: super::super::cli::TimeControl {
+                        initial_ms: 10_000,
+                        increment_ms: 100,
+                    },
                 },
                 WorkerReport::PairComplete { worker_id: 1 },
             ];
@@ -5536,6 +6524,10 @@ mod controller {
                             pgn_moves: vec![],
                             white_name: "w".into(),
                             black_name: "b".into(),
+                            tc: super::super::cli::TimeControl {
+                                initial_ms: 10_000,
+                                increment_ms: 100,
+                            },
                         },
                         WorkerReport::GameComplete {
                             game_index: p * 2 + 2,
@@ -5545,6 +6537,10 @@ mod controller {
                             pgn_moves: vec![],
                             white_name: "w".into(),
                             black_name: "b".into(),
+                            tc: super::super::cli::TimeControl {
+                                initial_ms: 10_000,
+                                increment_ms: 100,
+                            },
                         },
                         WorkerReport::PairComplete { worker_id: 0 },
                     ]
@@ -5603,6 +6599,10 @@ mod controller {
                             pgn_moves: vec![],
                             white_name: "w".into(),
                             black_name: "b".into(),
+                            tc: super::super::cli::TimeControl {
+                                initial_ms: 10_000,
+                                increment_ms: 100,
+                            },
                         },
                         WorkerReport::GameComplete {
                             game_index: p * 2 + 2,
@@ -5612,6 +6612,10 @@ mod controller {
                             pgn_moves: vec![],
                             white_name: "w".into(),
                             black_name: "b".into(),
+                            tc: super::super::cli::TimeControl {
+                                initial_ms: 10_000,
+                                increment_ms: 100,
+                            },
                         },
                         WorkerReport::PairComplete { worker_id: 0 },
                     ]
@@ -5663,10 +6667,19 @@ mod controller {
                             WorkerCmd::PlayPair {
                                 pair_index,
                                 opponent_uci_elo,
+                                ..
                             } => {
                                 log.lock().unwrap().push(WorkerCmd::PlayPair {
                                     pair_index,
                                     opponent_uci_elo,
+                                    engine_tc: super::super::cli::TimeControl {
+                                        initial_ms: 10_000,
+                                        increment_ms: 100,
+                                    },
+                                    opponent_tc: super::super::cli::TimeControl {
+                                        initial_ms: 10_000,
+                                        increment_ms: 100,
+                                    },
                                 });
                                 let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
                                     game_index: pair_index * 2 + 1,
@@ -5676,6 +6689,10 @@ mod controller {
                                     pgn_moves: vec![],
                                     white_name: "w".into(),
                                     black_name: "b".into(),
+                                    tc: super::super::cli::TimeControl {
+                                        initial_ms: 10_000,
+                                        increment_ms: 100,
+                                    },
                                 });
                                 let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
                                     game_index: pair_index * 2 + 2,
@@ -5685,6 +6702,10 @@ mod controller {
                                     pgn_moves: vec![],
                                     white_name: "w".into(),
                                     black_name: "b".into(),
+                                    tc: super::super::cli::TimeControl {
+                                        initial_ms: 10_000,
+                                        increment_ms: 100,
+                                    },
                                 });
                                 let _ = rpt_tx_clone.send(WorkerReport::PairComplete { worker_id });
                             }
@@ -5780,6 +6801,10 @@ mod controller {
                             pgn_moves: vec![],
                             white_name: "w".into(),
                             black_name: "b".into(),
+                            tc: super::super::cli::TimeControl {
+                                initial_ms: 10_000,
+                                increment_ms: 100,
+                            },
                         },
                         WorkerReport::GameComplete {
                             game_index: p * 2 + 2,
@@ -5789,6 +6814,10 @@ mod controller {
                             pgn_moves: vec![],
                             white_name: "w".into(),
                             black_name: "b".into(),
+                            tc: super::super::cli::TimeControl {
+                                initial_ms: 10_000,
+                                increment_ms: 100,
+                            },
                         },
                         WorkerReport::PairComplete { worker_id: 0 },
                     ]
@@ -5847,6 +6876,10 @@ mod controller {
                                         pgn_moves: vec![],
                                         white_name: "w".into(),
                                         black_name: "b".into(),
+                                        tc: super::super::cli::TimeControl {
+                                            initial_ms: 10_000,
+                                            increment_ms: 100,
+                                        },
                                     });
                                 }
                                 let _ = rpt_tx_clone.send(WorkerReport::PairComplete { worker_id });
@@ -6018,6 +7051,842 @@ mod controller {
                 );
             }
         }
+
+        // -----------------------------------------------------------------------
+        // §6.5 ELOH.D controller tests — TC dispatch + per-TC bucket aggregation
+        // -----------------------------------------------------------------------
+
+        /// Helpers for ELOH.D controller tests.
+        fn tc(initial_ms: u32, increment_ms: u32) -> super::super::cli::TimeControl {
+            super::super::cli::TimeControl {
+                initial_ms,
+                increment_ms,
+            }
+        }
+
+        /// Build a `TcDistribution` from a spec string; panics on parse error (tests only).
+        #[allow(dead_code)]
+        fn make_dist(spec: &str) -> super::super::tc_sample::TcDistribution {
+            super::super::tc_sample::parse_tc_sample(spec)
+                .expect("make_dist: parse_tc_sample failed")
+        }
+
+        #[test]
+        fn bootstrap_dispatches_per_pair_sampled_tc_under_tc_sample() {
+            // args.tc_sample = Some(dist); controller's bootstrap sends WorkerCmd::PlayPair
+            // { engine_tc, .. } where engine_tc is the sampler's first draw under the fixed seed.
+            // Captured via the synthetic_pool's command-recorder.
+            use std::sync::{Arc, Mutex};
+            let recorded_cmds: Arc<Mutex<Vec<WorkerCmd>>> = Arc::new(Mutex::new(Vec::new()));
+            let (rpt_tx, rpt_rx) = mpsc::channel::<WorkerReport>();
+            let mut cmd_txs: Vec<mpsc::Sender<WorkerCmd>> = Vec::new();
+            let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+            let log = Arc::clone(&recorded_cmds);
+            let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+            cmd_txs.push(cmd_tx);
+            let rpt_tx_clone = rpt_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                for cmd in &cmd_rx {
+                    match cmd {
+                        WorkerCmd::Quit => break,
+                        WorkerCmd::PlayPair {
+                            pair_index,
+                            opponent_uci_elo,
+                            engine_tc,
+                            opponent_tc,
+                        } => {
+                            log.lock().unwrap().push(WorkerCmd::PlayPair {
+                                pair_index,
+                                opponent_uci_elo,
+                                engine_tc,
+                                opponent_tc,
+                            });
+                            let _ = rpt_tx_clone.send(WorkerReport::PairComplete { worker_id: 0 });
+                        }
+                    }
+                }
+            }));
+
+            let mut pool = WorkerPool {
+                senders: cmd_txs,
+                reports: rpt_rx,
+                join_handles: handles,
+            };
+
+            // Build args with tc_sample; must use parse_args to set tc_sample correctly.
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc-sample".into(),
+                "10+0.1:1,20+0.2:1".into(),
+                "--max-games".into(),
+                "2".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+                "--seed".into(),
+                "42".into(),
+            ];
+            let args = super::super::cli::parse_args(argv)
+                .expect("parse ok with --tc-sample — ELOH.D Slice A pending");
+            let out_dir = std::env::temp_dir().join("eloh_d_bootstrap_tc_sample_test");
+            let _ = run_iteration(&mut pool, &args, &out_dir);
+
+            let cmds = recorded_cmds.lock().unwrap();
+            assert_eq!(
+                cmds.len(),
+                1,
+                "exactly one PlayPair dispatched at --max-games 2"
+            );
+            // Pin the exact first draw of Prng::new(42) against
+            // parse_tc_sample("10+0.1:1,20+0.2:1") — = tc(20_000, 200).
+            // Computed by reading the SplitMix64 stream once at the seed +
+            // doing one cumulative-bucket lookup over the 2-bucket dist.
+            // Catches a sampler-skip bug, a stale-pair_index bug, or a
+            // streaming-rather-than-pre-materialised regression that
+            // set-membership would miss.
+            let WorkerCmd::PlayPair { engine_tc, .. } = &cmds[0] else {
+                unreachable!("only PlayPair is logged")
+            };
+            assert_eq!(
+                *engine_tc,
+                tc(20_000, 200),
+                "first draw under Prng::new(42) against [10+0.1:1, 20+0.2:1] \
+                 must be 20+0.2; got {engine_tc:?}"
+            );
+        }
+
+        #[test]
+        fn drain_loop_redispatch_resamples_per_pair() {
+            // After 2 PairComplete reports, the third dispatched PlayPair carries
+            // the sampler's third draw. Pins per-pair-not-per-game cadence.
+            // The test verifies all dispatched PlayPairs carry a valid TC from the dist.
+            use std::sync::{Arc, Mutex};
+            let recorded: Arc<Mutex<Vec<super::super::cli::TimeControl>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let (rpt_tx, rpt_rx) = mpsc::channel::<WorkerReport>();
+            let mut cmd_txs: Vec<mpsc::Sender<WorkerCmd>> = Vec::new();
+            let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+            let log = Arc::clone(&recorded);
+            let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+            cmd_txs.push(cmd_tx);
+            let rpt_tx_clone = rpt_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                for cmd in &cmd_rx {
+                    match cmd {
+                        WorkerCmd::Quit => break,
+                        WorkerCmd::PlayPair {
+                            pair_index,
+                            opponent_uci_elo,
+                            engine_tc,
+                            opponent_tc,
+                        } => {
+                            log.lock().unwrap().push(engine_tc);
+                            let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                game_index: pair_index * 2 + 1,
+                                opponent_uci_elo,
+                                clawfish_score: 0.5,
+                                outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                                pgn_moves: vec![],
+                                white_name: "w".into(),
+                                black_name: "b".into(),
+                                tc: engine_tc,
+                            });
+                            let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                game_index: pair_index * 2 + 2,
+                                opponent_uci_elo,
+                                clawfish_score: 0.5,
+                                outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                                pgn_moves: vec![],
+                                white_name: "w".into(),
+                                black_name: "b".into(),
+                                tc: opponent_tc,
+                            });
+                            let _ = rpt_tx_clone.send(WorkerReport::PairComplete { worker_id: 0 });
+                        }
+                    }
+                }
+            }));
+
+            let mut pool = WorkerPool {
+                senders: cmd_txs,
+                reports: rpt_rx,
+                join_handles: handles,
+            };
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc-sample".into(),
+                "10+0.1:1,20+0.2:1".into(),
+                "--max-games".into(),
+                "6".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+                "--seed".into(),
+                "42".into(),
+            ];
+            let args =
+                super::super::cli::parse_args(argv).expect("parse ok — ELOH.D Slice A pending");
+            let out_dir = std::env::temp_dir().join("eloh_d_drain_resample_test");
+            let _ = run_iteration(&mut pool, &args, &out_dir);
+
+            let tcs = recorded.lock().unwrap();
+            // Pin the exact 3-element TC sequence for Prng::new(42) against
+            // [10+0.1:1, 20+0.2:1] — = [20+0.2, 10+0.1, 10+0.1].
+            // (First three draws of the SplitMix64 stream consumed in order
+            // by the up-front pair_tcs materialisation in run_iteration.)
+            // Catches a stale-pair_index bug, a copy-paste off-by-one in the
+            // redispatch path, or a streaming-rather-than-pre-materialised
+            // regression that set-membership would miss. Per-pair-not-per-game
+            // cadence is implicit: 3 pairs (6 games) yield 3 sampler advances.
+            let expected: Vec<super::super::cli::TimeControl> =
+                vec![tc(20_000, 200), tc(10_000, 100), tc(10_000, 100)];
+            assert_eq!(
+                *tcs, expected,
+                "expected 3 pair-level TCs in order [20+0.2, 10+0.1, 10+0.1]; \
+                 got {tcs:?}"
+            );
+        }
+
+        #[test]
+        fn tc_sample_pair_color_swap_uses_same_tc() {
+            // CONTROLLER-CONTRACT: this test validates the controller's reception path —
+            // that when two GameComplete reports arrive for the same pair_index carrying
+            // the same `tc`, both are counted in the same per-TC bucket. The synthetic
+            // worker below emits both GameComplete reports with `tc = engine_tc` (the
+            // value from the cmd payload), which is the correct production behavior.
+            // The production worker's emit-routing must be verified independently —
+            // see §6.7 end_to_end_self_play_tc_sample_runs which exercises the full
+            // pipeline.
+            use std::sync::{Arc, Mutex};
+            let reported_tcs: Arc<Mutex<Vec<super::super::cli::TimeControl>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let (rpt_tx, rpt_rx) = mpsc::channel::<WorkerReport>();
+            let mut cmd_txs: Vec<mpsc::Sender<WorkerCmd>> = Vec::new();
+            let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+            let log = Arc::clone(&reported_tcs);
+            let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+            cmd_txs.push(cmd_tx);
+            let rpt_tx_clone = rpt_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                for cmd in &cmd_rx {
+                    match cmd {
+                        WorkerCmd::Quit => break,
+                        WorkerCmd::PlayPair {
+                            pair_index,
+                            opponent_uci_elo,
+                            engine_tc,
+                            ..
+                        } => {
+                            // Emit two GameCompletes with the SAME tc (color-pair invariant).
+                            for game_in_pair in 0..2u32 {
+                                let report_tc = engine_tc;
+                                log.lock().unwrap().push(report_tc);
+                                let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                    game_index: pair_index * 2 + game_in_pair + 1,
+                                    opponent_uci_elo,
+                                    clawfish_score: 0.5,
+                                    outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                                    pgn_moves: vec![],
+                                    white_name: "w".into(),
+                                    black_name: "b".into(),
+                                    tc: report_tc,
+                                });
+                            }
+                            let _ = rpt_tx_clone.send(WorkerReport::PairComplete { worker_id: 0 });
+                        }
+                    }
+                }
+            }));
+
+            let mut pool = WorkerPool {
+                senders: cmd_txs,
+                reports: rpt_rx,
+                join_handles: handles,
+            };
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc-sample".into(),
+                "10+0.1:1,20+0.2:1".into(),
+                "--max-games".into(),
+                "2".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+                "--seed".into(),
+                "42".into(),
+            ];
+            let args =
+                super::super::cli::parse_args(argv).expect("parse ok — ELOH.D Slice A pending");
+            let out_dir = std::env::temp_dir().join("eloh_d_color_swap_tc_test");
+            let _ = run_iteration(&mut pool, &args, &out_dir);
+
+            let tcs = reported_tcs.lock().unwrap();
+            assert_eq!(tcs.len(), 2, "one pair = 2 GameComplete reports");
+            // Both games of the same pair must use the same TC.
+            assert_eq!(tcs[0], tcs[1], "color-swapped games must use the same TC");
+        }
+
+        #[test]
+        fn opponent_tc_override_dominates_under_tc_sample() {
+            // args.tc_sample = Some(dist), args.opponent_tc_override = Some(60+0.6);
+            // PlayPair's opponent_tc == 60+0.6 regardless of which TC the sampler drew.
+            use std::sync::{Arc, Mutex};
+            let recorded: Arc<
+                Mutex<
+                    Vec<(
+                        super::super::cli::TimeControl,
+                        super::super::cli::TimeControl,
+                    )>,
+                >,
+            > = Arc::new(Mutex::new(Vec::new()));
+            let (rpt_tx, rpt_rx) = mpsc::channel::<WorkerReport>();
+            let mut cmd_txs: Vec<mpsc::Sender<WorkerCmd>> = Vec::new();
+            let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+            let log = Arc::clone(&recorded);
+            let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+            cmd_txs.push(cmd_tx);
+            let rpt_tx_clone = rpt_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                for cmd in &cmd_rx {
+                    match cmd {
+                        WorkerCmd::Quit => break,
+                        WorkerCmd::PlayPair {
+                            pair_index,
+                            opponent_uci_elo,
+                            engine_tc,
+                            opponent_tc,
+                        } => {
+                            log.lock().unwrap().push((engine_tc, opponent_tc));
+                            let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                game_index: pair_index * 2 + 1,
+                                opponent_uci_elo,
+                                clawfish_score: 0.5,
+                                outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                                pgn_moves: vec![],
+                                white_name: "w".into(),
+                                black_name: "b".into(),
+                                tc: engine_tc,
+                            });
+                            let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                game_index: pair_index * 2 + 2,
+                                opponent_uci_elo,
+                                clawfish_score: 0.5,
+                                outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                                pgn_moves: vec![],
+                                white_name: "w".into(),
+                                black_name: "b".into(),
+                                tc: engine_tc,
+                            });
+                            let _ = rpt_tx_clone.send(WorkerReport::PairComplete { worker_id: 0 });
+                        }
+                    }
+                }
+            }));
+
+            let mut pool = WorkerPool {
+                senders: cmd_txs,
+                reports: rpt_rx,
+                join_handles: handles,
+            };
+            let override_tc = tc(60_000, 600);
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc-sample".into(),
+                "10+0.1:1,20+0.2:1".into(),
+                "--opponent-tc-override".into(),
+                "60+0.6".into(),
+                "--max-games".into(),
+                "2".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+                "--seed".into(),
+                "42".into(),
+            ];
+            let args =
+                super::super::cli::parse_args(argv).expect("parse ok — ELOH.D Slice A pending");
+            let out_dir = std::env::temp_dir().join("eloh_d_override_tc_test");
+            let _ = run_iteration(&mut pool, &args, &out_dir);
+
+            let pairs = recorded.lock().unwrap();
+            assert!(!pairs.is_empty(), "at least one PlayPair dispatched");
+            for (engine_tc_val, opp_tc_val) in pairs.iter() {
+                assert_eq!(
+                    *opp_tc_val, override_tc,
+                    "opponent_tc must always be the override 60+0.6; got {opp_tc_val:?}"
+                );
+                let valid = [tc(10_000, 100), tc(20_000, 200)];
+                assert!(
+                    valid.contains(engine_tc_val),
+                    "engine_tc {engine_tc_val:?} must come from dist"
+                );
+            }
+        }
+
+        #[test]
+        fn tc_mode_passes_static_tc_in_play_pair() {
+            // args.tc = Some(10+0.1), args.tc_sample = None; every PlayPair's
+            // engine_tc == 10+0.1 and opponent_tc == args.opponent_tc_override.unwrap_or(10+0.1).
+            // Backwards-compatibility test.
+            use std::sync::{Arc, Mutex};
+            let recorded: Arc<
+                Mutex<
+                    Vec<(
+                        super::super::cli::TimeControl,
+                        super::super::cli::TimeControl,
+                    )>,
+                >,
+            > = Arc::new(Mutex::new(Vec::new()));
+            let (rpt_tx, rpt_rx) = mpsc::channel::<WorkerReport>();
+            let mut cmd_txs: Vec<mpsc::Sender<WorkerCmd>> = Vec::new();
+            let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+            let log = Arc::clone(&recorded);
+            let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+            cmd_txs.push(cmd_tx);
+            let rpt_tx_clone = rpt_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                for cmd in &cmd_rx {
+                    match cmd {
+                        WorkerCmd::Quit => break,
+                        WorkerCmd::PlayPair {
+                            pair_index,
+                            opponent_uci_elo,
+                            engine_tc,
+                            opponent_tc,
+                        } => {
+                            log.lock().unwrap().push((engine_tc, opponent_tc));
+                            let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                game_index: pair_index * 2 + 1,
+                                opponent_uci_elo,
+                                clawfish_score: 0.5,
+                                outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                                pgn_moves: vec![],
+                                white_name: "w".into(),
+                                black_name: "b".into(),
+                                tc: engine_tc,
+                            });
+                            let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                game_index: pair_index * 2 + 2,
+                                opponent_uci_elo,
+                                clawfish_score: 0.5,
+                                outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                                pgn_moves: vec![],
+                                white_name: "w".into(),
+                                black_name: "b".into(),
+                                tc: engine_tc,
+                            });
+                            let _ = rpt_tx_clone.send(WorkerReport::PairComplete { worker_id: 0 });
+                        }
+                    }
+                }
+            }));
+
+            let mut pool = WorkerPool {
+                senders: cmd_txs,
+                reports: rpt_rx,
+                join_handles: handles,
+            };
+            let expected_tc = tc(10_000, 100);
+            let out_dir = std::env::temp_dir().join("eloh_d_tc_mode_passthrough_test");
+            let args = base_args(4);
+            let _ = run_iteration(&mut pool, &args, &out_dir);
+
+            let pairs = recorded.lock().unwrap();
+            assert!(!pairs.is_empty(), "at least one PlayPair dispatched");
+            for (engine_tc_val, opp_tc_val) in pairs.iter() {
+                assert_eq!(
+                    *engine_tc_val, expected_tc,
+                    "engine_tc must be the static --tc value 10+0.1; got {engine_tc_val:?}"
+                );
+                // No override → opponent_tc == engine_tc.
+                assert_eq!(
+                    *opp_tc_val, expected_tc,
+                    "opponent_tc must equal engine_tc when no override; got {opp_tc_val:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn per_tc_buckets_aggregate_in_input_order() {
+            // 4-bucket uniform dist, 8 games (4 pairs); after run, the captured
+            // summary-by-tc line exists and is in input-spec order with W+L+D = 2
+            // per bucket. Plan §6.5 spec: "after run, the captured buckets are in
+            // input-spec order with W+L+D summing to 2 per bucket."
+            //
+            // Each pair emits two GameComplete reports carrying the same tc, one per
+            // input-spec TC so each bucket gets exactly 2 games (one pair = two games).
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc-sample".into(),
+                "10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1".into(),
+                "--max-games".into(),
+                "8".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+                "--seed".into(),
+                "42".into(),
+            ];
+            let args =
+                super::super::cli::parse_args(argv).expect("parse ok — ELOH.D Slice A pending");
+            let out_dir = std::env::temp_dir().join("eloh_d_bucket_order_test");
+            // Four pairs, one for each TC in the distribution. Each pair's two
+            // GameComplete reports carry the TC corresponding to that pair's bucket,
+            // so each bucket accumulates exactly 2 game outcomes (W+L+D = 2).
+            let tc_fixtures = [
+                super::super::cli::TimeControl {
+                    initial_ms: 10_000,
+                    increment_ms: 100,
+                },
+                super::super::cli::TimeControl {
+                    initial_ms: 20_000,
+                    increment_ms: 200,
+                },
+                super::super::cli::TimeControl {
+                    initial_ms: 40_000,
+                    increment_ms: 400,
+                },
+                super::super::cli::TimeControl {
+                    initial_ms: 60_000,
+                    increment_ms: 600,
+                },
+            ];
+            let pair_reports: Vec<WorkerReport> = (0..4u32)
+                .flat_map(|p| {
+                    // Each pair uses the TC corresponding to its bucket in input-spec order.
+                    let t = tc_fixtures[p as usize];
+                    vec![
+                        WorkerReport::GameComplete {
+                            game_index: p * 2 + 1,
+                            opponent_uci_elo: 2000,
+                            clawfish_score: 0.5,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                            tc: t,
+                        },
+                        WorkerReport::GameComplete {
+                            game_index: p * 2 + 2,
+                            opponent_uci_elo: 2000,
+                            clawfish_score: 0.5,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                            tc: t,
+                        },
+                        WorkerReport::PairComplete { worker_id: 0 },
+                    ]
+                })
+                .collect();
+            let mut pool = synthetic_pool(1, vec![pair_reports]);
+            let _ = run_iteration(&mut pool, &args, &out_dir);
+            // After run, summary.txt must have a summary-by-tc: line in input-spec order.
+            let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap_or_default();
+            assert!(
+                summary.contains("summary-by-tc:"),
+                "summary.txt must contain 'summary-by-tc:' when --tc-sample active; got:\n{summary}"
+            );
+            // Verify input-spec order in the line.
+            let by_tc_line = summary
+                .lines()
+                .find(|l| l.starts_with("summary-by-tc:"))
+                .expect("summary-by-tc: line missing");
+            let pos_10 = by_tc_line.find("10+0.1:").expect("10+0.1 bucket missing");
+            let pos_20 = by_tc_line.find("20+0.2:").expect("20+0.2 bucket missing");
+            let pos_40 = by_tc_line.find("40+0.4:").expect("40+0.4 bucket missing");
+            let pos_60 = by_tc_line.find("60+0.6:").expect("60+0.6 bucket missing");
+            assert!(
+                pos_10 < pos_20 && pos_20 < pos_40 && pos_40 < pos_60,
+                "buckets must appear in input-spec order; line: {by_tc_line}"
+            );
+            // Each bucket must accumulate exactly 2 game outcomes (W+L+D = 2 per bucket).
+            // This asserts that the controller routes GameComplete reports to the correct
+            // per-TC bucket based on the tc field, not that all games go to one bucket.
+            for tc_str in ["10+0.1", "20+0.2", "40+0.4", "60+0.6"] {
+                let bucket_pattern = format!("{tc_str}: W=");
+                let bucket_entry = by_tc_line
+                    .split("  ")
+                    .find(|seg| seg.contains(&bucket_pattern))
+                    .unwrap_or_else(|| panic!("bucket {tc_str} missing in: {by_tc_line}"));
+                // Extract W, L, D values and sum them — must equal 2.
+                // Format: "10+0.1: W=N L=N D=N (total)"
+                let total_start = bucket_entry.rfind('(').expect("bucket total missing");
+                let total_end = bucket_entry
+                    .rfind(')')
+                    .expect("bucket total closing paren missing");
+                let total: u32 = bucket_entry[total_start + 1..total_end]
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        panic!("bucket {tc_str} total not a u32; entry: {bucket_entry}")
+                    });
+                assert_eq!(
+                    total, 2,
+                    "bucket {tc_str} must have W+L+D=2; entry: {bucket_entry}"
+                );
+            }
+        }
+
+        #[test]
+        fn summary_by_tc_line_appended_under_tc_sample() {
+            // args.tc_sample = Some(dist); summary.txt's last line matches ^summary-by-tc: regex.
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc-sample".into(),
+                "10+0.1:1,20+0.2:1".into(),
+                "--max-games".into(),
+                "2".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+                "--seed".into(),
+                "42".into(),
+            ];
+            let args =
+                super::super::cli::parse_args(argv).expect("parse ok — ELOH.D Slice A pending");
+            let out_dir = std::env::temp_dir().join("eloh_d_summary_by_tc_present_test");
+            let pair_reports: Vec<WorkerReport> = (0..1u32)
+                .flat_map(|p| {
+                    let t = super::super::cli::TimeControl {
+                        initial_ms: 10_000,
+                        increment_ms: 100,
+                    };
+                    vec![
+                        WorkerReport::GameComplete {
+                            game_index: p * 2 + 1,
+                            opponent_uci_elo: 2000,
+                            clawfish_score: 0.5,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                            tc: t,
+                        },
+                        WorkerReport::GameComplete {
+                            game_index: p * 2 + 2,
+                            opponent_uci_elo: 2000,
+                            clawfish_score: 0.5,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                            tc: t,
+                        },
+                        WorkerReport::PairComplete { worker_id: 0 },
+                    ]
+                })
+                .collect();
+            let mut pool = synthetic_pool(1, vec![pair_reports]);
+            let _ = run_iteration(&mut pool, &args, &out_dir);
+            let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap_or_default();
+            let last_nonempty = summary.lines().rfind(|l| !l.is_empty()).unwrap_or("");
+            assert!(
+                last_nonempty.starts_with("summary-by-tc:"),
+                "last non-empty line must be 'summary-by-tc:'; got: {last_nonempty:?}\nfull summary:\n{summary}"
+            );
+        }
+
+        #[test]
+        fn summary_by_tc_line_absent_under_tc_only() {
+            // args.tc = Some(...), args.tc_sample = None; summary.txt has no summary-by-tc: line.
+            //
+            // TDD-NOTE: passes trivially against the skeleton because the skeleton never
+            // emits a summary-by-tc: line regardless of mode. The real impl must verify
+            // the gating logic was actually checked. Companion test
+            // `summary_by_tc_line_appended_under_tc_sample` is the positive gate; this
+            // is the negative gate. Both are required for mutual-exclusion confidence.
+            let out_dir = std::env::temp_dir().join("eloh_d_no_summary_by_tc_test");
+            let args = base_args(4);
+            let pair_reports: Vec<WorkerReport> = (0..2u32)
+                .flat_map(|p| {
+                    vec![
+                        WorkerReport::GameComplete {
+                            game_index: p * 2 + 1,
+                            opponent_uci_elo: 2000,
+                            clawfish_score: 0.5,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                            tc: super::super::cli::TimeControl {
+                                initial_ms: 10_000,
+                                increment_ms: 100,
+                            },
+                        },
+                        WorkerReport::GameComplete {
+                            game_index: p * 2 + 2,
+                            opponent_uci_elo: 2000,
+                            clawfish_score: 0.5,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                            tc: super::super::cli::TimeControl {
+                                initial_ms: 10_000,
+                                increment_ms: 100,
+                            },
+                        },
+                        WorkerReport::PairComplete { worker_id: 0 },
+                    ]
+                })
+                .collect();
+            let mut pool = synthetic_pool(1, vec![pair_reports]);
+            let _ = run_iteration(&mut pool, &args, &out_dir);
+            let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap_or_default();
+            assert!(
+                !summary.contains("summary-by-tc:"),
+                "summary.txt must NOT contain 'summary-by-tc:' in --tc mode; got:\n{summary}"
+            );
+        }
+
+        #[test]
+        fn seed_reproducibility_pair_tc_mapping_deterministic() {
+            // Two synthetic runs with identical args + identical --seed → identical pair_tcs Vecs.
+            // Since pair_tcs are pre-materialised (§4.5), the mapping pair_index → engine_tc
+            // is deterministic independent of concurrency.
+            use std::sync::{Arc, Mutex};
+
+            fn run_and_collect_tcs(seed: u64, n_pairs: u32) -> Vec<super::super::cli::TimeControl> {
+                let collected: Arc<Mutex<Vec<(u32, super::super::cli::TimeControl)>>> =
+                    Arc::new(Mutex::new(Vec::new()));
+                let (rpt_tx, rpt_rx) = mpsc::channel::<WorkerReport>();
+                let mut cmd_txs: Vec<mpsc::Sender<WorkerCmd>> = Vec::new();
+                let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+                let log = Arc::clone(&collected);
+                let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+                cmd_txs.push(cmd_tx);
+                let rpt_tx_clone = rpt_tx.clone();
+                handles.push(std::thread::spawn(move || {
+                    for cmd in &cmd_rx {
+                        match cmd {
+                            WorkerCmd::Quit => break,
+                            WorkerCmd::PlayPair {
+                                pair_index,
+                                opponent_uci_elo,
+                                engine_tc,
+                                ..
+                            } => {
+                                log.lock().unwrap().push((pair_index, engine_tc));
+                                let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                    game_index: pair_index * 2 + 1,
+                                    opponent_uci_elo,
+                                    clawfish_score: 0.5,
+                                    outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                                    pgn_moves: vec![],
+                                    white_name: "w".into(),
+                                    black_name: "b".into(),
+                                    tc: engine_tc,
+                                });
+                                let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                    game_index: pair_index * 2 + 2,
+                                    opponent_uci_elo,
+                                    clawfish_score: 0.5,
+                                    outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                                    pgn_moves: vec![],
+                                    white_name: "w".into(),
+                                    black_name: "b".into(),
+                                    tc: engine_tc,
+                                });
+                                let _ =
+                                    rpt_tx_clone.send(WorkerReport::PairComplete { worker_id: 0 });
+                            }
+                        }
+                    }
+                }));
+
+                let mut pool = WorkerPool {
+                    senders: cmd_txs,
+                    reports: rpt_rx,
+                    join_handles: handles,
+                };
+                let argv: Vec<String> = vec![
+                    "--engine".into(),
+                    "/bin/clawfish".into(),
+                    "--opponent".into(),
+                    "/bin/stockfish".into(),
+                    "--tc-sample".into(),
+                    "10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1".into(),
+                    "--max-games".into(),
+                    (n_pairs * 2).to_string(),
+                    "--initial-elo".into(),
+                    "2000".into(),
+                    "--k0".into(),
+                    "0".into(),
+                    "--target-sigma".into(),
+                    "0".into(),
+                    "--seed".into(),
+                    seed.to_string(),
+                ];
+                let args =
+                    super::super::cli::parse_args(argv).expect("parse ok — ELOH.D Slice A pending");
+                let out_dir = std::env::temp_dir().join(format!(
+                    "eloh_d_seed_repro_test_{seed}_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                ));
+                let _ = run_iteration(&mut pool, &args, &out_dir);
+
+                let mut pairs = collected.lock().unwrap().clone();
+                // Sort by pair_index to get deterministic order.
+                pairs.sort_unstable_by_key(|(idx, _)| *idx);
+                pairs.into_iter().map(|(_, t)| t).collect()
+            }
+
+            let seed = 0xC1AB_F15A_E10D_D000u64;
+            let run1 = run_and_collect_tcs(seed, 4);
+            let run2 = run_and_collect_tcs(seed, 4);
+
+            assert_eq!(
+                run1, run2,
+                "two runs with identical seed must yield identical pair_index → engine_tc mapping"
+            );
+        }
     }
 }
 
@@ -6060,7 +7929,9 @@ fn main() -> ExitCode {
         .unwrap_or("opponent")
         .to_owned();
 
-    let opponent_tc = args.opponent_tc_override.unwrap_or(args.tc);
+    // post-parse: exactly one of tc/tc_sample is Some (enforced by parse_args).
+    // Per-pair TCs are pre-materialised in run_iteration via pair_tcs; WorkerConfig
+    // no longer holds static tc/opponent_tc — they are passed per-pair via WorkerCmd::PlayPair.
     let watchdog = std::time::Duration::from_millis(args.watchdog_ms);
 
     let cfg = controller::WorkerConfig {
@@ -6076,8 +7947,6 @@ fn main() -> ExitCode {
         },
         engine_options: args.engine_options.clone(),
         opponent_options: args.opponent_options.clone(),
-        tc: args.tc,
-        opponent_tc,
         mode: clawfish::MatchTimeMode::Wallclock,
         harness_overhead_ms: args.harness_overhead_ms,
         watchdog,
@@ -6646,6 +8515,105 @@ mod e2e_smoke {
         assert!(
             summary.contains("converged:"),
             "summary must contain 'converged:' line"
+        );
+    }
+
+    // ---- ELOH.D §6.7: mixed-TC sampling end-to-end smoke ----
+
+    #[test]
+    #[ignore = "spawns clawfish; opt-in via cargo test --release -- --ignored"]
+    fn end_to_end_self_play_tc_sample_runs() {
+        // --tc-sample 2+0.5:1,3+0.5:1 --concurrency 1 --max-games 4 --target-sigma 0
+        // --initial-elo 2000 --k0 0 --seed 42
+        // TCs are 2-3s base / 0.5s inc — generous enough that clawfish-vs-clawfish
+        // doesn't time-forfeit on a hot CI runner.
+        use std::process::Command;
+
+        let engine = resolve_bin(CLAWFISH_EXE, "clawfish");
+        let harness = resolve_bin(ELO_ITERATE_EXE, "elo-iterate");
+        let engine = engine.as_str();
+        let harness = harness.as_str();
+        let out_dir = std::env::temp_dir().join("elo-iterate-smoke-tc-sample");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let status = Command::new(harness)
+            .args([
+                "--engine",
+                engine,
+                "--opponent",
+                engine,
+                "--tc-sample",
+                "2+0.5:1,3+0.5:1",
+                "--concurrency",
+                "1",
+                "--max-games",
+                "4",
+                "--target-sigma",
+                "0",
+                "--initial-elo",
+                "2000",
+                "--k0",
+                "0",
+                "--seed",
+                "42",
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+            ])
+            .status()
+            .expect("failed to spawn elo-iterate");
+
+        assert!(status.success(), "harness exited with {status}");
+
+        // 4 PGN files must exist, each with a TimeControl tag from the configured set.
+        let games_dir = out_dir.join("games");
+        let pgns: Vec<_> = std::fs::read_dir(&games_dir)
+            .expect("games dir missing")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pgn"))
+            .collect();
+        assert_eq!(pgns.len(), 4, "expected 4 PGN files, found {}", pgns.len());
+
+        for entry in &pgns {
+            let content = std::fs::read_to_string(entry.path()).unwrap();
+            let has_tc = content.contains("[TimeControl \"2+0.5\"]")
+                || content.contains("[TimeControl \"3+0.5\"]");
+            assert!(
+                has_tc,
+                "PGN {:?} must have TimeControl tag from configured set; content:\n{}",
+                entry.path(),
+                &content[..content.len().min(500)]
+            );
+        }
+
+        // summary.txt structure: 4 game-summary lines + N progress: lines (one per
+        // PairComplete; with --concurrency 1 and 4 games = 2 pairs that's 2) + 1
+        // converged: line + 1 summary-by-tc: line = 8 non-empty lines. Assert the
+        // structural pieces directly rather than pinning the total count, which is
+        // sensitive to harness-internal write cadence and would couple this test to
+        // implementation choices that aren't load-bearing for ELOH.D's contract.
+        let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap();
+        let non_empty_lines: Vec<_> = summary.lines().filter(|l| !l.is_empty()).collect();
+        assert!(
+            non_empty_lines.len() >= 4,
+            "expected at least 4 summary lines (one per game), found {} — full text:\n{}",
+            non_empty_lines.len(),
+            summary
+        );
+        // Exactly 4 lines with the tc= field — one per GameComplete; progress: and
+        // converged: lines have no tc= field.
+        let tc_lines = non_empty_lines.iter().filter(|l| l.contains("tc=")).count();
+        assert_eq!(
+            tc_lines, 4,
+            "expected exactly 4 lines with tc= field (one per game), found {tc_lines}"
+        );
+        assert!(
+            summary.contains("summary-by-tc:"),
+            "summary.txt must contain summary-by-tc: line"
+        );
+        assert!(
+            summary.contains("converged:"),
+            "summary.txt must contain converged: line"
         );
     }
 

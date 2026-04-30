@@ -26,6 +26,18 @@ Usage: `cargo run --release --bin elo-iterate -- --engine <path> --opponent <pat
 
 **Estimated cost vs. payoff.** The current deferral is acceptable because (a) the ELOH.B back-validation gate (Part 1: 120-game online run vs M3.F's ~2114 ± 2σ) catches dispatch-level structural bugs end-to-end; (b) a future controller refactor with real bugs is also catchable by ELOH.C's self-play stress under `--go-nodes`. The mock harness pays back when running mutation tests against the controller surface becomes cheap enough that catching boundary mutants surfaces small bugs early.
 
+### ~~Per-game TC sampling for mixed-TC SPRT~~ — Done (ELOH.D, 2026-04-30)
+
+Landed as `--tc-sample <SPEC>` and `--seed N` flags on `src/bin/elo-iterate.rs`. Closes the ELOH milestone.
+
+**Mechanism.** Discrete weighted distribution `<TC>:<weight>(,<TC>:<weight>)*` (e.g. `10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1`); harness pre-materialises all per-pair TCs into `Vec<(TimeControl, TimeControl)>` indexed by pair_index *before* the bootstrap loop, so the SplitMix64 sampler advance order is deterministic regardless of subprocess scheduling under N>1 concurrency. Both color-swapped games of a pair use the same sampled TC (preserves the "fair experiment at one TC" invariant).
+
+**Output.** PGN's `[TimeControl "<base>+<inc>"]` tag and per-game `summary.txt` `tc=<base>+<inc>` field record the sampled TC; `summary-by-tc:` aggregate (input-spec order) appended at run end only under `--tc-sample`.
+
+**Compatibility.** `--tc` and `--tc-sample` mutually exclusive at parse time. Compatible with both rating-estimate (`--k0 0 --target-sigma 0`) and online-σ modes — game outcomes remain i.i.d. under the redefined mixed game; K-update math unchanged. Under `--tc-sample`, the resulting Elo number is "the rating of the mixed game"; for per-TC ratings, run separate fixed-TC sessions.
+
+**Decision-rule scope.** Mixed-game SPRT verdict computation, Δ(TC) regression fit, confidence-band visualisation are downstream tooling. The harness emits per-game (TC, W/L/D) data; analysis tooling consumes it. M4.D's mixed-TC width-tune campaign is the first consumer.
+
 ### ~~Hardware-invariant TC: `go nodes` mode + `VirtualClock` UCI extension~~ — Done (ELOH.C, 2026-04-30)
 
 Landed as `VirtualClock` UCI option + `--virtual-clock` harness flag on branch `tooling/elo-harness`. ADR-0021 (`docs/decisions/0021-virtual-clock-uci-option.md`). Bench: `bench/eloh-c.md`.
