@@ -617,3 +617,85 @@ fn integration_bench_emits_summary_within_60s_and_remains_responsive() {
         "E43: readyok ({ready_pos}) must arrive AFTER the bench signature line ({bench_pos})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// E46 — bench is deterministic across two consecutive runs in the same
+// engine session, with the M4.C history heuristic in play (M4.C re-pin of
+// the M3.F bench-determinism contract).
+// ---------------------------------------------------------------------------
+
+/// `bench 4 / bench 4` from a single engine subprocess must produce the
+/// same total node count both times. Re-pins the bench-determinism
+/// contract with the butterfly history table participating in move
+/// ordering: per-position `reset_for_new_game()` must clear the history
+/// table alongside the TT and game-history Vec, otherwise ordering would
+/// drift from run 1 to run 2 and node counts would differ.
+#[test]
+fn bench_signature_deterministic_across_two_runs_with_history() {
+    let mut child = spawn_engine();
+    let stdout = child.stdout.take().expect("stdout handle");
+    let line_rx = drain_stdout(stdout);
+
+    let mut stdin = child.stdin.take().expect("stdin handle");
+    stdin.write_all(b"bench 4\nbench 4\n").unwrap();
+
+    let mut lines: Vec<String> = Vec::new();
+    let bench_deadline_1 = Instant::now() + Duration::from_secs(60);
+    wait_for_line_starting_with(
+        &line_rx,
+        "info string bench: ",
+        bench_deadline_1,
+        &mut lines,
+    );
+    // Wait for the SECOND signature line. We accumulate any lines produced
+    // between the two bench signatures (per-position info lines from the
+    // second bench run), then look for a second prefix match.
+    let bench_deadline_2 = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < bench_deadline_2 {
+        match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                let matched = line.starts_with("info string bench: ");
+                lines.push(line);
+                if matched {
+                    break;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    stdin.write_all(b"quit\n").unwrap();
+    drop(stdin);
+
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    let exited = wait_for_exit(&mut child, exit_deadline);
+    lines.extend(collect_lines(&line_rx));
+    let output = lines.join("\n");
+
+    assert!(exited, "E46: engine did not exit within 5 s after quit");
+
+    let signatures: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("info string bench: "))
+        .collect();
+    assert_eq!(
+        signatures.len(),
+        2,
+        "E46: expected exactly two bench signature lines; got {}.\nfull output:\n{output}",
+        signatures.len()
+    );
+
+    let parse_nodes = |sig: &str| -> u64 {
+        let rest = sig.strip_prefix("info string bench: ").unwrap();
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        assert_eq!(parts.len(), 4, "E46: signature shape wrong; {sig:?}");
+        parts[0].parse::<u64>().expect("E46: nodes must parse")
+    };
+    let nodes1 = parse_nodes(signatures[0]);
+    let nodes2 = parse_nodes(signatures[1]);
+    assert_eq!(
+        nodes1, nodes2,
+        "E46: bench node counts must match across two runs in the same session \
+         (history table cleared per position via reset_for_new_game); got {nodes1} vs {nodes2}"
+    );
+}

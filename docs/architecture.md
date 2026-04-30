@@ -52,6 +52,7 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 | Game history + draw helpers | `Engine::game_history: Vec<u64>` + `is_repetition` + `is_fifty_move_draw` | "Game history and draw-detection helpers" below |
 | Bench command (M3.F) | `Command::Bench { depth: Option<u32> }` + `Engine::handle_bench`; per-position `reset_for_new_game()` (M4.A) preserves determinism with TT in play | "Bench command" below |
 | Per-game state lifecycle (M4.A) | `Engine::reset_for_new_game()` clears TT + position + game_history + Search-internal state. Called by `handle_ucinewgame` and per-position inside `handle_bench` | ADR-0018 §14 |
+| History heuristic (M4.C) | `HistoryTable` in `src/history.rs`: `[[[i16; 64]; 64]; 2]` butterfly + side dim (16 KiB); `+= depth*depth` bonus on quiet-cutoff with `±MAX_HISTORY = 16384` clamp (literature standard); matching `-= depth*depth` malus on prior quiets in `quiets_searched`; persists across ID iterations + across `go` within a game; clears via `Search::reset()` (additive on M4.A's + M4.B's clear paths). Score tier discipline: `CAPTURE_OFFSET = 1_000_000`, `KILLER0_SCORE = 100_001`, `KILLER1_SCORE = 100_000`, `MAX_HISTORY = 16384` (the M4.B-merged `200`/`100` killer constants were bumped at M4.C-rebase to keep the captures > killers > history-quiets hierarchy intact while the history dynamic range extends across `[-MAX_HISTORY, MAX_HISTORY]`). | "History heuristic" below; ADR-0019 |
 
 ## Position layout
 
@@ -161,19 +162,22 @@ See `decisions/0014-eval-material-pst.md` and `docs/research/m3-eval-material-ps
 
 Per ADR-0017 §2, mid-iteration aborts go through `should_abort` (the hard-cap path, polled at `nodes & 4095 == 0` inside negamax/qsearch). The inter-iteration `stop` check between iterations exists because per-iteration `aborted` reset would otherwise mask a `stop` flipped between iterations.
 
-**Negamax body** (`src/search.rs::AlphaBetaMover::negamax`, M3.D plan §5 restructure):
+**Negamax body** (`src/search.rs::AlphaBetaMover::negamax`, M3.D plan §5 restructure → M4.A prologue restructure → M4.B killer ordering + cutoff dispatch → M4.C history bonus/malus dispatch):
 
 1. `pv.clear_ply(ply)` first — runs even on the leaf path so a stale `lengths[ply] > 0` from a prior subtree doesn't make the parent's `pv.update` copy stale child PV moves.
 2. Horizon: at `depth == 0`, delegate to `qsearch` BEFORE the nodes increment. Qsearch's own per-frame increment + cancellation poll covers the leaf — preserves the "1 leaf = 1 node" budget contract under `go nodes <N>`.
 3. Cancellation poll at `nodes & 4095 == 0` cadence + `should_abort` (non-leaf only). On abort: set `self.aborted = true`, return 0.
-4. Repetition + 50-move draw checks at `ply > 0` only (root must always pick a move; helpers from M3.B).
-5. Mate-distance pruning: tighten `(alpha, beta)` against `MATE - ply` / `-(MATE - ply)`; return early if window collapses.
-6. Generate legal moves; at `ply == 0` apply `searchmoves` filter.
-7. Empty move list: at `ply == 0 with searchmoves filter active`, return 0 (degenerate user input). Otherwise mate (`-(MATE - ply)`) if in_check, stalemate (0) if not.
-8. MVV-LVA sort descending by score.
-9. Recurse fail-soft: `make_move + history.push + recurse + history.pop + unmake_move + post-call abort check + alpha-update + PV-update + beta-cutoff (return `best`, not `beta`)`.
-10. On post-call `self.aborted`: return 0 without committing score / PV update.
-11. PV update at `ply == 0 && score > alpha`: `pv.update(ply, mv)` AND `self.root_score = Some(score)` (lockstep — ADR-0016 §5).
+4. Capture `original_alpha = alpha` BEFORE MDP — load-bearing for M4.A's bound classification (Lower/Exact/Upper) at the store site. ADR-0018 §13.
+5. Repetition + 50-move draw checks at `ply > 0` only (root must always pick a move; helpers from M3.B). Runs BEFORE TT probe per ADR-0018 §10.
+6. Mate-distance pruning: tighten `(alpha, beta)` against `MATE - ply` / `-(MATE - ply)`; return early if window collapses.
+7. TT probe (M4.A): bound-aware cutoff at non-PV nodes only; ordering-only at PV nodes. ADR-0018 §11.
+8. Generate legal moves; at `ply == 0` apply `searchmoves` filter.
+9. Empty move list: at `ply == 0 with searchmoves filter active`, return 0 (degenerate user input). Otherwise mate (`-(MATE - ply)`) if in_check, stalemate (0) if not.
+10. **Sort by `negamax_move_order_score(mv, pos, killer0, killer1, &history_table)` descending (M4.A + M4.B + M4.C)**: non-quiets get `mvv_lva_score(mv, pos) + CAPTURE_OFFSET` (≥ 1_000_287 for QxP); killer0 → 100_001; killer1 → 100_000; non-killer quiets → `history_table.score(side, from, to) as i32` in `[-16384, 16384]`. M4.A's TT-move-first bubble runs after the comparator sort. See "Move ordering" subsection above.
+11. Recurse fail-soft: `make_move + history.push + recurse + history.pop + unmake_move + post-call abort check + alpha-update + PV-update + beta-cutoff (return `best`, not `beta`)`. **M4.B killer-update**: on quiet beta-cutoff, `update_killers(killers, ply, mv)`. **M4.C history dispatch**: on quiet beta-cutoff, apply `+depth*depth` to the cutter's history entry and `-depth*depth` to every prior quiet in the per-frame `quiets_searched: MoveList` accumulator. **M4.C push site**: on no-cutoff quiet, push `mv` onto `quiets_searched` (with `debug_assert!` sentinel guard against `Move::default()` injection). See "Move ordering history-update discipline" paragraph above.
+12. On post-call `self.aborted`: return 0 without committing score / PV update / history bonus or malus.
+13. PV update at `ply == 0 && score > alpha`: `pv.update(ply, mv)` AND `self.root_score = Some(score)` (lockstep — ADR-0016 §5).
+14. Store on completion (M4.A): bound classification against `original_alpha`; skip on abort, end-of-loop only. ADR-0018 §13.
 
 **Qsearch body** (`src/search.rs::AlphaBetaMover::qsearch`, M3.D plan §3):
 
@@ -190,7 +194,19 @@ Per ADR-0017 §2, mid-iteration aborts go through `should_abort` (the hard-cap p
 
 **Qsearch does NOT consult repetition / 50-move helpers.** By design (plan §3 "Subtleties to honor"). Captures + queen-promos reset halfmove_clock; in-check evasions can include non-capture king moves (which don't reset clock), but the chain of in-check evasions required to produce a repetition is vanishingly rare and detectable only by explicit history-walking that we deliberately skip for tightness. Pinned by `qsearch_skips_fifty_move_at_threshold` and `qsearch_skips_repetition_when_history_contains_current_position` tests.
 
-**Move ordering.** Layered scoring per `negamax_move_order_score`: MVV-LVA on captures (`victim_value × 16 - attacker_value` using PeSTO MG values; smallest non-losing capture is QxP = 287 cp), promotions valued by promo piece (queen-promo 1025 cp; under-promo by promo material), then **two killer slots per ply** (M4.B: `KILLER0_SCORE = 200`, `KILLER1_SCORE = 100` — both strictly between 0 and the QxP floor so killers slot above remaining quiets but below all captures), then non-killer quiets at score 0. Post-sort, the TT move (M4.A) is unconditionally promoted to index 0 if present and not already first. Killer slots: `[[Move; 2]; MAX_PLY]` on `AlphaBetaMover`, `Move::default()` sentinel; updated on quiet beta cutoffs via shift-on-distinct (`update_killers`); cleared per-go, per-iteration (the M4.B inter-iteration policy), and on `Search::reset`. M4.C will add history-heuristic ordering as a tiebreaker among non-killer quiets in `[0, 99]`; M4.D will add aspiration windows over the ID outer loop.
+**Move ordering (M4.A + M4.B + M4.C).** Layered scoring per `negamax_move_order_score(mv, pos, killer0, killer1, &history_table)`:
+- **Non-quiets** (captures + EP + promotions) — `mvv_lva_score(mv, pos) + CAPTURE_OFFSET` where `CAPTURE_OFFSET = 1_000_000`. Smallest non-losing capture (QxP) = 287 cp raw → 1_000_287 in the comparator; queen-promo = 1025 cp raw → 1_001_025; promotions valued by promo piece (see ADR-0016 §6 for the worked-out table). The offset places every non-quiet strictly above every killer and every history-rated quiet; relative ordering between captures (and between captures and promos) is preserved by their raw `mvv_lva_score`.
+- **Killer slot 0** (most recent quiet beta-cutoff at this ply, M4.B): `KILLER0_SCORE = 100_001`. Above killer1 and all non-killer quiets.
+- **Killer slot 1** (prior quiet beta-cutoff at this ply, M4.B): `KILLER1_SCORE = 100_000`. Above all non-killer quiets.
+- **Non-killer quiets** (M4.C): `history_table.score(pos.side_to_move(), mv.from_square(), mv.to_square()) as i32`. Range `[-MAX_HISTORY, MAX_HISTORY] = [-16384, 16384]`, strictly below `KILLER1_SCORE`.
+
+The four tunables (`CAPTURE_OFFSET`, `KILLER0_SCORE`, `KILLER1_SCORE`, `MAX_HISTORY`) are pinned by a compile-time const-assert (`_SCORE_TIER_INVARIANTS`) at the top of M4.B+M4.C's helpers section in `src/search.rs`; runtime test S23 re-pins the discipline against MVV-LVA-formula drift, and HS12 re-pins the captures > killers > history-quiets ordering across the full pipeline.
+
+Post-sort, the TT move (M4.A) is unconditionally promoted to index 0 if present and not already first. Killer slots: `[[Move; 2]; MAX_PLY]` on `AlphaBetaMover`, `Move::default()` sentinel; updated on quiet beta cutoffs via shift-on-distinct (`update_killers`); cleared per-go, per-iteration (M4.B inter-iteration policy), and on `Search::reset`.
+
+**Move ordering history-update discipline (M4.C).** On quiet-move beta cutoff in negamax, the cutter's `(side, from, to)` history entry receives `+depth²` (clamped to `±MAX_HISTORY`); every quiet in the per-frame `quiets_searched: MoveList` accumulator (quiets recursed-but-not-cutting earlier in this node's move loop) receives `-depth²` (also clamped). Captures, EP, and promotions are NOT in `quiets_searched` (only `is_quiet(mv)` moves are pushed). The `pos.side_to_move()` read happens at the cutoff site AFTER `unmake_move(mv, undo)` — i.e., at the mover's color. Path-independent; not gated by `is_pv`. Killers (M4.B) are quiets and DO participate in `quiets_searched` like any other quiet — when tried-and-failed at this node and a later quiet cuts, the killer receives malus (research §10).
+
+M4.D will add aspiration windows over the ID outer loop.
 
 **Cancellation.** Per ADR-0016 §7: 4096-node poll cadence; sentinel-return-0 on abort; post-call `self.aborted` check skips score/PV update. Worker thread joined by `handle_quit` so `bestmove` write is visible before `run` returns.
 
@@ -228,9 +244,29 @@ See `docs/plans/m3.c.md`, `docs/plans/m3.d.md`, `docs/decisions/0016-search-stru
 
 **Graph-history-interaction.** Option 1 ("live with it") — repetition check runs BEFORE the TT probe in the prologue, neutralizing the most common GHI manifestation (draw-by-repetition mis-scoring). 50-move-boundary GHI is acknowledged and deferred. ADR-0018 §10.
 
-**Per-game state inventory.** `Engine::reset_for_new_game()` clears: TT entries (zero), TT generation (0), position (startpos), game_history (`vec![startpos.zobrist()]`), Search-internal state (via `Search::reset`). Called from `handle_ucinewgame` AND per-position inside `handle_bench` for deterministic bench across positions.
+**Per-game state inventory.** `Engine::reset_for_new_game()` clears: TT entries (zero), TT generation (0), position (startpos), game_history (`vec![startpos.zobrist()]`), Search-internal state (via `Search::reset`, which clears the M3.B game-history Zobrist Vec AND the M4.C `HistoryTable`). Called from `handle_ucinewgame` AND per-position inside `handle_bench` for deterministic bench across positions.
 
-See `decisions/0018-transposition-table.md` and `docs/research/m4-transposition-table.md`.
+## History heuristic (M4.C)
+
+`src/history.rs` ships:
+
+- `pub(crate) const MAX_HISTORY: i16 = 16384` — saturation cap (literature standard; CPW + MadChess + general practice).
+- `pub(crate) struct HistoryTable { entries: [[[i16; 64]; 64]; 2] }` — 16 KiB; `[side][from][to]` butterfly + side dim.
+- `impl HistoryTable` with `new`, `clear` (memset via `*self = Self::new()`), `score`, `update` (clamp on add).
+
+**Update semantics.** `update(side, from, to, bonus: i32)` adds `bonus` to the entry then clamps to `[-MAX_HISTORY, MAX_HISTORY]`. Callers pass `+depth*depth` for cutter bonus or `-depth*depth` for malus; the i32 intermediate prevents transient overflow before clamping.
+
+**Lifecycle.** `AlphaBetaMover` owns the `HistoryTable` directly (no shared `Arc`; the search worker is the sole mutator per ADR-0011). `Search::reset()` clears it (additive — preserves the M3.B `self.history.clear()` line). Engine's `reset_for_new_game()` call chain is unchanged from M4.A — this is the M4.A boundary the M4.C clear hooks into.
+
+**Why no `Hash` UCI integration.** The 16 KiB table is below the threshold cited in TalkChess t=67878; the `Hash` UCI option remains TT-only per ADR-0018 §4. ADR-0019 §5 codifies.
+
+**Persistence.** History accumulates across all ID iterations within a `go`, AND across `go` invocations within a game. Resets only on the M4.A boundary (`ucinewgame` + bench-position). Clearing between iterations would destroy the cross-iteration carry-over which is the primary value of history.
+
+**Path-independence.** Indexed only by the move's `(side, from, to)` — not by position. A move's history score depends on its overall historical effectiveness, not on the path taken. ADR-0019 §3 + research §1.
+
+**Killer interaction (post-M4.B-merge).** Killers participate in `quiets_searched` like ordinary quiets — when tried-and-failed they receive malus from a later quiet's cutoff. ADR-0019 §3 + research §10. The merge plan in `docs/plans/m4.c.md` §7 documents the integration explicitly to prevent re-introduction of an unfounded killer-skip filter.
+
+See `decisions/0019-history-heuristic.md` and `docs/research/m4-history-heuristic.md`.
 
 ## Game history and draw-detection helpers
 
