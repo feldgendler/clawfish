@@ -6,27 +6,35 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > **Status: early.** Fail-soft alpha-beta with quiescence search,
 > iterative deepening, transposition table (Zobrist-keyed, 16 MiB default),
 > killer-aware move ordering (TT move + MVV-LVA captures + 2 killer slots
-> per ply + remaining quiets), mate-distance pruning, PeSTO middlegame
-> piece-square tables, and `compute_caps`-driven time management. `bench`
-> UCI command for deterministic node-count regression baselines. The rest
-> of the strength path (history, PVS, aspiration; eval improvements; NNUE)
-> is tracked in [`docs/roadmap.md`](docs/roadmap.md).
+> per ply + history-rated quiets), butterfly history heuristic
+> (`[side][from][to]` i16; `+= depth*depth` bonus + matching malus),
+> mate-distance pruning, PeSTO middlegame piece-square tables, and
+> `compute_caps`-driven time management. `bench` UCI command for
+> deterministic node-count regression baselines. The rest of the strength
+> path (PVS, aspiration; eval improvements; NNUE) is tracked in
+> [`docs/roadmap.md`](docs/roadmap.md).
 >
-> **Current strength: ~2884 Elo at tc=10+0.1** (chained estimate: M3.F's
-> ~2114 anchor + M4.A's measured Δ +282 + M4.B's measured Δ +488).
-> Apple M4 P-cores, single thread, no pondering, ±~140 Elo combined
-> uncertainty. The chained estimate sits in the upper end of the
-> "fast-TC amplifies ordering gains" band; actual strength against
-> calibrated opponents at slow TC may be 100–200 Elo lower. Direct
-> rating-estimate run deferred to M4.D close.
-> Latest SPRT methodology + caveats: [`bench/sprt/2026-04-30-m4.b-vs-tt.md`](bench/sprt/2026-04-30-m4.b-vs-tt.md).
+> **Current strength: ~2920 Elo at tc=60+0.6** (chained estimate: M3.F's
+> ~2114 anchor at tc=10+0.1 + M4.A's measured Δ +282 + M4.B's measured
+> Δ +488 + M4.C's measured Δ +36 at tc=60+0.6). Apple M4 P-cores,
+> single thread, no pondering, ±~155 Elo combined uncertainty. The
+> chained estimate sits in the upper end of the "fast-TC amplifies
+> ordering gains" band; actual strength against calibrated opponents at
+> slow TC may be 100–200 Elo lower. M4.C's SPRT @ tc=10+0.1 was
+> inconclusive (+3 ± 6 Elo, color advantage swamped the marginal at
+> shallow depth); the +36 ± 28 Elo at tc=60+0.6 with LOS 99.49%
+> is the load-bearing measurement. Direct rating-estimate run deferred
+> to M4.D close.
+> Latest SPRT methodology + caveats:
+> [`bench/sprt/2026-04-30-m4.c-vs-killer.md`](bench/sprt/2026-04-30-m4.c-vs-killer.md).
 >
-> **Current bench:** `bench: 22237579 nodes <NPS> nps` at default depth 7
-> (M4.B end; node count is deterministic, NPS is wallclock-dependent).
-> Down from M4.A's 39,964,046 nodes — ~44% reduction from killer ordering;
-> down from M3.F's 172,312,700 — ~87% cumulative reduction from TT +
-> killer. Run `printf 'bench\nquit\n' | ./target/release/clawfish` to
-> reproduce the node count.
+> **Current bench:** `bench: 17650332 nodes <NPS> nps` at default depth 7
+> (M4.C end; node count is deterministic, NPS is wallclock-dependent).
+> Down from M4.B's 22,237,579 nodes — ~21% reduction from history-aware
+> non-killer-quiet ordering composing on top of killers + TT; down from
+> M3.F's 172,312,700 — ~90% cumulative reduction from TT + killer + history.
+> Run `printf 'bench\nquit\n' | ./target/release/clawfish` to reproduce
+> the node count.
 
 ## Build
 
