@@ -699,3 +699,91 @@ fn bench_signature_deterministic_across_two_runs_with_history() {
          (history table cleared per position via reset_for_new_game); got {nodes1} vs {nodes2}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// E47 — bench is deterministic across two consecutive runs in the same
+// engine session, with M4.D aspiration windows in play (re-pin of the
+// M3.F / M4.A / M4.C bench-determinism contract).
+// ---------------------------------------------------------------------------
+
+/// `bench / bench` from a single engine subprocess must produce the same
+/// total node count both times, even with aspiration windows participating
+/// in the ID outer loop. Aspiration centers each iteration's window on the
+/// prior iteration's score (from `last_complete`); per-position
+/// `reset_for_new_game()` clears the per-game state (TT + game_history +
+/// killer + history table) so iteration 1 of position N starts from the
+/// same state regardless of whether earlier positions ran in the same
+/// session, which makes `last_complete` deterministic across runs and
+/// hence aspiration's window choices deterministic. Default depth is 7
+/// (set by `BENCH_DEFAULT_DEPTH`).
+#[test]
+fn bench_signature_deterministic_across_two_runs_with_aspiration() {
+    let mut child = spawn_engine();
+    let stdout = child.stdout.take().expect("stdout handle");
+    let line_rx = drain_stdout(stdout);
+
+    let mut stdin = child.stdin.take().expect("stdin handle");
+    // E47 uses `bench 4` to keep the test wallclock low; the determinism
+    // contract holds at every depth (M3.F BENCH_DEFAULT_DEPTH=7 is exercised
+    // by the production `bench` signature recorded in bench/m4.md). E46's
+    // 60-second per-run timeout pattern is preserved.
+    stdin.write_all(b"bench 4\nbench 4\n").unwrap();
+
+    let mut lines: Vec<String> = Vec::new();
+    let bench_deadline_1 = Instant::now() + Duration::from_secs(60);
+    wait_for_line_starting_with(
+        &line_rx,
+        "info string bench: ",
+        bench_deadline_1,
+        &mut lines,
+    );
+    let bench_deadline_2 = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < bench_deadline_2 {
+        match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                let matched = line.starts_with("info string bench: ");
+                lines.push(line);
+                if matched {
+                    break;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    stdin.write_all(b"quit\n").unwrap();
+    drop(stdin);
+
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    let exited = wait_for_exit(&mut child, exit_deadline);
+    lines.extend(collect_lines(&line_rx));
+    let output = lines.join("\n");
+
+    assert!(exited, "E47: engine did not exit within 5 s after quit");
+
+    let signatures: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("info string bench: "))
+        .collect();
+    assert_eq!(
+        signatures.len(),
+        2,
+        "E47: expected exactly two bench signature lines; got {}.\nfull output:\n{output}",
+        signatures.len()
+    );
+
+    let parse_nodes = |sig: &str| -> u64 {
+        let rest = sig.strip_prefix("info string bench: ").unwrap();
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        assert_eq!(parts.len(), 4, "E47: signature shape wrong; {sig:?}");
+        parts[0].parse::<u64>().expect("E47: nodes must parse")
+    };
+    let nodes1 = parse_nodes(signatures[0]);
+    let nodes2 = parse_nodes(signatures[1]);
+    assert_eq!(
+        nodes1, nodes2,
+        "E47: bench node counts must match across two runs in the same session \
+         (aspiration window choices are deterministic given identical per-position \
+         start state from reset_for_new_game); got {nodes1} vs {nodes2}"
+    );
+}

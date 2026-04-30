@@ -117,7 +117,7 @@ The 50-move-boundary GHI is acknowledged. Option 2 (suppress probe/store when `h
 
 At PV nodes: TT probe extracts the stored move for ordering only; never returns early on the stored score (even Exact). At non-PV nodes: full bound comparison (`Lower` ≥ beta → return; `Upper` ≤ alpha → return; `Exact` → return).
 
-Under fail-soft pure alpha-beta there is no window-based PV/non-PV distinction (every node has the same window type semantically). `is_pv` is a synthetic ordering predicate governing TT-cutoff suppression. PVS (M4.D) replaces it with the window-based `beta - alpha == 1` predicate.
+Under fail-soft pure alpha-beta there is no window-based PV/non-PV distinction (every node has the same window type semantically). `is_pv` is a synthetic ordering predicate governing TT-cutoff suppression. M4.D's aspiration windows still use the synthetic `is_pv` (first-try window has `beta - alpha = 100`, far from PVS's zero-window). PVS (M5) replaces `is_pv` with the window-based `beta - alpha == 1` predicate.
 
 Why suppress cutoffs at PV: an Exact-bound TT hit at a PV node would return early without searching all moves, shortening the displayed `info pv` line and hiding the fully-explored variation. CPW: "in more advanced engines transposition table cutoffs are not performed on PV-Nodes."
 
