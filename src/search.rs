@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::history::{HistoryTable, MAX_HISTORY};
 use crate::tt::{TranspositionTable, TtBound, TtData, score_from_tt, score_to_tt};
 use crate::{Color, Move, Position};
 
@@ -280,6 +281,10 @@ pub(crate) struct AlphaBetaMover {
     /// previous one. Sentinel = `Move::default()` (bits == 0). Cleared
     /// per-go and per-iteration; not persisted across iterations.
     killers: [[Move; 2]; MAX_PLY],
+    /// M4.C: butterfly history table. Persists across ID iterations and across
+    /// `go` invocations within a game. Cleared by `Search::reset()` (called
+    /// from `Engine::reset_for_new_game()` on `ucinewgame` and per bench position).
+    history_table: HistoryTable,
 }
 
 impl AlphaBetaMover {
@@ -293,6 +298,7 @@ impl AlphaBetaMover {
             root_score: None,
             tt: None,
             killers: [[Move::default(); 2]; MAX_PLY],
+            history_table: HistoryTable::new(),
         }
     }
 }
@@ -425,9 +431,10 @@ impl Search for AlphaBetaMover {
     }
 
     fn reset(&mut self) {
-        self.history.clear();
-        clear_killers(&mut self.killers);
-        // pv and nodes are reset per-go; history table joins this list at M4.C; TT lives in engine.
+        self.history.clear(); // M3.B carry-forward: game-history Zobrist Vec.
+        clear_killers(&mut self.killers); // M4.B: killer table.
+        self.history_table.clear(); // M4.C: butterfly history table.
+        // pv and nodes are reset per-go; TT lives in engine.
     }
 }
 
@@ -552,20 +559,30 @@ impl AlphaBetaMover {
             }
         }
 
-        // 10. Order: killer-aware scoring (captures > killers > other quiets)
-        //     descending, then promote the TT move (if any) to index 0.
+        // 10. Order: killer-aware scoring (captures > killers > history-scored
+        //     quiets) descending via `order_moves` (extended for M4.C to consult
+        //     the history table); then promote the TT move (if any) to index 0.
         //     `Move::default().bits() == 0` is the no-move sentinel and is
         //     never produced by movegen, so `tt_move == 0` falls through.
         //     The legality scan over the legal-move list rejects garbage
         //     values (ADR-0018 §12).
         let killer0 = self.killers[ply as usize][0];
         let killer1 = self.killers[ply as usize][1];
-        order_moves(&mut moves_vec, pos, killer0, killer1, tt_move);
+        order_moves(
+            &mut moves_vec,
+            pos,
+            killer0,
+            killer1,
+            &self.history_table,
+            tt_move,
+        );
 
         // 11. Recurse fail-soft. `child_is_pv = is_pv && i == 0` per ADR-0018 §11
         //     where `i` is the recursion-order index (post-step-10 reorder).
         let mut best = -INF;
         let mut cutoff_move: Option<Move> = None;
+        // M4.C: quiets that complete recursion without cutting; used for malus on cutoff.
+        let mut quiets_searched: MoveList = MoveList::new();
         for (i, &mv) in moves_vec.iter().enumerate() {
             let undo = pos.make_move(mv);
             self.history.push(pos.zobrist());
@@ -603,11 +620,40 @@ impl AlphaBetaMover {
                 }
                 if alpha >= beta {
                     cutoff_move = Some(mv);
+                    // M4.B + M4.C: on quiet beta-cutoff, update killers + apply
+                    // history bonus to cutter and malus to all priors.
                     if is_quiet(mv) {
                         update_killers(&mut self.killers, ply as usize, mv);
+                        let bonus = (depth as i32) * (depth as i32);
+                        // SIDE-TO-MOVE INVARIANT: pos has been restored to the
+                        // pre-move-loop state by `pos.unmake_move(mv, undo)` above,
+                        // so `pos.side_to_move()` here is the **mover's color**.
+                        // Read here, BEFORE any future make/unmake; do NOT recompute
+                        // inside the malus loop. Pinned by HS8 (root White) + HS8b
+                        // (non-root Black).
+                        let side = pos.side_to_move();
+                        self.history_table
+                            .update(side, mv.from_square(), mv.to_square(), bonus);
+                        for prior in quiets_searched.iter() {
+                            self.history_table.update(
+                                side,
+                                prior.from_square(),
+                                prior.to_square(),
+                                -bonus,
+                            );
+                        }
                     }
                     break; // beta cutoff — fail-soft: return `best`, not `beta`
                 }
+            }
+
+            // Did not cut. If quiet, record for potential malus by a later cutter.
+            if is_quiet(mv) {
+                debug_assert!(
+                    mv.from_square() != mv.to_square(),
+                    "Move::default() sentinel must never enter quiets_searched"
+                );
+                quiets_searched.push(mv);
             }
         }
 
@@ -701,6 +747,44 @@ impl AlphaBetaMover {
     #[cfg(test)]
     pub(super) fn pv_root_for_test(&self) -> Vec<Move> {
         self.pv.moves[0][..self.pv.lengths[0]].to_vec()
+    }
+
+    /// HS9-only test accessor: returns the comparator-sorted move list for
+    /// `pos` against `self.history_table` and the *current* killer slots at
+    /// ply 0 (typically empty in HS9's pre-search setup), **without** the
+    /// post-sort TT-move-first bubble that production negamax step-10
+    /// applies. To test the full step-10 pipeline (including TT-bubble), use
+    /// `negamax_for_test` and read PV[0] post-search. Production code never
+    /// calls this.
+    #[cfg(test)]
+    pub(super) fn ordered_moves_for_test(&self, pos: &Position) -> Vec<Move> {
+        use crate::movegen::{MoveList, generate_moves};
+        let mut ml = MoveList::new();
+        generate_moves(pos, &mut ml);
+        let mut moves_vec: Vec<Move> = ml.iter().collect();
+        let killer0 = self.killers[0][0];
+        let killer1 = self.killers[0][1];
+        moves_vec.sort_by_cached_key(|&m| {
+            -negamax_move_order_score(m, pos, killer0, killer1, &self.history_table)
+        });
+        moves_vec
+    }
+
+    /// Test-only accessor for the history table. Used by E_h
+    /// (engine-level ucinewgame-clears-history-table test) to inspect
+    /// the table after `Search::reset()` runs.
+    #[cfg(test)]
+    pub(crate) fn history_table_for_test(&self) -> &HistoryTable {
+        &self.history_table
+    }
+
+    /// Test-only mutable accessor for the history table. Used by E_h to
+    /// pre-seed entries before driving `reset_for_new_game()`. Production
+    /// code never calls this — the search worker mutates the table only
+    /// during `go`.
+    #[cfg(test)]
+    pub(crate) fn history_table_for_test_mut(&mut self) -> &mut HistoryTable {
+        &mut self.history_table
     }
 
     /// Quiescence search: extends the leaf evaluation with captures and queen
@@ -850,18 +934,51 @@ impl AlphaBetaMover {
 }
 
 // ---------------------------------------------------------------------------
-// M4.B — Killer-move helpers + ordering.
+// M4.B + M4.C — Killer- and history-aware move-ordering helpers + score tiers.
 // ---------------------------------------------------------------------------
 
+/// Score offset added to every non-quiet move's `mvv_lva_score` in the
+/// unified `negamax_move_order_score` comparator. Chosen so every
+/// capture/promo/EP sorts strictly above both killer slots and every
+/// history-rated quiet, regardless of how high the captures' raw MVV-LVA
+/// values run. Pinned by `score_tier_invariants_compile` (compile-time
+/// const-assert at the bottom of this section).
+const CAPTURE_OFFSET: i32 = 1_000_000;
+
 /// Bonus score for the most-recent quiet beta-cutoff at this ply (slot 0).
-/// Strictly between 0 and the smallest MVV-LVA capture score (QxP ≈ 287 cp)
-/// so killers slot above remaining quiets but below all captures and promos.
-/// Pinned by S23 at runtime against the actual MVV-LVA formula.
-const KILLER0_SCORE: i32 = 200;
+/// Strictly above `KILLER1_SCORE` and `MAX_HISTORY`, and strictly below
+/// `CAPTURE_OFFSET` so captures still sort above killers under the
+/// post-M4.C unified scoring scheme. The previous M4.B value (`200`) was
+/// chosen to fit between `0` and the smallest capture (QxP=287); restoring
+/// `MAX_HISTORY = 16384` (literature standard for the history table; see
+/// `src/history.rs`) required bumping the killer constants above
+/// `MAX_HISTORY` and shifting captures above the killer band via
+/// `CAPTURE_OFFSET`. The relative ordering invariants are unchanged from
+/// M4.B; only the absolute-score scale shifted.
+const KILLER0_SCORE: i32 = 100_001;
 
 /// Bonus score for the prior quiet beta-cutoff at this ply (slot 1).
-/// Must satisfy `KILLER1_SCORE < KILLER0_SCORE` and `KILLER1_SCORE > 0`.
-const KILLER1_SCORE: i32 = 100;
+/// Must satisfy `KILLER1_SCORE < KILLER0_SCORE` and
+/// `KILLER1_SCORE > MAX_HISTORY` (so killers always rank above the best
+/// history-rated quiet).
+const KILLER1_SCORE: i32 = 100_000;
+
+/// Compile-time check that the score tiers are strictly ordered:
+///
+/// ```text
+/// CAPTURE_OFFSET > KILLER0_SCORE > KILLER1_SCORE > MAX_HISTORY > -MAX_HISTORY
+/// ```
+///
+/// This fixes the relative discipline between the four tunables in one
+/// place. If any of them is changed in a way that violates the ordering,
+/// the crate fails to compile rather than silently producing wrong
+/// move-ordering decisions at runtime.
+const _SCORE_TIER_INVARIANTS: () = {
+    assert!(CAPTURE_OFFSET > KILLER0_SCORE);
+    assert!(KILLER0_SCORE > KILLER1_SCORE);
+    assert!(KILLER1_SCORE > MAX_HISTORY as i32);
+    assert!((MAX_HISTORY as i32) > -(MAX_HISTORY as i32));
+};
 
 /// Returns true iff `mv` is a non-capture, non-promotion, non-en-passant
 /// move (the moves eligible to populate the killer slots).
@@ -890,26 +1007,41 @@ fn update_killers(killers: &mut [[Move; 2]; MAX_PLY], ply: usize, mv: Move) {
     }
 }
 
-/// Killer-aware move-ordering score for negamax (NOT qsearch). Wraps
-/// `mvv_lva_score`:
-///   - non-quiet move → `mvv_lva_score(mv, pos)` (captures/promos).
+/// Killer- and history-aware move-ordering score for negamax (NOT qsearch).
+/// Wraps `mvv_lva_score`:
+///   - non-quiet move → `mvv_lva_score(mv, pos) + CAPTURE_OFFSET`
+///     (captures/promos sort above all killers and all history-rated quiets).
 ///   - quiet move matching `killer0` → `KILLER0_SCORE`.
 ///   - quiet move matching `killer1` (and not `killer0`) → `KILLER1_SCORE`.
-///   - other quiet → `0`.
+///   - other quiet → `history_table.score(side, from, to) as i32`, in
+///     `[-MAX_HISTORY, MAX_HISTORY]`.
 ///
-/// Boundary discipline: `KILLER0_SCORE > KILLER1_SCORE > 0` and both
-/// strictly less than the smallest possible MVV-LVA capture score.
-/// Pinned by S23 at runtime.
-fn negamax_move_order_score(mv: Move, pos: &Position, killer0: Move, killer1: Move) -> i32 {
+/// Boundary discipline (post-M4.C):
+///
+/// ```text
+/// captures > KILLER0_SCORE > KILLER1_SCORE > MAX_HISTORY > -MAX_HISTORY
+/// ```
+///
+/// The four tunables are pinned by the `_SCORE_TIER_INVARIANTS`
+/// compile-time const-assert above; runtime tests S23
+/// (smallest-capture-above-killer0) and HS12 (capture above killer above
+/// history-quiet at MAX_HISTORY) re-pin the discipline against drift.
+fn negamax_move_order_score(
+    mv: Move,
+    pos: &Position,
+    killer0: Move,
+    killer1: Move,
+    history_table: &HistoryTable,
+) -> i32 {
     if !is_quiet(mv) {
-        return mvv_lva_score(mv, pos);
+        return mvv_lva_score(mv, pos) + CAPTURE_OFFSET;
     }
     if mv == killer0 {
         KILLER0_SCORE
     } else if mv == killer1 {
         KILLER1_SCORE
     } else {
-        0
+        history_table.score(pos.side_to_move(), mv.from_square(), mv.to_square()) as i32
     }
 }
 
@@ -936,9 +1068,12 @@ fn order_moves(
     pos: &Position,
     killer0: Move,
     killer1: Move,
+    history_table: &HistoryTable,
     tt_move: u16,
 ) {
-    moves_vec.sort_by_cached_key(|&m| -negamax_move_order_score(m, pos, killer0, killer1));
+    moves_vec.sort_by_cached_key(|&m| {
+        -negamax_move_order_score(m, pos, killer0, killer1, history_table)
+    });
     if tt_move != 0
         && let Some(idx) = moves_vec.iter().position(|m| m.bits() == tt_move)
         && idx != 0
@@ -4841,7 +4976,8 @@ mod tests {
         let pos = Position::starting_position();
         let mv = Move::new(Square::E2, Square::E3, MoveFlag::Quiet);
         let other = Move::new(Square::D2, Square::D3, MoveFlag::Quiet);
-        let score = negamax_move_order_score(mv, &pos, mv, other);
+        let history_table = HistoryTable::new();
+        let score = negamax_move_order_score(mv, &pos, mv, other, &history_table);
         assert_eq!(
             score, KILLER0_SCORE,
             "quiet matching killer0 must return KILLER0_SCORE"
@@ -4860,7 +4996,8 @@ mod tests {
         let mv = Move::new(Square::E2, Square::E3, MoveFlag::Quiet);
         let other = Move::new(Square::D2, Square::D3, MoveFlag::Quiet);
         // mv is in killer1, other is in killer0 (mv != other so the killer0 check fails).
-        let score = negamax_move_order_score(mv, &pos, other, mv);
+        let history_table = HistoryTable::new();
+        let score = negamax_move_order_score(mv, &pos, other, mv, &history_table);
         assert_eq!(
             score, KILLER1_SCORE,
             "quiet matching killer1 (not killer0) must return KILLER1_SCORE"
@@ -4873,8 +5010,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Pins the `!is_quiet(mv)` early-return gate at the top of the helper.
+    /// Post-M4.C: the capture-score path returns `mvv_lva_score + CAPTURE_OFFSET`
+    /// (NOT `mvv_lva_score` raw); CAPTURE_OFFSET is the M4.C-introduced shift
+    /// that places captures above killers regardless of the small killer
+    /// constants. This test pins both the gate (capture path is taken even
+    /// when bits match killer0) and the offset (the score is the shifted
+    /// value, not raw mvv_lva).
     #[test]
-    fn negamax_move_order_score_returns_mvv_lva_for_capture_even_if_matches_killer() {
+    fn negamax_move_order_score_returns_mvv_lva_plus_offset_for_capture_even_if_matches_killer() {
         // Position: white pawn on b4 can capture black queen on c5.
         let pos =
             Position::from_fen("4k3/8/2p5/2qQ4/1P6/8/8/4K3 w - - 0 1").expect("FEN must parse");
@@ -4882,19 +5025,26 @@ mod tests {
             Move::from_uci("b4c5", &pos).expect("b4c5 must be a legal pawn capture");
         // Install the same capture move as killer0 (artificial — captures can't
         // legally become killers, but the test verifies the gate independently).
-        let score =
-            negamax_move_order_score(pawn_takes_queen, &pos, pawn_takes_queen, Move::default());
-        let expected = mvv_lva_score(pawn_takes_queen, &pos);
+        let history_table = HistoryTable::new();
+        let score = negamax_move_order_score(
+            pawn_takes_queen,
+            &pos,
+            pawn_takes_queen,
+            Move::default(),
+            &history_table,
+        );
+        let expected = mvv_lva_score(pawn_takes_queen, &pos) + CAPTURE_OFFSET;
         assert_eq!(
             score, expected,
-            "capture matching killer0 must return mvv_lva_score ({expected}), not KILLER0_SCORE"
+            "capture matching killer0 must return mvv_lva_score + CAPTURE_OFFSET \
+             ({expected}), not KILLER0_SCORE"
         );
-        // Cross-check: the mvv_lva score is strictly greater than KILLER0_SCORE,
-        // proving the test is not vacuously passing because KILLER0_SCORE == expected.
+        // Cross-check: the comparator's capture-path output is strictly greater
+        // than KILLER0_SCORE, proving the test is not vacuously passing.
         assert!(
             expected > KILLER0_SCORE,
-            "mvv_lva_score for a capture must exceed KILLER0_SCORE to make S22 non-vacuous; \
-             got mvv_lva={expected}, KILLER0_SCORE={KILLER0_SCORE}"
+            "comparator capture-path output must exceed KILLER0_SCORE to make S22 non-vacuous; \
+             got expected={expected}, KILLER0_SCORE={KILLER0_SCORE}"
         );
     }
 
@@ -4910,38 +5060,47 @@ mod tests {
         let mv = Move::new(Square::E2, Square::E3, MoveFlag::Quiet);
         let killer0 = Move::new(Square::D2, Square::D3, MoveFlag::Quiet);
         let killer1 = Move::new(Square::C2, Square::C3, MoveFlag::Quiet);
-        let score = negamax_move_order_score(mv, &pos, killer0, killer1);
-        assert_eq!(score, 0, "quiet not in either killer slot must score 0");
+        let history_table = HistoryTable::new();
+        let score = negamax_move_order_score(mv, &pos, killer0, killer1, &history_table);
+        assert_eq!(
+            score, 0,
+            "quiet not in either killer slot with empty history must score 0"
+        );
     }
 
     // -----------------------------------------------------------------------
-    // S23 — `KILLER0_SCORE` and `KILLER1_SCORE` are strictly below the
-    //        smallest MVV-LVA capture (QxP) and above 0.
+    // S23 — Killer constants strictly above MAX_HISTORY and strictly below
+    // the comparator's capture-path output (mvv_lva_score + CAPTURE_OFFSET).
     // -----------------------------------------------------------------------
 
     /// Runtime boundary check using the actual MVV-LVA formula and PeSTO MG
-    /// values. Pins the constant values against any future bumps of KILLER0_SCORE
-    /// past the capture floor, or changes to the MVV-LVA scaling factor.
+    /// values, plus the M4.C-introduced CAPTURE_OFFSET shift. Pins the four
+    /// score-tier constants (`CAPTURE_OFFSET`, `KILLER0_SCORE`,
+    /// `KILLER1_SCORE`, `MAX_HISTORY`) against drift in either the MVV-LVA
+    /// formula or the killer/history score values.
+    ///
+    /// The compile-time `_SCORE_TIER_INVARIANTS` const-assert at the top of
+    /// the M4.B+M4.C section pins the relative ordering between the four
+    /// constants. This test additionally pins the discipline against the
+    /// concrete MVV-LVA values: that adding `CAPTURE_OFFSET` to even the
+    /// smallest non-losing capture (QxP=287) yields a comparator output
+    /// above `KILLER0_SCORE`.
     #[test]
-    fn killer_scores_strictly_below_smallest_capture() {
-        // Constant ordering invariants checked at compile time.
+    fn killer_scores_strictly_below_capture_path_output_and_above_max_history() {
+        // Killer above MAX_HISTORY (compile-time also).
         const {
-            assert!(
-                KILLER0_SCORE > KILLER1_SCORE,
-                "KILLER0_SCORE must be > KILLER1_SCORE"
-            );
-            assert!(KILLER1_SCORE > 0, "KILLER1_SCORE must be > 0");
+            assert!(KILLER1_SCORE as i64 > MAX_HISTORY as i64);
         }
-        // Runtime check: KILLER0_SCORE must be below the actual smallest capture
-        // (QxP), which depends on the MVV-LVA formula and PeSTO MG values.
+        // Runtime: capture path yields a strictly larger score than KILLER0_SCORE
+        // even for the smallest non-losing capture.
         let pos =
             Position::from_fen("4k3/8/2p5/2qQ4/1P6/8/8/4K3 w - - 0 1").expect("FEN must parse");
         let qxp = Move::from_uci("d5c6", &pos).expect("d5c6 must be a legal queen×pawn capture");
-        let qxp_score = mvv_lva_score(qxp, &pos);
+        let qxp_capture_path_score = mvv_lva_score(qxp, &pos) + CAPTURE_OFFSET;
         assert!(
-            KILLER0_SCORE < qxp_score,
-            "KILLER0_SCORE ({KILLER0_SCORE}) must be < mvv_lva_score(QxP) ({qxp_score}) \
-             so killers slot below all captures"
+            KILLER0_SCORE < qxp_capture_path_score,
+            "KILLER0_SCORE ({KILLER0_SCORE}) must be < mvv_lva_score(QxP) + CAPTURE_OFFSET \
+             ({qxp_capture_path_score}) so killers slot below all captures in the comparator"
         );
     }
 
@@ -4963,6 +5122,7 @@ mod tests {
             &pos,
             Move::default(),
             Move::default(),
+            &HistoryTable::new(),
             tt_move.bits(),
         );
         assert_eq!(
@@ -4991,7 +5151,14 @@ mod tests {
         generate_moves(&pos, &mut ml);
         let mut moves_vec: Vec<Move> = ml.iter().collect();
         // Sort first so we can identify what's at index 0 after ordering.
-        order_moves(&mut moves_vec, &pos, Move::default(), Move::default(), 0);
+        order_moves(
+            &mut moves_vec,
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+        );
         let first = moves_vec[0];
         let before = moves_vec.clone();
         // Now call again with the first move as the TT move.
@@ -5000,6 +5167,7 @@ mod tests {
             &pos,
             Move::default(),
             Move::default(),
+            &HistoryTable::new(),
             first.bits(),
         );
         // The order must be unchanged (first is already at 0; swap is skipped).
@@ -5024,8 +5192,22 @@ mod tests {
         let mut moves_a: Vec<Move> = ml.iter().collect();
         let mut moves_ref: Vec<Move> = ml.iter().collect();
         // Produce the reference order (pure MVV-LVA, no tt_move).
-        order_moves(&mut moves_ref, &pos, Move::default(), Move::default(), 0);
-        order_moves(&mut moves_a, &pos, Move::default(), Move::default(), 0);
+        order_moves(
+            &mut moves_ref,
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+        );
+        order_moves(
+            &mut moves_a,
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+        );
         assert_eq!(
             moves_a, moves_ref,
             "tt_move==0 must produce pure MVV-LVA order (same as reference)"
@@ -5035,7 +5217,14 @@ mod tests {
         // Use 0xFFFF — an impossible legal move (from=H1, to=H8, flag=QueenPromoCapture
         // which never appears at startpos). The sort must not promote any entry.
         let mut moves_b: Vec<Move> = ml.iter().collect();
-        order_moves(&mut moves_b, &pos, Move::default(), Move::default(), 0xFFFF);
+        order_moves(
+            &mut moves_b,
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            0xFFFF,
+        );
         assert_eq!(
             moves_b, moves_ref,
             "absent tt_move must produce pure MVV-LVA order (same as reference)"
@@ -5099,6 +5288,7 @@ mod tests {
             &pos,
             Move::default(),
             Move::default(),
+            &HistoryTable::new(),
             0,
         );
         let baseline_killer_idx = moves_baseline
@@ -5123,7 +5313,14 @@ mod tests {
         // killer_quiet's post-sort index is STRICTLY LESS THAN witness's
         // post-sort index — the killer logic flipped them.
         let mut moves_vec = moves_vec_initial.clone();
-        order_moves(&mut moves_vec, &pos, killer_quiet, Move::default(), 0);
+        order_moves(
+            &mut moves_vec,
+            &pos,
+            killer_quiet,
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+        );
 
         let killer_idx = moves_vec.iter().position(|&m| m == killer_quiet).unwrap();
         let witness_idx = moves_vec
@@ -5180,6 +5377,7 @@ mod tests {
             &pos,
             overlap_move,
             Move::default(),
+            &HistoryTable::new(),
             overlap_move.bits(),
         );
 
@@ -5218,7 +5416,14 @@ mod tests {
 
         // Reference order: no killer, no TT.
         let mut moves_ref: Vec<Move> = ml.iter().collect();
-        order_moves(&mut moves_ref, &pos, Move::default(), Move::default(), 0);
+        order_moves(
+            &mut moves_ref,
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+        );
 
         // Stale killer: a move whose bits don't match any move in moves_vec.
         // Use a1→a1 quiet (from==to, flag=Quiet, bits != 0 only if from!=to;
@@ -5235,7 +5440,14 @@ mod tests {
         );
 
         let mut moves_stale: Vec<Move> = ml.iter().collect();
-        order_moves(&mut moves_stale, &pos, stale_killer, Move::default(), 0);
+        order_moves(
+            &mut moves_stale,
+            &pos,
+            stale_killer,
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+        );
 
         assert_eq!(
             moves_stale, moves_ref,
@@ -5412,7 +5624,14 @@ mod tests {
 
         // Verify the chosen quiet is NOT at index 0 in the empty-killer ordering.
         let mut moves_check: Vec<Move> = ml.iter().collect();
-        order_moves(&mut moves_check, &pos, Move::default(), Move::default(), 0);
+        order_moves(
+            &mut moves_check,
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+        );
         let pre_killer_idx = moves_check
             .iter()
             .position(|&m| m == chosen_quiet)
@@ -5557,6 +5776,875 @@ mod tests {
             [Move::default(); 2],
             "killers[40] must be zeroed by the per-go reset; \
              synthetic move must not survive across a go() call"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M4.C — History heuristic integration tests (HS1..HS12 + HS3b/HS3c/HS8b).
+    //
+    // PRE-IMPL NOTE: this slice (test-writing) lands the tests + the structural
+    // wiring (`history_table` field, `Search::reset` clear-call,
+    // `move_ordering_score`, `ordered_moves_for_test`). The negamax body is
+    // **unchanged** — the bonus/malus dispatch on quiet-move beta cutoff
+    // lands in the next slice. Until then:
+    //
+    //   - HS3, HS3b, HS3c, HS7 trivially PASS (no dispatch ⇒ history never
+    //     updated ⇒ post-search "history is zero" holds vacuously).
+    //   - HS9, HS11, HS12 PASS (they exercise the structural wiring directly).
+    //   - HS1, HS2, HS4, HS5, HS6, HS8, HS8b, HS10 FAIL at runtime: their
+    //     assertions depend on history-table values that only the impl-slice
+    //     wiring produces. The next slice makes them pass.
+    // -----------------------------------------------------------------------
+
+    use crate::history::{HistoryTable, MAX_HISTORY};
+    use crate::piece::Color;
+    use crate::square::Square;
+
+    // -----------------------------------------------------------------------
+    // HS1 — quiet beta cutoff at depth 2 deposits +depth*depth = +4 bonus.
+    // -----------------------------------------------------------------------
+
+    /// Drive a depth-2 negamax with a tightened window so that the
+    /// engine-chosen first move (a quiet from movegen order) fail-highs.
+    /// At depth 2 the bonus is `depth * depth = 4`. Depth 2 (rather than
+    /// depth 1, which would yield `+1` for both `+= depth*depth` and `+=
+    /// depth` formulas) anchors the formula choice.
+    ///
+    /// Fixture: KvKR endgame — White's king moves are quiet; with a tight
+    /// window the first quiet sorted will be searched, and any move that
+    /// improves alpha past the tightened beta cuts off.
+    #[test]
+    fn negamax_updates_history_on_quiet_beta_cutoff_at_depth_2() {
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/2R1K3 w - - 0 1")
+            .expect("KvKR endgame FEN must parse");
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        // Tight window at zero centipawns: any move with positive eval will
+        // immediately fail-high, producing a quiet beta-cutoff.
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, &ctx);
+
+        // After the cutoff fires, exactly one quiet `(side, from, to)` triple
+        // must hold the +4 bonus (depth=2, depth*depth=4). Sweep all entries
+        // and find the unique non-zero one.
+        let mut nonzero: Vec<(Color, Square, Square, i16)> = Vec::new();
+        for side in [Color::White, Color::Black] {
+            for from in 0..64u8 {
+                for to in 0..64u8 {
+                    let f = Square::new_unchecked(from);
+                    let t = Square::new_unchecked(to);
+                    let s = ab.history_table.score(side, f, t);
+                    if s != 0 {
+                        nonzero.push((side, f, t, s));
+                    }
+                }
+            }
+        }
+        // The cutter receives +4; any prior quiets in `quiets_searched`
+        // receive -4. At most one non-zero entry should be the cutter (+4);
+        // the others (if any) should be -4 maluses.
+        assert!(
+            nonzero.iter().any(|(_, _, _, s)| *s == 4),
+            "expected at least one entry to hold +4 (the cutter's depth*depth bonus); \
+             non-zero entries: {nonzero:?}"
+        );
+        // Strengthen anti-stub: every non-zero entry must be exactly +4 or -4
+        // — the only two values produced by the depth=2 dispatch (bonus or
+        // malus). A buggy impl that applied +4 to all quiets (not just the
+        // cutter) would have non-zero entries at +4 only — caught by HS4.
+        // A buggy impl that used `+= depth` (linear) would produce entries at
+        // +2 / -2 — caught by this all-check.
+        assert!(
+            nonzero.iter().all(|(_, _, _, s)| *s == 4 || *s == -4),
+            "every non-zero entry must be exactly +bonus or -bonus (+4 or -4 at \
+             depth=2); a non-canonical value indicates a wrong increment formula; \
+             non-zero entries: {nonzero:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HS2 — capture cutoff produces no history update.
+    // -----------------------------------------------------------------------
+
+    /// Hanging-bishop fixture: White Q d1 captures Black B d4. With a wide
+    /// window the capture wins material and the post-capture eval improves
+    /// alpha; with a tightened window placed below stand-pat-after-capture,
+    /// Qxd4 fail-highs on its return value, producing a *capture* cutoff.
+    /// History must remain zero across all entries.
+    #[test]
+    fn negamax_does_not_update_history_on_capture_cutoff() {
+        let pos = Position::from_fen("4k3/8/8/8/3b4/8/8/3QK3 w - - 0 1")
+            .expect("hanging-bishop FEN must parse");
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        // Tighten the window so Qxd4 (winning material) fail-highs.
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, &ctx);
+
+        for side in [Color::White, Color::Black] {
+            for from in 0..64u8 {
+                for to in 0..64u8 {
+                    let f = Square::new_unchecked(from);
+                    let t = Square::new_unchecked(to);
+                    assert_eq!(
+                        ab.history_table.score(side, f, t),
+                        0,
+                        "capture cutoff must not update any history entry; \
+                         entry ({side:?}, {f:?}, {t:?}) is non-zero"
+                    );
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // HS3 — TT cutoff (non-PV, sufficient depth) produces no history update.
+    // -----------------------------------------------------------------------
+
+    /// Pre-populate the TT with a non-PV-eligible Lower entry at the root
+    /// position; drive negamax with `is_pv=false` and a window where the
+    /// stored score >= beta. The TT shortcut returns at step 7 of the M4.A
+    /// prologue, BEFORE the move loop; no history update fires.
+    #[test]
+    fn negamax_does_not_update_history_on_tt_cutoff() {
+        let pos = Position::starting_position();
+        let tt = Arc::new(TranspositionTable::new(1));
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 200,
+                depth: 5,
+                bound: TtBound::Lower,
+                best_move: 0,
+            },
+        );
+        let (ctx, _stop) = non_aborting_ctx_with_tt(tt.clone());
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        ab.history = vec![pos.zobrist()];
+        ab.set_tt_for_test(Some(tt.clone()));
+
+        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, &ctx);
+
+        for side in [Color::White, Color::Black] {
+            for from in 0..64u8 {
+                for to in 0..64u8 {
+                    let f = Square::new_unchecked(from);
+                    let t = Square::new_unchecked(to);
+                    assert_eq!(
+                        ab.history_table.score(side, f, t),
+                        0,
+                        "TT cutoff must not update any history entry"
+                    );
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // HS3b — Repetition return at ply > 0 produces no history update.
+    // -----------------------------------------------------------------------
+
+    /// `ctx.history`/`ab.history` contains the current zobrist at a 2-ply
+    /// distance from the end. At ply=1, step 5 of the negamax prologue
+    /// returns 0 immediately; the move loop never runs and no cutter exists
+    /// to credit.
+    #[test]
+    fn negamax_does_not_update_history_on_repetition_return() {
+        let pos = Position::from_fen("4k3/8/8/8/3b4/8/8/3QK3 w - - 4 1")
+            .expect("FEN with halfmove=4 must parse");
+        let z = pos.zobrist();
+        let other: u64 = 0xDEAD_BEEF_CAFE_FEED;
+        let history = vec![z, other, z];
+        // Sanity: confirm the rep-detection helper would fire.
+        assert!(
+            is_repetition(&history, pos.halfmove_clock()),
+            "fixture must trigger is_repetition (otherwise rep-return path is not exercised)"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        ab.history = history;
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, true, &ctx);
+
+        assert_eq!(score, 0, "rep-return at ply > 0 must yield 0");
+        for side in [Color::White, Color::Black] {
+            for from in 0..64u8 {
+                for to in 0..64u8 {
+                    let f = Square::new_unchecked(from);
+                    let t = Square::new_unchecked(to);
+                    assert_eq!(
+                        ab.history_table.score(side, f, t),
+                        0,
+                        "rep-return must not update any history entry"
+                    );
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // HS3c — MDP window collapse produces no history update.
+    // -----------------------------------------------------------------------
+
+    /// Drive negamax with `alpha=MATE-5`, `beta=MATE-1`, `ply=10`. Then
+    /// `mating_value = MATE-10`, which is < beta (so beta tightens) AND
+    /// `alpha (MATE-5) >= mating_value (MATE-10)`, triggering the early
+    /// return at step 6 of the prologue.
+    #[test]
+    fn negamax_does_not_update_history_on_mdp_window_collapse() {
+        let pos = Position::starting_position();
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+
+        let ply: u32 = 10;
+        let alpha = MATE - 5;
+        let beta = MATE - 1;
+        let mating_value = MATE - ply as i32;
+        assert!(
+            alpha >= mating_value,
+            "fixture preconditions: alpha={alpha}, mating_value={mating_value} — \
+             alpha must be >= mating_value to trigger upper-bound MD pruning"
+        );
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, ply, alpha, beta, false, &ctx);
+
+        for side in [Color::White, Color::Black] {
+            for from in 0..64u8 {
+                for to in 0..64u8 {
+                    let f = Square::new_unchecked(from);
+                    let t = Square::new_unchecked(to);
+                    assert_eq!(
+                        ab.history_table.score(side, f, t),
+                        0,
+                        "MDP-window-collapse return must not update any history entry"
+                    );
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // HS4 — Malus excludes the cutter; only prior quiets receive -bonus.
+    // -----------------------------------------------------------------------
+
+    /// At a node with quiet moves Q1, Q2, Q3 (in that searched order) where
+    /// Q3 is the cutter and Q1, Q2 fail to improve alpha enough to cut: the
+    /// cutter receives +bonus exclusively (no malus); Q1 and Q2 receive
+    /// -bonus.
+    ///
+    /// Fixture: tight zero-width window at a position where quiets dominate.
+    /// We don't pin specific squares — instead we assert structural
+    /// counts: exactly one entry is +depth*depth (the cutter) and zero or
+    /// more entries are -depth*depth (the prior quiets). No entry equals
+    /// `+bonus - bonus = 0` for a move that was both cutter and prior
+    /// (which would happen if a buggy impl applied both bonus and malus to
+    /// the cutter).
+    #[test]
+    fn negamax_history_malus_excludes_cutter() {
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/2R1K3 w - - 0 1")
+            .expect("KvKR endgame FEN must parse");
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let depth: u32 = 2;
+        let _ = ab.negamax_for_test(&mut pos.clone(), depth, 0, 0, 1, false, &ctx);
+
+        let bonus = (depth as i32) * (depth as i32); // = 4
+        let mut plus_count = 0;
+        let mut minus_count = 0;
+        for side in [Color::White, Color::Black] {
+            for from in 0..64u8 {
+                for to in 0..64u8 {
+                    let f = Square::new_unchecked(from);
+                    let t = Square::new_unchecked(to);
+                    let s = ab.history_table.score(side, f, t) as i32;
+                    if s == bonus {
+                        plus_count += 1;
+                    } else if s == -bonus {
+                        minus_count += 1;
+                    } else {
+                        assert_eq!(
+                            s, 0,
+                            "every entry must be 0, +bonus, or -bonus; \
+                             ({side:?}, {f:?}, {t:?}) = {s}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            plus_count, 1,
+            "exactly one entry must hold +bonus (the unique cutter); \
+             plus_count={plus_count}, minus_count={minus_count}"
+        );
+        // NOTE: `minus_count` may be 0 if the move generator emits the
+        // cutting quiet first (no priors in `quiets_searched`). The KvKR
+        // fixture's static-eval-at-depth-1 returns ~+477 for every quiet,
+        // so the FIRST quiet in movegen order cuts. The malus path is
+        // exercised by HS4b (via a multi-iteration search where multiple
+        // subtrees fire malus across them) and by the structural argument
+        // in HS5 (capture-then-quiet ordering). This test's load-bearing
+        // assertion is `plus_count == 1` (the cutter is unique).
+        let _ = minus_count;
+    }
+
+    // -----------------------------------------------------------------------
+    // HS4b — Malus path exercised at depth=3 (aggregate accumulation across
+    // subtrees). Complements HS4's "exactly one cutter" pin: across many
+    // subtrees with cutoffs at varying depths, both bonuses (+1, +4, +9) and
+    // maluses (-1, -4, -9) accumulate. At least one negative entry must
+    // exist post-search, proving the malus loop fires somewhere in the tree.
+    // -----------------------------------------------------------------------
+
+    /// Drive a depth=3 search from startpos with a tight window. At depth=3,
+    /// the search tree fans out: root has 20 quiet moves (no captures at
+    /// startpos); each child has 20 quiet responses; each grandchild has
+    /// ~20 quiet replies. Cutoffs fire at varying plies. The `quiets_searched`
+    /// accumulator at any node where a non-first quiet cuts produces -bonus
+    /// entries. The aggregate must include at least one negative value.
+    #[test]
+    fn negamax_history_malus_fires_somewhere_at_depth_3_startpos() {
+        let pos = Position::starting_position();
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        // Wide-ish window so multiple cutoffs fire at varying plies but
+        // not so wide as to suppress all cuts.
+        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -50, 50, false, &ctx);
+
+        let mut has_negative = false;
+        let mut has_positive = false;
+        for side in [Color::White, Color::Black] {
+            for from in 0..64u8 {
+                for to in 0..64u8 {
+                    let f = Square::new_unchecked(from);
+                    let t = Square::new_unchecked(to);
+                    let s = ab.history_table.score(side, f, t);
+                    if s > 0 {
+                        has_positive = true;
+                    } else if s < 0 {
+                        has_negative = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            has_positive,
+            "depth=3 startpos search must produce at least one bonus (+ entry); \
+             a no-op stub would leave all entries at 0"
+        );
+        assert!(
+            has_negative,
+            "depth=3 startpos search with cutoffs at multiple plies must \
+             fire the malus loop somewhere — at least one entry must be \
+             negative; a stub that skips the malus loop would never produce \
+             negatives even if the bonus path is correct"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HS5 — Captures never enter `quiets_searched`; quiet cutter follows
+    // a capture without polluting the capture's history entry.
+    // -----------------------------------------------------------------------
+
+    /// Fixture: White Q+K vs Black N+K, with Black knight en prise on e7.
+    /// MVV-LVA orders Qxe7+ first, BUT the only legal Black response is
+    /// Kxe7 (recapture with king), so White loses queen for knight =
+    /// −688 cp. After Qxe7+ Kxe7 the position is K vs K, which the eval's
+    /// insufficient-material short-circuit returns as exactly 0. So at
+    /// depth=2, Qxe7 returns 0 — and with window (0, 1), `0 < 1` so the
+    /// capture does NOT cut. Subsequent quiets preserve White's queen
+    /// (+688 cp material edge), so any quiet move returns ~+688 ≥ 1
+    /// and cuts.
+    ///
+    /// Load-bearing assertion: the capture's `(from=e2, to=e7)` history
+    /// entry must remain 0 across both sides — captures are excluded
+    /// from `quiets_searched`, so neither bonus (capture didn't cut here)
+    /// nor malus (capture not in priors) applies. A buggy impl that
+    /// pushes captures onto `quiets_searched` would visibly produce a
+    /// −bonus malus on this entry.
+    ///
+    /// Anti-stub: a stub that skips ALL history updates would also leave
+    /// the capture entry at 0 (false-pass on the capture-only assertion).
+    /// To distinguish, we ALSO assert that at least one White quiet entry
+    /// holds the +bonus (cutter exists). Together: capture is unmodified
+    /// AND a real cutter is observed.
+    #[test]
+    fn negamax_quiets_searched_excludes_captures() {
+        // White queen (e2) can capture the Black knight on e7 (a bad trade —
+        // Black king takes back, leaving K vs K which the eval's
+        // insufficient-material short-circuit returns as exactly 0). That
+        // capture sorts first (CAPTURE_OFFSET) but doesn't cut at window
+        // (0, 1) since 0 < 1. A quiet queen move preserves White's queen
+        // (+688 cp material edge), so any quiet returns >= 1 and cuts.
+        // Key invariant: the capture never enters `quiets_searched`, so its
+        // history entry remains 0 even after a quiet cuts.
+        let pos = Position::from_fen("4k3/4n3/8/8/8/8/4Q3/4K3 w - - 0 1")
+            .expect("queen-vs-knight sacrifice FEN must parse");
+        let cap_from = Square::E2;
+        let cap_to = Square::E7;
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        // Window (0, 1): Qxe7+ → Kxe7 returns 0 (no cut); any quiet
+        // returns ~+688 (cut).
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, &ctx);
+
+        assert_eq!(
+            ab.history_table.score(Color::White, cap_from, cap_to),
+            0,
+            "Qxe7 capture must not receive a history update; \
+             a buggy impl that pushes captures onto quiets_searched would \
+             malus this entry to -4"
+        );
+        assert_eq!(
+            ab.history_table.score(Color::Black, cap_from, cap_to),
+            0,
+            "Qxe7 capture must not receive a Black-side history update either"
+        );
+
+        // Anti-stub: confirm a cutter exists (a real cutoff fired).
+        // Otherwise the capture-stays-zero assertion is trivially true
+        // against a no-op stub. The cutter is some quiet on the White
+        // side with +bonus (= +4 at depth=2).
+        let mut found_cutter = false;
+        for from in 0..64u8 {
+            for to in 0..64u8 {
+                let f = Square::new_unchecked(from);
+                let t = Square::new_unchecked(to);
+                if ab.history_table.score(Color::White, f, t) == 4 {
+                    found_cutter = true;
+                    break;
+                }
+            }
+            if found_cutter {
+                break;
+            }
+        }
+        assert!(
+            found_cutter,
+            "expected at least one White quiet entry with +4 bonus (the cutter); \
+             a no-op stub would leave all entries at 0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HS6 — No cutoff over the move loop produces no history update.
+    // -----------------------------------------------------------------------
+
+    /// Drive negamax over a position with the full window `(-INF, INF)`.
+    /// The move loop completes without any move triggering `alpha >= beta`,
+    /// so no quiet-cutter exists. History remains zero everywhere.
+    #[test]
+    fn negamax_does_not_update_history_when_no_cutoff() {
+        let pos = Position::starting_position();
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        // depth=1, full window: root exhausts all 20 legal moves without
+        // alpha ever reaching beta (window is (-INF, INF)). Each child is
+        // searched at depth=0 → qsearch only; no child node runs a move loop
+        // or dispatches history. History remains zero everywhere.
+        // depth=2 is NOT safe here: root's second and later children are
+        // searched with a narrowed window (negate(updated_alpha, INF)) and
+        // their depth=1 children CAN cut, updating history.
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, &ctx);
+
+        for side in [Color::White, Color::Black] {
+            for from in 0..64u8 {
+                for to in 0..64u8 {
+                    let f = Square::new_unchecked(from);
+                    let t = Square::new_unchecked(to);
+                    assert_eq!(
+                        ab.history_table.score(side, f, t),
+                        0,
+                        "no-cutoff search must not update history; \
+                         ({side:?}, {f:?}, {t:?}) is non-zero"
+                    );
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // HS7 — Abort propagation skips the bonus/malus block.
+    // -----------------------------------------------------------------------
+
+    /// Pre-set `ctx.stop = true`. Drive negamax. The first cancellation
+    /// poll fires at the top of the frame (or per-recursive call); the
+    /// `if self.aborted { return 0; }` post-recursion check skips the
+    /// bonus/malus dispatch. History remains zero.
+    #[test]
+    fn negamax_does_not_update_history_on_abort() {
+        let pos = Position::from_fen("4k3/8/8/8/3b4/8/8/3QK3 w - - 0 1")
+            .expect("hanging-bishop FEN must parse");
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, stop) = non_aborting_ctx();
+        stop.store(true, Ordering::Relaxed);
+        // Pre-set aborted as well so the post-recursion check fires.
+        ab.aborted = true;
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, -INF, INF, false, &ctx);
+
+        for side in [Color::White, Color::Black] {
+            for from in 0..64u8 {
+                for to in 0..64u8 {
+                    let f = Square::new_unchecked(from);
+                    let t = Square::new_unchecked(to);
+                    assert_eq!(
+                        ab.history_table.score(side, f, t),
+                        0,
+                        "abort path must not update history"
+                    );
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // HS8 — Side-to-move at root (White) deposits bonus into entries[White].
+    // -----------------------------------------------------------------------
+
+    /// At a White-to-move root, force a quiet cutoff. Verify the bonus
+    /// entries land on `Color::White`, never on `Color::Black`.
+    #[test]
+    fn negamax_history_bonus_uses_movers_side_at_root_for_white() {
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/2R1K3 w - - 0 1")
+            .expect("KvKR W-to-move FEN must parse");
+        assert_eq!(
+            pos.side_to_move(),
+            Color::White,
+            "fixture must be White-to-move"
+        );
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, &ctx);
+
+        let mut white_nonzero = 0;
+        let mut black_nonzero = 0;
+        for from in 0..64u8 {
+            for to in 0..64u8 {
+                let f = Square::new_unchecked(from);
+                let t = Square::new_unchecked(to);
+                if ab.history_table.score(Color::White, f, t) != 0 {
+                    white_nonzero += 1;
+                }
+                if ab.history_table.score(Color::Black, f, t) != 0 {
+                    black_nonzero += 1;
+                }
+            }
+        }
+        assert!(
+            white_nonzero >= 1,
+            "White-to-move cutoff must produce at least one White-side history update; \
+             white_nonzero={white_nonzero}, black_nonzero={black_nonzero}"
+        );
+        assert_eq!(
+            black_nonzero, 0,
+            "White-to-move cutoff must NOT touch any Black-side history entry; \
+             white_nonzero={white_nonzero}, black_nonzero={black_nonzero}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HS8b — Side-to-move at non-root for Black (anti-stub for "side-from-
+    // post-recursion" bug).
+    // -----------------------------------------------------------------------
+
+    /// A buggy implementation that reads `pos.side_to_move()` AFTER the
+    /// recursive `make_move`/`unmake_move` instead of at the cutoff site
+    /// would silently invert the side. To pin: drive negamax_for_test at
+    /// `ply=1` where the position is Black-to-move (i.e. start from a
+    /// position whose side_to_move is Black at the call site). Then any
+    /// quiet cutoff at ply 1 must land on `Color::Black`.
+    #[test]
+    fn negamax_history_bonus_uses_movers_side_at_non_root_for_black() {
+        let pos = Position::from_fen("4k3/2r5/8/8/8/8/8/4K3 b - - 0 1")
+            .expect("KR-vs-K Black-to-move FEN must parse");
+        assert_eq!(
+            pos.side_to_move(),
+            Color::Black,
+            "fixture must be Black-to-move"
+        );
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        // Tight window forces a quick quiet cutoff at ply=1.
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 1, 0, 1, false, &ctx);
+
+        let mut white_nonzero = 0;
+        let mut black_nonzero = 0;
+        for from in 0..64u8 {
+            for to in 0..64u8 {
+                let f = Square::new_unchecked(from);
+                let t = Square::new_unchecked(to);
+                if ab.history_table.score(Color::White, f, t) != 0 {
+                    white_nonzero += 1;
+                }
+                if ab.history_table.score(Color::Black, f, t) != 0 {
+                    black_nonzero += 1;
+                }
+            }
+        }
+        assert!(
+            black_nonzero >= 1,
+            "Black-to-move cutoff must produce at least one Black-side history update; \
+             white_nonzero={white_nonzero}, black_nonzero={black_nonzero}"
+        );
+        assert_eq!(
+            white_nonzero, 0,
+            "Black-to-move cutoff must NOT touch any White-side history entry; \
+             white_nonzero={white_nonzero}, black_nonzero={black_nonzero}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HS9 — `negamax_move_order_score` sorts non-killer quiets descending by
+    // history value.
+    // -----------------------------------------------------------------------
+
+    /// Pre-populate four distinct quiet history values for White at startpos.
+    /// All values are within `[0, MAX_HISTORY]` so the clamp does not collapse
+    /// them; values are spaced apart so the test verifies a full descending
+    /// sort, not just bubble-to-front behavior:
+    ///   - e2e4 → +80
+    ///   - d2d4 → +50
+    ///   - b1c3 → +20
+    ///   - g1f3 →   0 (default; left untouched)
+    ///
+    /// Call `mover.ordered_moves_for_test(&pos)`; assert the four moves
+    /// appear in the order e2e4 < d2d4 < b1c3 < g1f3 (positions strictly
+    /// increasing). Other startpos quiets at history=0 may be interspersed.
+    /// Startpos has zero captures, so no capture/quiet boundary check here.
+    #[test]
+    fn negamax_move_order_score_sorts_quiets_descending_with_four_distinct_history_values() {
+        let pos = Position::starting_position();
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        ab.history_table
+            .update(Color::White, Square::E2, Square::E4, 80);
+        ab.history_table
+            .update(Color::White, Square::D2, Square::D4, 50);
+        ab.history_table
+            .update(Color::White, Square::B1, Square::C3, 20);
+        // g1f3 left at 0 explicitly.
+
+        let ordered = ab.ordered_moves_for_test(&pos);
+        let pos_e2e4 = ordered
+            .iter()
+            .position(|m| m.from_square() == Square::E2 && m.to_square() == Square::E4)
+            .expect("e2e4 must be present");
+        let pos_d2d4 = ordered
+            .iter()
+            .position(|m| m.from_square() == Square::D2 && m.to_square() == Square::D4)
+            .expect("d2d4 must be present");
+        let pos_b1c3 = ordered
+            .iter()
+            .position(|m| m.from_square() == Square::B1 && m.to_square() == Square::C3)
+            .expect("b1c3 must be present");
+        let pos_g1f3 = ordered
+            .iter()
+            .position(|m| m.from_square() == Square::G1 && m.to_square() == Square::F3)
+            .expect("g1f3 must be present");
+
+        assert!(
+            pos_e2e4 < pos_d2d4,
+            "e2e4 (history=80) must sort before d2d4 (history=50); got positions {pos_e2e4} vs {pos_d2d4}"
+        );
+        assert!(
+            pos_d2d4 < pos_b1c3,
+            "d2d4 (history=50) must sort before b1c3 (history=20); got positions {pos_d2d4} vs {pos_b1c3}"
+        );
+        assert!(
+            pos_b1c3 < pos_g1f3,
+            "b1c3 (history=20) must sort before g1f3 (history=0); got positions {pos_b1c3} vs {pos_g1f3}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HS10 — clamp boundary: pre-populate at MAX_HISTORY-1, depth-4 cutoff
+    // (bonus=16) saturates at MAX_HISTORY.
+    // -----------------------------------------------------------------------
+
+    /// Pre-populate one entry at `MAX_HISTORY - 1` (= 98 with `MAX_HISTORY = 99`).
+    /// Drive a depth-4 negamax with a tight window so a quiet move causes a
+    /// beta cutoff; `bonus = depth*depth = 16`. Post-search, the entry must
+    /// equal `MAX_HISTORY` (99), NOT `98 + 16 = 114` — proving the clamp
+    /// fires at the negamax integration site.
+    ///
+    /// We don't know the exact cutter in advance — so we pre-populate the
+    /// entries for ALL White quiets at `MAX_HISTORY - 1`. Whichever quiet
+    /// fires the cutoff is then guaranteed to clamp.
+    #[test]
+    fn history_table_update_clamps_at_positive_saturation_boundary_via_negamax() {
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/2R1K3 w - - 0 1")
+            .expect("KvKR endgame FEN must parse");
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        // Saturate every White-quiet entry to MAX_HISTORY - 1.
+        let preload: i32 = (MAX_HISTORY as i32) - 1;
+        for from in 0..64u8 {
+            for to in 0..64u8 {
+                let f = Square::new_unchecked(from);
+                let t = Square::new_unchecked(to);
+                ab.history_table.update(Color::White, f, t, preload);
+            }
+        }
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 0, 0, 1, false, &ctx);
+
+        // The cutter's entry must clamp at MAX_HISTORY. Sweep all White
+        // quiets and find at least one entry equal to MAX_HISTORY (the
+        // clamp-fired entry).
+        let mut clamped = false;
+        for from in 0..64u8 {
+            for to in 0..64u8 {
+                let f = Square::new_unchecked(from);
+                let t = Square::new_unchecked(to);
+                if ab.history_table.score(Color::White, f, t) == MAX_HISTORY {
+                    clamped = true;
+                    break;
+                }
+            }
+            if clamped {
+                break;
+            }
+        }
+        assert!(
+            clamped,
+            "depth-4 quiet-cutoff bonus must clamp at MAX_HISTORY; \
+             expected at least one White entry to equal {MAX_HISTORY}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HS11 — `Search::reset()` clears the history table.
+    // -----------------------------------------------------------------------
+
+    /// Populate four entries spanning both sides; call `Search::reset()`;
+    /// assert all entries are 0. Anchors the `Engine::reset_for_new_game()`
+    /// integration via E_h.
+    #[test]
+    fn search_reset_clears_history_table() {
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table.clear();
+        // Values within `[-MAX_HISTORY, MAX_HISTORY]` so the clamp doesn't
+        // collapse them — the test verifies the *clear*, not the clamp.
+        ab.history_table
+            .update(Color::White, Square::E2, Square::E4, 50);
+        ab.history_table
+            .update(Color::White, Square::D2, Square::D4, -20);
+        ab.history_table
+            .update(Color::Black, Square::E7, Square::E5, 30);
+        ab.history_table
+            .update(Color::Black, Square::G8, Square::F6, 10);
+
+        // Sanity: confirm pre-reset state is non-zero.
+        assert_eq!(
+            ab.history_table.score(Color::White, Square::E2, Square::E4),
+            50
+        );
+        assert_eq!(
+            ab.history_table.score(Color::Black, Square::E7, Square::E5),
+            30
+        );
+
+        <AlphaBetaMover as Search>::reset(&mut ab);
+
+        assert_eq!(
+            ab.history_table.score(Color::White, Square::E2, Square::E4),
+            0,
+            "Search::reset must clear history_table[White][e2][e4]"
+        );
+        assert_eq!(
+            ab.history_table.score(Color::White, Square::D2, Square::D4),
+            0,
+            "Search::reset must clear history_table[White][d2][d4]"
+        );
+        assert_eq!(
+            ab.history_table.score(Color::Black, Square::E7, Square::E5),
+            0,
+            "Search::reset must clear history_table[Black][e7][e5]"
+        );
+        assert_eq!(
+            ab.history_table.score(Color::Black, Square::G8, Square::F6),
+            0,
+            "Search::reset must clear history_table[Black][g8][f6]"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HS12 — `negamax_move_order_score` orders captures > killers > quiets
+    // (history-rated and not), even when the quiet has saturated history.
+    // -----------------------------------------------------------------------
+
+    /// Construct a position offering simultaneously: a capture (QxP), a
+    /// non-capture queen-promotion, a quiet move pre-populated at
+    /// `MAX_HISTORY` in the history table, and a quiet move installed as
+    /// `killer0`. Verify the comparator ranks them:
+    ///    `s_promo > s_cap > s_killer > s_history_quiet`.
+    ///
+    /// This pins the cross-tier discipline:
+    ///   - mvv_lva (≥ 287) > KILLER0_SCORE (200): captures above killers.
+    ///   - KILLER1_SCORE (100) > MAX_HISTORY (99): killers above quiets.
+    ///   - non-capture promos rank above ordinary captures via the M3.D
+    ///     promo-piece-value MVV-LVA discipline (ADR-0016 §6).
+    #[test]
+    fn negamax_move_order_score_places_captures_above_killers_above_history_quiets() {
+        let pos = Position::from_fen("4k3/P7/8/8/3p4/8/8/3QK3 w - - 0 1")
+            .expect("HS12 fixture FEN must parse");
+        let cap = Move::from_uci("d1d4", &pos).expect("d1d4 (QxP capture) must be legal");
+        let promo = Move::from_uci("a7a8q", &pos).expect("a7a8q (queen-promo) must be legal");
+        let history_quiet = Move::from_uci("e1e2", &pos).expect("e1e2 (king quiet) must be legal");
+        let killer_quiet = Move::from_uci("e1d2", &pos).expect("e1d2 (king quiet) must be legal");
+
+        let mut ht = HistoryTable::new();
+        // Saturate the history-quiet's entry to MAX_HISTORY.
+        ht.update(
+            Color::White,
+            history_quiet.from_square(),
+            history_quiet.to_square(),
+            MAX_HISTORY as i32,
+        );
+
+        // killer_quiet installed as killer0; killer1 empty.
+        let killer0 = killer_quiet;
+        let killer1 = Move::default();
+
+        let s_cap = negamax_move_order_score(cap, &pos, killer0, killer1, &ht);
+        let s_promo = negamax_move_order_score(promo, &pos, killer0, killer1, &ht);
+        let s_killer = negamax_move_order_score(killer_quiet, &pos, killer0, killer1, &ht);
+        let s_history_quiet = negamax_move_order_score(history_quiet, &pos, killer0, killer1, &ht);
+
+        assert!(
+            s_promo > s_cap,
+            "non-capture queen-promo must score above plain capture (per ADR-0016 §6); \
+             promo={s_promo}, capture={s_cap}"
+        );
+        assert!(
+            s_cap > s_killer,
+            "every capture/promo must score above every killer; \
+             capture={s_cap}, killer={s_killer}"
+        );
+        assert!(
+            s_killer > s_history_quiet,
+            "every killer must score above every non-killer quiet, even at MAX_HISTORY; \
+             killer={s_killer}, history_quiet={s_history_quiet}, MAX_HISTORY={MAX_HISTORY}"
         );
     }
 }

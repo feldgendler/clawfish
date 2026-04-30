@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M4.B complete — killer moves landed and SPRT-validated; M4.C — history heuristic — is next.** Architectural commitments settled (see `docs/decisions/`).
+**Phase: M4.C complete — history heuristic landed; M4.D — aspiration windows — is next.** Architectural commitments settled (see `docs/decisions/`).
 
 | Phase | Status | One-line summary |
 |---|---|---|
@@ -20,13 +20,14 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 | M3.F | ✓ | `bench` UCI command (signature `bench: 172312700 nodes 11489045 nps`); `scripts/sprt.sh sprt\|match\|rating-estimate` wrapper + `scripts/elo-iterate.sh` online iterator; SPRT vs RandomMover **148-0-0 H1 accepted**; rating estimate via online Elo iteration converged to **~2114 Elo at tc=10+0.1** (±35 Elo, P-core pinned, 120 games); `compute_bench_nps` helper closes 3 mutation gaps. Closes M3. |
 | M4.A | ✓ | Zobrist-keyed transposition table (`UnsafeCell<Vec<TtEntry>>` + 16-byte entry; depth-preferred + age-bias replacement; mate-score depth-adjustment); `Hash` UCI option; `Engine::reset_for_new_game` consolidated. ADR-0018. Bench: `bench: 39964046 nodes <NPS> nps` (-77% vs M3.F). SPRT vs `baseline/alpha-beta-no-tt`: +281.89 ± 55.64 Elo. |
 | M4.B | ✓ | Two killer slots per ply (`[[Move; 2]; MAX_PLY]` with `Move::default()` sentinel); `is_quiet`/`update_killers`/`negamax_move_order_score`/`order_moves`/`clear_killers` helpers extracted per the M3.D `negate_window` precedent; killers updated on quiet beta cutoffs and folded into negamax move ordering between captures and remaining quiets. Bench: `bench: 22237579 nodes <NPS> nps` (-44% vs M4.A). SPRT vs `baseline/alpha-beta-tt`: 148-8-2 (94.30%), Δ Elo **+487.58 ± 125.42** in 158 games / 12m20s. |
+| M4.C | ✓ | Butterfly history table `[side][from][to]` i16 (`MAX_HISTORY = 16384`, literature standard); `+= depth*depth` bonus on quiet beta-cutoff with explicit clamp; matching `-= depth*depth` malus on prior quiets in `quiets_searched`. Layered into `negamax_move_order_score` as the comparator score for non-killer quiets in `[-MAX_HISTORY, MAX_HISTORY]`. To preserve the captures > killers > history-quiets hierarchy, M4.B's `KILLER0_SCORE = 200` and `KILLER1_SCORE = 100` were bumped to `100_001` / `100_000`, and the comparator's non-quiet path adds `CAPTURE_OFFSET = 1_000_000` to `mvv_lva_score`. ADR-0019. Bench: `bench: 17650332 nodes <NPS> nps` (-20.6% vs M4.B). SPRT vs `baseline/alpha-beta-tt-killer`: _(populated post-SPRT)_. |
 | Tooling/fuzzing | ✓ | `cargo-fuzz` harnesses for FEN + UCI (ADR-0013); 3.17B execs aggregate across saturation + smoke campaigns, one real parser bug found and fixed. |
 
 For per-phase detail (what landed, verification numbers, lessons), see [`docs/milestones/`](docs/milestones/). The forward-looking milestone plan lives in [`docs/roadmap.md`](docs/roadmap.md).
 
 ### What's next
 
-**M4.C — history heuristic.** History counter table indexed by piece-and-to (or from-and-to; chosen at ADR landing); depth-weighted increment on quiet-move beta cutoff; matching decrement on quiet moves that failed to cut at the same node; aging-or-saturation discipline. Ordering tiebreaker among non-killer quiets in `[0, 99]` below `KILLER1_SCORE = 100`. SPRT-gated against `baseline/alpha-beta-tt-killer` (the tag landing at M4.B's merge commit). Detail in [`docs/roadmap.md`](docs/roadmap.md).
+**M4.D — aspiration windows.** ID outer-loop wrapper consuming the prior iteration's score from `last_complete: Option<(depth, bestmove, score)>` (already plumbed by M3.E). SPRT-gated against `baseline/alpha-beta-tt-killer-history` (the tag landing at M4.C's merge commit). Detail in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## How to pick up a new session
 

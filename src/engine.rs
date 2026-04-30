@@ -3733,6 +3733,63 @@ mod tests {
         );
     }
 
+    /// E_h (M4.C): `ucinewgame` clears the butterfly history table populated
+    /// by a prior search. Pinned via the search-side test accessor
+    /// `AlphaBetaMover::history_table_for_test`. After a depth-2 search the
+    /// table may be zero or non-zero depending on whether any quiet caused a
+    /// beta cutoff during the search; what's load-bearing is that AFTER
+    /// `reset_for_new_game()` the table is uniformly zero. To force a
+    /// non-trivial pre-state we pre-seed via a direct `update` call held under
+    /// the search mutex; then `ucinewgame` (`reset_for_new_game`) must clear.
+    #[test]
+    fn ucinewgame_clears_history_table() {
+        use crate::piece::Color;
+        use crate::square::Square;
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
+
+        // Drive one search end-to-end so the orchestrator has run a `go` and
+        // the worker has touched the search mutex; afterwards the search is
+        // idle and the orchestrator can lock it.
+        let (tx, rx) = mpsc::channel::<Command>();
+        tx.send(parse_uci_line("position startpos")).unwrap();
+        tx.send(parse_uci_line("go depth 2")).unwrap();
+        tx.send(Command::Quit).unwrap();
+        engine.run(rx);
+
+        // Pre-seed the history table to a known non-zero state (independent
+        // of whether the depth-2 search itself populated entries). Value
+        // chosen below `MAX_HISTORY` so the clamp does not collapse it —
+        // the test verifies the *clear*, not the clamp.
+        {
+            let mut s = engine.search.lock().unwrap();
+            s.history_table_for_test_mut()
+                .update(Color::White, Square::E2, Square::E4, 50);
+        }
+        // Sanity: confirm the seed is observable.
+        {
+            let s = engine.search.lock().unwrap();
+            assert_eq!(
+                s.history_table_for_test()
+                    .score(Color::White, Square::E2, Square::E4),
+                50,
+                "pre-seed must be observable through the test accessor"
+            );
+        }
+
+        engine.reset_for_new_game();
+
+        let s = engine.search.lock().unwrap();
+        let ht = s.history_table_for_test();
+        assert_eq!(
+            ht.score(Color::White, Square::E2, Square::E4),
+            0,
+            "ucinewgame must clear the history table (Search::reset path)"
+        );
+    }
+
     /// E_f: `bench` is deterministic run-to-run with TT in play.
     #[test]
     fn bench_clears_tt_between_positions_for_determinism() {

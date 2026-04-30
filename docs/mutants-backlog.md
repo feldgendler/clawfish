@@ -27,34 +27,43 @@ Per-unit `cargo mutants --in-diff` runs that are deferred from the unit's commit
 
 ## Pending
 
-### M4.B — Killer moves (committed 2026-04-29; rebased onto main 2026-04-30 on `m4.b-killer-moves` branch)
+### M4.B + M4.C — Killer moves + History heuristic (joint campaign)
+
+**Why combined:** M4.B and M4.C developed on parallel branches off M4.A; the user opted to defer their mutation campaigns and run them together as one overnight batch covering both diff ranges. M4.C's rebase onto main folds its history table into M4.B's already-merged `negamax_move_order_score` and extends `Search::reset` / killer scoring boundaries (`MAX_HISTORY = 99` to fit strictly below `KILLER1_SCORE = 100`). One single `cargo mutants --in-diff` invocation covers both phases via the commit-range diff below.
 
 **Diff command** (resilient to working-tree state — uses commit hashes):
 
 ```sh
-git diff 33a0d0d..1771e57 -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.b.diff"
+git diff 33a0d0d..<M4.C-TIP> -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.bc.diff"
 ```
 
-- `33a0d0d` — M4.A follow-up (cargo-mutants survivors fix); M4.B's branching point after the rebase onto main.
-- `1771e57` — M4.B landing commit on branch `m4.b-killer-moves` post-rebase; the head of the unit's diff.
-- Pathspec `'src/*.rs' 'tests/*.rs'` — single-star glob (git pathspec doesn't expand `**`); restricts to the source + integration-test surface. The M4.B unit modified only `src/search.rs` plus four doc files; the doc files are out of scope for cargo-mutants.
+- `33a0d0d` — M4.A follow-up (cargo-mutants survivors fix); M4.B's branching point on main and the joint range's start.
+- `<M4.C-TIP>` — the M4.C tip on `m4.c-history-heuristic` after rebase onto main; resolved to a concrete SHA (printed by `git rev-parse m4.c-history-heuristic` at campaign-start time, or by `git rev-list --max-count=1 baseline/alpha-beta-tt-killer-history` once that tag is created at the M4.C merge commit).
+- Pathspec `'src/*.rs' 'tests/*.rs'` — single-star glob (git pathspec doesn't expand `**`); restricts to the source + integration-test surface. M4.B + M4.C modify `src/search.rs`, `src/history.rs` (new), `src/mov.rs`, `src/engine.rs`, `src/lib.rs`, `tests/uci_integration.rs` plus doc files; the doc files are out of scope for cargo-mutants.
 
 After landing the diff, run:
 
 ```sh
-cargo mutants --in-diff "$TMPDIR/m4.b.diff"
+cargo mutants --in-diff "$TMPDIR/m4.bc.diff"
 ```
 
-If the unit has merged to main by the time the campaign starts, the commit hashes above are still valid — they are immutable. Once `baseline/alpha-beta-tt-killer` is created at the M4.B merge commit, a tag-based regenerate is also available: `git diff baseline/alpha-beta-tt..baseline/alpha-beta-tt-killer -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.b.diff"`. Note that `baseline/alpha-beta-tt` points at `ecacf57` (M4.A landing, before the M4.A mutants follow-up), so a tag-baseline regenerate would also include `33a0d0d`'s S13 tightening + T20c boundary tests in the diff — wider than the M4.B-only surface above, but harmless.
+Once `baseline/alpha-beta-tt-killer-history` is created at the M4.C merge commit, a tag-based regenerate is also available: `git diff baseline/alpha-beta-tt..baseline/alpha-beta-tt-killer-history -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.bc.diff"`. Note that `baseline/alpha-beta-tt` points at `ecacf57` (M4.A landing, before the M4.A mutants follow-up), so a tag-baseline regenerate would also include `33a0d0d`'s S13 tightening + T20c boundary tests in the diff — wider than the M4.B+M4.C-only surface above, but harmless.
 
 **Unit context** (read these before triaging):
 
-- Plan: [`docs/plans/m4.b.md`](plans/m4.b.md) — see §3 (helper signatures) and §8 (anticipated catchable surface table).
-- Research: [`docs/research/m4-killer-moves.md`](research/m4-killer-moves.md).
-- Retrospective: [`docs/milestones/m4.b.md`](milestones/m4.b.md) — "Mutation-survivor analysis" section is the target for the post-triage update.
-- Code surface: `src/search.rs` lines ~285 (field), ~870–945 (helpers), ~552–610 (negamax steps 10 + 11), ~320 / ~338 / ~426 (lifecycle reset call sites), plus ~22 tests in the `mod tests` block at S14–S29 (search for the `S14 —` comment marker).
+- M4.B plan: [`docs/plans/m4.b.md`](plans/m4.b.md) — see §3 (helper signatures) and §8 (anticipated catchable surface table).
+- M4.B research: [`docs/research/m4-killer-moves.md`](research/m4-killer-moves.md).
+- M4.B retrospective: [`docs/milestones/m4.b.md`](milestones/m4.b.md) — "Mutation-survivor analysis" section is the target for the post-triage update.
+- M4.C plan: [`docs/plans/m4.c.md`](plans/m4.c.md) — see §3.5 (cutoff dispatch) and §11 (mutation-testing prep).
+- M4.C research: [`docs/research/m4-history-heuristic.md`](research/m4-history-heuristic.md).
+- M4.C retrospective: [`docs/milestones/m4.c.md`](milestones/m4.c.md) — "Mutation-survivor analysis" section is the target for the post-triage update.
+- M4.C ADR: [`docs/decisions/0019-history-heuristic.md`](decisions/0019-history-heuristic.md).
+- Code surface:
+  - `src/search.rs` lines ~285 (killer field), ~870–945 (M4.B helpers), ~552–610 (negamax steps 10 + 11), ~320 / ~338 / ~426 (lifecycle reset call sites), the cutoff dispatch + `quiets_searched` accumulator + push site for M4.C, plus ~22 M4.B tests at S14–S29 and ~16 M4.C tests at HS1–HS12 + HS3b/HS3c/HS4b/HS8b (search for the `S14 —` and `HS1 —` comment markers).
+  - `src/history.rs` — the entire M4.C module + 12 H-tests.
+  - `src/engine.rs` — the M4.C `ucinewgame_clears_history_table` E_h test.
 
-**Anticipated catchable surface** (from plan §8; verify or refute per actual run):
+**Anticipated catchable surface (M4.B portion, from M4.B plan §8):**
 
 | Helper / call site | Anticipated mutations | Test that should kill |
 |---|---|---|
@@ -76,11 +85,55 @@ If the unit has merged to main by the time the campaign starts, the commit hashe
 | Per-go `clear_killers` call | dropped | S29 jointly with per-iteration |
 | `Search::reset` `clear_killers` call | dropped | S28 |
 
-**Known structural test-surface gap** (per plan §8):
+**Anticipated catchable surface (M4.C portion):**
 
-The per-iteration `clear_killers` call site is structurally hard to distinguish from per-go via test surface alone — per-iteration runs at the top of iteration 1 (before any negamax call), so dropping the per-go call alone is masked by per-iteration. If the campaign reports a survivor at the per-iteration call site, follow the fix protocol above (extract a named method + direct unit test).
+| Mutation class | Where | Expected catch |
+|---|---|---|
+| `+= bonus → += -bonus` (cutter sign flip) | `src/search.rs` cutoff dispatch | HS1 (`assert!(... s == 4)` exact match for cutter at depth 2) AND HS1's strict `nonzero.iter().all(\|s\| *s == 4 \|\| *s == -4)` |
+| Loop body deletion in malus loop | `src/search.rs` malus `for prior in quiets_searched.iter()` | HS4b's `has_negative` aggregate at depth 3 startpos |
+| `if is_quiet(mv) → if !is_quiet(mv)` flip on cutoff dispatch gate | `src/search.rs` cutoff site | HS2 (capture cutoff produces all-zero) |
+| `if is_quiet(mv) → if !is_quiet(mv)` flip on push gate | `src/search.rs` push-on-no-cutoff | HS5 (capture's history entry stays 0 even when later quiet cuts) |
+| Deletion of `quiets_searched.push(mv)` line | `src/search.rs` push site | HS4b (no negatives if no priors) |
+| `mv.from_square()` ↔ `mv.to_square()` swap on update arg | `src/search.rs` cutter update | HS9's relative-position assertion (e2e4 < d2d4 < b1c3 < g1f3) |
+| `+= depth*depth → += depth` (linear) | `src/search.rs` bonus computation | HS1's `s == 4` exact match (depth=2 gives `4` for `depth*depth` but `2` for `depth`) |
+| Clamp boundary off-by-one | `src/history.rs::update` | H5/H6/H7 module-level boundary tests |
+| `negamax_move_order_score` history branch returning constant | non-killer-quiet branch | HS9 (relative ordering with 4 distinct values) |
+| `negamax_move_order_score` MAX_HISTORY-vs-KILLER1 boundary | implicit via tier discipline | HS12 (capture > killer > history-quiet at MAX_HISTORY) |
+| TT-cutoff early-return path falsely updating history | negamax prologue | HS3 (no update on TT-cutoff) |
+| Repetition / 50-move / MDP-collapse early-return paths falsely updating history | negamax prologue | HS3b + HS3c |
+| Abort-skip discipline on history update | post-recursion abort guard | HS7 |
+| Side-to-move read at wrong point (post-make instead of post-unmake) | negamax cutoff dispatch | HS8 (root White) + HS8b (non-root Black) |
 
-**No `.cargo/mutants.toml` changes anticipated.** Helper extraction (`order_moves`, `clear_killers`, etc.) follows the M3.D `negate_window` + M3.E `aborted_fallback_result` precedent specifically to avoid needing exclusions; if the actual run produces survivors that don't fit into the categories above, prefer "extract a named helper + add a unit test" before "add an `exclude_re` rule".
+**Predicted equivalent-with-rationale survivor (M4.C portion):**
+
+- **`negamax_move_order_score` MAX_HISTORY-vs-KILLER1 off-by-one** (`KILLER1_SCORE = 100, MAX_HISTORY = 99`): bumping MAX_HISTORY to 100 would tie the worst-case history-quiet score with KILLER1_SCORE; the comparator's `sort_by_cached_key` is stable but tie-breaks by movegen order. Whether this counts as a real bug depends on the SPRT signal — for this milestone it would be classified as **equivalent-with-rationale** since the strict-inequality is the design intent (per ADR-0019 §1 + CLAUDE.md status text), but the actual behavioral delta from a single-move tie at the killer/history boundary is below SPRT noise floor.
+
+**Triage protocol** (per `docs/workflow.md`):
+
+1. **Caught** — re-run `cargo test --lib <test_name>` to confirm; nothing to do.
+2. **Equivalent mutant** — prove indistinguishability; add `exclude_re` rule to `.cargo/mutants.toml` with a comment explaining why no input distinguishes original from mutant. Cite ADR-0019 / plan §3 where the design intent supports the equivalence.
+3. **Real-bug, structurally undetectable at this milestone scope** — add `exclude_re` rule with a "deferred to M\<X\>" comment and surface in the M4.C retrospective's "Mutation-survivor analysis" section.
+4. **Real-bug, catchable by adding a test** — add the test (preserve naming convention from existing S14–S29 + HS1–HS12 series), re-run with `cargo mutants --in-diff $TMPDIR/m4.bc.diff --iterate`, return to step 1.
+
+Avoid `exclude_re` rules anchored to line numbers (per `.cargo/mutants.toml` guidance — line-number-anchored regexes are fragile; structural patterns or specific function names are stable). M3.D's `negate_window` extraction is the precedent for refactoring instead of excluding.
+
+### Where the follow-up commit lands
+
+On `main` (M4.C will have merged by the time the campaign runs). The commit message follows the M4.A follow-up pattern (commit `33a0d0d`):
+
+> M4.B+M4.C follow-up: address N cargo-mutants survivors
+>
+> `cargo mutants --in-diff ...` produced K mutations: J caught + L
+> timeout (caught-via-hang) + M unviable + N missed. This commit addresses
+> all N: ...
+
+Update both `docs/milestones/m4.b.md`'s and `docs/milestones/m4.c.md`'s "Mutation-survivor analysis" sections atomically with the commit. Remove this entry from the backlog.
+
+### Edge cases
+
+- **If `cargo mutants` reports `unviable` for the M4.C `Move::default()` sentinel `debug_assert!`**: that's expected — the assertion is in a path movegen never produces, so no chess fixture can drive it. Classify as caught-via-unreachable; no action needed.
+- **If the campaign hangs**: per `.cargo/mutants.toml` guidance, the timeout multiplier should be enough; if a specific mutation hangs the test suite, it's almost always the cancellation-poll cadence interacting with the mutated code. Cancel via Ctrl-C; the mutation is caught-via-timeout.
+- **If a survivor maps outside the M4.B/M4.C surface** (i.e., a mutation on a line outside `src/search.rs` killer / history logic, `src/history.rs`, or the M4.C-specific test surface): something's off with the diff scope. Re-check that `33a0d0d..<M4.C-TIP>` is the correct hash range and that no drift commits have landed.
 
 ## Done
 

@@ -10,6 +10,7 @@ pub mod bitboard;
 pub mod engine;
 pub mod eval;
 pub mod fen;
+pub mod history;
 pub mod magic;
 pub mod mov;
 pub mod movegen;
