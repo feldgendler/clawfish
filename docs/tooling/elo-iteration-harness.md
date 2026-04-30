@@ -51,7 +51,7 @@ ADR numbers allocated at landing time. ELOH.B and ELOH.D may land without an ADR
 |---|---|---|
 | **ELOH.A** ✓ — Harness foundation | Persistent subprocesses + UCI driver + native adjudication (mate/stalemate/50-move/FIDE-3-fold/insufficient-material) + per-side clock management + match-loop time-source seam + color-paired fixed-batch match loop. Plays N games against a fixed-config opponent; emits per-game PGN + summary. No K-update, no σ-stopping, no concurrency, no threshold adjudication. **Landed 2026-04-29.** ADR-0020; plan: `docs/plans/eloh.a.md`. Actual landing size: ~2300 LOC binary + 80 LOC lib seam (`src/match_clock.rs`) + 51 in-tree tests passing. Back-test gate result archived in `docs/research/tooling-elo-harness-validation.md` (lands as follow-up commit once the manual back-test completes). | ~500 (actual ~2300; integration glue across 7 submodules — driver/cli/adjudicate/pgn/summary/match_loop/main — overshot the plan's bin estimate) |
 | **ELOH.B** ✓ — Online iteration + concurrency + progress + threshold adjudication | Robbins-Monro K-update + σ-stopping + concurrency (N parallel game-pairs) + convergence-progress output + resign/draw/max-moves threshold adjudication. Replaces `scripts/elo-iterate.sh` (thin wrapper) and `scripts/sprt.sh rating-estimate` arm end-to-end. **Landed 2026-04-30.** Plan: `docs/plans/eloh.b.md`. Actual landing size: ~5917 LOC total binary (ELOH.A+B combined) + 139 in-tree tests passing. Back-test gate (Part 1: online run vs M3.F ~2114 Elo; Part 2: synthetic Bernoulli σ-stopping) deferred to post-merge manual run. | ~150 binary + ~80 tests (actual ~650 new LOC across `estimator`, `sigma`, `progress`, `adjudicate` extension, `match_loop` extension, `controller`, `main` rewrite) |
-| **ELOH.C** — Hardware-invariant TC | Harness `--go-nodes N` flag (fills the seam ELOH.A leaves) + clawfish `VirtualClock` UCI option (`option name VirtualClock type check default false`) substituting `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` for `Instant::now()` in `compute_caps`. Single ADR for the time-source decision covering both sides. | ~70 harness + ~80 engine + ~80 tests |
+| **ELOH.C** ✓ — Hardware-invariant TC | VirtualClock UCI option (`option name VirtualClock type check default false`) in clawfish: swaps `Instant::now()` for per-thread `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` in the worker-owned `SearchClock`; harness `--virtual-clock` flag + handshake-driven `setoption` negotiation (sent only to engines that advertise the option). `--go-nodes N` dropped per user decision 2026-04-30. ADR-0019. Back-test gate Part 1 deferred to post-merge manual run. **Landed 2026-04-30.** Plan: `docs/plans/eloh.c.md`. Actual landing size: ~190 prod LOC + ~140 test LOC = ~330 LOC. | ~190 prod + ~140 tests (actual) |
 | **ELOH.D** — Mixed-TC sampling | Per-game TC sampling for mixed-TC SPRT and Δ(TC) regression. New `--tc-sample <SPEC>` flag accepting a discrete weighted list of TCs (e.g. `10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1`); harness draws TC per game before clock initialisation; PGN `TimeControl` tag and per-game summary line record the sampled TC. Mutually exclusive with `--tc`. Compatible with both SPRT and rating-estimate workflows. Decision-rule (mixed-game SPRT verdict, Δ(TC) regression fit) computed by downstream tooling — harness emits data only. | ~120 harness + ~50 tests |
 
 ELOH.A → B → C is sequential. ELOH.D depends on ELOH.B (must have); is parallel-compatible with ELOH.C at the type-system level (TC sampling and time-source primitive are orthogonal axes — TC sampling sets the *base + increment* before clock initialisation; ELOH.C swaps the *time-source primitive* under those clocks); but is sequenced *after* ELOH.C to avoid match-loop merge conflicts and to inherit hardware-invariant TC for the Δ(TC) curve fit (less wallclock noise → tighter per-TC confidence bands). Each phase's back-validation gate must pass before the next is planned.
@@ -127,43 +127,27 @@ Together these gates exercise the K-update + concurrency path (Part 1, against a
 - `scripts/elo-iterate.sh` — replaced with thin wrapper invoking `cargo run --release --bin elo-iterate -- ...`, OR removed entirely with `scripts/sprt.sh rating-estimate` rerouted directly. Decided in plan.
 - `docs/tooling/elo-iteration-harness.md` — ELOH.B row marked done.
 
-## ELOH.C scope detail
+## ELOH.C scope detail — Done (2026-04-30)
 
-ELOH.C is a **single coordinated change** spanning clawfish source (engine-side `VirtualClock` UCI option) and the harness binary (`--go-nodes` mode + `VirtualClock` negotiation). Lands on a single branch covering both — likely `tooling/eloh-c-hardware-invariant-tc` — since the engine and harness changes are tightly coupled (the engine option is unusable without harness negotiation; the harness `--go-nodes` mode is a separate axis but lands together for cohesion). Earlier draft suggested `engine/virtual-clock` as a pure-engine branch; revised because ELOH.C's harness-side scope makes the boundary moot.
+ELOH.C landed on branch `tooling/elo-harness` (worktree `/Users/alex/clawfish-elo-harness`) on top of ELOH.B. ADR-0021 (`docs/decisions/0021-virtual-clock-uci-option.md`) captures the load-bearing design decisions. Research: `docs/research/tooling-cpu-cycle-counters.md` (initial survey + Apple Silicon follow-up + Linux VM follow-up + M4 empirical probe).
 
-**In scope (clawfish-side, ~80 LOC).**
-1. New UCI option `option name VirtualClock type check default false`.
-2. When `true`, `compute_caps` substitutes `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` (POSIX) / `mach_thread_info(THREAD_BASIC_INFO)` (Darwin) for `Instant::now()`. Platform shim via `#[cfg(target_os)]`.
-3. UCI option plumbing in `Engine::handle_setoption` (mirrors `MoveOverhead`).
-4. `MoveOverhead` semantics under `VirtualClock=true`: still in milliseconds, but milliseconds of CPU time. Documented in the option's UCI description string. Acknowledged degenerate case: under CPU-time TC there's no wallclock-scheduling jitter for `MoveOverhead` to hedge against, so the option becomes a small fixed-cost conservatism (engine plays slightly under budget). Harmless at the default 50ms; left as-is unless empirically problematic.
-5. Test fixture pinning the option's effect: deterministic CPU-time fixture (a tight loop consuming a known number of cycles via `std::hint::black_box`) confirms `compute_caps` returns CPU-time-based deadlines when `VirtualClock=true` and wallclock-based deadlines when `VirtualClock=false`.
+**What landed (clawfish-side, ~130 prod LOC including test-site migrations).**
+1. New `SearchInstant` enum (`Wall(Instant)` / `Cpu(u64)`) + `SearchClock` worker-local struct. Time-source ownership lives in the worker thread — `SearchClock::start_for(virtual_clock, caps)` reads the calling thread's CPU clock once at entry of `Search::go` and derives all deadlines from that single read.
+2. `SearchContext` loses the orchestrator-thread `start`/`deadline`/`soft_deadline` fields; gains `caps: TimeCaps` and `virtual_clock: bool`. This was the plan-review v2 must-fix: per-thread `CLOCK_THREAD_CPUTIME_ID` semantics made orchestrator-pre-computed deadlines categorically wrong for the worker thread.
+3. `read_thread_cpu_ns()` private libc shim (`#[cfg(unix)]`).
+4. `Engine::virtual_clock: bool` field + `handle_uci` emits `option name VirtualClock type check default false` (`#[cfg(unix)]`); `handle_setoption` parses and validates it.
 
-**In scope (harness-side, ~70 LOC).**
-6. **`--go-nodes N` CLI flag (~30 LOC).** Constructs the `MatchTimeMode::Nodes(N)` variant from the seam ELOH.A landed. Harness substitutes `go nodes <N>` for `go wtime/btime/winc/binc`; per-side clock tracking is bypassed (the seam already makes this conditional); the wallclock pipe-watchdog stays active per ELOH.A's invariant. Asymmetric: per-engine via `--engine-go-nodes` / `--opponent-go-nodes` if needed (decided in plan).
-7. **`VirtualClock` negotiation (~40 LOC).** Parse opponent's `option name VirtualClock ...` line from the `uci` response handshake; conditionally send `setoption name VirtualClock value true`; fall back silently when the opponent doesn't advertise the option (Stockfish's case). Integrates with the existing UCI handshake state machine.
+**What landed (harness-side, ~55 prod LOC).**
+5. `EngineCapabilities { supports_virtual_clock: bool }` + `parse_option_advertisement` in `mod driver`; `wait_for_uciok` extended to return `EngineCapabilities`.
+6. `--virtual-clock` CLI flag (boolean, no value, default false); sends `setoption name VirtualClock value true` after `uciok` to any engine advertising the option when the flag is set.
 
-**Out of scope.**
-- PMU instruction counting (the "even sharper" follow-up in the original backlog entry). Defer until `CLOCK_THREAD_CPUTIME_ID` proves empirically inadequate.
-- Cross-engine `VirtualClock` enforcement (Stockfish doesn't support it; harness simply doesn't send the option to engines that don't advertise it).
+**`--go-nodes N` — explicitly dropped.** The `MatchTimeMode::Nodes(u64)` seam from ELOH.A remains in the codebase as unconstructible-from-CLI dead code. Per user decision 2026-04-30: `go nodes N` is implementation-coupled — the nodes-per-work-unit figure shifts even within a single binary across runtime settings (Hash size, eval weights, etc.), making it unsuitable for cross-version SPRT. The seam is retained (removing it costs more churn than retention; future work may revive it for non-gate diagnostic use). The pre-ELOH.C spec item 6 of "In scope (harness-side)" is struck by this decision; ADR-0019 carries the full rationale.
 
-**Open questions (resolved at ELOH.C plan landing).**
-- Time-source generic vs. runtime check: zero-cost generic over a `TimeSource` trait monomorphized at search entry, vs. an `is_virtual_clock` field in `compute_caps` and a runtime branch. Default plan: runtime branch (simpler; predictable; not in the inner loop).
-- `MoveOverhead` reinterpretation under `VirtualClock=true`: defaults to CPU time (since the whole point is to make TC CPU-time-relative); documented explicitly.
-- Mate-distance pruning interaction: M3.E's MDP is algorithmically agnostic to the time source; confirm in tests.
+**Size.** Actual landing: ~190 prod LOC + ~140 test LOC = ~330 LOC total. The plan's earlier `~70 harness + ~80 engine + ~80 tests` estimate predated the plan-review v2 must-fix that moved `SearchClock` to the worker thread — the `SearchContext` field migration across ~16 test-site constructions accounts for the growth.
 
-**Back-validation gate.** Two parts — both M4-independent, addresses earlier concern that M4.A dependency was elided.
+**Back-test gate Part 1** (clawfish-vs-clawfish SPRT under simulated CPU load with `--virtual-clock`; target σ_VC / σ_wall ≤ 0.7) — deferred to post-merge manual run. Result will be archived to `docs/research/tooling-virtual-clock-validation.md` once completed.
 
-- **Part 1 — Engine-side under load.** Clawfish-vs-clawfish SPRT under simulated CPU load (a `stress -c 4 &` background process) with `setoption VirtualClock true` on both sides. Pass: variance is meaningfully tighter than the wallclock-baseline equivalent under the same load. Quantitative target: σ of the SPRT's Elo estimator at least 30% lower than the wallclock baseline at equivalent compute budget. Result archived to `docs/research/tooling-virtual-clock-validation.md`.
-- **Part 2 — Harness-side `--go-nodes` invariance (synthetic, no M4 dependency).** Run two clawfish-vs-clawfish matches on the *same* binary: one with `--tc 10+0.1`, one with `--go-nodes N` where `N` is chosen so the *median wallclock duration per game* matches the `--tc 10+0.1` baseline on the test machine. Calibration recipe: run a 10-game `--tc 10+0.1` calibration match first; record median per-game wallclock; pick `N` such that a follow-up 10-game `--go-nodes N` calibration match has the same median wallclock to within 5%. (Picking `N` from `bench` nps is *not* sufficient — node-count-per-game varies with position complexity, so the calibration must be empirical at the match level.) Then run the two 200-game matches at the calibrated `N`. Pass: result distributions overlap (W/L/D within Wilson-95% CI of each other). Validates that `--go-nodes` mode produces statistically equivalent results to wallclock mode on identical engines at comparable compute. Independent of M4.A's existence.
-
-The earlier "replay M4.A's TT-vs-no-TT estimate with `--go-nodes`" forward-validation is *opportunistic*, not a gate — when M4.A lands and uses `--go-nodes` for forward-validation, that's a useful signal but not a precondition for ELOH.C closure.
-
-**Doc-delta (atomic with ELOH.C landing).**
-- New ADR — `VirtualClock` UCI option + `--go-nodes` harness mode (number allocated at landing).
-- `docs/tooling-backlog.md` — "Hardware-invariant TC" entry moved to "Done."
-- `docs/architecture.md` — small update if `compute_caps`'s time-source abstraction warrants (likely a ~3-line note in the Search-v1 subsection).
-- New: `docs/research/tooling-virtual-clock-validation.md` — engine-side back-test result.
-- `docs/tooling/elo-iteration-harness.md` — ELOH.C row marked done.
+See also: ADR-0021 (`docs/decisions/0021-virtual-clock-uci-option.md`); research: `docs/research/tooling-cpu-cycle-counters.md`; bench: `bench/eloh-c.md`.
 
 ## ELOH.D scope detail
 
@@ -212,8 +196,7 @@ The two gates exercise the sampler (Part 1, deterministic) and the integration-w
 
 ## Branches and worktrees
 
-- **ELOH.A and ELOH.B.** Branch `tooling/elo-harness`, worktree `/Users/alex/clawfish-elo-harness`.
-- **ELOH.C.** Single branch covering both engine and harness changes, default name `tooling/eloh-c-hardware-invariant-tc`. Branched off `main` after ELOH.B has merged so the harness-side seam is in place. Worktree path TBD at ELOH.C plan time.
+- **ELOH.A, ELOH.B, and ELOH.C.** Branch `tooling/elo-harness`, worktree `/Users/alex/clawfish-elo-harness`. (ELOH.C landed on the same branch as A and B rather than its own branch, per user directive to work in the existing worktree; ELOH.B had not merged to main when ELOH.C planning started.)
 - **ELOH.D.** Harness-only branch, default name `tooling/eloh-d-mixed-tc`. Branched off `main` after ELOH.C has merged so the match-loop's TC-sampling addition layers on top of the time-source seam without merge-conflict risk. Worktree path TBD at ELOH.D plan time.
 
 ## Sequencing relative to M4

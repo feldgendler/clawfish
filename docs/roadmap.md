@@ -4,15 +4,20 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1 complete; M2 complete; M3 complete; M4 complete — aspiration windows landed at M4.D. Mixed-TC SPRT vs `baseline/alpha-beta-tt-killer-history` queued; result lands as a follow-up commit. M5 (search-advanced: NMP / LMR / futility / staged movegen / qsearch-in-TT / third aspiration tier) is next.**
+**M1 complete; M2 complete; M3 complete; M4 complete — aspiration windows landed at M4.D. ELOH tooling milestone complete (ELOH.A–ELOH.C). Mixed-TC SPRT vs `baseline/alpha-beta-tt-killer-history` queued; result lands as a follow-up commit. M5 (search-advanced: NMP / LMR / futility / staged movegen / qsearch-in-TT / third aspiration tier) is next.**
 
-For per-phase retrospectives (what landed, implementation highlights, verification numbers), see [`milestones/`](milestones/). The latest landed phase is M4.D (aspiration windows); M4.C's retrospective is at [`milestones/m4.c.md`](milestones/m4.c.md).
+For per-phase retrospectives (what landed, implementation highlights, verification numbers), see [`milestones/`](milestones/). The latest landed strength phase is M4.D (aspiration windows); M4.C's retrospective is at [`milestones/m4.c.md`](milestones/m4.c.md). The latest landed tooling phase is ELOH.C (VirtualClock UCI option + harness `--virtual-clock` flag — closes the ELOH milestone).
 
 - Bench signature: `bench: 15863206 nodes <NPS> nps` at default depth 7 (M4.D; -10.1% nodes vs M4.C's 17650332).
 - M4.D SPRT vs `baseline/alpha-beta-tt-killer-history` at tc=10+0.1 with threshold=6: 400 games, 189-114-97 (59.38%), Δ Elo **+65.92 ± 26.52**, LOS 100%, LLR 2.63. Threshold raised from 4 to 6 mid-campaign after threshold=4 regressed by 22 Elo at fast TC; threshold=6 gained +88 Elo on the swap. Slow-TC follow-up (tc=40+0.4, tc=60+0.6) deferred to user-scheduled run.
 - SPRT vs `baseline/random-mover`: 148-0-0 (LLR=2.95 H1 accepted in 148 games / 3m35s).
 - Rating estimate chain: M3.F online iteration anchored at ~2114 Elo (tc=10+0.1, ±35 Elo); M4.A SPRT gain +281.89 ± 55.64 Elo (chained ~2396); M4.B SPRT gain +487.58 ± 125.42 Elo (chained ~2884, ±~140 combined); M4.C SPRT gain **+35.74 ± 27.51 Elo at tc=60+0.6** (chained ~2920 at slow TC, ±~155 combined). M4.C @ tc=10+0.1 inconclusive (+3.47 ± 5.88) — the slow-TC retry per user suggestion validated cleanly. [Full M4.C log](bench/sprt/2026-04-30-m4.c-vs-killer.md), [M4.B log](bench/sprt/2026-04-30-m4.b-vs-tt.md).
 - Baseline tags: `baseline/alpha-beta-no-tt` (M3.F end), `baseline/alpha-beta-tt` (M4.A end), `baseline/alpha-beta-tt-killer` (M4.B end), `baseline/alpha-beta-tt-killer-history` (M4.C end), `baseline/alpha-beta-tt-killer-history-aspiration` (M4.D end — landed at the M4.D primary commit; SPRT-validation follow-up).
+
+**ELOH milestone — closed 2026-04-30.** Three sub-phases all landed:
+- ELOH.A (harness foundation): persistent subprocesses, UCI driver, native adjudication, per-side wallclock TC, color-paired match loop, PGN/summary. ~2300 LOC. ADR-0020.
+- ELOH.B (statistical layer): Robbins-Monro K-update, σ-stopping, N-parallel concurrency, threshold adjudication, convergence-progress output. Replaced `scripts/elo-iterate.sh`.
+- ELOH.C (hardware-invariant TC): `VirtualClock` UCI option (thread CPU time via `CLOCK_THREAD_CPUTIME_ID`) + harness `--virtual-clock` handshake negotiation. `--go-nodes N` dropped per user 2026-04-30 (implementation-coupled). ADR-0021. Back-test gate Part 1 (load-variance reduction) deferred to post-merge manual run.
 
 ### What's next
 
