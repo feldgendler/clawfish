@@ -221,12 +221,30 @@ case "$SUBCMD" in
         ;;
     rating-estimate)
         GAMES="${SPRT_GAMES:-200}"
-        ROUNDS=$((GAMES / 2))
-        echo "Running rating-estimate match: tc=$TC, $GAMES games"
+        echo "Running rating-estimate match: tc=$TC, $GAMES games (in-process harness)"
         echo "  HEAD vs $BASELINE_LABEL (Stockfish UCI_Elo=$STOCKFISH_ELO_VALUE)"
-        "$FASTCHESS" \
-            "${COMMON[@]}" \
-            -rounds "$ROUNDS"
+        # ELOH.B harness with --k0 0 --target-sigma 0 freezes both K and σ-stopping,
+        # producing a fixed-anchor measurement equivalent to the prior fastchess
+        # invocation. Per-game adjudication thresholds match scripts/match.sh defaults.
+        OUT_DIR="$SPRT_DIR/${TS}-${BASELINE_SLUG}-${SUBCMD}-out"
+        cargo run --release --bin elo-iterate --manifest-path "$REPO_ROOT/Cargo.toml" --quiet -- \
+            --engine "$CURRENT_BINARY" \
+            --opponent "$BASELINE_BINARY" \
+            --engine-launch-prefix "taskpolicy -c utility" \
+            --opponent-launch-prefix "taskpolicy -c utility" \
+            --opponent-option UCI_LimitStrength=true \
+            --opponent-option "UCI_Elo=$STOCKFISH_ELO_VALUE" \
+            --tc "$TC" \
+            --max-games "$GAMES" \
+            --concurrency "$CONCURRENCY" \
+            --initial-elo "$STOCKFISH_ELO_VALUE" \
+            --k0 0 \
+            --target-sigma 0 \
+            --resign-movecount 3 --resign-score 600 \
+            --draw-movenumber 34 --draw-movecount 8 --draw-score 20 \
+            --max-moves 200 \
+            --out-dir "$OUT_DIR"
+        echo "Output dir: $OUT_DIR"
         ;;
     *)
         echo "ERROR: unknown subcommand '$SUBCMD'" >&2

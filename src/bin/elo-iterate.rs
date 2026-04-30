@@ -46,12 +46,59 @@ mod cli {
         pub harness_overhead_ms: u32,
         /// Watchdog timeout in milliseconds.
         pub watchdog_ms: u64,
-        /// PGN Event tag. Default "ELOH.A run".
+        /// PGN Event tag. Default "elo-iterate run".
         pub event_tag: String,
         /// Engine options sent as `setoption name NAME value VALUE`.
         pub engine_options: Vec<(String, String)>,
         /// Opponent options.
         pub opponent_options: Vec<(String, String)>,
+
+        // ELOH.B fields.
+        /// Starting Elo estimate; required.
+        pub initial_elo: f64,
+        /// Robbins-Monro initial K factor. 0.0 = freeze-K sentinel.
+        pub k0: f64,
+        /// Robbins-Monro decay constant τ (must be > 0).
+        pub tau: f64,
+        /// σ-stopping target. 0.0 = disabled sentinel.
+        pub target_sigma: f64,
+        /// Number of trailing estimates for trailing-σ computation.
+        pub stop_window: usize,
+        /// Consecutive in-window confirmations required before stopping.
+        pub stop_window_confirm: usize,
+        /// Number of parallel color-pairs.
+        pub concurrency: u32,
+        /// Threshold adjudication parameters.
+        pub thresholds: Thresholds,
+        /// Maximum plies per game before adjudicating as a draw.
+        pub max_moves: u32,
+    }
+
+    /// Threshold adjudication parameters matching fastchess defaults.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Thresholds {
+        /// Resign after this many consecutive moves below the score threshold.
+        pub resign_movecount: u32,
+        /// Resign score threshold in centipawns (positive; compared as ≤ −value).
+        pub resign_score: i32,
+        /// Minimum full-move number before draw adjudication is allowed.
+        pub draw_movenumber: u32,
+        /// Both sides must show balanced scores for this many consecutive own-moves.
+        pub draw_movecount: u32,
+        /// Draw score threshold in centipawns (positive; |score| ≤ value qualifies).
+        pub draw_score: i32,
+    }
+
+    impl Default for Thresholds {
+        fn default() -> Self {
+            Thresholds {
+                resign_movecount: 3,
+                resign_score: 600,
+                draw_movenumber: 34,
+                draw_movecount: 8,
+                draw_score: 20,
+            }
+        }
     }
 
     /// Parsed time control: initial time + per-move increment.
@@ -134,9 +181,24 @@ mod cli {
         let mut out_dir: Option<String> = None;
         let mut harness_overhead_ms: u32 = 50;
         let mut watchdog_ms: Option<u64> = None;
-        let mut event_tag: String = "ELOH.A run".into();
+        let mut event_tag: String = "elo-iterate run".into();
         let mut engine_options: Vec<(String, String)> = Vec::new();
         let mut opponent_options: Vec<(String, String)> = Vec::new();
+
+        // ELOH.B fields.
+        let mut initial_elo: Option<f64> = None;
+        let mut k0: f64 = 40.0;
+        let mut tau: f64 = 10.0;
+        let mut target_sigma: f64 = 30.0;
+        let mut stop_window: usize = 30;
+        let mut stop_window_confirm: usize = 5;
+        let mut concurrency: u32 = 1;
+        let mut resign_movecount: u32 = 3;
+        let mut resign_score: i32 = 600;
+        let mut draw_movenumber: u32 = 34;
+        let mut draw_movecount: u32 = 8;
+        let mut draw_score: i32 = 20;
+        let mut max_moves: u32 = 200;
 
         let mut i = 0usize;
         while i < argv.len() {
@@ -230,6 +292,125 @@ mod cli {
                         })?,
                     );
                 }
+                "--initial-elo" => {
+                    let s = next_val!();
+                    let v: f64 = s
+                        .parse()
+                        .map_err(|_| CliError::InvalidValue(format!("--initial-elo: {s}")))?;
+                    initial_elo = Some(v);
+                }
+                "--k0" => {
+                    let s = next_val!();
+                    let v: f64 = s
+                        .parse()
+                        .map_err(|_| CliError::InvalidValue(format!("--k0: {s}")))?;
+                    if v < 0.0 {
+                        return Err(CliError::InvalidValue(
+                            "--k0 must be >= 0 (0 = freeze-K sentinel)".into(),
+                        ));
+                    }
+                    k0 = v;
+                }
+                "--tau" => {
+                    let s = next_val!();
+                    let v: f64 = s
+                        .parse()
+                        .map_err(|_| CliError::InvalidValue(format!("--tau: {s}")))?;
+                    if v <= 0.0 {
+                        return Err(CliError::InvalidValue("--tau must be > 0".into()));
+                    }
+                    tau = v;
+                }
+                "--target-sigma" => {
+                    let s = next_val!();
+                    let v: f64 = s
+                        .parse()
+                        .map_err(|_| CliError::InvalidValue(format!("--target-sigma: {s}")))?;
+                    if v < 0.0 {
+                        return Err(CliError::InvalidValue(
+                            "--target-sigma must be >= 0 (0 = disabled sentinel)".into(),
+                        ));
+                    }
+                    target_sigma = v;
+                }
+                "--stop-window" => {
+                    let s = next_val!();
+                    let v: usize = s
+                        .parse()
+                        .map_err(|_| CliError::InvalidValue(format!("--stop-window: {s}")))?;
+                    if v < 2 {
+                        return Err(CliError::InvalidValue("--stop-window must be >= 2".into()));
+                    }
+                    stop_window = v;
+                }
+                "--stop-window-confirm" => {
+                    let s = next_val!();
+                    let v: usize = s.parse().map_err(|_| {
+                        CliError::InvalidValue(format!("--stop-window-confirm: {s}"))
+                    })?;
+                    if v < 1 {
+                        return Err(CliError::InvalidValue(
+                            "--stop-window-confirm must be >= 1".into(),
+                        ));
+                    }
+                    stop_window_confirm = v;
+                }
+                "--concurrency" => {
+                    let s = next_val!();
+                    let v: u32 = s
+                        .parse()
+                        .map_err(|_| CliError::InvalidValue(format!("--concurrency: {s}")))?;
+                    if v < 1 {
+                        return Err(CliError::InvalidValue("--concurrency must be >= 1".into()));
+                    }
+                    concurrency = v;
+                }
+                "--resign-movecount" => {
+                    let s = next_val!();
+                    resign_movecount = s
+                        .parse()
+                        .map_err(|_| CliError::InvalidValue(format!("--resign-movecount: {s}")))?;
+                }
+                "--resign-score" => {
+                    let s = next_val!();
+                    resign_score = s
+                        .parse()
+                        .map_err(|_| CliError::InvalidValue(format!("--resign-score: {s}")))?;
+                    if resign_score < 0 {
+                        return Err(CliError::InvalidValue("--resign-score must be >= 0".into()));
+                    }
+                }
+                "--draw-movenumber" => {
+                    let s = next_val!();
+                    draw_movenumber = s
+                        .parse()
+                        .map_err(|_| CliError::InvalidValue(format!("--draw-movenumber: {s}")))?;
+                }
+                "--draw-movecount" => {
+                    let s = next_val!();
+                    draw_movecount = s
+                        .parse()
+                        .map_err(|_| CliError::InvalidValue(format!("--draw-movecount: {s}")))?;
+                }
+                "--draw-score" => {
+                    let s = next_val!();
+                    draw_score = s
+                        .parse()
+                        .map_err(|_| CliError::InvalidValue(format!("--draw-score: {s}")))?;
+                    if draw_score < 0 {
+                        return Err(CliError::InvalidValue("--draw-score must be >= 0".into()));
+                    }
+                }
+                "--max-moves" => {
+                    let s = next_val!();
+                    let v: u32 = s
+                        .parse()
+                        .map_err(|_| CliError::InvalidValue(format!("--max-moves: {s}")))?;
+                    if v < 2 {
+                        return Err(CliError::InvalidValue("--max-moves must be >= 2".into()));
+                    }
+                    max_moves = v;
+                }
                 other => {
                     return Err(CliError::UnknownArg(other.to_owned()));
                 }
@@ -241,6 +422,18 @@ mod cli {
         let opponent = opponent.ok_or_else(|| CliError::MissingFlag("--opponent".into()))?;
         let tc = tc.ok_or_else(|| CliError::MissingFlag("--tc".into()))?;
         let max_games = max_games.ok_or_else(|| CliError::MissingFlag("--max-games".into()))?;
+        let initial_elo =
+            initial_elo.ok_or_else(|| CliError::MissingFlag("--initial-elo".into()))?;
+
+        // Sentinel composition: --k0 0 requires --target-sigma 0.
+        // With K=0 the estimate trail is constant, so σ=0 always, and σ-stopping
+        // would fire trivially. Enforce explicit --target-sigma 0 to declare
+        // fixed-anchor intent clearly.
+        if k0 == 0.0 && target_sigma != 0.0 {
+            return Err(CliError::InvalidValue(
+                "--k0 0 requires --target-sigma 0 (frozen-K fixed-anchor mode)".into(),
+            ));
+        }
 
         // Defaults computed here so parse_args returns a fully-resolved Args.
         let watchdog_ms = watchdog_ms.unwrap_or_else(|| {
@@ -269,6 +462,21 @@ mod cli {
             event_tag,
             engine_options,
             opponent_options,
+            initial_elo,
+            k0,
+            tau,
+            target_sigma,
+            stop_window,
+            stop_window_confirm,
+            concurrency,
+            thresholds: Thresholds {
+                resign_movecount,
+                resign_score,
+                draw_movenumber,
+                draw_movecount,
+                draw_score,
+            },
+            max_moves,
         })
     }
 
@@ -347,9 +555,9 @@ mod cli {
                 "10+0.1".into(),
                 "--max-games".into(),
                 "2".into(),
+                "--initial-elo".into(),
+                "2000".into(),
             ];
-            // parse_args is not yet implemented; this test will todo!()-panic.
-            // When impl lands, assert Ok and check max_games == 2.
             let result = parse_args(argv);
             match result {
                 Ok(args) => assert_eq!(args.max_games, 2),
@@ -378,6 +586,8 @@ mod cli {
                 "60+0".into(),
                 "--max-games".into(),
                 "2".into(),
+                "--initial-elo".into(),
+                "2000".into(),
             ];
             let args = parse_args(argv).expect("parse_args ok");
             assert_eq!(
@@ -398,6 +608,8 @@ mod cli {
                 "10+0.1".into(),
                 "--max-games".into(),
                 "4".into(),
+                "--initial-elo".into(),
+                "2000".into(),
                 "--engine-option".into(),
                 "MoveOverhead=50".into(),
                 "--engine-option".into(),
@@ -415,6 +627,231 @@ mod cli {
                 }
                 Err(e) => panic!("expected Ok, got {e:?}"),
             }
+        }
+
+        // --- §6.5 ELOH.B CLI tests ---
+
+        /// Helper: minimum valid argv for tests that need a parseable command-line.
+        /// Supplies all required flags with reasonable defaults.
+        fn base_argv() -> Vec<String> {
+            vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc".into(),
+                "10+0.1".into(),
+                "--max-games".into(),
+                "4".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+            ]
+        }
+
+        #[test]
+        fn parse_args_default_thresholds_match_sprt_sh() {
+            // Defaults (3, 600, 34, 8, 20) must match the fastchess-default parameters
+            // documented in the plan §4.6.
+            let args = parse_args(base_argv()).expect("parse_args ok");
+            assert_eq!(
+                args.thresholds,
+                Thresholds::default(),
+                "thresholds must match documented defaults"
+            );
+            assert_eq!(args.thresholds.resign_movecount, 3);
+            assert_eq!(args.thresholds.resign_score, 600);
+            assert_eq!(args.thresholds.draw_movenumber, 34);
+            assert_eq!(args.thresholds.draw_movecount, 8);
+            assert_eq!(args.thresholds.draw_score, 20);
+        }
+
+        #[test]
+        fn parse_args_concurrency_default_one() {
+            let args = parse_args(base_argv()).expect("parse_args ok");
+            assert_eq!(args.concurrency, 1);
+        }
+
+        #[test]
+        fn parse_args_initial_elo_required() {
+            // Omitting --initial-elo must produce MissingFlag.
+            let argv = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc".into(),
+                "10+0.1".into(),
+                "--max-games".into(),
+                "4".into(),
+            ];
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::MissingFlag(_)),
+                "expected MissingFlag, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn parse_args_target_sigma_zero_valid_sentinel() {
+            // --target-sigma 0 is valid (disabled sentinel).
+            let mut argv = base_argv();
+            argv.extend(["--target-sigma".into(), "0".into()]);
+            let args = parse_args(argv).expect("--target-sigma 0 should be accepted");
+            assert_eq!(args.target_sigma, 0.0);
+        }
+
+        #[test]
+        fn parse_args_negative_target_sigma_rejected() {
+            let mut argv = base_argv();
+            argv.extend(["--target-sigma".into(), "-1".into()]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "expected InvalidValue, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn parse_args_stop_window_minimum_two() {
+            // --stop-window 1 is below the minimum of 2.
+            let mut argv = base_argv();
+            argv.extend(["--stop-window".into(), "1".into()]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "expected InvalidValue for --stop-window 1, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn parse_args_concurrency_zero_rejected() {
+            let mut argv = base_argv();
+            argv.extend(["--concurrency".into(), "0".into()]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "expected InvalidValue for --concurrency 0, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn parse_args_max_moves_default_200() {
+            let args = parse_args(base_argv()).expect("parse_args ok");
+            assert_eq!(args.max_moves, 200);
+        }
+
+        #[test]
+        fn parse_args_k0_zero_with_target_sigma_zero_valid() {
+            // Frozen-K + disabled-σ is the explicit fixed-anchor sentinel combination.
+            let mut argv = base_argv();
+            argv.extend([
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+            ]);
+            let args = parse_args(argv).expect("--k0 0 --target-sigma 0 should be accepted");
+            assert_eq!(args.k0, 0.0);
+            assert_eq!(args.target_sigma, 0.0);
+        }
+
+        #[test]
+        fn parse_args_k0_zero_requires_target_sigma_zero() {
+            // --k0 0 without --target-sigma 0 must be rejected: with K=0 the estimate
+            // trail is constant, so σ=0 always, and σ-stopping would fire trivially.
+            let mut argv = base_argv();
+            argv.extend(["--k0".into(), "0".into()]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "expected InvalidValue for --k0 0 without --target-sigma 0, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn parse_args_tau_zero_rejected() {
+            // --tau 0 would cause division by zero in compute_k.
+            let mut argv = base_argv();
+            argv.extend(["--tau".into(), "0".into()]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "expected InvalidValue for --tau 0, got {err:?}"
+            );
+        }
+
+        // ---- ELOH.B: acceptance-boundary tests (catch Tier-C pure-fn mutants) ----
+        //
+        // Each test passes the minimum valid value for a validated flag and
+        // asserts Ok.  These distinguish `< N` (correct) from `<= N` (mutant)
+        // by proving the exact minimum is accepted.
+
+        #[test]
+        fn parse_args_stop_window_two_accepted() {
+            // Minimum valid --stop-window is 2.  Mutant `< 2` → `<= 2` would
+            // reject value 2 as invalid.
+            let mut argv = base_argv();
+            argv.extend(["--stop-window".into(), "2".into()]);
+            let args = parse_args(argv).expect("--stop-window 2 must be accepted");
+            assert_eq!(args.stop_window, 2);
+        }
+
+        #[test]
+        fn parse_args_stop_window_confirm_one_accepted() {
+            // Minimum valid --stop-window-confirm is 1.
+            let mut argv = base_argv();
+            argv.extend(["--stop-window-confirm".into(), "1".into()]);
+            let args = parse_args(argv).expect("--stop-window-confirm 1 must be accepted");
+            assert_eq!(args.stop_window_confirm, 1);
+        }
+
+        #[test]
+        fn parse_args_concurrency_one_explicit_accepted() {
+            // --concurrency 1 is the minimum valid value.  Mutant `< 1` → `<= 1`
+            // would reject 1.
+            let mut argv = base_argv();
+            argv.extend(["--concurrency".into(), "1".into()]);
+            let args = parse_args(argv).expect("--concurrency 1 must be accepted");
+            assert_eq!(args.concurrency, 1);
+        }
+
+        #[test]
+        fn parse_args_resign_score_zero_accepted() {
+            // --resign-score 0 is the minimum valid value.
+            let mut argv = base_argv();
+            argv.extend(["--resign-score".into(), "0".into()]);
+            let args = parse_args(argv).expect("--resign-score 0 must be accepted");
+            assert_eq!(args.thresholds.resign_score, 0);
+        }
+
+        #[test]
+        fn parse_args_draw_score_zero_accepted() {
+            // --draw-score 0 is the minimum valid value.
+            let mut argv = base_argv();
+            argv.extend(["--draw-score".into(), "0".into()]);
+            let args = parse_args(argv).expect("--draw-score 0 must be accepted");
+            assert_eq!(args.thresholds.draw_score, 0);
+        }
+
+        #[test]
+        fn parse_args_max_moves_two_accepted() {
+            // --max-moves 2 is the minimum valid value.
+            let mut argv = base_argv();
+            argv.extend(["--max-moves".into(), "2".into()]);
+            let args = parse_args(argv).expect("--max-moves 2 must be accepted");
+            assert_eq!(args.max_moves, 2);
+        }
+
+        #[test]
+        fn parse_args_max_moves_above_minimum_accepted() {
+            // Pin --max-moves N for N > 2 also passes. The validation rule
+            // `v < 2` rejects below-minimum; mutating to `v > 2` would reject
+            // values above minimum (e.g. 3+) instead. This test catches such
+            // a directional flip.
+            let mut argv = base_argv();
+            argv.extend(["--max-moves".into(), "200".into()]);
+            let args = parse_args(argv).expect("--max-moves 200 must be accepted");
+            assert_eq!(args.max_moves, 200);
         }
     }
 }
@@ -1152,6 +1589,7 @@ mod adjudicate {
     //! `detect_native_game_over` does NOT cover time forfeit; that is computed
     //! by the match loop from per-side clock state.
 
+    use super::driver;
     use clawfish::{
         Color, MoveList, PieceKind, Position, generate_moves, in_check, search::is_fifty_move_draw,
     };
@@ -1176,6 +1614,11 @@ mod adjudicate {
         /// `match_loop::GameOutcome::TimeForfeit` rather than adjudication.
         #[allow(dead_code)]
         TimeForfeit(Color),
+        /// The just-moved side resigned — its score reached the threshold.
+        /// Carries the *resigning* (= losing) color.
+        ResignAdjudicated(Color),
+        /// Both sides agreed on a near-zero score after the movenumber floor.
+        DrawAdjudicated,
     }
 
     /// Check for a native game-over condition after a move has been made.
@@ -1273,6 +1716,68 @@ mod adjudicate {
         };
         let count = history.iter().filter(|&&h| h == current).count();
         count >= 3
+    }
+
+    /// **Just-moved-side discipline.** Called after the side `mover` plays a move
+    /// and pushes its score onto its history. Returns `true` if `mover` should
+    /// resign — its trailing `movecount` scores are all at-or-below
+    /// `-score_threshold` (Cp) or are losing-mate (`Mate(n)` with `n < 0`).
+    /// Caller wraps the result as `GameOver::ResignAdjudicated(mover)`.
+    ///
+    /// `mover_history.len() < movecount` → returns `false`.
+    /// `None` entries break the streak.
+    /// `Mate(n)` with `n >= 0` does NOT resign (engine sees winning mate).
+    pub(crate) fn resign_threshold_check(
+        mover_history: &[Option<driver::Score>],
+        movecount: u32,
+        score_threshold: i32,
+    ) -> bool {
+        let n = movecount as usize;
+        if mover_history.len() < n {
+            return false;
+        }
+        let window = &mover_history[mover_history.len() - n..];
+        window.iter().all(|entry| match entry {
+            Some(driver::Score::Cp(s)) => *s <= -score_threshold,
+            Some(driver::Score::Mate(n)) => *n < 0,
+            None => false,
+        })
+    }
+
+    /// Both sides agree on a near-zero score for `movecount` consecutive own-moves
+    /// each, and the current `move_number` (1-based full-move) is ≥ `movenumber_floor`.
+    ///
+    /// `Score::Cp(s)` with `|s| ≤ score_threshold` qualifies. `Score::Mate(_)`
+    /// is treated as a non-balanced score regardless of inner value — mate is
+    /// by definition not a near-zero evaluation, so the impl matches Cp
+    /// explicitly and treats Mate(_) as breaking the streak. (Note: `Mate(n)`
+    /// carries plies-to-mate, not a centipawn-scaled score, so a |inner| ≤ thr
+    /// shortcut would be wrong for small `n`. Pinned by `draw_mate_score_breaks_streak`.)
+    /// `None` breaks the streak. Either side's history shorter than `movecount`
+    /// → returns `false`.
+    pub(crate) fn draw_threshold_check(
+        white_history: &[Option<driver::Score>],
+        black_history: &[Option<driver::Score>],
+        move_number: u32,
+        movenumber_floor: u32,
+        movecount: u32,
+        score_threshold: i32,
+    ) -> bool {
+        if move_number < movenumber_floor {
+            return false;
+        }
+        let n = movecount as usize;
+        if white_history.len() < n || black_history.len() < n {
+            return false;
+        }
+        let is_balanced = |history: &[Option<driver::Score>]| {
+            let window = &history[history.len() - n..];
+            window.iter().all(|entry| match entry {
+                Some(driver::Score::Cp(s)) => s.abs() <= score_threshold,
+                _ => false,
+            })
+        };
+        is_balanced(white_history) && is_balanced(black_history)
     }
 
     #[cfg(test)]
@@ -1761,6 +2266,833 @@ mod adjudicate {
                 "expected InsufficientMaterial for KK with no threefold; got {result:?}"
             );
         }
+
+        // ---------------------------------------------------------------
+        // §6.3 Threshold adjudication tests (todo!() until impl phase)
+        // ---------------------------------------------------------------
+
+        use super::super::driver::Score::{Cp, Mate};
+
+        #[test]
+        fn resign_three_consecutive_below_threshold_fires() {
+            assert!(resign_threshold_check(
+                &[Some(Cp(-700)), Some(Cp(-650)), Some(Cp(-720))],
+                3,
+                600
+            ));
+        }
+
+        #[test]
+        fn resign_two_below_one_above_does_not_fire() {
+            // The trailing entry Cp(-100) is above −600 threshold, so streak breaks.
+            assert!(!resign_threshold_check(
+                &[Some(Cp(-700)), Some(Cp(-650)), Some(Cp(-100))],
+                3,
+                600
+            ));
+        }
+
+        #[test]
+        fn resign_negative_mate_score_fires() {
+            // Mate(n) with n < 0 means mover gets mated; counts as losing.
+            assert!(resign_threshold_check(
+                &[Some(Mate(-3)), Some(Mate(-4)), Some(Mate(-5))],
+                3,
+                600
+            ));
+        }
+
+        #[test]
+        fn resign_positive_mate_does_not_fire() {
+            // Mate(n) with n > 0 means mover is winning; must NOT resign.
+            assert!(!resign_threshold_check(
+                &[Some(Mate(3)), Some(Mate(2)), Some(Mate(1))],
+                3,
+                600
+            ));
+        }
+
+        #[test]
+        fn resign_none_entry_breaks_streak() {
+            // None in the trailing window breaks the streak even if flanking entries qualify.
+            assert!(!resign_threshold_check(
+                &[Some(Cp(-700)), None, Some(Cp(-720))],
+                3,
+                600
+            ));
+        }
+
+        #[test]
+        fn resign_short_history_returns_false() {
+            // History length < movecount must return false without panicking.
+            assert!(!resign_threshold_check(
+                &[Some(Cp(-700)), Some(Cp(-650))],
+                3,
+                600
+            ));
+        }
+
+        #[test]
+        fn resign_exact_threshold_fires() {
+            // Pins ≤ (not <) at the boundary: score = −threshold should resign.
+            assert!(resign_threshold_check(
+                &[Some(Cp(-600)), Some(Cp(-600)), Some(Cp(-600))],
+                3,
+                600
+            ));
+        }
+
+        #[test]
+        fn resign_just_above_threshold_does_not_fire() {
+            // Cp(-599) with threshold 600: |-599| = 599, not ≤ -threshold (i.e. -599 > -600).
+            // Pins the boundary on the OTHER side from `resign_exact_threshold_fires`.
+            assert!(!resign_threshold_check(
+                &[
+                    Some(driver::Score::Cp(-599)),
+                    Some(driver::Score::Cp(-599)),
+                    Some(driver::Score::Cp(-599))
+                ],
+                3,
+                600
+            ));
+        }
+
+        #[test]
+        fn draw_eight_consecutive_balanced_after_movenumber_fires() {
+            // Both sides have 8 balanced entries, move_number ≥ movenumber_floor.
+            let white_hist: Vec<Option<driver::Score>> = vec![
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(5)),
+                Some(Cp(-5)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+            ];
+            let black_hist: Vec<Option<driver::Score>> = vec![
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-5)),
+                Some(Cp(5)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+            ];
+            assert!(draw_threshold_check(
+                &white_hist,
+                &black_hist,
+                40,
+                34,
+                8,
+                20
+            ));
+        }
+
+        #[test]
+        fn draw_before_movenumber_does_not_fire() {
+            // Same balanced history but move_number < movenumber_floor → false.
+            let white_hist: Vec<Option<driver::Score>> = vec![
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(5)),
+                Some(Cp(-5)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+            ];
+            let black_hist: Vec<Option<driver::Score>> = vec![
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-5)),
+                Some(Cp(5)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+            ];
+            assert!(!draw_threshold_check(
+                &white_hist,
+                &black_hist,
+                30,
+                34,
+                8,
+                20
+            ));
+        }
+
+        #[test]
+        fn draw_one_side_above_threshold() {
+            // Black has one entry Cp(-50): |−50| = 50 > threshold 20, breaks streak.
+            let white_hist: Vec<Option<driver::Score>> = vec![
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(5)),
+                Some(Cp(-5)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+            ];
+            let black_hist: Vec<Option<driver::Score>> = vec![
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-5)),
+                Some(Cp(5)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(-50)), // breaks the balanced streak
+            ];
+            assert!(!draw_threshold_check(
+                &white_hist,
+                &black_hist,
+                40,
+                34,
+                8,
+                20
+            ));
+        }
+
+        #[test]
+        fn draw_mate_score_breaks_streak() {
+            // Mate(_) anywhere in the trailing window of either side breaks the streak,
+            // regardless of sign: mate is by definition not a near-zero evaluation.
+            let balanced: Vec<Option<driver::Score>> = vec![
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(5)),
+                Some(Cp(-5)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+            ];
+            let white_mate: Vec<Option<driver::Score>> = vec![
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(5)),
+                Some(Cp(-5)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Mate(5)), // winning mate in white's history breaks draw streak
+            ];
+            let black_mate: Vec<Option<driver::Score>> = vec![
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-5)),
+                Some(Cp(5)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Mate(-3)), // losing mate in black's history breaks draw streak
+            ];
+            assert!(!draw_threshold_check(&white_mate, &balanced, 40, 34, 8, 20));
+            assert!(!draw_threshold_check(&balanced, &black_mate, 40, 34, 8, 20));
+        }
+
+        #[test]
+        fn draw_short_history_either_side_returns_false() {
+            // Either side having fewer than movecount entries → false.
+            let short: Vec<Option<driver::Score>> = vec![Some(Cp(10)), Some(Cp(-10))];
+            let enough: Vec<Option<driver::Score>> = vec![
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+            ];
+            assert!(!draw_threshold_check(&short, &enough, 40, 34, 3, 20));
+            assert!(!draw_threshold_check(&enough, &short, 40, 34, 3, 20));
+        }
+
+        #[test]
+        fn draw_none_entry_breaks_streak() {
+            // None in the trailing window on either side breaks the streak.
+            let with_none: Vec<Option<driver::Score>> = vec![
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(5)),
+                Some(Cp(-5)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                None, // breaks streak
+            ];
+            let balanced: Vec<Option<driver::Score>> = vec![
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-5)),
+                Some(Cp(5)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+                Some(Cp(-10)),
+                Some(Cp(10)),
+            ];
+            assert!(!draw_threshold_check(&with_none, &balanced, 40, 34, 8, 20));
+            assert!(!draw_threshold_check(&balanced, &with_none, 40, 34, 8, 20));
+        }
+
+        #[test]
+        fn draw_exact_threshold_fires() {
+            // Pins |s| ≤ thr (not <): all entries ±20 with threshold=20 should fire.
+            let white_hist: Vec<Option<driver::Score>> = vec![
+                Some(Cp(20)),
+                Some(Cp(-20)),
+                Some(Cp(20)),
+                Some(Cp(-20)),
+                Some(Cp(20)),
+                Some(Cp(-20)),
+                Some(Cp(20)),
+                Some(Cp(-20)),
+            ];
+            let black_hist: Vec<Option<driver::Score>> = vec![
+                Some(Cp(-20)),
+                Some(Cp(20)),
+                Some(Cp(-20)),
+                Some(Cp(20)),
+                Some(Cp(-20)),
+                Some(Cp(20)),
+                Some(Cp(-20)),
+                Some(Cp(20)),
+            ];
+            assert!(draw_threshold_check(
+                &white_hist,
+                &black_hist,
+                40,
+                34,
+                8,
+                20
+            ));
+        }
+
+        // ---- ELOH.B Tier-C targeted tests --------------------------------
+
+        #[test]
+        fn resign_slice_uses_subtraction_not_division() {
+            // Pins the `-` in `mover_history[len - movecount..]` against the
+            // `/` mutant.  History has 6 entries; movecount=3.
+            //   Correct (-): window = history[3..6] → entries 3,4,5 (all ≤ −600) → fires.
+            //   Mutant  (/): window = history[6/3..6] = history[2..6] → entry at
+            //                index 2 is Cp(-100), which is not ≤ −600 → does NOT fire.
+            let history = vec![
+                Some(Cp(-100)), // index 0 — not in correct window
+                Some(Cp(-100)), // index 1 — not in correct window
+                Some(Cp(-100)), // index 2 — not in correct window; IS in mutant window
+                Some(Cp(-700)), // index 3 — in correct window
+                Some(Cp(-650)), // index 4 — in correct window
+                Some(Cp(-720)), // index 5 — in correct window
+            ];
+            assert!(
+                resign_threshold_check(&history, 3, 600),
+                "last 3 entries all ≤ −600: must fire"
+            );
+        }
+
+        #[test]
+        fn resign_mate_zero_does_not_fire() {
+            // Mate(0) means the side to move IS already mated (ply-to-mate = 0).
+            // But this is an edge-case value; the original guard `n < 0` returns
+            // false for n=0, so the streak is broken.
+            // Mutant `< 0` → `<= 0` would treat Mate(0) as a "losing" score and
+            // fire when three Mate(0) entries are present.
+            assert!(
+                !resign_threshold_check(&[Some(Mate(0)), Some(Mate(0)), Some(Mate(0))], 3, 600),
+                "Mate(0) is not < 0 so it must NOT trigger resign"
+            );
+        }
+
+        #[test]
+        fn draw_at_movenumber_floor_fires() {
+            // Pins the `<` in `move_number < movenumber_floor` against the `<=`
+            // mutant.  move_number == movenumber_floor: original returns true
+            // (condition false → doesn't short-circuit); mutant returns false
+            // (condition true → early return false).
+            let balanced: Vec<Option<driver::Score>> = vec![Some(Cp(5)), Some(Cp(-5)), Some(Cp(5))];
+            assert!(
+                draw_threshold_check(&balanced, &balanced, 34, 34, 3, 20),
+                "move_number == movenumber_floor must fire (not be rejected by < guard)"
+            );
+        }
+
+        #[test]
+        fn draw_slice_uses_subtraction_not_division() {
+            // Pins the `-` in `history[history.len() - n..]` against the `/`
+            // mutant for `draw_threshold_check`.  Each history has 6 entries;
+            // movecount n = 3.
+            //   Correct (-): window = history[3..6] → entries 3,4,5 all balanced → fires.
+            //   Mutant  (/): window = history[6/3..6] = history[2..6] → entry at
+            //                index 2 has |s| > threshold → does NOT fire.
+            let unbalanced_then_balanced: Vec<Option<driver::Score>> = vec![
+                Some(Cp(0)),    // 0 — not in correct window
+                Some(Cp(0)),    // 1 — not in correct window
+                Some(Cp(-100)), // 2 — not in correct window; IS in mutant window (|s| > thr=20)
+                Some(Cp(5)),    // 3 — in correct window (balanced)
+                Some(Cp(-5)),   // 4 — in correct window (balanced)
+                Some(Cp(5)),    // 5 — in correct window (balanced)
+            ];
+            assert!(
+                draw_threshold_check(
+                    &unbalanced_then_balanced,
+                    &unbalanced_then_balanced,
+                    50,
+                    34,
+                    3,
+                    20
+                ),
+                "last 3 entries balanced: must fire"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mod estimator  (SLICE-A stub)
+// ---------------------------------------------------------------------------
+
+mod estimator {
+    // #[allow(dead_code)] on each fn: wired by controller in slice E; until
+    // then, clippy's dead-code lint fires because nothing outside tests calls these.
+    #[allow(dead_code)]
+    pub(crate) fn compute_k(t: u32, k0: f64, tau: f64) -> f64 {
+        if k0 == 0.0 {
+            return 0.0;
+        }
+        k0 / (1.0 + (t as f64) / tau)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn expected_score(my_elo: f64, opp_elo: f64) -> f64 {
+        1.0 / (1.0 + 10_f64.powf((opp_elo - my_elo) / 400.0))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn update_estimate(prior_elo: f64, opp_elo: f64, result: f64, k: f64) -> f64 {
+        prior_elo + k * (result - expected_score(prior_elo, opp_elo))
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn compute_k_at_t_zero_returns_k0() {
+            let k = compute_k(0, 40.0, 10.0);
+            assert!((k - 40.0).abs() < 1e-3, "expected 40.0, got {k}");
+        }
+        #[test]
+        fn compute_k_at_t_equals_tau_halves() {
+            let k = compute_k(10, 40.0, 10.0);
+            assert!((k - 20.0).abs() < 1e-3, "expected 20.0, got {k}");
+        }
+        #[test]
+        fn compute_k_decay_at_ten_tau() {
+            let k = compute_k(100, 40.0, 10.0);
+            let expected = 40.0 / 11.0;
+            assert!((k - expected).abs() < 1e-3, "expected {expected}, got {k}");
+        }
+        #[test]
+        fn compute_k_monotone_non_increasing() {
+            let ts = [0u32, 5, 10, 20, 50, 100];
+            let ks: Vec<f64> = ts.iter().map(|&t| compute_k(t, 40.0, 10.0)).collect();
+            for i in 1..ks.len() {
+                assert!(
+                    ks[i] <= ks[i - 1] + 1e-12,
+                    "K not monotone at index {i}: k[{i}]={} > k[{}]={}",
+                    ks[i],
+                    i - 1,
+                    ks[i - 1]
+                );
+            }
+        }
+        #[test]
+        fn compute_k_zero_k0_returns_zero() {
+            for t in [0u32, 1, 10, 100, 1000] {
+                let k = compute_k(t, 0.0, 10.0);
+                assert!(k == 0.0, "expected 0.0 for k0=0.0 at t={t}, got {k}");
+            }
+        }
+        #[test]
+        fn expected_score_equal_elo_returns_half() {
+            let e = expected_score(2000.0, 2000.0);
+            assert!((e - 0.5).abs() < 1e-9, "expected 0.5, got {e}");
+        }
+        #[test]
+        fn expected_score_400_above() {
+            let e = expected_score(2400.0, 2000.0);
+            assert!((e - 0.909).abs() < 1e-3, "expected ≈0.909, got {e}");
+        }
+        #[test]
+        fn expected_score_400_below() {
+            let e = expected_score(2000.0, 2400.0);
+            assert!((e - 0.091).abs() < 1e-3, "expected ≈0.091, got {e}");
+        }
+        #[test]
+        fn update_win_against_equal() {
+            // S=1 vs equal: E=0.5, delta = k*(1-0.5) = k/2.
+            let prior = 2000.0;
+            let k = 32.0;
+            let updated = update_estimate(prior, prior, 1.0, k);
+            assert!(
+                (updated - (prior + k / 2.0)).abs() < 1e-3,
+                "expected {}, got {updated}",
+                prior + k / 2.0
+            );
+        }
+        #[test]
+        fn update_loss_against_equal() {
+            // S=0 vs equal: E=0.5, delta = k*(0-0.5) = -k/2.
+            let prior = 2000.0;
+            let k = 32.0;
+            let updated = update_estimate(prior, prior, 0.0, k);
+            assert!(
+                (updated - (prior - k / 2.0)).abs() < 1e-3,
+                "expected {}, got {updated}",
+                prior - k / 2.0
+            );
+        }
+        #[test]
+        fn update_draw_against_equal_no_change() {
+            // S=0.5 vs equal: E=0.5, delta = k*(0.5-0.5) = 0.
+            let prior = 2000.0;
+            let updated = update_estimate(prior, prior, 0.5, 32.0);
+            assert!(
+                (updated - prior).abs() < 1e-9,
+                "draw against equal should not change estimate; got {updated}"
+            );
+        }
+        #[test]
+        fn update_with_zero_k_freezes_estimate() {
+            for &(prior, opp, result) in &[
+                (2000.0_f64, 1800.0_f64, 1.0_f64),
+                (1500.0, 2100.0, 0.0),
+                (2100.0, 2100.0, 0.5),
+            ] {
+                let updated = update_estimate(prior, opp, result, 0.0);
+                assert!(
+                    (updated - prior).abs() < 1e-9,
+                    "k=0 should freeze estimate; prior={prior}, got {updated}"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mod sigma  (SLICE-A stub)
+// ---------------------------------------------------------------------------
+
+mod sigma {
+    // #[allow(dead_code)] on each fn: wired by controller in slice E.
+    #[allow(dead_code)]
+    pub(crate) fn sample_stddev(xs: &[f64]) -> f64 {
+        if xs.len() < 2 {
+            return 0.0;
+        }
+        let n = xs.len() as f64;
+        let mean = xs.iter().sum::<f64>() / n;
+        let variance = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        variance.sqrt()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn should_stop(
+        estimates: &[f64],
+        window: usize,
+        target_sigma: f64,
+        confirm: usize,
+    ) -> bool {
+        if target_sigma == 0.0 {
+            return false;
+        }
+        let len = estimates.len();
+        // Need at least `window + confirm - 1` entries so every confirm position
+        // has a full window behind it.
+        //
+        // Index-arithmetic proof: the loop iterates `i ∈ [len-confirm, len-1]`.
+        // For each `i`, the slice is `estimates[i+1-window .. i+1]`. The earliest
+        // slice (at `i = len-confirm`) starts at `len - confirm + 1 - window`.
+        // For this start index to be ≥ 0, we need `len + 1 ≥ window + confirm`,
+        // i.e. `len ≥ window + confirm - 1`. The guard below pins exactly this
+        // tight bound. With `window=30, confirm=5`, the threshold is 34 — pinned
+        // by `should_stop_minimum_data_boundary` and `should_stop_short_estimates_returns_false`.
+        if len < window + confirm - 1 {
+            return false;
+        }
+        // Check the last `confirm` positions (indices len-confirm .. len-1 inclusive).
+        // Position i uses the slice estimates[i+1-window .. i+1] (length = window).
+        for i in (len - confirm)..len {
+            let slice = &estimates[i + 1 - window..i + 1];
+            if sample_stddev(slice) >= target_sigma {
+                return false;
+            }
+        }
+        true
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::super::estimator;
+        use super::*;
+
+        struct Xorshift64 {
+            state: u64,
+        }
+        impl Xorshift64 {
+            fn new(seed: u64) -> Self {
+                Self {
+                    state: seed.wrapping_mul(0x9E3779B97F4A7C15).max(1),
+                }
+            }
+            fn next_u64(&mut self) -> u64 {
+                let mut x = self.state;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.state = x;
+                x.wrapping_mul(0x2545F4914F6CDD1D)
+            }
+            fn next_f64(&mut self) -> f64 {
+                (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+            }
+        }
+
+        #[test]
+        fn sample_stddev_constant_series_zero() {
+            let sd = sample_stddev(&[5.0f64, 5.0, 5.0]);
+            assert!(
+                sd.abs() < 1e-9,
+                "constant series should have stddev 0.0, got {sd}"
+            );
+        }
+        #[test]
+        fn sample_stddev_two_point_uses_bessel() {
+            // [0.0, 2.0]: mean=1.0, sum-sq-dev=2.0, Bessel divisor n-1=1 → stddev=√2.
+            let sd = sample_stddev(&[0.0f64, 2.0]);
+            let expected = f64::sqrt(2.0);
+            assert!(
+                (sd - expected).abs() < 1e-9,
+                "expected √2 ≈ {expected}, got {sd}"
+            );
+        }
+        #[test]
+        fn sample_stddev_short_returns_zero() {
+            assert!(
+                sample_stddev(&[]).abs() < 1e-9,
+                "empty slice should return 0.0"
+            );
+            assert!(
+                sample_stddev(&[42.0]).abs() < 1e-9,
+                "single-element slice should return 0.0"
+            );
+        }
+        #[test]
+        fn should_stop_disabled_when_target_zero() {
+            let estimates: Vec<f64> = vec![2100.0; 50];
+            assert!(
+                !should_stop(&estimates, 30, 0.0, 5),
+                "target_sigma=0.0 must return false (disabled)"
+            );
+        }
+        #[test]
+        fn should_stop_fires_when_recent_window_below() {
+            let estimates: Vec<f64> = vec![2100.0; 50];
+            assert!(
+                should_stop(&estimates, 30, 10.0, 5),
+                "constant series with target=10 should stop"
+            );
+        }
+        #[test]
+        fn should_stop_does_not_fire_with_high_variance() {
+            let estimates: Vec<f64> = (0..60)
+                .map(|i| if i % 2 == 0 { 2200.0 } else { 2000.0 })
+                .collect();
+            assert!(
+                !should_stop(&estimates, 30, 10.0, 5),
+                "high-variance series should not stop"
+            );
+        }
+        #[test]
+        fn should_stop_anti_flap_concrete_fixture() {
+            // Case 1: alternating throughout — every trailing 30-window has σ ~ 50;
+            // should NOT stop with target=10.
+            let estimates_alternating: Vec<f64> = (0..35)
+                .map(|i| if i % 2 == 0 { 2050.0_f64 } else { 2150.0 })
+                .collect();
+            assert_eq!(estimates_alternating.len(), 35);
+            assert!(
+                !should_stop(&estimates_alternating, 30, 10.0, 5),
+                "alternating series has high trailing-σ; should not stop"
+            );
+            // Case 2: flat throughout → σ=0 < target=10 for all 5 confirm positions → fires.
+            let estimates_flat: Vec<f64> = vec![2100.0; 35];
+            assert!(
+                should_stop(&estimates_flat, 30, 10.0, 5),
+                "flat series of 35 should stop"
+            );
+        }
+        #[test]
+        fn should_stop_short_estimates_returns_false() {
+            // window=30, confirm=5 → need at least 34; test with 33.
+            let estimates: Vec<f64> = vec![2100.0; 33];
+            assert!(
+                !should_stop(&estimates, 30, 10.0, 5),
+                "too short to confirm; must return false"
+            );
+        }
+        #[test]
+        fn bernoulli_back_test_gate() {
+            // Bernoulli stream: p=0.760, equilibrium at expected_score(2200, 2000) ≈ 0.760.
+            // Initial estimate set 200 Elo above equilibrium so E[S−E] ≈ −0.149 at t=0;
+            // the trail drifts DOWN toward 2200 before settling.
+            //
+            // σ-stopping must fire within [34, 400] games. Lower bound 34 is the
+            // minimum-data threshold (window=30 + confirm=5 - 1); with K_0=40 and
+            // p=0.760, per-step jitter K·√(p(1−p)) ≈ 17 < target_sigma=30, so the
+            // trailing-σ over a 30-window stays below 30 throughout, and the
+            // algorithm correctly fires at the minimum sample size. Upper bound
+            // 400 is the never-fires safeguard. The test detects:
+            //   - never-fires bug (panic on stop_at.expect).
+            //   - too-late-fires bug (assertion fails at t > 400).
+            //   - sign-flip on update_estimate (post-convergence value check below).
+            //   - too-early-fires bug (short-input guard at the bottom).
+            let p = 0.760_f64;
+            let opp_elo = 2000.0_f64;
+            let mut current_estimate = 2400.0_f64; // 200 above equilibrium → directional convergence
+            let mut estimates: Vec<f64> = Vec::new();
+            let mut rng = Xorshift64::new(0x00DE_DBEE_F123_4567);
+            let mut stop_at: Option<usize> = None;
+            for t in 0u32..1000 {
+                let s = if rng.next_f64() < p { 1.0_f64 } else { 0.0 };
+                let k = estimator::compute_k(t, 40.0, 10.0);
+                current_estimate = estimator::update_estimate(current_estimate, opp_elo, s, k);
+                estimates.push(current_estimate);
+                if should_stop(&estimates, 30, 30.0, 5) {
+                    stop_at = Some(t as usize + 1);
+                    break;
+                }
+            }
+            let t_stop = stop_at
+                .expect("σ-stopping never fired within 1000 games; check estimator or sigma impl");
+            assert!(
+                (34..=400).contains(&t_stop),
+                "σ-stopping fired at t={t_stop}; expected within [34, 400]"
+            );
+
+            // Directional-drift check: with σ-stopping firing at the minimum
+            // sample size (t≈34), the estimate has drifted only partway toward
+            // equilibrium 2200 from initial 2400. We don't require full
+            // convergence here — the test's primary purpose is the σ-stopping
+            // decision, not convergence depth. We DO require the estimate to
+            // be moving DOWN (toward equilibrium) and within ±300 Elo of it,
+            // which catches gross update_estimate bugs (e.g. sign flip would
+            // push the estimate UP past 2400).
+            assert!(
+                current_estimate < 2400.0,
+                "post-stop estimate {current_estimate:.1} did not drift below initial 2400 — likely sign flip in update_estimate"
+            );
+            assert!(
+                (current_estimate - 2200.0).abs() < 300.0,
+                "post-stop estimate {current_estimate:.1} >300 Elo from equilibrium 2200 — likely sign flip or wrong K direction"
+            );
+
+            // Short-input guard: should_stop must return false until the data
+            // window even fills. window=30 + confirm=5 - 1 = 34. We re-run a
+            // parallel iteration up to game 35 and verify should_stop is false
+            // at each step ≤ 34. Catches a stub that returns true unconditionally.
+            let mut early_estimates = Vec::new();
+            let mut early_rng = Xorshift64::new(0x00DE_DBEE_F123_4567);
+            let mut early_estimate = 2400.0;
+            for tt in 0..35 {
+                let s = if early_rng.next_f64() < 0.760 {
+                    1.0
+                } else {
+                    0.0
+                };
+                let k = estimator::compute_k(tt as u32, 40.0, 10.0);
+                early_estimate = estimator::update_estimate(early_estimate, 2000.0, s, k);
+                early_estimates.push(early_estimate);
+                // Trail length post-push = tt + 1. should_stop is eligible to
+                // fire when len >= window + confirm - 1 = 34, i.e. when tt >= 33.
+                // The guard runs only for tt ∈ [0, 32] (len ∈ [1, 33]).
+                if tt < 33 {
+                    assert!(
+                        !should_stop(&early_estimates, 30, 30.0, 5),
+                        "should_stop must return false for fewer than window+confirm-1=34 entries; fired at tt={tt} (len={})",
+                        early_estimates.len()
+                    );
+                }
+            }
+        }
+
+        // ---- ELOH.B Tier-C targeted tests --------------------------------
+
+        #[test]
+        fn sample_stddev_three_point_pins_bessel_divisor() {
+            // [1.0, 2.0, 3.0]: mean=2.0, sum-sq-dev=(1+0+1)=2.0, n-1=2 → σ=√1=1.0.
+            // Mutant `/` → `*` at the Bessel step:
+            //   variance = 2.0 * (3.0 - 1.0) = 4.0, σ = 2.0  (not 1.0).
+            // Also catches the `*` variant.
+            let sd = sample_stddev(&[1.0_f64, 2.0, 3.0]);
+            assert!(
+                (sd - 1.0_f64).abs() < 1e-9,
+                "expected σ=1.0 for [1,2,3], got {sd}"
+            );
+        }
+
+        #[test]
+        fn should_stop_minimum_data_boundary() {
+            // window=3, confirm=2 → need at least 3+2-1=4 entries.
+            // With exactly 4 constant entries, `<` guard (correct) does NOT fire
+            // (4 < 4 is false), so the confirm loop runs and fires (σ=0 < target).
+            // Mutant `<= 4` would fire the guard → return false prematurely.
+            let estimates = vec![2100.0_f64; 4];
+            assert!(
+                should_stop(&estimates, 3, 10.0, 2),
+                "exactly window+confirm-1=4 constant entries must fire should_stop"
+            );
+            // One entry short (3) must still return false.
+            let too_short = vec![2100.0_f64; 3];
+            assert!(
+                !should_stop(&too_short, 3, 10.0, 2),
+                "window+confirm-1-1=3 entries must not fire should_stop"
+            );
+        }
+
+        #[test]
+        fn should_stop_slice_window_uses_i_plus_one_minus_window() {
+            // Pins that the window slice is `estimates[i+1-window..i+1]` and NOT
+            // `estimates[i-1-window..i+1]` (+ → - mutant) or `estimates[i-window..i+1]`
+            // (* → identity mutant).
+            //
+            // Setup: window=2, confirm=1, target=10.
+            //   need at least 2+1-1=2 entries.  Use 3 entries: [2100, 2100, 9999].
+            //   i = len-1 = 2; correct slice = estimates[2+1-2..3] = estimates[1..3] = [2100,9999]
+            //   σ([2100,9999]) >> 10 → NOT below target → should NOT stop.
+            //
+            //   With + → - mutant: slice = estimates[2-1-2..3]. 2-1-2 = -1 (underflow)
+            //   → panic or wrong result. With * mutant (i*1 - window):
+            //   slice = estimates[2*1-2..3] = estimates[0..3] = all three → σ still large.
+            //
+            // Use a fixture that distinguishes the correct vs. wrong slice boundary:
+            //   [9999, 2100, 2100]. i=2, window=2.
+            //   Correct: estimates[1..3] = [2100, 2100] → σ=0 < 10 → STOPS.
+            //   Wrong (if slice started one earlier): [9999, 2100, 2100] → σ large → NOT stop.
+            let estimates = vec![9999.0_f64, 2100.0, 2100.0];
+            assert!(
+                should_stop(&estimates, 2, 10.0, 1),
+                "window=2 confirm=1: last 2 entries are constant; should stop"
+            );
+            // Complementary: if the high-variance entry IS in the window, must not stop.
+            let estimates2 = vec![2100.0_f64, 9999.0, 2100.0];
+            assert!(
+                !should_stop(&estimates2, 2, 10.0, 1),
+                "window=2 confirm=1: middle entry 9999 is in the window; must not stop"
+            );
+        }
     }
 }
 
@@ -2187,6 +3519,149 @@ mod summary {
 }
 
 // ---------------------------------------------------------------------------
+// StopReason — crate-internal; shared by mod progress and (eventually) mod controller
+// ---------------------------------------------------------------------------
+
+/// Why the online iteration terminated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum StopReason {
+    /// Trailing-σ fell below `--target-sigma` for `--stop-window-confirm` consecutive games.
+    Sigma,
+    /// `--max-games` exhausted without σ convergence.
+    MaxGames,
+}
+
+// ---------------------------------------------------------------------------
+// mod progress
+// ---------------------------------------------------------------------------
+
+mod progress {
+    //! Progress-line and convergence-line formatters for the iteration harness.
+
+    use super::StopReason;
+
+    /// Snapshot of per-game-batch progress for human-readable output.
+    #[allow(dead_code)]
+    pub(crate) struct ProgressLine {
+        /// Game (pair) serial index `t`.
+        pub t: u32,
+        /// Total games completed so far.
+        pub games: u32,
+        /// Current Elo estimate.
+        pub elo: f64,
+        /// Current trailing-window σ.
+        pub sigma: f64,
+        /// Current K factor.
+        pub k: f64,
+        /// Win / Loss / Draw counts from clawfish's perspective.
+        pub wld: (u32, u32, u32),
+    }
+
+    /// Format a mid-run progress line.
+    ///
+    /// Output: `progress: t=<t> games=<G> elo=<%.2f> sigma=<%.2f> K=<%.3f> wld=<W>-<L>-<D>`
+    #[allow(dead_code)]
+    pub(crate) fn format_progress(line: &ProgressLine) -> String {
+        let (w, l, d) = line.wld;
+        format!(
+            "progress: t={t} games={games} elo={elo:.2} sigma={sigma:.2} K={k:.3} wld={w}-{l}-{d}",
+            t = line.t,
+            games = line.games,
+            elo = line.elo,
+            sigma = line.sigma,
+            k = line.k,
+        )
+    }
+
+    /// Format the final convergence line.
+    ///
+    /// Output: `converged: elo=<%.2f> sigma=<%.2f> games=<G> reason=<sigma|max-games>`
+    #[allow(dead_code)]
+    pub(crate) fn format_converged(
+        final_elo: f64,
+        final_sigma: f64,
+        games: u32,
+        reason: StopReason,
+    ) -> String {
+        let reason_str = match reason {
+            StopReason::Sigma => "sigma",
+            StopReason::MaxGames => "max-games",
+        };
+        format!(
+            "converged: elo={final_elo:.2} sigma={final_sigma:.2} games={games} reason={reason_str}"
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn format_progress_canonical_string() {
+            let line = ProgressLine {
+                t: 60,
+                games: 60,
+                elo: 2103.45,
+                sigma: 28.7,
+                k: 13.333,
+                wld: (45, 8, 7),
+            };
+            assert_eq!(
+                format_progress(&line),
+                "progress: t=60 games=60 elo=2103.45 sigma=28.70 K=13.333 wld=45-8-7"
+            );
+        }
+
+        #[test]
+        fn format_converged_sigma_reason() {
+            let s = format_converged(2103.45, 28.7, 60, StopReason::Sigma);
+            assert_eq!(
+                s,
+                "converged: elo=2103.45 sigma=28.70 games=60 reason=sigma"
+            );
+        }
+
+        #[test]
+        fn format_converged_max_games_reason() {
+            let s = format_converged(2103.45, 28.7, 60, StopReason::MaxGames);
+            assert_eq!(
+                s,
+                "converged: elo=2103.45 sigma=28.70 games=60 reason=max-games"
+            );
+        }
+
+        #[test]
+        fn format_progress_zero_sigma() {
+            let line = ProgressLine {
+                t: 1,
+                games: 2,
+                elo: 2000.0,
+                sigma: 0.0,
+                k: 40.0,
+                wld: (1, 0, 1),
+            };
+            let s = format_progress(&line);
+            assert!(s.contains("sigma=0.00"));
+        }
+
+        #[test]
+        fn format_progress_two_decimal_elo_rounds() {
+            let line = ProgressLine {
+                t: 1,
+                games: 2,
+                elo: 1999.999,
+                sigma: 5.0,
+                k: 40.0,
+                wld: (2, 0, 0),
+            };
+            let s = format_progress(&line);
+            assert!(s.contains("elo=2000.00"));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // mod match_loop
 // ---------------------------------------------------------------------------
 
@@ -2245,6 +3720,8 @@ mod match_loop {
         pub white_clock: PerSideClock,
         /// Current clock state for the Black player.
         pub black_clock: PerSideClock,
+        /// Threshold adjudication parameters (resign / draw-by-score / max-moves).
+        pub thresholds: super::cli::Thresholds,
     }
 
     /// Post-move clock state returned by `pure_apply_move_clock_update`.
@@ -2295,7 +3772,9 @@ mod match_loop {
     pub(crate) fn play_one_game(
         ctx: &mut GameContext<'_>,
     ) -> (GameOutcome, Vec<super::pgn::PgnMove>) {
-        use super::adjudicate::detect_native_game_over;
+        use super::adjudicate::{
+            detect_native_game_over, draw_threshold_check, resign_threshold_check,
+        };
         use super::driver::{recv_until_bestmove, send_line};
         use super::pgn::PgnMove;
         use clawfish::{Color, Move, Position, generate_moves};
@@ -2310,6 +3789,11 @@ mod match_loop {
         let mut moves_uci: Vec<String> = Vec::new();
         let mut pgn_moves: Vec<PgnMove> = Vec::new();
         let mut move_count = 0u32;
+        // Per-color score histories for threshold adjudication (§4.3).
+        let mut white_history: Vec<Option<super::driver::Score>> = Vec::new();
+        let mut black_history: Vec<Option<super::driver::Score>> = Vec::new();
+        // 1-based full-move number (increments after each black move, per chess convention).
+        let mut move_number: u32 = 1;
 
         // Per-colour clocks are reset from the context at game start.
         let mut white_clock = ctx.white_clock;
@@ -2416,12 +3900,57 @@ mod match_loop {
 
             move_count += 1;
 
-            // Check native game-over after the move.
+            // Push just-moved side's score onto its per-color history (§4.3 step 1).
+            let just_moved_score = active_handle.last_info.score.clone();
+            match side {
+                Color::White => white_history.push(just_moved_score),
+                Color::Black => black_history.push(just_moved_score),
+            }
+
+            // Increment full-move number after black moves (standard chess convention).
+            if side == Color::Black {
+                move_number += 1;
+            }
+
+            // Check native game-over after the move (§4.3 step 2).
             if let Some(go) = detect_native_game_over(&position, &history) {
                 return (GameOutcome::NativeGameOver(go), pgn_moves);
             }
 
-            // Guard against runaway games.
+            // Resign adjudication: check just-moved side (§4.3 step 3).
+            let mover_history: &[Option<super::driver::Score>] = match side {
+                Color::White => &white_history,
+                Color::Black => &black_history,
+            };
+            if resign_threshold_check(
+                mover_history,
+                ctx.thresholds.resign_movecount,
+                ctx.thresholds.resign_score,
+            ) {
+                return (
+                    GameOutcome::NativeGameOver(super::adjudicate::GameOver::ResignAdjudicated(
+                        side,
+                    )),
+                    pgn_moves,
+                );
+            }
+
+            // Draw-by-score adjudication (§4.3 step 4).
+            if draw_threshold_check(
+                &white_history,
+                &black_history,
+                move_number,
+                ctx.thresholds.draw_movenumber,
+                ctx.thresholds.draw_movecount,
+                ctx.thresholds.draw_score,
+            ) {
+                return (
+                    GameOutcome::NativeGameOver(super::adjudicate::GameOver::DrawAdjudicated),
+                    pgn_moves,
+                );
+            }
+
+            // Guard against runaway games (§4.3 step 5).
             if move_count >= ctx.max_plies {
                 return (GameOutcome::MaxMovesReached, pgn_moves);
             }
@@ -2591,6 +4120,1464 @@ mod match_loop {
 }
 
 // ---------------------------------------------------------------------------
+// mod controller
+// ---------------------------------------------------------------------------
+
+mod controller {
+    //! Worker-pool lifecycle and iteration-loop controller.
+    //!
+    //! `spawn_workers` creates N worker threads, each owning its own engine pair.
+    //! `run_iteration` drives the color-pair dispatch + Robbins-Monro update loop
+    //! until σ convergence or max-games exhaustion.
+
+    use std::sync::mpsc;
+
+    /// Command sent from the controller to a worker thread.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[allow(dead_code)]
+    pub(crate) enum WorkerCmd {
+        /// Play one color-pair (2 games, color-swapped, same `opponent_uci_elo`).
+        /// `pair_index` is the 0-based pair count for game-index assignment.
+        PlayPair {
+            pair_index: u32,
+            opponent_uci_elo: u32,
+        },
+        /// Tell the worker to exit its recv loop and clean up.
+        Quit,
+    }
+
+    /// Report sent from a worker thread back to the controller.
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    pub(crate) enum WorkerReport {
+        /// A single game in the current pair has completed.
+        GameComplete {
+            game_index: u32,
+            opponent_uci_elo: u32,
+            /// Clawfish's score: 1.0 = win, 0.5 = draw, 0.0 = loss.
+            clawfish_score: f64,
+            outcome: super::match_loop::GameOutcome,
+            pgn_moves: Vec<super::pgn::PgnMove>,
+            white_name: String,
+            black_name: String,
+        },
+        /// Both games of the current pair are done; controller may dispatch next.
+        PairComplete { worker_id: u32 },
+        /// The worker encountered an unrecoverable error.
+        Failure(String),
+    }
+
+    /// Static configuration shared by all worker threads.
+    #[derive(Clone, Debug)]
+    pub(crate) struct WorkerConfig {
+        #[allow(dead_code)]
+        pub engine_spec: super::driver::EngineSpec,
+        #[allow(dead_code)]
+        pub opponent_spec: super::driver::EngineSpec,
+        #[allow(dead_code)]
+        pub engine_options: Vec<(String, String)>,
+        #[allow(dead_code)]
+        pub opponent_options: Vec<(String, String)>,
+        #[allow(dead_code)]
+        pub tc: super::cli::TimeControl,
+        #[allow(dead_code)]
+        pub opponent_tc: super::cli::TimeControl,
+        #[allow(dead_code)]
+        pub mode: clawfish::MatchTimeMode,
+        #[allow(dead_code)]
+        pub harness_overhead_ms: u32,
+        #[allow(dead_code)]
+        pub watchdog: std::time::Duration,
+        #[allow(dead_code)]
+        pub max_plies: u32,
+        #[allow(dead_code)]
+        pub thresholds: super::cli::Thresholds,
+    }
+
+    /// Live worker pool: command senders, report receiver, and thread handles.
+    pub(crate) struct WorkerPool {
+        pub senders: Vec<mpsc::Sender<WorkerCmd>>,
+        #[allow(dead_code)]
+        pub reports: mpsc::Receiver<WorkerReport>,
+        #[allow(dead_code)]
+        pub join_handles: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for WorkerPool {
+        /// Drop senders so workers see `Disconnected` and exit naturally.
+        /// Does NOT join — joining in Drop could block forever on panicking paths.
+        fn drop(&mut self) {
+            self.senders.clear();
+        }
+    }
+
+    /// Result of a completed iteration run.
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    pub(crate) struct IterationOutcome {
+        pub final_estimate: f64,
+        pub final_sigma: f64,
+        pub games_played: u32,
+        pub stop_reason: super::StopReason,
+        pub wld: (u32, u32, u32),
+    }
+
+    /// The function signature each worker thread must implement.
+    pub(super) type WorkerFn =
+        fn(u32, WorkerConfig, mpsc::Receiver<WorkerCmd>, mpsc::Sender<WorkerReport>);
+
+    /// Stockfish-compatible UCI_Elo bounds.
+    #[allow(dead_code)]
+    const UCI_ELO_MIN: u32 = 1320;
+    #[allow(dead_code)]
+    const UCI_ELO_MAX: u32 = 3190;
+
+    /// Clamp a real-valued estimate to Stockfish's UCI_Elo range and round to u32.
+    #[allow(dead_code)]
+    pub(super) fn clamp_uci_elo(elo: f64) -> u32 {
+        let rounded = elo.round();
+        if rounded.is_nan() {
+            return UCI_ELO_MIN;
+        }
+        if rounded < UCI_ELO_MIN as f64 {
+            UCI_ELO_MIN
+        } else if rounded > UCI_ELO_MAX as f64 {
+            UCI_ELO_MAX
+        } else {
+            rounded as u32
+        }
+    }
+
+    /// Map a `GameOutcome` and the side clawfish played to clawfish's POV score
+    /// (1.0 = win, 0.5 = draw, 0.0 = loss).
+    pub(super) fn compute_clawfish_score(
+        outcome: &super::match_loop::GameOutcome,
+        clawfish_white: bool,
+    ) -> f64 {
+        use super::adjudicate::GameOver;
+        use super::match_loop::GameOutcome;
+        use clawfish::Color;
+
+        let white_score: f64 = match outcome {
+            GameOutcome::NativeGameOver(go) => match go {
+                GameOver::Checkmate(winner) => match winner {
+                    Color::White => 1.0,
+                    Color::Black => 0.0,
+                },
+                GameOver::Stalemate
+                | GameOver::FiftyMove
+                | GameOver::ThreefoldRepetition
+                | GameOver::InsufficientMaterial
+                | GameOver::DrawAdjudicated => 0.5,
+                GameOver::TimeForfeit(loser) | GameOver::ResignAdjudicated(loser) => match loser {
+                    Color::White => 0.0,
+                    Color::Black => 1.0,
+                },
+            },
+            GameOutcome::TimeForfeit(loser) | GameOutcome::IllegalMove(loser) => match loser {
+                Color::White => 0.0,
+                Color::Black => 1.0,
+            },
+            GameOutcome::MaxMovesReached => 0.5,
+        };
+
+        if clawfish_white {
+            white_score
+        } else {
+            1.0 - white_score
+        }
+    }
+
+    /// Production worker-thread function: spawns engine pair, runs UCI handshake,
+    /// applies static options, and drives the per-pair flow on each `WorkerCmd`.
+    fn production_worker_fn(
+        worker_id: u32,
+        cfg: WorkerConfig,
+        cmd_rx: mpsc::Receiver<WorkerCmd>,
+        rpt_tx: mpsc::Sender<WorkerReport>,
+    ) {
+        let handshake_to = std::time::Duration::from_secs(10);
+        let isready_to = std::time::Duration::from_secs(5);
+
+        let mut engine = match super::driver::spawn_engine(&cfg.engine_spec) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = rpt_tx.send(WorkerReport::Failure(format!(
+                    "worker {worker_id}: spawn engine: {e:?}"
+                )));
+                return;
+            }
+        };
+        let mut opponent = match super::driver::spawn_engine(&cfg.opponent_spec) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = rpt_tx.send(WorkerReport::Failure(format!(
+                    "worker {worker_id}: spawn opponent: {e:?}"
+                )));
+                let _ = super::driver::shutdown(engine);
+                return;
+            }
+        };
+
+        // UCI handshake: send `uci` then drain via `wait_for_uciok` for both engines.
+        let handshake_ok = super::driver::send_line(&mut engine, "uci").is_ok()
+            && super::driver::wait_for_uciok(&mut engine, handshake_to).is_ok()
+            && super::driver::send_line(&mut opponent, "uci").is_ok()
+            && super::driver::wait_for_uciok(&mut opponent, handshake_to).is_ok();
+        if !handshake_ok {
+            let _ = rpt_tx.send(WorkerReport::Failure(format!(
+                "worker {worker_id}: uci handshake"
+            )));
+            let _ = super::driver::shutdown(engine);
+            let _ = super::driver::shutdown(opponent);
+            return;
+        }
+
+        // Apply static options, then sync via isready.
+        for (name, value) in &cfg.engine_options {
+            let _ = super::driver::send_line(
+                &mut engine,
+                &format!("setoption name {name} value {value}"),
+            );
+        }
+        for (name, value) in &cfg.opponent_options {
+            let _ = super::driver::send_line(
+                &mut opponent,
+                &format!("setoption name {name} value {value}"),
+            );
+        }
+        let setopt_ok = super::driver::wait_for_readyok(&mut engine, isready_to).is_ok()
+            && super::driver::wait_for_readyok(&mut opponent, isready_to).is_ok();
+        if !setopt_ok {
+            let _ = rpt_tx.send(WorkerReport::Failure(format!(
+                "worker {worker_id}: readyok after setoption"
+            )));
+            let _ = super::driver::shutdown(engine);
+            let _ = super::driver::shutdown(opponent);
+            return;
+        }
+
+        // Recv loop on WorkerCmd.
+        while let Ok(cmd) = cmd_rx.recv() {
+            match cmd {
+                WorkerCmd::Quit => break,
+                WorkerCmd::PlayPair {
+                    pair_index,
+                    opponent_uci_elo,
+                } => {
+                    // **INVARIANT (load-bearing per plan §4.4 + ADR-0018 §2):**
+                    // `setoption UCI_Elo` MUST precede `ucinewgame` within a pair.
+                    // The Stockfish 18 preflight probe
+                    // (`docs/research/tooling-stockfish-mid-session-setoption.md`)
+                    // confirms mid-session setoption is honored, but UCI's spec
+                    // allows engines to reset per-game state on `ucinewgame`. By
+                    // sending setoption FIRST, we defend against any engine that
+                    // would clear UCI_Elo on the ucinewgame transition. Reordering
+                    // these two operations (or hoisting ucinewgame before the
+                    // setoption block) would silently produce wrong-strength play
+                    // — the synthetic-worker tests cannot catch this; the
+                    // structural ordering pin lives in this comment + the
+                    // sequence below.
+                    //
+                    // Re-apply opponent UCI_Elo + UCI_LimitStrength (idempotent;
+                    // sent before each pair to defend against engines that drop
+                    // options on ucinewgame).
+                    let _ = super::driver::send_line(
+                        &mut opponent,
+                        &format!("setoption name UCI_Elo value {opponent_uci_elo}"),
+                    );
+                    let _ = super::driver::send_line(
+                        &mut opponent,
+                        "setoption name UCI_LimitStrength value true",
+                    );
+                    if super::driver::wait_for_readyok(&mut opponent, isready_to).is_err() {
+                        let _ = rpt_tx.send(WorkerReport::Failure(format!(
+                            "worker {worker_id}: readyok after UCI_Elo setoption"
+                        )));
+                        break;
+                    }
+
+                    // Two color-swapped games against the same opp_elo.
+                    let mut pair_failed = false;
+                    for game_in_pair in 0..2u32 {
+                        let clawfish_white = game_in_pair == 0;
+                        let game_index = pair_index * 2 + game_in_pair + 1;
+
+                        // ucinewgame + isready for both engines.
+                        let _ = super::driver::send_line(&mut engine, "ucinewgame");
+                        let engine_ready =
+                            super::driver::wait_for_readyok(&mut engine, isready_to).is_ok();
+                        let _ = super::driver::send_line(&mut opponent, "ucinewgame");
+                        let opponent_ready =
+                            super::driver::wait_for_readyok(&mut opponent, isready_to).is_ok();
+                        if !(engine_ready && opponent_ready) {
+                            let _ = rpt_tx.send(WorkerReport::Failure(format!(
+                                "worker {worker_id}: readyok after ucinewgame"
+                            )));
+                            pair_failed = true;
+                            break;
+                        }
+
+                        // Build per-color clocks. clawfish-white means engine is white.
+                        let (white_tc, black_tc) = if clawfish_white {
+                            (cfg.tc, cfg.opponent_tc)
+                        } else {
+                            (cfg.opponent_tc, cfg.tc)
+                        };
+                        let white_clock = clawfish::PerSideClock {
+                            remaining_ms: i64::from(white_tc.initial_ms),
+                            increment_ms: white_tc.increment_ms,
+                        };
+                        let black_clock = clawfish::PerSideClock {
+                            remaining_ms: i64::from(black_tc.initial_ms),
+                            increment_ms: black_tc.increment_ms,
+                        };
+
+                        let (white_engine_index, white_name, black_name) = if clawfish_white {
+                            (
+                                0usize,
+                                cfg.engine_spec.name.clone(),
+                                cfg.opponent_spec.name.clone(),
+                            )
+                        } else {
+                            (
+                                1usize,
+                                cfg.opponent_spec.name.clone(),
+                                cfg.engine_spec.name.clone(),
+                            )
+                        };
+
+                        let mut ctx = super::match_loop::GameContext {
+                            game_index,
+                            white_engine_index,
+                            engine: &mut engine,
+                            opponent: &mut opponent,
+                            engine_tc: cfg.tc,
+                            opponent_tc: cfg.opponent_tc,
+                            harness_overhead_ms: cfg.harness_overhead_ms,
+                            watchdog: cfg.watchdog,
+                            mode: cfg.mode,
+                            max_plies: cfg.max_plies,
+                            starting_fen: None,
+                            white_clock,
+                            black_clock,
+                            thresholds: cfg.thresholds.clone(),
+                        };
+
+                        let (outcome, pgn_moves) = super::match_loop::play_one_game(&mut ctx);
+                        let clawfish_score = compute_clawfish_score(&outcome, clawfish_white);
+
+                        let _ = rpt_tx.send(WorkerReport::GameComplete {
+                            game_index,
+                            opponent_uci_elo,
+                            clawfish_score,
+                            outcome,
+                            pgn_moves,
+                            white_name,
+                            black_name,
+                        });
+                    }
+
+                    if pair_failed {
+                        break;
+                    }
+                    let _ = rpt_tx.send(WorkerReport::PairComplete { worker_id });
+                }
+            }
+        }
+
+        let _ = super::driver::shutdown(engine);
+        let _ = super::driver::shutdown(opponent);
+    }
+
+    /// Spawn `n` worker threads using the production worker-thread function.
+    #[allow(dead_code)]
+    pub(crate) fn spawn_workers(
+        n: u32,
+        cfg: WorkerConfig,
+    ) -> Result<WorkerPool, super::driver::HarnessError> {
+        spawn_workers_with_fn(n, cfg, production_worker_fn)
+    }
+
+    /// Internal spawn that accepts a substitutable worker function for tests.
+    pub(super) fn spawn_workers_with_fn(
+        n: u32,
+        cfg: WorkerConfig,
+        worker_fn: WorkerFn,
+    ) -> Result<WorkerPool, super::driver::HarnessError> {
+        let (rpt_tx, rpt_rx) = mpsc::channel::<WorkerReport>();
+        let mut senders = Vec::with_capacity(n as usize);
+        let mut join_handles = Vec::with_capacity(n as usize);
+        for worker_id in 0..n {
+            let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+            senders.push(cmd_tx);
+            let cfg_clone = cfg.clone();
+            let rpt_tx_clone = rpt_tx.clone();
+            let handle = std::thread::spawn(move || {
+                worker_fn(worker_id, cfg_clone, cmd_rx, rpt_tx_clone);
+            });
+            join_handles.push(handle);
+        }
+        // Drop the original rpt_tx; receiver disconnects when all worker clones drop.
+        drop(rpt_tx);
+        Ok(WorkerPool {
+            senders,
+            reports: rpt_rx,
+            join_handles,
+        })
+    }
+
+    /// Drive the color-pair dispatch + K-update loop to completion.
+    #[allow(dead_code)]
+    pub(crate) fn run_iteration(
+        pool: &mut WorkerPool,
+        args: &super::cli::Args,
+        out_dir: &std::path::Path,
+    ) -> Result<IterationOutcome, super::driver::HarnessError> {
+        let total_pairs = args.max_games / 2;
+        let n_workers = pool.senders.len();
+        let mut pairs_in_flight: Vec<u32> = vec![0; n_workers];
+
+        let mut current_estimate: f64 = args.initial_elo;
+        let mut estimates_trail: Vec<f64> = Vec::new();
+        let mut t: u32 = 0;
+        let mut wins: u32 = 0;
+        let mut losses: u32 = 0;
+        let mut draws: u32 = 0;
+        let mut pairs_dispatched: u32 = 0;
+        let mut terminating = false;
+        let mut sigma_fired = false;
+        let mut failure: Option<super::driver::HarnessError> = None;
+
+        // Best-effort directory setup; errors here just mean later writes fail.
+        let _ = std::fs::create_dir_all(out_dir);
+        let games_dir = out_dir.join("games");
+        let _ = std::fs::create_dir_all(&games_dir);
+        let summary_path = out_dir.join("summary.txt");
+
+        // Bootstrap: dispatch up to one PlayPair per worker (or fewer if total_pairs < n_workers).
+        for (worker_id, in_flight_slot) in pairs_in_flight.iter_mut().enumerate().take(n_workers) {
+            if pairs_dispatched >= total_pairs {
+                break;
+            }
+            let opp_elo = clamp_uci_elo(current_estimate);
+            if pool.senders[worker_id]
+                .send(WorkerCmd::PlayPair {
+                    pair_index: pairs_dispatched,
+                    opponent_uci_elo: opp_elo,
+                })
+                .is_err()
+            {
+                failure = Some(super::driver::HarnessError::EngineExit);
+                break;
+            }
+            pairs_dispatched += 1;
+            *in_flight_slot += 1;
+        }
+
+        // Drain loop.
+        let drain_done = |terminating: bool, pairs_dispatched: u32, in_flight: &[u32]| -> bool {
+            let all_idle = in_flight.iter().all(|&x| x == 0);
+            (terminating || pairs_dispatched >= total_pairs) && all_idle
+        };
+
+        while !drain_done(terminating, pairs_dispatched, &pairs_in_flight) {
+            // If we've hit max_games via game count, exit immediately. The final
+            // stop_reason distinguishes σ-stop from MaxGames via `sigma_fired`.
+            if t >= args.max_games {
+                break;
+            }
+            let report = match pool.reports.recv() {
+                Ok(r) => r,
+                Err(_) => {
+                    // All worker senders disconnected; nothing more to drain.
+                    break;
+                }
+            };
+            match report {
+                WorkerReport::GameComplete {
+                    game_index,
+                    opponent_uci_elo,
+                    clawfish_score,
+                    outcome,
+                    pgn_moves,
+                    white_name,
+                    black_name,
+                } => {
+                    // Persist PGN + summary line (best-effort; missing dirs in tests are tolerated).
+                    let (result, termination_str) = super::outcome_to_pgn_result(&outcome);
+                    let pgn_header = super::pgn::PgnHeader {
+                        event: args.event_tag.clone(),
+                        site: super::current_hostname(),
+                        date: super::current_date_str(),
+                        round: game_index,
+                        white: white_name.clone(),
+                        black: black_name.clone(),
+                        result: result.clone(),
+                        time_control: Some(super::format_tc(args.tc)),
+                        termination: Some(termination_str.clone()),
+                        setup_fen: None,
+                    };
+                    let pgn_str = super::pgn::format_pgn(&pgn_header, &pgn_moves);
+                    let pgn_path = games_dir.join(format!("{game_index}.pgn"));
+                    let _ = std::fs::write(&pgn_path, &pgn_str);
+
+                    let summary_line = super::summary::SummaryLine {
+                        game_index,
+                        white: white_name,
+                        black: black_name,
+                        result,
+                        plies: pgn_moves.len() as u32,
+                        termination: super::outcome_to_termination_reason(&outcome),
+                    };
+                    let _ = super::summary::append_summary_line(&summary_path, &summary_line);
+
+                    // Robbins-Monro update.
+                    let k = super::estimator::compute_k(t, args.k0, args.tau);
+                    current_estimate = super::estimator::update_estimate(
+                        current_estimate,
+                        opponent_uci_elo as f64,
+                        clawfish_score,
+                        k,
+                    );
+                    estimates_trail.push(current_estimate);
+                    t += 1;
+
+                    if (clawfish_score - 1.0).abs() < 1e-9 {
+                        wins += 1;
+                    } else if clawfish_score.abs() < 1e-9 {
+                        losses += 1;
+                    } else {
+                        draws += 1;
+                    }
+
+                    // σ-stopping check (per-game cadence).
+                    if !terminating
+                        && super::sigma::should_stop(
+                            &estimates_trail,
+                            args.stop_window,
+                            args.target_sigma,
+                            args.stop_window_confirm,
+                        )
+                    {
+                        terminating = true;
+                        sigma_fired = true;
+                    }
+                }
+                WorkerReport::PairComplete { worker_id } => {
+                    let wid = worker_id as usize;
+                    if wid < pairs_in_flight.len() {
+                        pairs_in_flight[wid] = pairs_in_flight[wid].saturating_sub(1);
+                    }
+
+                    // Emit progress line for this pair.
+                    let window_start = estimates_trail.len().saturating_sub(args.stop_window);
+                    let current_sigma =
+                        super::sigma::sample_stddev(&estimates_trail[window_start..]);
+                    let current_k =
+                        super::estimator::compute_k(t.saturating_sub(1), args.k0, args.tau);
+                    let progress_line = super::progress::ProgressLine {
+                        t,
+                        games: t,
+                        elo: current_estimate,
+                        sigma: current_sigma,
+                        k: current_k,
+                        wld: (wins, losses, draws),
+                    };
+                    let progress_str = super::progress::format_progress(&progress_line);
+                    println!("{progress_str}");
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&summary_path)
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{progress_str}");
+                    }
+
+                    // Dispatch next pair on this worker if we still have budget.
+                    if !terminating && pairs_dispatched < total_pairs && wid < pool.senders.len() {
+                        let opp_elo = clamp_uci_elo(current_estimate);
+                        if pool.senders[wid]
+                            .send(WorkerCmd::PlayPair {
+                                pair_index: pairs_dispatched,
+                                opponent_uci_elo: opp_elo,
+                            })
+                            .is_ok()
+                        {
+                            pairs_dispatched += 1;
+                            pairs_in_flight[wid] += 1;
+                        }
+                    }
+                }
+                WorkerReport::Failure(msg) => {
+                    eprintln!("worker failure: {msg}");
+                    failure = Some(super::driver::HarnessError::EngineExit);
+                    break;
+                }
+            }
+        }
+
+        // Send Quit to every sender (best-effort; workers may already be exiting).
+        for s in &pool.senders {
+            let _ = s.send(WorkerCmd::Quit);
+        }
+        // Disconnect senders explicitly so any worker still blocked on recv exits.
+        pool.senders.clear();
+
+        for h in pool.join_handles.drain(..) {
+            // Surface worker panics for diagnosability — a panicking worker is
+            // a real-bug signal worth logging even on the error-path cleanup.
+            // We don't propagate the panic (cleanup must complete); just log.
+            if let Err(panic) = h.join() {
+                eprintln!("worker thread panicked during cleanup: {panic:?}");
+            }
+        }
+
+        if let Some(e) = failure {
+            return Err(e);
+        }
+
+        let stop_reason = if sigma_fired {
+            super::StopReason::Sigma
+        } else {
+            super::StopReason::MaxGames
+        };
+
+        let final_window_start = estimates_trail.len().saturating_sub(args.stop_window);
+        let final_sigma = super::sigma::sample_stddev(&estimates_trail[final_window_start..]);
+
+        let converged_str =
+            super::progress::format_converged(current_estimate, final_sigma, t, stop_reason);
+        println!("{converged_str}");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&summary_path)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{converged_str}");
+        }
+
+        Ok(IterationOutcome {
+            final_estimate: current_estimate,
+            final_sigma,
+            games_played: t,
+            stop_reason,
+            wld: (wins, losses, draws),
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::mpsc;
+
+        use super::*;
+
+        // -----------------------------------------------------------------------
+        // Test infrastructure
+        // -----------------------------------------------------------------------
+
+        /// Minimum valid `Args` for controller tests.
+        ///
+        /// Uses `--k0 0 --target-sigma 0` (frozen-K, disabled-σ) so the only
+        /// stop criterion is `--max-games`.  Callers may override fields freely.
+        fn base_args(max_games: u32) -> super::super::cli::Args {
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc".into(),
+                "10+0.1".into(),
+                "--max-games".into(),
+                max_games.to_string(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+            ];
+            super::super::cli::parse_args(argv).expect("base_args: parse failed")
+        }
+
+        /// Construct a `WorkerPool` whose N synthetic worker threads consume
+        /// `WorkerCmd`s and emit canned `WorkerReport`s in order.
+        ///
+        /// Each element of `canned_reports_per_worker` is the sequence of reports
+        /// emitted by worker `i` before it idles.  Workers exit when their
+        /// command channel closes or they receive `WorkerCmd::Quit`.
+        fn synthetic_pool(n: u32, canned_reports_per_worker: Vec<Vec<WorkerReport>>) -> WorkerPool {
+            let (rpt_tx, rpt_rx) = mpsc::channel::<WorkerReport>();
+            let mut cmd_txs: Vec<mpsc::Sender<WorkerCmd>> = Vec::new();
+            let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+            for reports in canned_reports_per_worker.into_iter().take(n as usize) {
+                let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+                cmd_txs.push(cmd_tx);
+                let rpt_tx_clone = rpt_tx.clone();
+                handles.push(std::thread::spawn(move || {
+                    for cmd in &cmd_rx {
+                        match cmd {
+                            WorkerCmd::Quit => break,
+                            WorkerCmd::PlayPair { .. } => {
+                                for report in &reports {
+                                    // Reports are pre-constructed; we can only clone
+                                    // non-Clone variants by re-sending a new value.
+                                    // We use the variant-by-variant approach here.
+                                    let _ = rpt_tx_clone.send(match report {
+                                        WorkerReport::PairComplete { worker_id } => {
+                                            WorkerReport::PairComplete {
+                                                worker_id: *worker_id,
+                                            }
+                                        }
+                                        WorkerReport::Failure(s) => {
+                                            WorkerReport::Failure(s.clone())
+                                        }
+                                        WorkerReport::GameComplete {
+                                            game_index,
+                                            opponent_uci_elo,
+                                            clawfish_score,
+                                            ..
+                                        } => WorkerReport::GameComplete {
+                                            game_index: *game_index,
+                                            opponent_uci_elo: *opponent_uci_elo,
+                                            clawfish_score: *clawfish_score,
+                                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                                            pgn_moves: vec![],
+                                            white_name: "w".into(),
+                                            black_name: "b".into(),
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }));
+            }
+
+            WorkerPool {
+                senders: cmd_txs,
+                reports: rpt_rx,
+                join_handles: handles,
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // §6.6 controller tests
+        // -----------------------------------------------------------------------
+
+        /// After bootstrap, each of the 4 workers received exactly one `PlayPair`;
+        /// the four `pair_index` values across workers are unique (set {0,1,2,3});
+        /// each `PlayPair.opponent_uci_elo == round(initial_elo) == 2000`.
+        #[test]
+        fn dispatch_round_robin_one_pair_per_worker() {
+            use std::sync::{Arc, Mutex};
+
+            // 4 per-worker logs — one Arc<Mutex<Vec<WorkerCmd>>> per worker.
+            let worker_logs: Vec<Arc<Mutex<Vec<WorkerCmd>>>> =
+                (0..4).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+
+            let (rpt_tx, rpt_rx) = mpsc::channel::<WorkerReport>();
+            let mut cmd_txs: Vec<mpsc::Sender<WorkerCmd>> = Vec::new();
+            let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+            for worker_id in 0u32..4 {
+                let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+                cmd_txs.push(cmd_tx);
+                let rpt_tx_clone = rpt_tx.clone();
+                let log = Arc::clone(&worker_logs[worker_id as usize]);
+                handles.push(std::thread::spawn(move || {
+                    for cmd in &cmd_rx {
+                        match cmd {
+                            WorkerCmd::Quit => break,
+                            WorkerCmd::PlayPair {
+                                pair_index,
+                                opponent_uci_elo,
+                            } => {
+                                log.lock().unwrap().push(WorkerCmd::PlayPair {
+                                    pair_index,
+                                    opponent_uci_elo,
+                                });
+                                // Emit one canned PairComplete (no GameComplete needed for
+                                // dispatch-only verification).
+                                let _ = rpt_tx_clone.send(WorkerReport::PairComplete { worker_id });
+                            }
+                        }
+                    }
+                }));
+            }
+
+            let mut pool = WorkerPool {
+                senders: cmd_txs,
+                reports: rpt_rx,
+                join_handles: handles,
+            };
+            let out_dir = std::env::temp_dir().join("eloh_b_dispatch_test");
+            // concurrency=4, max_games=8 → total_pairs=4; all 4 dispatched at bootstrap.
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc".into(),
+                "10+0.1".into(),
+                "--max-games".into(),
+                "8".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+                "--concurrency".into(),
+                "4".into(),
+            ];
+            let args = super::super::cli::parse_args(argv).expect("parse ok");
+            let _ = run_iteration(&mut pool, &args, &out_dir);
+
+            // Each worker must have received at least one PlayPair at bootstrap.
+            let first_pairs: Vec<u32> = worker_logs
+                .iter()
+                .enumerate()
+                .map(|(wid, log)| {
+                    let guard = log.lock().unwrap();
+                    let first = guard.iter().find_map(|cmd| {
+                        if let WorkerCmd::PlayPair { pair_index, .. } = cmd {
+                            Some(*pair_index)
+                        } else {
+                            None
+                        }
+                    });
+                    first.unwrap_or_else(|| {
+                        panic!("worker {wid} received no PlayPair during bootstrap")
+                    })
+                })
+                .collect();
+
+            // The bootstrap pair_indices across workers must be the set {0, 1, 2, 3}.
+            let mut sorted = first_pairs.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                vec![0, 1, 2, 3],
+                "bootstrap pair_indices must be {{0,1,2,3}}, got {first_pairs:?}"
+            );
+
+            // Each worker received exactly one PlayPair (no over-dispatch),
+            // and every dispatched PlayPair carries opponent_uci_elo == 2000.
+            for (wid, log) in worker_logs.iter().enumerate() {
+                let entries = log.lock().unwrap();
+                assert_eq!(
+                    entries.len(),
+                    1,
+                    "worker {wid}: expected exactly 1 PlayPair, got {}",
+                    entries.len()
+                );
+                for cmd in entries.iter() {
+                    let WorkerCmd::PlayPair {
+                        opponent_uci_elo, ..
+                    } = cmd
+                    else {
+                        unreachable!("only PlayPair is pushed to worker logs")
+                    };
+                    assert_eq!(
+                        *opponent_uci_elo, 2000u32,
+                        "worker {wid}: expected opponent_uci_elo=2000, got {opponent_uci_elo}"
+                    );
+                }
+            }
+        }
+
+        /// Score mapping: 2W + 1L + 1D → `wld = (2, 1, 1)` from clawfish's POV.
+        ///
+        /// A pair = 2 games. Two workers, each completing 1 pair (2 GameComplete +
+        /// 1 PairComplete).  Pair 0: win-as-white (1.0) + win-as-black (1.0).
+        /// Pair 1: loss-as-white (0.0) + draw-as-black (0.5).
+        ///
+        /// **Scope.** This is a controller-surface test on POV-corrected score
+        /// aggregation. The `(game_index - 1) % 2 == 0 → clawfish white` color
+        /// invariant is a worker-thread internal property; it is not pinned here.
+        /// TODO(impl-phase): the e2e `#[ignore]`-gated smoke pins clawfish-color
+        /// assignment via PGN tag inspection.
+        #[test]
+        fn aggregate_wld_handles_clawfish_white_and_black() {
+            let out_dir = std::env::temp_dir().join("eloh_b_wld_test");
+            // 2 workers, 4 total games (2 per pair), --max-games 4 --concurrency 2.
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc".into(),
+                "10+0.1".into(),
+                "--max-games".into(),
+                "4".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+                "--concurrency".into(),
+                "2".into(),
+            ];
+            let args = super::super::cli::parse_args(argv).expect("parse ok");
+            // Worker 0: pair 0 → score(1.0 white) + score(1.0 black) → 2 wins.
+            // Worker 1: pair 1 → score(0.0 white) + score(0.5 black) → 1 loss + 1 draw.
+            let worker0_reports = vec![
+                WorkerReport::GameComplete {
+                    game_index: 1,
+                    opponent_uci_elo: 2000,
+                    clawfish_score: 1.0,
+                    outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                    pgn_moves: vec![],
+                    white_name: "clawfish".into(),
+                    black_name: "stockfish".into(),
+                },
+                WorkerReport::GameComplete {
+                    game_index: 2,
+                    opponent_uci_elo: 2000,
+                    clawfish_score: 1.0,
+                    outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                    pgn_moves: vec![],
+                    white_name: "stockfish".into(),
+                    black_name: "clawfish".into(),
+                },
+                WorkerReport::PairComplete { worker_id: 0 },
+            ];
+            let worker1_reports = vec![
+                WorkerReport::GameComplete {
+                    game_index: 3,
+                    opponent_uci_elo: 2000,
+                    clawfish_score: 0.0,
+                    outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                    pgn_moves: vec![],
+                    white_name: "clawfish".into(),
+                    black_name: "stockfish".into(),
+                },
+                WorkerReport::GameComplete {
+                    game_index: 4,
+                    opponent_uci_elo: 2000,
+                    clawfish_score: 0.5,
+                    outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                    pgn_moves: vec![],
+                    white_name: "stockfish".into(),
+                    black_name: "clawfish".into(),
+                },
+                WorkerReport::PairComplete { worker_id: 1 },
+            ];
+            let mut pool = synthetic_pool(2, vec![worker0_reports, worker1_reports]);
+            let outcome = run_iteration(&mut pool, &args, &out_dir).unwrap();
+            assert_eq!(outcome.wld, (2, 1, 1), "wld must be (2, 1, 1)");
+        }
+
+        /// With `--target-sigma 0 --max-games N`, the loop stops after exactly N
+        /// games and the stop reason is `MaxGames`.
+        #[test]
+        fn controller_terminates_on_max_games() {
+            let out_dir = std::env::temp_dir().join("eloh_b_maxgames_test");
+            let n: u32 = 4;
+            let args = base_args(n);
+            // Feed N/2 pairs each with 2 GameComplete + 1 PairComplete.
+            let pair_reports: Vec<WorkerReport> = (0..n / 2)
+                .flat_map(|p| {
+                    vec![
+                        WorkerReport::GameComplete {
+                            game_index: p * 2 + 1,
+                            opponent_uci_elo: 2000,
+                            clawfish_score: 0.5,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                        },
+                        WorkerReport::GameComplete {
+                            game_index: p * 2 + 2,
+                            opponent_uci_elo: 2000,
+                            clawfish_score: 0.5,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                        },
+                        WorkerReport::PairComplete { worker_id: 0 },
+                    ]
+                })
+                .collect();
+            let mut pool = synthetic_pool(1, vec![pair_reports]);
+            let outcome = run_iteration(&mut pool, &args, &out_dir).unwrap();
+            assert_eq!(
+                outcome.stop_reason,
+                super::super::StopReason::MaxGames,
+                "expected MaxGames stop reason"
+            );
+            assert_eq!(outcome.games_played, n, "games_played must equal max_games");
+        }
+
+        /// A constant-estimate stream causes σ=0, so `should_stop` fires and
+        /// the stop reason is `Sigma` (with `--target-sigma > 0`).
+        #[test]
+        fn controller_terminates_on_sigma() {
+            let out_dir = std::env::temp_dir().join("eloh_b_sigma_test");
+            // Use a non-zero target_sigma (not frozen) with a large max_games
+            // ceiling so only σ-stopping can terminate the loop.
+            // Provide enough constant draws to saturate the confirm window.
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc".into(),
+                "10+0.1".into(),
+                "--max-games".into(),
+                "200".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "40".into(),
+                "--target-sigma".into(),
+                "30".into(),
+                "--stop-window".into(),
+                "30".into(),
+                "--stop-window-confirm".into(),
+                "5".into(),
+            ];
+            let args = super::super::cli::parse_args(argv).expect("parse ok");
+            // Feed 100 pairs, all draws (clawfish_score=0.5).
+            // With constant scores and Robbins-Monro, the estimate trail will
+            // stabilise → trailing σ → 0 → should_stop fires within 34+5=39 games.
+            let pair_reports: Vec<WorkerReport> = (0..100u32)
+                .flat_map(|p| {
+                    vec![
+                        WorkerReport::GameComplete {
+                            game_index: p * 2 + 1,
+                            opponent_uci_elo: 2000,
+                            clawfish_score: 0.5,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                        },
+                        WorkerReport::GameComplete {
+                            game_index: p * 2 + 2,
+                            opponent_uci_elo: 2000,
+                            clawfish_score: 0.5,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                        },
+                        WorkerReport::PairComplete { worker_id: 0 },
+                    ]
+                })
+                .collect();
+            let mut pool = synthetic_pool(1, vec![pair_reports]);
+            let outcome = run_iteration(&mut pool, &args, &out_dir).unwrap();
+            assert_eq!(
+                outcome.stop_reason,
+                super::super::StopReason::Sigma,
+                "expected Sigma stop reason on constant-draw stream"
+            );
+            assert!(
+                outcome.games_played >= 34,
+                "should_stop must respect window+confirm-1=34 minimum data entries; got {}",
+                outcome.games_played
+            );
+        }
+
+        /// Verify that every `PlayPair` emitted by the controller carries
+        /// `opponent_uci_elo` equal to `round(initial_elo)`.
+        ///
+        /// The setoption-before-ucinewgame ordering is a worker-thread internal
+        /// discipline pinned by the e2e smoke; this controller-surface test only
+        /// verifies opponent_uci_elo round-trip in the WorkerCmd payload.
+        // TODO(impl-phase): The setoption-before-ucinewgame ordering is a
+        // worker-thread internal discipline pinned by the e2e smoke; this
+        // controller-surface test only verifies opponent_uci_elo round-trip in
+        // the WorkerCmd payload.
+        #[test]
+        fn controller_dispatches_playpair_carrying_correct_opponent_uci_elo() {
+            use std::sync::{Arc, Mutex};
+
+            let (rpt_tx, rpt_rx) = mpsc::channel::<WorkerReport>();
+            let mut cmd_txs: Vec<mpsc::Sender<WorkerCmd>> = Vec::new();
+            let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+            // One shared log across both workers to collect all received PlayPairs.
+            let received: Arc<Mutex<Vec<WorkerCmd>>> = Arc::new(Mutex::new(Vec::new()));
+
+            for worker_id in 0u32..2 {
+                let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+                cmd_txs.push(cmd_tx);
+                let rpt_tx_clone = rpt_tx.clone();
+                let log = Arc::clone(&received);
+                handles.push(std::thread::spawn(move || {
+                    for cmd in &cmd_rx {
+                        match cmd {
+                            WorkerCmd::Quit => break,
+                            WorkerCmd::PlayPair {
+                                pair_index,
+                                opponent_uci_elo,
+                            } => {
+                                log.lock().unwrap().push(WorkerCmd::PlayPair {
+                                    pair_index,
+                                    opponent_uci_elo,
+                                });
+                                let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                    game_index: pair_index * 2 + 1,
+                                    opponent_uci_elo,
+                                    clawfish_score: 0.5,
+                                    outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                                    pgn_moves: vec![],
+                                    white_name: "w".into(),
+                                    black_name: "b".into(),
+                                });
+                                let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                    game_index: pair_index * 2 + 2,
+                                    opponent_uci_elo,
+                                    clawfish_score: 0.5,
+                                    outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                                    pgn_moves: vec![],
+                                    white_name: "w".into(),
+                                    black_name: "b".into(),
+                                });
+                                let _ = rpt_tx_clone.send(WorkerReport::PairComplete { worker_id });
+                            }
+                        }
+                    }
+                }));
+            }
+
+            let mut pool = WorkerPool {
+                senders: cmd_txs,
+                reports: rpt_rx,
+                join_handles: handles,
+            };
+            let out_dir = std::env::temp_dir().join("eloh_b_uci_elo_roundtrip_test");
+            // initial_elo=2114; --k0 0 freezes the estimate so subsequent dispatches
+            // also use opp=2114. (Workers DO emit GameComplete reports; the no-drift
+            // property is structural via --k0 0, not arithmetic via score cancellation.)
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc".into(),
+                "10+0.1".into(),
+                "--max-games".into(),
+                "4".into(),
+                "--initial-elo".into(),
+                "2114".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+                "--concurrency".into(),
+                "2".into(),
+            ];
+            let args = super::super::cli::parse_args(argv).expect("parse ok");
+            let _ = run_iteration(&mut pool, &args, &out_dir);
+            // Verify all dispatched PlayPairs carry opponent_uci_elo == 2114.
+            let log = received.lock().unwrap();
+            assert!(
+                !log.is_empty(),
+                "at least one PlayPair must have been dispatched"
+            );
+            for cmd in log.iter() {
+                let WorkerCmd::PlayPair {
+                    opponent_uci_elo, ..
+                } = cmd
+                else {
+                    unreachable!("only PlayPair is pushed to the log")
+                };
+                assert_eq!(
+                    *opponent_uci_elo, 2114u32,
+                    "opponent_uci_elo must equal round(initial_elo)=2114, got {opponent_uci_elo}"
+                );
+            }
+        }
+
+        /// With `--k0 0`, the K-update is a no-op and the estimate stays at
+        /// `initial_elo` regardless of game results.
+        #[test]
+        fn controller_freeze_k_holds_initial_estimate() {
+            let out_dir = std::env::temp_dir().join("eloh_b_freeze_k_test");
+            let initial_elo = 2114.0;
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc".into(),
+                "10+0.1".into(),
+                "--max-games".into(),
+                "8".into(),
+                "--initial-elo".into(),
+                initial_elo.to_string(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+            ];
+            let args = super::super::cli::parse_args(argv).expect("parse ok");
+            // Mix of wins, losses, draws — should have no effect on the estimate.
+            let pair_reports: Vec<WorkerReport> = [1.0f64, 0.0, 1.0, 0.0]
+                .iter()
+                .enumerate()
+                .flat_map(|(p, &s)| {
+                    let p = p as u32;
+                    vec![
+                        WorkerReport::GameComplete {
+                            game_index: p * 2 + 1,
+                            opponent_uci_elo: 2114,
+                            clawfish_score: s,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                        },
+                        WorkerReport::GameComplete {
+                            game_index: p * 2 + 2,
+                            opponent_uci_elo: 2114,
+                            clawfish_score: 1.0 - s,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                        },
+                        WorkerReport::PairComplete { worker_id: 0 },
+                    ]
+                })
+                .collect();
+            let mut pool = synthetic_pool(1, vec![pair_reports]);
+            let outcome = run_iteration(&mut pool, &args, &out_dir).unwrap();
+            assert!(
+                (outcome.final_estimate - initial_elo).abs() < 1e-6,
+                "frozen-K: estimate must stay at initial_elo={initial_elo}, \
+                 got {}",
+                outcome.final_estimate
+            );
+        }
+
+        /// With 2 workers where worker 0 sleeps 200 ms per report, the controller
+        /// should finish 4 pairs in <700 ms by dispatching to worker 1 concurrently
+        /// (~500 ms theoretical lower bound + ~200 ms scheduling slack for CI noise).
+        /// Serial blocking would take ≥800 ms.
+        #[test]
+        fn controller_does_not_block_on_slow_worker() {
+            let out_dir = std::env::temp_dir().join("eloh_b_nonblocking_test");
+            let mut args = base_args(8);
+            // Concurrency must match the manually-built 2-worker pool;
+            // base_args defaults to 1, which would serialise dispatch.
+            args.concurrency = 2;
+
+            // Worker 0: sleeps 200ms before each report.
+            let (rpt_tx, rpt_rx) = mpsc::channel::<WorkerReport>();
+            let mut cmd_txs: Vec<mpsc::Sender<WorkerCmd>> = Vec::new();
+            let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+            for worker_id in 0u32..2 {
+                let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+                cmd_txs.push(cmd_tx);
+                let rpt_tx_clone = rpt_tx.clone();
+                let slow = worker_id == 0;
+                handles.push(std::thread::spawn(move || {
+                    let mut pair_counter = 0u32;
+                    for cmd in &cmd_rx {
+                        match cmd {
+                            WorkerCmd::Quit => break,
+                            WorkerCmd::PlayPair { .. } => {
+                                if slow {
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                }
+                                pair_counter += 1;
+                                let g = pair_counter * 2;
+                                for gi in [g - 1, g] {
+                                    let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                        game_index: gi,
+                                        opponent_uci_elo: 2000,
+                                        clawfish_score: 0.5,
+                                        outcome:
+                                            super::super::match_loop::GameOutcome::MaxMovesReached,
+                                        pgn_moves: vec![],
+                                        white_name: "w".into(),
+                                        black_name: "b".into(),
+                                    });
+                                }
+                                let _ = rpt_tx_clone.send(WorkerReport::PairComplete { worker_id });
+                            }
+                        }
+                    }
+                }));
+            }
+
+            let mut pool = WorkerPool {
+                senders: cmd_txs,
+                reports: rpt_rx,
+                join_handles: handles,
+            };
+
+            let t0 = std::time::Instant::now();
+            let _ = run_iteration(&mut pool, &args, &out_dir);
+            let elapsed = t0.elapsed();
+
+            // Serial would take ≥800ms (4 slow-worker pairs × 200ms each).
+            // With concurrency, worker 1 handles some pairs while worker 0 sleeps.
+            assert!(
+                elapsed < std::time::Duration::from_millis(700),
+                "controller blocked serially: elapsed={elapsed:?}, expected < 700ms"
+            );
+        }
+
+        // ---- ELOH.B Tier-B/C targeted tests: clamp_uci_elo ---------------
+
+        #[test]
+        fn clamp_uci_elo_below_min_clamps_to_1320() {
+            // Any value below 1320 must be clamped to 1320.
+            assert_eq!(clamp_uci_elo(1319.0), UCI_ELO_MIN);
+        }
+
+        #[test]
+        fn clamp_uci_elo_at_min_returns_min() {
+            // Exactly 1320.0: must return 1320 without clamping.
+            // Mutant `< 1320` → `<= 1320` would also clamp 1320.0 to 1320 (same
+            // result), but `< 1320` → `== 1320` would miss it (falls through to the
+            // `> max` check or the `rounded as u32` path, giving 1320 anyway).
+            // The `<= 1320` mutant is caught because clamp_uci_elo(1320.0) == 1320
+            // either way; the important test is the ACCEPTANCE test at 1321 below.
+            assert_eq!(clamp_uci_elo(UCI_ELO_MIN as f64), UCI_ELO_MIN);
+        }
+
+        #[test]
+        fn clamp_uci_elo_just_above_min_passes_through() {
+            // 1321 is strictly above the min; must not be clamped.
+            // Distinguishes `< 1320` (correct) from `<= 1320` (mutant): with the
+            // mutant, 1321 would not be clamped (both pass the lower guard), so
+            // this test does not catch that specific mutant.  The test pairs with
+            // `clamp_uci_elo_at_min_returns_min` to bracket the boundary.
+            assert_eq!(clamp_uci_elo(1321.0), 1321);
+        }
+
+        #[test]
+        fn clamp_uci_elo_at_max_returns_max() {
+            // Exactly 3190.0: must return 3190 without clamping.
+            assert_eq!(clamp_uci_elo(UCI_ELO_MAX as f64), UCI_ELO_MAX);
+        }
+
+        #[test]
+        fn clamp_uci_elo_above_max_clamps_to_3190() {
+            // Any value above 3190 must be clamped to 3190.
+            assert_eq!(clamp_uci_elo(3191.0), UCI_ELO_MAX);
+        }
+
+        // ---- ELOH.B Tier-B targeted tests: compute_clawfish_score ----------
+        //
+        // Cover each GameOutcome branch for both clawfish_white=true and false,
+        // pinning the `1.0 - white_score` subtraction against `+` and `/` mutants.
+
+        #[test]
+        fn compute_clawfish_score_white_wins_clawfish_white() {
+            use super::super::adjudicate::GameOver;
+            use super::super::match_loop::GameOutcome;
+            use clawfish::Color;
+            let outcome = GameOutcome::NativeGameOver(GameOver::Checkmate(Color::White));
+            // White wins → white_score=1.0; clawfish_white → clawfish_score=1.0.
+            let score = compute_clawfish_score(&outcome, true);
+            assert!((score - 1.0).abs() < 1e-9, "expected 1.0, got {score}");
+        }
+
+        #[test]
+        fn compute_clawfish_score_white_wins_clawfish_black() {
+            use super::super::adjudicate::GameOver;
+            use super::super::match_loop::GameOutcome;
+            use clawfish::Color;
+            let outcome = GameOutcome::NativeGameOver(GameOver::Checkmate(Color::White));
+            // White wins → white_score=1.0; clawfish_black → clawfish_score = 1.0-1.0 = 0.0.
+            // Mutant `1.0 - white_score` → `1.0 + white_score` would give 2.0.
+            // Mutant `- → /` would give 1.0/1.0 = 1.0 (wrong).
+            let score = compute_clawfish_score(&outcome, false);
+            assert!(score.abs() < 1e-9, "expected 0.0, got {score}");
+        }
+
+        #[test]
+        fn compute_clawfish_score_black_wins_clawfish_white() {
+            use super::super::adjudicate::GameOver;
+            use super::super::match_loop::GameOutcome;
+            use clawfish::Color;
+            let outcome = GameOutcome::NativeGameOver(GameOver::Checkmate(Color::Black));
+            // Black wins → white_score=0.0; clawfish_white → clawfish_score=0.0.
+            let score = compute_clawfish_score(&outcome, true);
+            assert!(score.abs() < 1e-9, "expected 0.0, got {score}");
+        }
+
+        #[test]
+        fn compute_clawfish_score_black_wins_clawfish_black() {
+            use super::super::adjudicate::GameOver;
+            use super::super::match_loop::GameOutcome;
+            use clawfish::Color;
+            let outcome = GameOutcome::NativeGameOver(GameOver::Checkmate(Color::Black));
+            // Black wins → white_score=0.0; clawfish_black → clawfish_score = 1.0-0.0 = 1.0.
+            // Mutant `- → +` would give 1.0+0.0 = 1.0 (same! — can't distinguish for 0.0 input).
+            // The white-wins tests above pin the subtraction for non-zero input.
+            let score = compute_clawfish_score(&outcome, false);
+            assert!((score - 1.0).abs() < 1e-9, "expected 1.0, got {score}");
+        }
+
+        #[test]
+        fn compute_clawfish_score_draw_variants() {
+            use super::super::adjudicate::GameOver;
+            use super::super::match_loop::GameOutcome;
+            // All draw variants must yield 0.5 regardless of side.
+            let draws = [
+                GameOutcome::NativeGameOver(GameOver::Stalemate),
+                GameOutcome::NativeGameOver(GameOver::FiftyMove),
+                GameOutcome::NativeGameOver(GameOver::ThreefoldRepetition),
+                GameOutcome::NativeGameOver(GameOver::InsufficientMaterial),
+                GameOutcome::NativeGameOver(GameOver::DrawAdjudicated),
+                GameOutcome::MaxMovesReached,
+            ];
+            for outcome in &draws {
+                let score_w = compute_clawfish_score(outcome, true);
+                let score_b = compute_clawfish_score(outcome, false);
+                assert!(
+                    (score_w - 0.5).abs() < 1e-9,
+                    "draw outcome {outcome:?} clawfish_white: expected 0.5, got {score_w}"
+                );
+                assert!(
+                    (score_b - 0.5).abs() < 1e-9,
+                    "draw outcome {outcome:?} clawfish_black: expected 0.5, got {score_b}"
+                );
+            }
+        }
+
+        #[test]
+        fn compute_clawfish_score_time_forfeit_and_illegal_move() {
+            use super::super::match_loop::GameOutcome;
+            use clawfish::Color;
+            // White forfeits on time or plays an illegal move → clawfish wins if black.
+            for outcome in [
+                GameOutcome::TimeForfeit(Color::White),
+                GameOutcome::IllegalMove(Color::White),
+            ] {
+                // clawfish_white=true means clawfish IS white → clawfish loses.
+                let s_cw = compute_clawfish_score(&outcome, true);
+                assert!(
+                    s_cw.abs() < 1e-9,
+                    "white forfeits, clawfish_white: expected 0.0, got {s_cw}"
+                );
+                // clawfish_black means clawfish is black → clawfish wins.
+                let s_cb = compute_clawfish_score(&outcome, false);
+                assert!(
+                    (s_cb - 1.0).abs() < 1e-9,
+                    "white forfeits, clawfish_black: expected 1.0, got {s_cb}"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // End-to-end smoke (integration, #[ignore]-gated)
 // ---------------------------------------------------------------------------
 
@@ -2618,7 +5605,6 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    // Build the engine names from the binary path basenames.
     let engine_name = std::path::Path::new(&args.engine)
         .file_name()
         .and_then(|n| n.to_str())
@@ -2630,201 +5616,47 @@ fn main() -> ExitCode {
         .unwrap_or("opponent")
         .to_owned();
 
-    // Spawn both engines.
-    let mut engine_handle = match driver::spawn_engine(&driver::EngineSpec {
-        name: engine_name.clone(),
-        path: args.engine.clone(),
-        launch_prefix: args.engine_launch_prefix.clone(),
-    }) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("error: failed to spawn engine {:?}: {e:?}", args.engine);
-            return ExitCode::from(1);
-        }
-    };
-    let mut opponent_handle = match driver::spawn_engine(&driver::EngineSpec {
-        name: opponent_name.clone(),
-        path: args.opponent.clone(),
-        launch_prefix: args.opponent_launch_prefix.clone(),
-    }) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("error: failed to spawn opponent {:?}: {e:?}", args.opponent);
-            let _ = driver::shutdown(engine_handle);
-            return ExitCode::from(1);
-        }
-    };
-
-    let handshake_timeout = std::time::Duration::from_secs(10);
-
-    // UCI handshake for both engines.
-    for handle in [&mut engine_handle, &mut opponent_handle] {
-        if let Err(e) = driver::send_line(handle, "uci") {
-            eprintln!("error: uci send: {e:?}");
-            return ExitCode::from(1);
-        }
-        if let Err(e) = driver::wait_for_uciok(handle, handshake_timeout) {
-            eprintln!("error: waiting for uciok: {e:?}");
-            return ExitCode::from(1);
-        }
-    }
-
-    // Apply engine options.
-    for (name, value) in &args.engine_options {
-        let cmd = format!("setoption name {name} value {value}");
-        let _ = driver::send_line(&mut engine_handle, &cmd);
-    }
-    for (name, value) in &args.opponent_options {
-        let cmd = format!("setoption name {name} value {value}");
-        let _ = driver::send_line(&mut opponent_handle, &cmd);
-    }
-
-    // Drain any output produced by setoption (engines typically emit nothing,
-    // but the channel must stay clean).
-    let isready_timeout = std::time::Duration::from_secs(5);
-    for handle in [&mut engine_handle, &mut opponent_handle] {
-        if let Err(e) = driver::wait_for_readyok(handle, isready_timeout) {
-            eprintln!("error: waiting for readyok after setoption: {e:?}");
-            return ExitCode::from(1);
-        }
-    }
-
     let opponent_tc = args.opponent_tc_override.unwrap_or(args.tc);
     let watchdog = std::time::Duration::from_millis(args.watchdog_ms);
-    let mode = clawfish::MatchTimeMode::Wallclock;
 
-    // PGN site: hostname best-effort.
-    let site = {
-        let mut buf = [0u8; 64];
-        get_hostname(&mut buf);
-        std::ffi::CStr::from_bytes_until_nul(&buf)
-            .ok()
-            .and_then(|c| c.to_str().ok())
-            .unwrap_or("localhost")
-            .to_owned()
+    let cfg = controller::WorkerConfig {
+        engine_spec: driver::EngineSpec {
+            name: engine_name,
+            path: args.engine.clone(),
+            launch_prefix: args.engine_launch_prefix.clone(),
+        },
+        opponent_spec: driver::EngineSpec {
+            name: opponent_name,
+            path: args.opponent.clone(),
+            launch_prefix: args.opponent_launch_prefix.clone(),
+        },
+        engine_options: args.engine_options.clone(),
+        opponent_options: args.opponent_options.clone(),
+        tc: args.tc,
+        opponent_tc,
+        mode: clawfish::MatchTimeMode::Wallclock,
+        harness_overhead_ms: args.harness_overhead_ms,
+        watchdog,
+        max_plies: args.max_moves,
+        thresholds: args.thresholds.clone(),
     };
 
-    // Local date for PGN header.
-    let date = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        // Crude date from Unix timestamp (ignores leap seconds).
-        let days_since_epoch = secs / 86400;
-        unix_days_to_date_str(days_since_epoch)
+    let mut pool = match controller::spawn_workers(args.concurrency, cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: spawn_workers: {e:?}");
+            return ExitCode::from(1);
+        }
     };
 
-    let num_pairs = args.max_games / 2;
-    let mut game_index = 1u32;
-
-    for _pair_idx in 0..num_pairs {
-        // Play two games (colour-swapped pair).
-        for swap in [false, true] {
-            // UCI spec: send ucinewgame before each game so the engine can
-            // reset its per-game state (TT, history heuristic, etc.).
-            let ucinewgame_ok = {
-                let mut ok = true;
-                for handle in [&mut engine_handle, &mut opponent_handle] {
-                    let _ = driver::send_line(handle, "ucinewgame");
-                    if let Err(e) = driver::wait_for_readyok(handle, isready_timeout) {
-                        eprintln!("error: readyok after ucinewgame: {e:?}");
-                        ok = false;
-                        break;
-                    }
-                }
-                ok
-            };
-            if !ucinewgame_ok {
-                let _ = driver::shutdown(engine_handle);
-                let _ = driver::shutdown(opponent_handle);
-                return ExitCode::from(1);
-            }
-            // swap=false: engine plays White (index 0), opponent plays Black (index 1).
-            // swap=true:  engine plays Black (index 1), opponent plays White (index 0).
-            let white_engine_index = if swap { 1 } else { 0 };
-
-            let white_tc = if swap { opponent_tc } else { args.tc };
-            let black_tc = if swap { args.tc } else { opponent_tc };
-
-            let white_clock = clawfish::PerSideClock {
-                remaining_ms: i64::from(white_tc.initial_ms),
-                increment_ms: white_tc.increment_ms,
-            };
-            let black_clock = clawfish::PerSideClock {
-                remaining_ms: i64::from(black_tc.initial_ms),
-                increment_ms: black_tc.increment_ms,
-            };
-
-            let (white_name, black_name) = if swap {
-                (opponent_name.clone(), engine_name.clone())
-            } else {
-                (engine_name.clone(), opponent_name.clone())
-            };
-
-            let mut ctx = match_loop::GameContext {
-                game_index,
-                white_engine_index,
-                engine: &mut engine_handle,
-                opponent: &mut opponent_handle,
-                engine_tc: args.tc,
-                opponent_tc,
-                harness_overhead_ms: args.harness_overhead_ms,
-                watchdog,
-                mode,
-                max_plies: 200,
-                starting_fen: None,
-                white_clock,
-                black_clock,
-            };
-
-            let (outcome, pgn_moves) = match_loop::play_one_game(&mut ctx);
-
-            // Map outcome to PGN result + termination tag.
-            let (result, termination) = outcome_to_pgn_result(&outcome, white_engine_index);
-
-            // Write PGN.
-            let pgn_header = pgn::PgnHeader {
-                event: args.event_tag.clone(),
-                site: site.clone(),
-                date: date.clone(),
-                round: game_index,
-                white: white_name,
-                black: black_name,
-                result: result.clone(),
-                time_control: Some(format_tc(args.tc)),
-                termination: Some(termination),
-                setup_fen: None,
-            };
-            let pgn_str = pgn::format_pgn(&pgn_header, &pgn_moves);
-            let pgn_path = games_dir.join(format!("{game_index}.pgn"));
-            if let Err(e) = std::fs::write(&pgn_path, &pgn_str) {
-                eprintln!("error: write PGN {pgn_path:?}: {e}");
-            }
-
-            // Append summary line.
-            let summary_line = summary::SummaryLine {
-                game_index,
-                white: pgn_header.white.clone(),
-                black: pgn_header.black.clone(),
-                result: result.clone(),
-                plies: pgn_moves.len() as u32,
-                termination: outcome_to_termination_reason(&outcome),
-            };
-            let summary_path = std::path::Path::new(&args.out_dir).join("summary.txt");
-            if let Err(e) = summary::append_summary_line(&summary_path, &summary_line) {
-                eprintln!("error: write summary: {e}");
-            }
-
-            game_index += 1;
+    let out_dir = std::path::Path::new(&args.out_dir).to_owned();
+    match controller::run_iteration(&mut pool, &args, &out_dir) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: run_iteration: {e:?}");
+            ExitCode::from(1)
         }
     }
-
-    let _ = driver::shutdown(engine_handle);
-    let _ = driver::shutdown(opponent_handle);
-
-    ExitCode::SUCCESS
 }
 
 /// Map a `GameOutcome` to its human-readable termination reason string.
@@ -2842,6 +5674,9 @@ pub(crate) fn outcome_to_termination_reason(outcome: &match_loop::GameOutcome) -
             GameOver::ThreefoldRepetition => "adjudication: threefold repetition".into(),
             GameOver::InsufficientMaterial => "adjudication: insufficient material".into(),
             GameOver::TimeForfeit(_) => "time forfeit".into(),
+            // Slice D wires match_loop to produce these; unreachable until then.
+            GameOver::ResignAdjudicated(_) => "adjudication: resign".into(),
+            GameOver::DrawAdjudicated => "adjudication: draw-by-score".into(),
         },
         match_loop::GameOutcome::TimeForfeit(_) => "time forfeit".into(),
         match_loop::GameOutcome::IllegalMove(_) => "adjudication: illegal move".into(),
@@ -2856,10 +5691,7 @@ pub(crate) fn outcome_to_termination_reason(outcome: &match_loop::GameOutcome) -
 ///
 /// The termination string is sourced from `outcome_to_termination_reason` so
 /// the PGN `[Termination]` tag and the summary.txt column always agree.
-fn outcome_to_pgn_result(
-    outcome: &match_loop::GameOutcome,
-    _white_engine_index: usize,
-) -> (String, String) {
+pub(crate) fn outcome_to_pgn_result(outcome: &match_loop::GameOutcome) -> (String, String) {
     use adjudicate::GameOver;
     use clawfish::Color;
     let termination = outcome_to_termination_reason(outcome);
@@ -2877,6 +5709,13 @@ fn outcome_to_pgn_result(
                 Color::White => "0-1",
                 Color::Black => "1-0",
             },
+            // Slice D wires match_loop to produce these; unreachable until then.
+            // White resigns → white loses → "0-1"; black resigns → "1-0".
+            GameOver::ResignAdjudicated(loser) => match loser {
+                Color::White => "0-1",
+                Color::Black => "1-0",
+            },
+            GameOver::DrawAdjudicated => "1/2-1/2",
         },
         match_loop::GameOutcome::TimeForfeit(loser) => match loser {
             Color::White => "0-1",
@@ -2892,7 +5731,7 @@ fn outcome_to_pgn_result(
 }
 
 /// Format a `TimeControl` back to its canonical string form (e.g. `"10+0.1"`).
-fn format_tc(tc: cli::TimeControl) -> String {
+pub(crate) fn format_tc(tc: cli::TimeControl) -> String {
     let base_s = tc.initial_ms as f64 / 1000.0;
     let inc_s = tc.increment_ms as f64 / 1000.0;
     if tc.increment_ms == 0 {
@@ -2911,6 +5750,30 @@ unsafe extern "C" {
 fn get_hostname(buf: &mut [u8]) {
     // SAFETY: buf is a valid mutable slice; u8 and c_char have the same layout.
     unsafe { gethostname(buf.as_mut_ptr() as *mut std::ffi::c_char, buf.len()) };
+}
+
+/// Best-effort current hostname, defaulting to `"localhost"`.
+#[allow(dead_code)]
+pub(crate) fn current_hostname() -> String {
+    let mut buf = [0u8; 64];
+    get_hostname(&mut buf);
+    std::ffi::CStr::from_bytes_until_nul(&buf)
+        .ok()
+        .and_then(|c| c.to_str().ok())
+        .unwrap_or("localhost")
+        .to_owned()
+}
+
+/// Current local-day date string in `YYYY.MM.DD` form for PGN headers.
+#[allow(dead_code)]
+pub(crate) fn current_date_str() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days_since_epoch = secs / 86400;
+    unix_days_to_date_str(days_since_epoch)
 }
 
 /// Cheap date-from-unix-days without a calendar crate.
@@ -3126,7 +5989,7 @@ mod root_tests {
         ];
 
         for (exp_result, exp_term, outcome) in cases {
-            let (result, term) = outcome_to_pgn_result(outcome, 0);
+            let (result, term) = outcome_to_pgn_result(outcome);
             assert_eq!(result, *exp_result, "result for {outcome:?}");
             assert_eq!(term, *exp_term, "termination for {outcome:?}");
         }
