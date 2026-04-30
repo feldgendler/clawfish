@@ -163,6 +163,28 @@ impl Move {
         Move(bits)
     }
 
+    /// Decode a raw 16-bit encoding back into a `Move`. The canonical
+    /// raw-bits decode entry point — mirrors `MoveFlag::from_bits` at the
+    /// type one level up.
+    ///
+    /// The `Move(u16)` tuple field is private to this module; this is the
+    /// only crate-visible way to reconstruct a `Move` from stored bits
+    /// (e.g., from a transposition-table `best_move` field).
+    ///
+    /// **Caller contract**: `bits` must encode a valid 14-of-16 flag value
+    /// (one of `0..=5` or `8..=15`). The constructor itself does no
+    /// validation — flag-nibble values 6 or 7 will panic on the next
+    /// `Move::flag()` call via the `unreachable!()` arm in `flag()`. Today's
+    /// only consumer is the M4.D `extract_bestmove_or_tt_fallback` reading
+    /// from the TT, which only stores values produced by `Move::bits()`, so
+    /// the invariant holds by construction. A future M8 multi-threaded TT
+    /// (lockless XOR-trick) would need to re-confirm this invariant or add
+    /// a fast-structural-validity check at the call site.
+    #[inline]
+    pub(crate) const fn from_bits(bits: u16) -> Move {
+        Move(bits)
+    }
+
     /// Convenience: `Move::new(from, to, MoveFlag::Quiet)`.
     #[inline]
     pub const fn quiet(from: Square, to: Square) -> Move {
@@ -2672,6 +2694,102 @@ mod tests {
     // For every move that can arise from a legal play, to_uci then
     // from_uci must recover the original move byte-for-byte.
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Move::from_bits round-trip.
+    // -----------------------------------------------------------------------
+
+    /// `Move::from_bits(m.bits()) == m` for all cases; also verify each
+    /// decoded component (from_square, to_square, flag) matches the original.
+    #[test]
+    fn move_from_bits_round_trips_with_bits() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("Kiwipete FEN parses");
+
+        // Quiet move.
+        let quiet = Move::from_uci("f3g3", &pos).expect("f3g3 is legal");
+        let quiet_rt = Move::from_bits(quiet.bits());
+        assert_eq!(
+            quiet_rt, quiet,
+            "quiet: from_bits round-trip must equal original"
+        );
+        assert_eq!(
+            quiet_rt.from_square(),
+            quiet.from_square(),
+            "quiet: from_square must match"
+        );
+        assert_eq!(
+            quiet_rt.to_square(),
+            quiet.to_square(),
+            "quiet: to_square must match"
+        );
+        assert_eq!(quiet_rt.flag(), quiet.flag(), "quiet: flag must match");
+
+        // Capture (e5 knight captures d7 pawn).
+        let cap = Move::from_uci("e5d7", &pos).expect("e5d7 is a capture");
+        let cap_rt = Move::from_bits(cap.bits());
+        assert_eq!(
+            cap_rt, cap,
+            "capture: from_bits round-trip must equal original"
+        );
+        assert_eq!(
+            cap_rt.from_square(),
+            cap.from_square(),
+            "capture: from_square must match"
+        );
+        assert_eq!(
+            cap_rt.to_square(),
+            cap.to_square(),
+            "capture: to_square must match"
+        );
+        assert_eq!(cap_rt.flag(), cap.flag(), "capture: flag must match");
+
+        // Promotion (using a promotion FEN).
+        let promo_pos =
+            Position::from_fen("8/P7/8/8/8/8/8/4K1k1 w - - 0 1").expect("promo FEN parses");
+        let promo = Move::from_uci("a7a8q", &promo_pos).expect("a7a8q is a queen promo");
+        let promo_rt = Move::from_bits(promo.bits());
+        assert_eq!(
+            promo_rt, promo,
+            "promotion: from_bits round-trip must equal original"
+        );
+        assert_eq!(
+            promo_rt.from_square(),
+            promo.from_square(),
+            "promo: from_square must match"
+        );
+        assert_eq!(
+            promo_rt.to_square(),
+            promo.to_square(),
+            "promo: to_square must match"
+        );
+        assert_eq!(promo_rt.flag(), promo.flag(), "promo: flag must match");
+
+        // Move::default() (bits == 0).
+        let default_move = Move::default();
+        let default_rt = Move::from_bits(default_move.bits());
+        assert_eq!(
+            default_rt, default_move,
+            "default: from_bits(0) must equal Move::default()"
+        );
+        assert_eq!(
+            default_rt.from_square(),
+            default_move.from_square(),
+            "default: from_square must match"
+        );
+        assert_eq!(
+            default_rt.to_square(),
+            default_move.to_square(),
+            "default: to_square must match"
+        );
+        assert_eq!(
+            default_rt.flag(),
+            default_move.flag(),
+            "default: flag must match"
+        );
+    }
 
     #[test]
     fn round_trip_curated_cases() {

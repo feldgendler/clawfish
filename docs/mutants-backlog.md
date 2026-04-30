@@ -27,27 +27,27 @@ Per-unit `cargo mutants --in-diff` runs that are deferred from the unit's commit
 
 ## Pending
 
-### M4.B + M4.C — Killer moves + History heuristic (joint campaign)
+### M4.B + M4.C + M4.D — Killer moves + History heuristic + Aspiration windows (joint campaign)
 
-**Why combined:** M4.B and M4.C developed on parallel branches off M4.A; the user opted to defer their mutation campaigns and run them together as one overnight batch covering both diff ranges. M4.C's rebase onto main folds its history table into M4.B's already-merged `negamax_move_order_score` and extends `Search::reset` / killer scoring boundaries (`MAX_HISTORY = 99` to fit strictly below `KILLER1_SCORE = 100`). One single `cargo mutants --in-diff` invocation covers both phases via the commit-range diff below.
+**Why combined:** M4.B and M4.C developed on parallel branches off M4.A; the user opted to defer their mutation campaigns and run them together as one overnight batch covering both diff ranges. M4.D landed on main after the M4.C merge; the user extended the deferral to include M4.D in the same batch. One single `cargo mutants --in-diff` invocation covers all three phases via the commit-range diff below.
 
 **Diff command** (resilient to working-tree state — uses commit hashes):
 
 ```sh
-git diff 33a0d0d..4886667 -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.bc.diff"
+git diff 33a0d0d..<m4.d-merge-sha> -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.bcd.diff"
 ```
 
 - `33a0d0d` — M4.A follow-up (cargo-mutants survivors fix); M4.B's branching point on main and the joint range's start.
-- `4886667` — the M4.C tip on `m4.c-history-heuristic` after rebase onto main; resolved to a concrete SHA (printed by `git rev-parse m4.c-history-heuristic` at campaign-start time, or by `git rev-list --max-count=1 baseline/alpha-beta-tt-killer-history` once that tag is created at the M4.C merge commit).
-- Pathspec `'src/*.rs' 'tests/*.rs'` — single-star glob (git pathspec doesn't expand `**`); restricts to the source + integration-test surface. M4.B + M4.C modify `src/search.rs`, `src/history.rs` (new), `src/mov.rs`, `src/engine.rs`, `src/lib.rs`, `tests/uci_integration.rs` plus doc files; the doc files are out of scope for cargo-mutants.
+- `<m4.d-merge-sha>` — the M4.D primary landing commit on main. Resolve at campaign-start time via `git rev-list --max-count=1 baseline/alpha-beta-tt-killer-history-aspiration` (the tag created at M4.D's merge commit) or `git log --grep='M4.D:' --max-count=1 --format='%H'`.
+- Pathspec `'src/*.rs' 'tests/*.rs'` — single-star glob (git pathspec doesn't expand `**`); restricts to the source + integration-test surface. M4.B + M4.C + M4.D modify `src/search.rs`, `src/history.rs` (new), `src/mov.rs`, `src/engine.rs`, `src/lib.rs`, `tests/uci_integration.rs` plus doc files; the doc files are out of scope for cargo-mutants.
 
 After landing the diff, run:
 
 ```sh
-cargo mutants --in-diff "$TMPDIR/m4.bc.diff"
+cargo mutants --in-diff "$TMPDIR/m4.bcd.diff"
 ```
 
-Once `baseline/alpha-beta-tt-killer-history` is created at the M4.C merge commit, a tag-based regenerate is also available: `git diff baseline/alpha-beta-tt..baseline/alpha-beta-tt-killer-history -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.bc.diff"`. Note that `baseline/alpha-beta-tt` points at `ecacf57` (M4.A landing, before the M4.A mutants follow-up), so a tag-baseline regenerate would also include `33a0d0d`'s S13 tightening + T20c boundary tests in the diff — wider than the M4.B+M4.C-only surface above, but harmless.
+A tag-based regenerate is also available once `baseline/alpha-beta-tt-killer-history-aspiration` is in place: `git diff baseline/alpha-beta-tt..baseline/alpha-beta-tt-killer-history-aspiration -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.bcd.diff"`. Note that `baseline/alpha-beta-tt` points at `ecacf57` (M4.A landing, before the M4.A mutants follow-up), so a tag-baseline regenerate would also include `33a0d0d`'s S13 tightening + T20c boundary tests in the diff — wider than the M4.B+M4.C+M4.D-only surface above, but harmless.
 
 **Unit context** (read these before triaging):
 
@@ -58,10 +58,15 @@ Once `baseline/alpha-beta-tt-killer-history` is created at the M4.C merge commit
 - M4.C research: [`docs/research/m4-history-heuristic.md`](research/m4-history-heuristic.md).
 - M4.C retrospective: [`docs/milestones/m4.c.md`](milestones/m4.c.md) — "Mutation-survivor analysis" section is the target for the post-triage update.
 - M4.C ADR: [`docs/decisions/0019-history-heuristic.md`](decisions/0019-history-heuristic.md).
+- M4.D plan: [`docs/plans/m4.d.md`](plans/m4.d.md) — see §3 (helpers) and §11 (mutation-testing prep with anticipated catchable surface table).
+- M4.D research: [`docs/research/m4-aspiration-windows.md`](research/m4-aspiration-windows.md).
+- M4.D retrospective: [`docs/milestones/m4.d.md`](milestones/m4.d.md) — "Mutation-survivor analysis" section is the target for the post-triage update.
 - Code surface:
-  - `src/search.rs` lines ~285 (killer field), ~870–945 (M4.B helpers), ~552–610 (negamax steps 10 + 11), ~320 / ~338 / ~426 (lifecycle reset call sites), the cutoff dispatch + `quiets_searched` accumulator + push site for M4.C, plus ~22 M4.B tests at S14–S29 and ~16 M4.C tests at HS1–HS12 + HS3b/HS3c/HS4b/HS8b (search for the `S14 —` and `HS1 —` comment markers).
+  - `src/search.rs` lines ~285 (killer field), ~870–945 (M4.B helpers), ~552–610 (negamax steps 10 + 11), ~320 / ~338 / ~426 (lifecycle reset call sites), the cutoff dispatch + `quiets_searched` accumulator + push site for M4.C, the aspiration-loop body in `Search::go` for M4.D (lines ~422–540), and the three M4.D helpers (`aspiration_window`, `widen_after_fail`, `extract_bestmove_or_tt_fallback`). Plus ~22 M4.B tests at S14–S29, ~16 M4.C tests at HS1–HS12 + HS3b/HS3c/HS4b/HS8b, and ~22 M4.D tests at AS1–AS24d (search for the `S14 —`, `HS1 —`, and `AS1 —` comment markers).
   - `src/history.rs` — the entire M4.C module + 12 H-tests.
   - `src/engine.rs` — the M4.C `ucinewgame_clears_history_table` E_h test.
+  - `src/mov.rs` — M4.D's `Move::from_bits(u16) -> Move` constructor (`pub(crate) const fn`) + 1 round-trip unit test.
+  - `tests/uci_integration.rs` — M4.D's `bench_signature_deterministic_across_two_runs_with_aspiration` E47 integration test.
 
 **Anticipated catchable surface (M4.B portion, from M4.B plan §8):**
 
@@ -108,6 +113,27 @@ Once `baseline/alpha-beta-tt-killer-history` is created at the M4.C merge commit
 
 - **`negamax_move_order_score` MAX_HISTORY-vs-KILLER1 off-by-one** (`KILLER1_SCORE = 100, MAX_HISTORY = 99`): bumping MAX_HISTORY to 100 would tie the worst-case history-quiet score with KILLER1_SCORE; the comparator's `sort_by_cached_key` is stable but tie-breaks by movegen order. Whether this counts as a real bug depends on the SPRT signal — for this milestone it would be classified as **equivalent-with-rationale** since the strict-inequality is the design intent (per ADR-0019 §1 + CLAUDE.md status text), but the actual behavioral delta from a single-move tie at the killer/history boundary is below SPRT noise floor.
 
+**Anticipated catchable surface (M4.D portion, from M4.D plan §11):**
+
+| Mutation class | Where | Expected catch |
+|---|---|---|
+| `aspiration_window` half-width drop / sign flip | `prior ± HALF_WIDTH` arithmetic | AS3 / AS4 / AS5 specific values |
+| Re-introduced mate-skip branch | `aspiration_window` body | AS5b explicit `(prior - 50, prior + 50)` for mate-magnitude prior |
+| `widen_after_fail` `returned` → `prev_alpha` | `(returned, INF)` body | AS6 + AS19 specific values |
+| `widen_after_fail` `returned` → `prev_beta` | `(-INF, returned)` body | AS7 + AS20 specific values |
+| `widen_after_fail` branch swap | `if returned >= prev_beta` ↔ `<=` | AS8 + AS9 boundary cases |
+| `widen_after_fail` operand drift `>=` ↔ `>` on the upper-bound branch | comparator | AS8 (`returned == prev_beta` exact-equal) |
+| `extract_bestmove_or_tt_fallback` PV-first branch deletion | `if pv.lengths[0] > 0 { return Some(...) }` | AS24a (PV present + TT differs → returns PV) |
+| `extract_bestmove_or_tt_fallback` TT-fallback branch deletion | `tt?.probe(root_key)?` | AS24b (PV empty + TT has bestmove → returns TT) |
+| `extract_bestmove_or_tt_fallback` zero-bestmove guard | `if entry.best_move == 0 { return None; }` | AS24c (PV empty + TT bestmove=0 → returns None) |
+| `extract_bestmove_or_tt_fallback` `?` propagation | `tt?` early-return | AS24d (PV empty + tt=None → returns None) |
+| ID outer-loop's per-try `pv.lengths[..] = 0` deletion | inner aspiration loop body | AS12 (deep PV consistency after re-search) |
+| ID outer-loop's `tries >= 2` cap → `tries >= 3` (third tier introduced) | aspiration-loop break | AS10 (cumulative re-search count over multiple iterations) |
+| Window-contained check operator drift (`>` ↔ `>=`) | `returned > alpha && returned < beta` | AS11 + AS21 (non-degenerate window-contained vs. boundary cases) |
+| Per-iteration `clear_killers` NOT moved to between-tries | inner aspiration loop body | **AS23 is a weak pin** — asserts only "any populated" post-go, which a between-tries-clear bug would still satisfy (try-2 re-populates with its own cutoffs). **Anticipated possibly-surviving**; classify at triage time as either "real-bug-low-Elo-impact" (the bug reduces ordering quality but not test observability) or "structurally-undetectable; deferred to M5 PVS rework which will revisit cross-iteration ordering state." Final-review pass 1 surfaced this gap. |
+| `aspiration_window` argument-order swap (depth vs prior) | call site in `Search::go` | AS3 / AS4 / AS5 must match exact prior×depth pairs |
+| `last_complete` snapshot bestmove source switched from helper to inline `(pv.lengths[0] > 0).then(...)` | call site at the snapshot line | AS24a–d (helper coverage) |
+
 **Triage protocol** (per `docs/workflow.md`):
 
 1. **Caught** — re-run `cargo test --lib <test_name>` to confirm; nothing to do.
@@ -119,21 +145,21 @@ Avoid `exclude_re` rules anchored to line numbers (per `.cargo/mutants.toml` gui
 
 ### Where the follow-up commit lands
 
-On `main` (M4.C will have merged by the time the campaign runs). The commit message follows the M4.A follow-up pattern (commit `33a0d0d`):
+On `main` (M4.B + M4.C + M4.D will have merged by the time the campaign runs). The commit message follows the M4.A follow-up pattern (commit `33a0d0d`):
 
-> M4.B+M4.C follow-up: address N cargo-mutants survivors
+> M4.B+M4.C+M4.D follow-up: address N cargo-mutants survivors
 >
 > `cargo mutants --in-diff ...` produced K mutations: J caught + L
 > timeout (caught-via-hang) + M unviable + N missed. This commit addresses
 > all N: ...
 
-Update both `docs/milestones/m4.b.md`'s and `docs/milestones/m4.c.md`'s "Mutation-survivor analysis" sections atomically with the commit. Remove this entry from the backlog.
+Update `docs/milestones/m4.b.md`'s, `docs/milestones/m4.c.md`'s, AND `docs/milestones/m4.d.md`'s "Mutation-survivor analysis" sections atomically with the commit. Remove this entry from the backlog.
 
 ### Edge cases
 
 - **If `cargo mutants` reports `unviable` for the M4.C `Move::default()` sentinel `debug_assert!`**: that's expected — the assertion is in a path movegen never produces, so no chess fixture can drive it. Classify as caught-via-unreachable; no action needed.
 - **If the campaign hangs**: per `.cargo/mutants.toml` guidance, the timeout multiplier should be enough; if a specific mutation hangs the test suite, it's almost always the cancellation-poll cadence interacting with the mutated code. Cancel via Ctrl-C; the mutation is caught-via-timeout.
-- **If a survivor maps outside the M4.B/M4.C surface** (i.e., a mutation on a line outside `src/search.rs` killer / history logic, `src/history.rs`, or the M4.C-specific test surface): something's off with the diff scope. Re-check that `33a0d0d..4886667` is the correct hash range and that no drift commits have landed.
+- **If a survivor maps outside the M4.B/M4.C/M4.D surface** (i.e., a mutation on a line outside `src/search.rs` killer / history / aspiration logic, `src/history.rs`, `src/mov.rs::from_bits`, the M4.C-specific test surface, or the M4.D-specific test surface): something's off with the diff scope. Re-check that `33a0d0d..<m4.d-merge-sha>` is the correct hash range and that no drift commits have landed.
 
 ## Done
 
