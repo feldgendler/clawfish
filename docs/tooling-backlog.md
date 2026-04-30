@@ -29,6 +29,7 @@ Industry-best-practice items surfaced during the 2026-04-27 workflow review but 
 5. **Asymmetric time controls** trivially expressed: clawfish at 10+0.1, Stockfish at "effectively unlimited" (3600+0). Fastchess accepts asymmetric `tc=` per `-engine` block but the bash wrapper has to thread it explicitly.
 6. **Better instrumentation** — the harness can record per-game: clawfish's reported depth, score, time used, plus Stockfish's reported depth (when available). Surfacing this enables per-anchor diagnostics ("does clawfish reach depth 8 within budget at all anchors?") that fastchess's PGN format doesn't expose.
 7. **Reuses crate code** — `Position`, movegen, draw helpers all already exist and are exhaustively tested. The harness inherits the project's correctness guarantees on the board-side.
+8. **Per-game TC sampling for mixed-TC SPRT** — the harness drives clocks per side, so randomizing TC per game is a one-line addition to the game-setup phase: sample `(base, increment)` from a configured distribution before sending `go wtime/btime/winc/binc`. Enables true mixed-TC SPRT under the redefined game "draw TC from D, then play standard chess at that TC" (surfaced during the M4.D walkthrough on 2026-04-30). M4.D's fixed-TC discrete-sweep approximation can be retired once this lands, and per-(TC, outcome) regression becomes a continuous curve rather than 4 discrete points.
 
 **Estimated size.** ~250-350 LOC of Rust at `src/bin/elo-iterate.rs` (or as a separate sub-crate if test isolation is preferred). Plus ~100 LOC of unit tests covering the adjudication logic and the K-update math.
 
@@ -90,16 +91,23 @@ window = clamp(k * |score(d-1) − score(d-2)|, MIN, MAX)
 
 Three SPSA-tunable params. Empirically this baseline captures 60-80% of the ML model's gain in published work on similar problems. If the baseline + SPSA SPRTs neutral or marginal vs M4.D's fixed schedule, the ML approach is unlikely to clear `elo1=5`.
 
+**TC-adaptive (or depth-adaptive) intermediate tier.** Between the cheap delta-baseline and a full MLP, a parameterized adaptive width that scales with search depth or estimated time-per-move is a natural stepping stone (surfaced during the M4.D walkthrough on 2026-04-30 alongside the mixed-TC SPRT discussion). Functional shape: `half_width(depth) = base · max(min_factor, 1 - α·(depth - threshold))` — two parameters (`base`, `α`) plus the existing `threshold`. Depth-adaptive is cleaner than time-adaptive (depth is a discrete observable in the ID outer loop; no coupling to `compute_caps` time-management state). Validation: mixed-TC SPRT against M4.D's fixed-width baseline (the same campaign methodology M4.D establishes), with adaptive variants entering the per-TC regression curve to surface where adaptation helps. Expected gain: small (+2-4 Elo over fixed-width) but cheap to implement (~30 LOC + parameter tune); validates whether the depth/TC interaction motif is real before investing in delta-EWMA or MLP variants.
+
 **Why not now.**
 
-- M4.D's gate is the fixed schedule passing SPRT; building ML training infra is a multi-week scope expansion to a phase that should land in days.
+- M4.D's gate is the fixed schedule passing mixed-TC SPRT; building ML training infra is a multi-week scope expansion to a phase that should land in days.
 - Prerequisites missing: tapered eval for proper phase signal (M6), SPSA / CLOP harness for the cheap baseline, position corpus, offline label-generation pipeline.
 - Elo headroom small at this layer: ~+3-5 Elo realistic ceiling for ML over hand-tuned, vs +50-80 Elo for NMP, +80-100 Elo for LMR, +400+ Elo for NNUE. Opportunity cost is poor.
 - NNUE (M9) re-trains the eval from scratch; an ML aspiration model trained on PeSTO eval would need re-training post-NNUE.
 
-**When to land.** After (a) M6 tapered eval, (b) a SPSA / CLOP harness, (c) a labeled position corpus, and (d) the cheap-baseline `window = k · prior_delta` SPSA-tune has demonstrated headroom over M4.D's fixed schedule. Three-tier escalation: fixed schedule (M4.D) → cheap baseline (post-M5) → ML model (post-M9, only if cheap baseline saturates). Each tier proceeds only if the previous tier's SPRT shows ≥ +5 Elo of remaining headroom worth chasing.
+**When to land.** Four-tier escalation, each tier proceeding only if the previous shows ≥ +5 Elo of remaining headroom worth chasing:
 
-**Estimated size.** Cheap baseline: ~50 LOC + SPSA harness reuse. ML model: ~500-800 LOC (feature extraction + inference + offline-training pipeline as a separate Python or Rust binary), plus the corpus + label-generation infrastructure (potentially shared with Texel tuning or NNUE data prep).
+1. **Fixed schedule (M4.D)** — ±50 default, width-tuned via mixed-TC SPRT. Ships at M4.D close.
+2. **TC- or depth-adaptive parametric (post-M5, pre-M9)** — `base · max(min_factor, 1 - α·(depth - threshold))`. SPSA-tuned. Cheapest validation of the depth/TC interaction motif.
+3. **Cheap delta-baseline (post-M9 or earlier if (2) saturates)** — `window = clamp(k · |score(d-1) − score(d-2)|, MIN, MAX)`. Three SPSA-tunable params.
+4. **MLP (post-M9, only if (2)+(3) saturate)** — full feature set + hidden layer.
+
+**Estimated size.** Adaptive parametric: ~30-50 LOC + SPSA harness reuse. Cheap delta-baseline: ~50 LOC + SPSA harness reuse. ML model: ~500-800 LOC (feature extraction + inference + offline-training pipeline as a separate Python or Rust binary), plus the corpus + label-generation infrastructure (potentially shared with Texel tuning or NNUE data prep).
 
 ---
 
