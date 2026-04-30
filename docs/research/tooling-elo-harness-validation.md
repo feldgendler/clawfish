@@ -127,3 +127,53 @@ Final test count: 15 new harness tests + 1 documented permanent-miss equivalence
 - `target/elo-iterate/back-test/run-1/summary.txt` — per-game results (gitignored; 200 lines).
 - `target/elo-iterate/back-test/run-1/games/<N>.pgn` — per-game PGN (gitignored).
 - This file — validation report, committed.
+
+---
+
+# ELOH.D Part 1 — Sampler chi-squared back-test (in-tree)
+
+**Date:** 2026-04-30.
+**Branch:** `tooling/elo-harness` at the ELOH.D landing commit.
+**Verdict:** Sampler is correct. Both gates pass.
+
+The §6.2 chi-squared sampler tests are pre-merge gates running against the `Prng::new(0xC1AB_FEED)`-seeded SplitMix64 stream (constants from Vigna 2014 / Steele-Lea-Flood 2014). N=1000 draws each; bucket-frequency χ² statistic asserted against the canonical critical values plus the exact bucket counts pinned as a regression fixture.
+
+## Test 1 — `sample_skewed_3to1_at_seed_xfeed_yields_known_counts`
+
+Distribution: `[(A, 3), (B, 1)]` (3:1 weighted).
+Expected counts at N=1000: `[750, 250]`.
+Observed: `[count_a=740, count_b=260]`.
+Chi-squared statistic: **0.533**.
+Critical value (1 dof, 99% CI): 6.635.
+**Pass:** χ² = 0.533 < 6.635.
+
+The exact counts `[740, 260]` are pinned in the test as a regression fixture — any future change to the seed or to the SplitMix64 mixer constants that shifts these counts will fail the test, regardless of whether the new counts are still chi-squared-plausible.
+
+## Test 2 — `sample_uniform_4_bucket_at_seed_xfeed_yields_known_counts`
+
+Distribution: `[(A, 1), (B, 1), (C, 1), (D, 1)]` (uniform 4-bucket).
+Expected counts at N=1000: `[250, 250, 250, 250]`.
+Observed: `[250, 251, 239, 260]`.
+Chi-squared statistic: **0.888**.
+Critical value (3 dof, 99% CI): 11.345.
+**Pass:** χ² = 0.888 < 11.345.
+
+Same regression-fixture pinning as Test 1.
+
+## Golden mixer-constant fixture — `prng_seed_zero_first_three_words_golden`
+
+`Prng::new(0).next_u64()` first three outputs:
+- `7_960_286_522_194_355_700`
+- `487_617_019_471_545_679`
+- `17_909_611_376_780_542_444`
+
+Pinned as `assert_eq!` fixtures in `mod prng::tests`. Catches mixer-constant transcription typos at compile-time-of-test — any future change to `GOLDEN_GAMMA`, `MIX_C1`, or `MIX_C2` that shifts these outputs will fail the test.
+
+## Part 2 (deferred)
+
+The Part 2 back-validation gate — degenerate single-TC mix self-back-test reproducing M3.F's ~2114 Elo within ±2σ ≈ ±70 Elo — runs as a follow-up commit after the manual ~30-min wallclock self-play match against Stockfish UCI_Elo=2114. Per ELOH.B/ELOH.C precedent.
+
+## Artefacts
+
+- `mod prng::tests` and `mod tc_sample::tests` in `src/bin/elo-iterate.rs` — the assertions are committed in-tree and run on every `cargo test` invocation.
+- This file — Part 1 result archive, committed.

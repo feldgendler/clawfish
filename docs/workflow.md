@@ -170,6 +170,32 @@ Output lives under `target/elo-iterate/run-<TS>/`:
 
 K-update cadence shifted from per-batch (the old bash version) to per-game (ELOH.B spec). Total game count and bash CLI surface are preserved.
 
+### Mixed-TC SPRT (ELOH.D)
+
+For mechanisms whose Δ Elo amplifies with depth (history, aspiration, depth-conditional pruning), a fast-TC SPRT can be inconclusive even when the slow-TC version is load-bearing positive (M4.C exhibited this — fast-TC `tc=10+0.1` SPRT inconclusive at +3.47 ± 5.88; slow-TC `tc=60+0.6` decisive at +35.74 ± 27.51). The **mixed-TC SPRT** redefines the game as "draw TC from a distribution D, then play standard chess at that TC." Game outcomes remain i.i.d. under the redefined game, so SPRT applies; the same data also supports a per-(TC, W/L/D) regression for the Δ(TC) curve.
+
+Drive via `--tc-sample <SPEC>` instead of `--tc <TC>`:
+
+```sh
+cargo run --release --bin elo-iterate -- \
+  --engine target/release/clawfish \
+  --opponent target/release/baseline-clawfish \
+  --tc-sample 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1 \
+  --max-games 400 \
+  --initial-elo 2114 --k0 0 --target-sigma 0 \
+  --seed 0xC1AB_F15A_E10D_D000 \
+  --concurrency 4 \
+  --engine-launch-prefix 'taskpolicy -c utility' \
+  --opponent-launch-prefix 'taskpolicy -c utility' \
+  --virtual-clock
+```
+
+`--tc-sample <SPEC>` and `--tc <TC>` are mutually exclusive at parse time. `--seed N` accepts decimal or `0x`-prefixed hex; default seed is constant so runs without `--seed` are still bit-deterministic for the TC-sampling stream. (Cross-run determinism still depends on subprocess scheduling under N>1 concurrency for the K-update path; the `--seed`-driven determinism is for the per-pair TC sequence only.)
+
+Per-game `summary.txt` lines gain a `tc=<base>+<inc>` field; a `summary-by-tc:` aggregate (input-spec order) is appended after the `converged:` line. PGNs carry the sampled TC in their `[TimeControl ...]` tag.
+
+Decision-rule support is downstream: the harness emits per-game `(TC, W/L/D)` data; mixed-game SPRT verdict computation, Δ(TC) regression fit, and confidence-band visualisation live outside the harness. M4.D's mixed-TC width-tune campaign is the first consumer.
+
 ## Static analysis and dependency hygiene
 
 Standing checks that complement the review loops. The review loops catch reasoning errors; these catch mechanical drift.
