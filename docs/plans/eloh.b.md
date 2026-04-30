@@ -26,7 +26,7 @@ Estimated total: ~400 prod LOC + ~250 test LOC = ~650, against spec's ~150+80 fi
 - `--go-nodes N` mode and `VirtualClock` UCI option negotiation → ELOH.C.
 - Adaptive K from running variance, multi-anchor regression, resume-from-checkpoint.
 - Tournament book / opening-positions file. Startpos-only stays.
-- SAN move formatter (still UCI long-algebraic per ADR-0018 §6).
+- SAN move formatter (still UCI long-algebraic per ADR-0020 §6).
 
 ## 3. Files modified
 
@@ -168,7 +168,7 @@ pub(crate) enum WorkerReport {
 }
 ```
 
-**Why the dispatch unit is the color-pair:** per ADR-0018 §1, color-paired games share `opponent_uci_elo` to control color-bias against the same anchor. Single-game dispatch under concurrency=1 would split a pair across batches with different opp_elo (estimate moves between games, opp_elo is recomputed). Pair dispatch keeps both games of pair `p` against `opp_uci_elo(p)` regardless of `--concurrency`. The K-update *fires* per game (single-game cadence per spec); only the opp-elo broadcast is per-pair. This is also what fastchess `-repeat` does.
+**Why the dispatch unit is the color-pair:** per ADR-0020 §1, color-paired games share `opponent_uci_elo` to control color-bias against the same anchor. Single-game dispatch under concurrency=1 would split a pair across batches with different opp_elo (estimate moves between games, opp_elo is recomputed). Pair dispatch keeps both games of pair `p` against `opp_uci_elo(p)` regardless of `--concurrency`. The K-update *fires* per game (single-game cadence per spec); only the opp-elo broadcast is per-pair. This is also what fastchess `-repeat` does.
 
 **Worker spawn flow (one-time, before any `PlayPair`):**
 1. Worker thread starts; calls `driver::spawn_engine` for clawfish + opponent (using `EngineSpec` from `WorkerConfig`).
@@ -216,7 +216,7 @@ pub(super) fn spawn_workers_with_fn(
 ```
 
 Algorithm:
-1. **Bootstrap.** Dispatch one `PlayPair` to each worker at `opponent_uci_elo = round(args.initial_elo)` (clamped to `[1320, 3190]` per Stockfish bounds — same as `scripts/elo-iterate.sh`). `total_pairs = args.max_games / 2` (max_games is even per ADR-0018 §8).
+1. **Bootstrap.** Dispatch one `PlayPair` to each worker at `opponent_uci_elo = round(args.initial_elo)` (clamped to `[1320, 3190]` per Stockfish bounds — same as `scripts/elo-iterate.sh`). `total_pairs = args.max_games / 2` (max_games is even per ADR-0020 §8).
 2. **Drain.** Loop on `pool.reports.recv()`:
    - On `GameComplete`: write PGN, append summary line, push clawfish_score → estimator updates `current_estimate`, append to `estimates_trail`, `t += 1`. Run `should_stop(estimates_trail, …)`; if `true`, set `terminating = true`.
    - On `PairComplete { worker_id }`: emit `progress: …` line (cumulative wld + current K + current σ); if `!terminating && pairs_dispatched < total_pairs`, dispatch next `PlayPair` to `worker_id` and `pairs_dispatched += 1`.

@@ -20,7 +20,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::search::{
-    AlphaBetaMover, Search, SearchContext, SearchLimits, SearchResult, compute_caps,
+    AlphaBetaMover, Search, SearchContext, SearchLimits, SearchResult, TimeCaps, compute_caps,
 };
 use crate::{Command, DebugMode, GoParams, Move, Position, PositionSpec, Register, parse_uci_line};
 
@@ -97,6 +97,12 @@ pub struct Engine<W: Write + Send + 'static, S: Search + Send + 'static> {
     /// valid `[MIN_HASH_MIB, MAX_HASH_MIB]`. Tracked separately from the TT
     /// for setoption echo / debugging; not used in hot paths.
     hash_mib: usize,
+    /// `VirtualClock` UCI option (ELOH.C). When `true`, `handle_go` sets
+    /// `SearchContext::virtual_clock = true` so the worker thread uses
+    /// thread-CPU-time for search time-keeping. Always defaults to `false`.
+    /// On non-unix platforms this field exists but cannot be set to `true`
+    /// (the option is not advertised and `handle_setoption` rejects the value).
+    virtual_clock: bool,
 }
 
 impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
@@ -117,6 +123,7 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
             move_overhead: DEFAULT_MOVE_OVERHEAD,
             tt,
             hash_mib: DEFAULT_HASH_MIB,
+            virtual_clock: false,
         }
     }
 
@@ -126,6 +133,14 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
     #[cfg(test)]
     pub(crate) fn move_overhead(&self) -> u64 {
         self.move_overhead
+    }
+
+    /// Test-only access to `virtual_clock` (ELOH.C). Required for the
+    /// `VirtualClock` UCI option tests in `mod tests` to verify the option's
+    /// flag-flip behavior without driving an actual `go`.
+    #[cfg(test)]
+    pub(crate) fn virtual_clock(&self) -> bool {
+        self.virtual_clock
     }
 
     /// Drive the engine. Returns when `Quit` is received from `rx`.
@@ -178,6 +193,10 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         self.write_line(&format!(
             "option name Hash type spin default {DEFAULT_HASH_MIB} min {MIN_HASH_MIB} max {MAX_HASH_MIB}"
         ));
+        // ELOH.C / ADR-0021: only advertise on platforms where the engine can
+        // service the option (POSIX `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`).
+        #[cfg(unix)]
+        self.write_line("option name VirtualClock type check default false");
         self.write_line("uciok");
     }
 
@@ -258,12 +277,12 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         };
 
         // (4) Compute soft + hard time caps via `compute_caps` (M3.E). The
-        // `Duration::MAX` sentinel for "no cap" must be guarded — `now +
-        // Duration::MAX` panics on `Instant` overflow.
-        let now = Instant::now();
+        // orchestrator NEVER reads any clock under ELOH.C: `compute_caps` is
+        // a pure function of durations, and `CLOCK_THREAD_CPUTIME_ID` is a
+        // per-thread counter — orchestrator-thread reads would be the wrong
+        // values for the worker. The worker constructs `SearchClock` at the
+        // top of `Search::go` from `caps + virtual_clock`.
         let caps = compute_caps(&limits, self.position.side_to_move(), self.move_overhead);
-        let deadline = (caps.hard != Duration::MAX).then(|| now + caps.hard);
-        let soft_deadline = (caps.soft != Duration::MAX).then(|| now + caps.soft);
 
         // (5) Spawn the worker. Always threaded — the orchestrator must remain
         // responsive to `isready`, `stop`, and `quit` while the search is in
@@ -276,9 +295,8 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         let stdout = Arc::clone(&self.stdout);
         let ctx = SearchContext {
             stop: Arc::clone(&self.stop),
-            deadline,
-            soft_deadline,
-            start: now,
+            caps,
+            virtual_clock: self.virtual_clock,
             limits,
             history: self.game_history.clone(),
             tt: Some(Arc::clone(&self.tt)),
@@ -403,6 +421,39 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
             return;
         }
 
+        // ELOH.C / ADR-0021: `VirtualClock` is a `check`-typed boolean option,
+        // gated `#[cfg(unix)]` because the time source it selects
+        // (`CLOCK_THREAD_CPUTIME_ID`) is POSIX-only. Value parsing is
+        // case-insensitive (`true`/`false`/`True`/`TRUE`/...). Like
+        // `MoveOverhead`, no worker-join is needed — `virtual_clock` is read
+        // at the top of `handle_go` to build the next SearchContext, not by
+        // the worker mid-search. Rejection emits via `info_string_always` to
+        // surface malformed values regardless of debug mode (mirrors the
+        // `info_string_always` rejection path on `position`).
+        #[cfg(unix)]
+        if name.eq_ignore_ascii_case("virtualclock") {
+            let parsed: Option<bool> =
+                value
+                    .as_deref()
+                    .map(|s| s.to_ascii_lowercase())
+                    .and_then(|s| match s.as_str() {
+                        "true" => Some(true),
+                        "false" => Some(false),
+                        _ => None,
+                    });
+            match parsed {
+                Some(b) => self.virtual_clock = b,
+                None => {
+                    let msg = match value.as_deref() {
+                        Some(v) => format!("VirtualClock: rejected value '{v}'"),
+                        None => "VirtualClock: rejected (no value given)".to_string(),
+                    };
+                    self.info_string_always(&msg);
+                }
+            }
+            return;
+        }
+
         // Unknown option — preserve M2.C behavior: silent if debug off, info
         // string if debug on. Do NOT emit Stockfish's bare "No such option:"
         // line (research §1.4, §2.5). Idiom mirrors existing M2.C handler:
@@ -499,9 +550,11 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
             let pos_start = Instant::now();
             let ctx = SearchContext {
                 stop: Arc::clone(&self.stop),
-                deadline: None,
-                soft_deadline: None,
-                start: pos_start,
+                caps: TimeCaps {
+                    soft: Duration::MAX,
+                    hard: Duration::MAX,
+                },
+                virtual_clock: self.virtual_clock,
                 limits,
                 history: vec![pos.zobrist()],
                 tt: Some(Arc::clone(&self.tt)),
@@ -3814,5 +3867,112 @@ mod tests {
             n1, n2,
             "bench total node count must be identical across two runs; got {n1} vs {n2}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ELOH.C — `VirtualClock` UCI option tests (plan §6.4).
+    //
+    // Mirrors the M3.E `MoveOverhead` test pattern: parse path, default,
+    // boundary handling, case-insensitivity, debug-on/off rejection echoing.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an Engine with captured stdout, run the given commands,
+    /// and return both the captured output AND the final virtual_clock value.
+    fn drive_capturing_virtual_clock(commands: &[&str]) -> (String, bool) {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
+
+        let (tx, rx) = mpsc::channel::<Command>();
+        for line in commands {
+            tx.send(parse_uci_line(line)).unwrap();
+        }
+        tx.send(Command::Quit).unwrap();
+        engine.run(rx);
+
+        let bytes = buf.lock().unwrap().clone();
+        let stdout = String::from_utf8(bytes).expect("output must be valid UTF-8");
+        (stdout, engine.virtual_clock())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn option_advertised_in_uci_response_on_unix() {
+        let (stdout, _) = drive(&["uci"]);
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l == "option name VirtualClock type check default false"),
+            "VirtualClock option line must be present in uci output; got stdout:\n{stdout}"
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn option_not_advertised_on_non_unix() {
+        let (stdout, _) = drive(&["uci"]);
+        assert!(
+            !stdout
+                .lines()
+                .any(|l| l.starts_with("option name VirtualClock")),
+            "VirtualClock option must NOT be advertised on non-unix"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setoption_virtual_clock_true_sets_flag() {
+        let (_stdout, vc) =
+            drive_capturing_virtual_clock(&["setoption name VirtualClock value true"]);
+        assert!(vc, "value true must set the flag");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setoption_virtual_clock_false_resets_flag() {
+        let (_stdout, vc) = drive_capturing_virtual_clock(&[
+            "setoption name VirtualClock value true",
+            "setoption name VirtualClock value false",
+        ]);
+        assert!(!vc, "value false after true must reset the flag");
+    }
+
+    #[test]
+    fn setoption_virtual_clock_default_is_false() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let engine = Engine::new(writer, AlphaBetaMover::new());
+        assert!(
+            !engine.virtual_clock(),
+            "fresh engine must default virtual_clock to false"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setoption_virtual_clock_invalid_value_rejected() {
+        let (stdout, vc) =
+            drive_capturing_virtual_clock(&["setoption name VirtualClock value bogus"]);
+        assert!(!vc, "invalid value must leave flag at default false");
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l.starts_with("info string VirtualClock:")),
+            "rejection must emit `info string VirtualClock: ...`; stdout:\n{stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setoption_virtual_clock_case_insensitive_value() {
+        for variant in &["TRUE", "True", "tRuE"] {
+            let (_stdout, vc) = drive_capturing_virtual_clock(&[&format!(
+                "setoption name VirtualClock value {variant}"
+            )]);
+            assert!(
+                vc,
+                "value {variant:?} must be parsed case-insensitively as true"
+            );
+        }
     }
 }

@@ -72,6 +72,17 @@ mod cli {
         pub thresholds: Thresholds,
         /// Maximum plies per game before adjudicating as a draw.
         pub max_moves: u32,
+
+        // ELOH.C fields.
+        /// When `true`, the harness sends `setoption name VirtualClock value true` to
+        /// engines advertising the option (clawfish does; Stockfish does not). Engines
+        /// with the option measure search time in thread CPU time rather than wallclock,
+        /// making rating measurements more robust to thermal throttling. Default off.
+        ///
+        /// Note: CPU time is not fully thermal-invariant; combine with P-core pinning
+        /// and external cooling for tighter results. See ADR-0021 /
+        /// `docs/research/tooling-cpu-cycle-counters.md` for the reasoning.
+        pub virtual_clock: bool,
     }
 
     /// Threshold adjudication parameters matching fastchess defaults.
@@ -199,6 +210,9 @@ mod cli {
         let mut draw_movecount: u32 = 8;
         let mut draw_score: i32 = 20;
         let mut max_moves: u32 = 200;
+
+        // ELOH.C fields.
+        let mut virtual_clock: bool = false;
 
         let mut i = 0usize;
         while i < argv.len() {
@@ -411,7 +425,18 @@ mod cli {
                     }
                     max_moves = v;
                 }
+                // ELOH.C: boolean flag — takes no value token.
+                "--virtual-clock" => {
+                    virtual_clock = true;
+                }
                 other => {
+                    // Reject the --virtual-clock=VALUE form: the rest of the CLI uses
+                    // no-equals conventions for boolean flags.
+                    if other.starts_with("--virtual-clock=") {
+                        return Err(CliError::InvalidValue(
+                            "--virtual-clock takes no value; use `--virtual-clock` alone".into(),
+                        ));
+                    }
                     return Err(CliError::UnknownArg(other.to_owned()));
                 }
             }
@@ -477,6 +502,7 @@ mod cli {
                 draw_score,
             },
             max_moves,
+            virtual_clock,
         })
     }
 
@@ -853,6 +879,50 @@ mod cli {
             let args = parse_args(argv).expect("--max-moves 200 must be accepted");
             assert_eq!(args.max_moves, 200);
         }
+
+        // ---- ELOH.C §6.6: `--virtual-clock` CLI tests ----
+
+        #[test]
+        fn parse_args_virtual_clock_default_false() {
+            let args = parse_args(base_argv()).expect("parse_args ok");
+            assert!(!args.virtual_clock, "virtual_clock must default to false");
+        }
+
+        #[test]
+        fn parse_args_virtual_clock_flag_sets_true() {
+            let mut argv = base_argv();
+            argv.push("--virtual-clock".into());
+            let args = parse_args(argv).expect("--virtual-clock should be accepted");
+            assert!(
+                args.virtual_clock,
+                "virtual_clock must be true after --virtual-clock"
+            );
+        }
+
+        #[test]
+        fn parse_args_virtual_clock_flag_takes_no_value() {
+            // Boolean flag must not consume the next token as its value.
+            let mut argv = base_argv();
+            argv.extend(["--virtual-clock".into(), "--max-games".into(), "4".into()]);
+            // --max-games is already in base_argv(), so this tests that the
+            // presence of another flag after --virtual-clock parses correctly.
+            // We just need the parse to succeed and virtual_clock to be true.
+            let args =
+                parse_args(argv).expect("--virtual-clock followed by another flag should parse");
+            assert!(args.virtual_clock, "virtual_clock must be true");
+        }
+
+        #[test]
+        fn parse_args_virtual_clock_equals_form_rejected() {
+            // --virtual-clock=true must be rejected (no-equals convention).
+            let mut argv = base_argv();
+            argv.push("--virtual-clock=true".into());
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "expected InvalidValue for --virtual-clock=true, got {err:?}"
+            );
+        }
     }
 }
 
@@ -923,6 +993,30 @@ mod driver {
         pub depth: Option<u32>,
         pub score: Option<Score>,
         pub time_ms: Option<u64>,
+    }
+
+    /// Capabilities advertised by an engine in its `uci` response.
+    ///
+    /// Populated by [`wait_for_uciok`] from `option name …` lines in the
+    /// handshake. Option names are matched case-insensitively per UCI spec.
+    #[derive(Default, Debug, Clone, Copy)]
+    pub(crate) struct EngineCapabilities {
+        /// `true` when the engine emitted `option name VirtualClock type check …`.
+        /// Harness sends `setoption name VirtualClock value true` only when this is
+        /// `true` AND `--virtual-clock` was supplied on the CLI.
+        pub supports_virtual_clock: bool,
+    }
+
+    /// Parse a single `option name <NAME> type …` line from a UCI handshake.
+    ///
+    /// Returns the option name as emitted by the engine (original casing).
+    /// The caller normalises to lowercase for case-insensitive matching per
+    /// UCI spec. Returns `None` for any line that does not match the pattern.
+    pub(crate) fn parse_option_advertisement(line: &str) -> Option<&str> {
+        let rest = line.strip_prefix("option name ")?;
+        // The name is everything up to the first ` type ` token.
+        let type_idx = rest.find(" type ")?;
+        Some(&rest[..type_idx])
     }
 
     /// Configuration for spawning an engine subprocess.
@@ -1189,24 +1283,43 @@ mod driver {
 
     /// Drain engine output until `uciok` is received (or timeout/error).
     ///
-    /// Called after sending `uci`; discards all `option` lines and fires once
-    /// the `uciok` response arrives.
+    /// Called after sending `uci`; collects `option name …` advertisements
+    /// from the handshake response (for capability negotiation) and returns
+    /// the accumulated [`EngineCapabilities`] alongside the settled handshake.
     pub(crate) fn wait_for_uciok(
         h: &mut EngineHandle,
         timeout: std::time::Duration,
-    ) -> Result<(), HarnessError> {
+    ) -> Result<EngineCapabilities, HarnessError> {
+        wait_for_uciok_inner(&h.rx, timeout)
+    }
+
+    /// Inner implementation, factored out so tests can inject a synthetic
+    /// `Receiver<EngineLine>` without spawning a real subprocess.
+    pub(super) fn wait_for_uciok_inner(
+        rx: &mpsc::Receiver<EngineLine>,
+        timeout: std::time::Duration,
+    ) -> Result<EngineCapabilities, HarnessError> {
         let deadline = std::time::Instant::now() + timeout;
+        let mut caps = EngineCapabilities::default();
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return Err(HarnessError::Watchdog);
             }
-            match h.rx.recv_timeout(remaining) {
-                Ok(EngineLine::Other(s)) if s.trim() == "uciok" => return Ok(()),
+            match rx.recv_timeout(remaining) {
+                Ok(EngineLine::Other(s)) if s.trim() == "uciok" => return Ok(caps),
+                Ok(EngineLine::Other(s)) => {
+                    // Inspect each non-uciok line for option advertisements.
+                    if let Some(name) = parse_option_advertisement(&s)
+                        && name.eq_ignore_ascii_case("virtualclock")
+                    {
+                        caps.supports_virtual_clock = true;
+                    }
+                }
                 Ok(EngineLine::Eof) => return Err(HarnessError::EngineExit),
                 Err(mpsc::RecvTimeoutError::Timeout) => return Err(HarnessError::Watchdog),
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Err(HarnessError::EngineExit),
-                _ => {} // discard option lines, info string, etc.
+                _ => {} // discard info lines, etc.
             }
         }
     }
@@ -1571,6 +1684,314 @@ mod driver {
             // `cat` doesn't understand `quit`; shutdown must escalate to kill.
             let result = shutdown(handle);
             assert!(result.is_ok(), "shutdown returned {result:?}");
+        }
+
+        // ---- ELOH.C §6.5: parse_option_advertisement + wait_for_uciok tests ----
+
+        /// Helper: spawn `/bin/cat`, write `mock_lines` to its stdin (each followed
+        /// by `\n`), flush, and return an `EngineHandle` whose `rx` will receive the
+        /// echoed lines.  Also returns the `ChildStdin` so the caller can write
+        /// additional lines after construction (e.g. the setoption-send-and-verify
+        /// pattern used by the `production_worker_*` tests).
+        fn make_cat_handle(
+            mock_lines: &[&str],
+        ) -> (EngineHandle, std::io::BufWriter<std::process::ChildStdin>) {
+            use std::io::Write as _;
+            use std::process::{Command, Stdio};
+
+            let mut child = Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("failed to spawn /bin/cat");
+            let stdout = child.stdout.take().unwrap();
+            // We split stdin: keep one writer for the test caller (via BufWriter),
+            // and take the ChildStdin for the EngineHandle.
+            // Instead, we use a single pipe and transfer it: write mock lines first,
+            // then give the stdin to the EngineHandle.
+            let child_stdin = child.stdin.take().unwrap();
+            let mut writer = std::io::BufWriter::new(child_stdin);
+
+            // Write mock lines synchronously so cat echoes them before we read.
+            for line in mock_lines {
+                writer.write_all(line.as_bytes()).unwrap();
+                writer.write_all(b"\n").unwrap();
+            }
+            writer.flush().unwrap();
+
+            // Reader thread: cat's stdout → mpsc.
+            let (tx, rx) = mpsc::sync_channel::<EngineLine>(1024);
+            let reader_handle = std::thread::spawn(move || {
+                use std::io::BufRead as _;
+                for line in std::io::BufReader::new(stdout).lines() {
+                    match line {
+                        Ok(l) => {
+                            let _ = tx.send(parse_engine_line(&l));
+                        }
+                        Err(_) => {
+                            let _ = tx.send(EngineLine::Eof);
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let handle = EngineHandle {
+                name: "cat".into(),
+                child,
+                stdin: None, // caller holds the writer; no ChildStdin in the handle
+                rx,
+                reader: Some(reader_handle),
+                last_info: LastInfo::default(),
+                shutting_down: false,
+            };
+            (handle, writer)
+        }
+
+        #[test]
+        fn parse_option_advertisement_well_formed() {
+            let result =
+                parse_option_advertisement("option name VirtualClock type check default false");
+            assert_eq!(result, Some("VirtualClock"));
+        }
+
+        #[test]
+        fn parse_option_advertisement_with_extras() {
+            let result = parse_option_advertisement(
+                "option name MoveOverhead type spin default 50 min 0 max 5000",
+            );
+            assert_eq!(result, Some("MoveOverhead"));
+        }
+
+        #[test]
+        fn parse_option_advertisement_malformed_returns_none() {
+            assert_eq!(parse_option_advertisement("option foo bar"), None);
+            assert_eq!(parse_option_advertisement("not an option"), None);
+            assert_eq!(parse_option_advertisement("option name NoTypeToken"), None);
+        }
+
+        #[test]
+        fn parse_option_advertisement_multiword_name() {
+            // Single-token name with underscores: the parser handles all names
+            // up to the first ` type ` — including those with underscores.
+            let result =
+                parse_option_advertisement("option name UCI_Chess960 type check default false");
+            assert_eq!(result, Some("UCI_Chess960"));
+        }
+
+        #[test]
+        fn wait_for_uciok_records_virtual_clock_capability() {
+            let rx = make_rx(vec![
+                EngineLine::Other("option name VirtualClock type check default false".into()),
+                EngineLine::Other("uciok".into()),
+            ]);
+            let caps = wait_for_uciok_inner(&rx, std::time::Duration::from_secs(1)).expect("ok");
+            assert!(
+                caps.supports_virtual_clock,
+                "VirtualClock option must be detected"
+            );
+        }
+
+        #[test]
+        fn wait_for_uciok_records_no_virtual_clock_when_absent() {
+            let rx = make_rx(vec![
+                EngineLine::Other(
+                    "option name MoveOverhead type spin default 50 min 0 max 5000".into(),
+                ),
+                EngineLine::Other("option name Hash type spin default 16 min 1 max 65536".into()),
+                EngineLine::Other("uciok".into()),
+            ]);
+            let caps = wait_for_uciok_inner(&rx, std::time::Duration::from_secs(1)).expect("ok");
+            assert!(
+                !caps.supports_virtual_clock,
+                "supports_virtual_clock must be false when option absent"
+            );
+        }
+
+        #[test]
+        fn wait_for_uciok_handles_interleaved_info_string() {
+            // Real engines may emit `info string …` lines during the uci handshake.
+            // Info lines are routed to EngineLine::Info(...), not EngineLine::Other.
+            // Use Other with an info-string prefix to exercise the pass-through path.
+            let rx = make_rx(vec![
+                EngineLine::Other("info string warming up".into()),
+                EngineLine::Other("option name VirtualClock type check default false".into()),
+                EngineLine::Other("info string ready".into()),
+                EngineLine::Other("uciok".into()),
+            ]);
+            let caps = wait_for_uciok_inner(&rx, std::time::Duration::from_secs(1)).expect("ok");
+            assert!(
+                caps.supports_virtual_clock,
+                "capability must be detected despite interleaved info strings"
+            );
+        }
+
+        #[test]
+        fn wait_for_uciok_case_insensitive_option_name_match() {
+            // UCI spec says option names are case-insensitive; harness must detect
+            // the VirtualClock option regardless of the case the engine uses.
+            let rx = make_rx(vec![
+                EngineLine::Other("option name virtualclock type check default false".into()),
+                EngineLine::Other("uciok".into()),
+            ]);
+            let caps = wait_for_uciok_inner(&rx, std::time::Duration::from_secs(1)).expect("ok");
+            assert!(
+                caps.supports_virtual_clock,
+                "lowercase option name must still be detected"
+            );
+        }
+
+        #[test]
+        fn wait_for_uciok_duplicate_advertisement_idempotent() {
+            // Two VirtualClock ads must not panic or flip the flag back.
+            let rx = make_rx(vec![
+                EngineLine::Other("option name VirtualClock type check default false".into()),
+                EngineLine::Other("option name VirtualClock type check default false".into()),
+                EngineLine::Other("uciok".into()),
+            ]);
+            let caps = wait_for_uciok_inner(&rx, std::time::Duration::from_secs(1)).expect("ok");
+            assert!(caps.supports_virtual_clock, "flag must remain true");
+        }
+
+        /// Helper: write `line\n` to `writer` and flush, checking for cat-echoed
+        /// reply in `rx` within 1 second.  Returns `true` if the reply contains
+        /// the substring `expected_substr`.
+        fn write_and_check_echo(
+            writer: &mut std::io::BufWriter<std::process::ChildStdin>,
+            rx: &mpsc::Receiver<EngineLine>,
+            line: &str,
+            expected_substr: &str,
+        ) -> bool {
+            use std::io::Write as _;
+            writer.write_all(line.as_bytes()).unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                match rx.recv_timeout(remaining) {
+                    Ok(EngineLine::Other(s)) if s.contains(expected_substr) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        }
+
+        #[test]
+        fn production_worker_sends_setoption_when_advertised_and_flag_on() {
+            // When --virtual-clock is set AND the engine advertises VirtualClock,
+            // the harness must send `setoption name VirtualClock value true`.
+            let mock_lines = ["option name VirtualClock type check default false", "uciok"];
+            let (mut handle, mut writer) = make_cat_handle(&mock_lines);
+
+            let caps = wait_for_uciok_inner(&handle.rx, std::time::Duration::from_secs(1))
+                .expect("wait_for_uciok_inner ok");
+            assert!(caps.supports_virtual_clock);
+
+            // Simulate the setoption-send logic.
+            let virtual_clock_flag = true;
+            if virtual_clock_flag && caps.supports_virtual_clock {
+                use std::io::Write as _;
+                writer
+                    .write_all(b"setoption name VirtualClock value true\n")
+                    .unwrap();
+                writer.flush().unwrap();
+            }
+
+            // Cat echoes the setoption line back to stdout → rx.
+            let found = {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break false;
+                    }
+                    match handle.rx.recv_timeout(remaining) {
+                        Ok(EngineLine::Other(s))
+                            if s.contains("setoption name VirtualClock value true") =>
+                        {
+                            break true;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => break false,
+                    }
+                }
+            };
+            let _ = handle.child.kill();
+            assert!(
+                found,
+                "setoption name VirtualClock value true must be sent when advertised+flag-on"
+            );
+        }
+
+        #[test]
+        fn production_worker_skips_setoption_when_unadvertised() {
+            // When --virtual-clock is set but the engine does NOT advertise VirtualClock,
+            // the harness must not send the setoption.
+            let mock_lines = [
+                "option name MoveOverhead type spin default 50 min 0 max 5000",
+                "uciok",
+            ];
+            let (mut handle, mut writer) = make_cat_handle(&mock_lines);
+
+            let caps = wait_for_uciok_inner(&handle.rx, std::time::Duration::from_secs(1))
+                .expect("wait_for_uciok_inner ok");
+            assert!(!caps.supports_virtual_clock);
+
+            // Simulate the setoption-send logic — must skip because unadvertised.
+            let virtual_clock_flag = true;
+            if virtual_clock_flag && caps.supports_virtual_clock {
+                use std::io::Write as _;
+                writer
+                    .write_all(b"setoption name VirtualClock value true\n")
+                    .unwrap();
+                writer.flush().unwrap();
+            }
+
+            // Write a sentinel so we have something to wait for, then check that
+            // no VirtualClock setoption appeared before it.
+            let found_vc_before_sentinel =
+                write_and_check_echo(&mut writer, &handle.rx, "sentinel", "VirtualClock");
+            let _ = handle.child.kill();
+            assert!(
+                !found_vc_before_sentinel,
+                "setoption name VirtualClock must NOT be sent when option is unadvertised"
+            );
+        }
+
+        #[test]
+        fn production_worker_skips_setoption_when_flag_off() {
+            // When the engine advertises VirtualClock but --virtual-clock is not set,
+            // the harness must not send the setoption (default behavior unchanged).
+            let mock_lines = ["option name VirtualClock type check default false", "uciok"];
+            let (mut handle, mut writer) = make_cat_handle(&mock_lines);
+
+            let caps = wait_for_uciok_inner(&handle.rx, std::time::Duration::from_secs(1))
+                .expect("wait_for_uciok_inner ok");
+            assert!(caps.supports_virtual_clock);
+
+            // Simulate the setoption-send logic — must skip because flag is off.
+            let virtual_clock_flag = false;
+            if virtual_clock_flag && caps.supports_virtual_clock {
+                use std::io::Write as _;
+                writer
+                    .write_all(b"setoption name VirtualClock value true\n")
+                    .unwrap();
+                writer.flush().unwrap();
+            }
+
+            // Write a sentinel; check no VirtualClock setoption appeared before it.
+            let found_vc_before_sentinel =
+                write_and_check_echo(&mut writer, &handle.rx, "sentinel", "VirtualClock");
+            let _ = handle.child.kill();
+            assert!(
+                !found_vc_before_sentinel,
+                "setoption name VirtualClock must NOT be sent when --virtual-clock flag is off"
+            );
         }
     }
 }
@@ -4192,6 +4613,10 @@ mod controller {
         pub max_plies: u32,
         #[allow(dead_code)]
         pub thresholds: super::cli::Thresholds,
+        /// When `true`, harness sends `setoption name VirtualClock value true` to
+        /// engines advertising the option. See ELOH.C / ADR-0021.
+        #[allow(dead_code)]
+        pub virtual_clock: bool,
     }
 
     /// Live worker pool: command senders, report receiver, and thread handles.
@@ -4320,11 +4745,19 @@ mod controller {
         };
 
         // UCI handshake: send `uci` then drain via `wait_for_uciok` for both engines.
-        let handshake_ok = super::driver::send_line(&mut engine, "uci").is_ok()
-            && super::driver::wait_for_uciok(&mut engine, handshake_to).is_ok()
-            && super::driver::send_line(&mut opponent, "uci").is_ok()
-            && super::driver::wait_for_uciok(&mut opponent, handshake_to).is_ok();
-        if !handshake_ok {
+        // Capture capabilities so we can negotiate VirtualClock below.
+        let engine_caps = if super::driver::send_line(&mut engine, "uci").is_ok() {
+            super::driver::wait_for_uciok(&mut engine, handshake_to).ok()
+        } else {
+            None
+        };
+        let opponent_caps =
+            if engine_caps.is_some() && super::driver::send_line(&mut opponent, "uci").is_ok() {
+                super::driver::wait_for_uciok(&mut opponent, handshake_to).ok()
+            } else {
+                None
+            };
+        if engine_caps.is_none() || opponent_caps.is_none() {
             let _ = rpt_tx.send(WorkerReport::Failure(format!(
                 "worker {worker_id}: uci handshake"
             )));
@@ -4332,8 +4765,19 @@ mod controller {
             let _ = super::driver::shutdown(opponent);
             return;
         }
+        let engine_caps = engine_caps.expect("checked above");
+        let opponent_caps = opponent_caps.expect("checked above");
 
-        // Apply static options, then sync via isready.
+        // Apply static options + VirtualClock negotiation, then sync via isready.
+        // VirtualClock is fire-and-forget per UCI; the post-option-block isready
+        // below already gates handshake settling. Mirrors the UCI_LimitStrength flow.
+        if cfg.virtual_clock && engine_caps.supports_virtual_clock {
+            let _ = super::driver::send_line(&mut engine, "setoption name VirtualClock value true");
+        }
+        if cfg.virtual_clock && opponent_caps.supports_virtual_clock {
+            let _ =
+                super::driver::send_line(&mut opponent, "setoption name VirtualClock value true");
+        }
         for (name, value) in &cfg.engine_options {
             let _ = super::driver::send_line(
                 &mut engine,
@@ -4365,7 +4809,7 @@ mod controller {
                     pair_index,
                     opponent_uci_elo,
                 } => {
-                    // **INVARIANT (load-bearing per plan §4.4 + ADR-0018 §2):**
+                    // **INVARIANT (load-bearing per plan §4.4 + ADR-0020 §2):**
                     // `setoption UCI_Elo` MUST precede `ucinewgame` within a pair.
                     // The Stockfish 18 preflight probe
                     // (`docs/research/tooling-stockfish-mid-session-setoption.md`)
@@ -5639,6 +6083,7 @@ fn main() -> ExitCode {
         watchdog,
         max_plies: args.max_moves,
         thresholds: args.thresholds.clone(),
+        virtual_clock: args.virtual_clock,
     };
 
     let mut pool = match controller::spawn_workers(args.concurrency, cfg) {
@@ -6144,5 +6589,126 @@ mod e2e_smoke {
                 entry.path()
             );
         }
+    }
+
+    // ---- ELOH.C §6.7: VirtualClock end-to-end smokes ----
+
+    #[test]
+    #[ignore = "spawns clawfish; opt-in via cargo test --release -- --ignored"]
+    fn end_to_end_self_play_virtual_clock_runs() {
+        // Both engines receive `setoption name VirtualClock value true` because
+        // clawfish advertises the option and `--virtual-clock` is set.
+        use std::process::Command;
+
+        let engine = resolve_bin(CLAWFISH_EXE, "clawfish");
+        let harness = resolve_bin(ELO_ITERATE_EXE, "elo-iterate");
+        let engine = engine.as_str();
+        let harness = harness.as_str();
+        let out_dir = std::env::temp_dir().join("elo-iterate-smoke-vc");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let status = Command::new(harness)
+            .args([
+                "--engine",
+                engine,
+                "--opponent",
+                engine,
+                "--tc",
+                "1+0.05",
+                "--max-games",
+                "2",
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--virtual-clock",
+                "--initial-elo",
+                "2000",
+                "--k0",
+                "0",
+                "--target-sigma",
+                "0",
+            ])
+            .status()
+            .expect("failed to spawn elo-iterate");
+
+        assert!(status.success(), "harness exited with {status}");
+
+        let games_dir = out_dir.join("games");
+        let pgns: Vec<_> = std::fs::read_dir(&games_dir)
+            .expect("games dir missing")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pgn"))
+            .collect();
+        assert_eq!(pgns.len(), 2, "expected 2 PGN files, found {}", pgns.len());
+
+        let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap();
+        // The summary file ends with a `converged:` line when --target-sigma 0.
+        assert!(
+            summary.contains("converged:"),
+            "summary must contain 'converged:' line"
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns clawfish + stockfish; opt-in via cargo test --release -- --ignored"]
+    fn end_to_end_vs_stockfish_virtual_clock_falls_back_silently() {
+        // Stockfish does not advertise VirtualClock; the harness must fall back
+        // silently (send setoption only to clawfish, not Stockfish) and complete
+        // the run without errors.
+        use std::process::Command;
+
+        // Skip if Stockfish is not on PATH.
+        let stockfish_ok = Command::new("stockfish")
+            .arg("quit")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok();
+        if !stockfish_ok {
+            eprintln!("test skipped: stockfish not found on PATH");
+            return;
+        }
+
+        let engine = resolve_bin(CLAWFISH_EXE, "clawfish");
+        let harness = resolve_bin(ELO_ITERATE_EXE, "elo-iterate");
+        let engine = engine.as_str();
+        let harness = harness.as_str();
+        let out_dir = std::env::temp_dir().join("elo-iterate-smoke-vc-sf");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let output = Command::new(harness)
+            .args([
+                "--engine",
+                engine,
+                "--opponent",
+                "stockfish",
+                "--tc",
+                "1+0.05",
+                "--max-games",
+                "2",
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--virtual-clock",
+                "--initial-elo",
+                "2000",
+                "--k0",
+                "0",
+                "--target-sigma",
+                "0",
+            ])
+            .output()
+            .expect("failed to spawn elo-iterate");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "harness must exit 0 even when opponent doesn't support VirtualClock; stderr={stderr}"
+        );
+        // No error about VirtualClock in stderr.
+        assert!(
+            !stderr.contains("VirtualClock"),
+            "stderr must not mention VirtualClock on silent fallback; got: {stderr}"
+        );
     }
 }

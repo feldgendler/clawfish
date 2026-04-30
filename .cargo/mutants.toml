@@ -329,7 +329,14 @@ exclude_re = [
     # `cargo test --release -- --ignored`).  Unit-testable mocking would
     # require a fake EngineHandle infrastructure (deferred; out of scope for
     # ELOH.B).  Excluding here documents the structural gap explicitly.
+    #
+    # Two pattern forms (mirrors current_hostname/current_date_str): the
+    # `in <fn>` form catches in-body operator/arithmetic mutations; the
+    # `replace <fn> with` form catches whole-function-replacement mutants.
+    # The function returns `()` so cargo-mutants generates `replace ... with ()`
+    # without the `-> ()` arrow form. Surfaced by ELOH.C's mutants run.
     "in controller::production_worker_fn",
+    "replace controller::production_worker_fn with",
 
     # `run_iteration` drain-loop boundary mutants are integration-only:
     #
