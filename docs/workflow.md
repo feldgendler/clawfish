@@ -157,6 +157,19 @@ First-time install: `scripts/install-fastchess.sh` (idempotent; downloads and SH
 
 See ADR-0012 for layout details, adjudication parameters, and the fresh-clone bootstrap sequence.
 
+## Online Elo iteration
+
+Rating estimation against Stockfish is driven by `cargo run --release --bin elo-iterate -- ...` (the ELOH.B in-process harness). Two entry points:
+
+- **`scripts/elo-iterate.sh [initial] [batches] [games-per-batch]`** — thin wrapper; defaults `initial=2171, batches=30, games-per-batch=4`. Translates to `--max-games BATCHES*GAMES_PER_BATCH --concurrency GAMES_PER_BATCH/2 --initial-elo INITIAL --k0 40 --tau 10 --target-sigma 30 --stop-window 30 --stop-window-confirm 5`. Requires Stockfish on PATH (`brew install stockfish`).
+- **`scripts/sprt.sh rating-estimate`** — fixed-anchor measurement (frozen-K + disabled-σ via `--k0 0 --target-sigma 0`). Semantically equivalent to the prior fastchess match at fixed `UCI_Elo`.
+
+Output lives under `target/elo-iterate/run-<TS>/`:
+- `games/<N>.pgn` — per-game PGN with Seven Tag Roster + per-move score comments.
+- `summary.txt` — one line per game, plus `progress:` lines per completed batch and a final `converged:` line.
+
+K-update cadence shifted from per-batch (the old bash version) to per-game (ELOH.B spec). Total game count and bash CLI surface are preserved.
+
 ## Static analysis and dependency hygiene
 
 Standing checks that complement the review loops. The review loops catch reasoning errors; these catch mechanical drift.

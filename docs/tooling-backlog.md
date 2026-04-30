@@ -2,38 +2,29 @@
 
 Industry-best-practice items surfaced during the 2026-04-27 workflow review but not yet adopted. **Listed in recommended implementation order** — pick from the top when the next slot opens for tooling work.
 
-### Custom in-process Elo-iteration harness (replaces fastchess for rating estimation)
+### ~~Custom in-process Elo-iteration harness~~ — Done (ELOH.B, 2026-04-30)
 
-**Purpose.** Replace `fastchess` for the rating-estimation use case with a custom in-process Rust harness. Surfaced during the M3.F rating estimate when the bash + fastchess iteration scheme proved acceptable but suboptimal: per-batch fastchess spawn + UCI handshake costs ~1-2 s overhead, and the bash + awk PGN-parsing chain adds further latency. A custom harness eliminates both.
+Landed as `src/bin/elo-iterate.rs` on branch `tooling/elo-harness`.
 
-**Use case.** Online Elo iteration against a calibrated opponent (typically Stockfish at variable UCI_Elo): play a small batch (one color-pair or more) at the current Elo hypothesis, parse results, update via Robbins-Monro `K_t = K_0 / (1 + t/τ)` schedule, re-configure the opponent, repeat. Currently implemented in bash at `scripts/elo-iterate.sh`.
+- **ELOH.A** (harness foundation): persistent subprocesses, UCI driver, native adjudication, per-side clock management, color-paired match loop, PGN/summary output. ~2300 LOC + 139 tests.
+- **ELOH.B** (statistical layer): Robbins-Monro K-update at single-game cadence, σ-based stopping, N-parallel-pair concurrency via `std::thread` + `mpsc`, threshold adjudication (resign/draw/max-moves), convergence-progress output. Replaced `scripts/elo-iterate.sh` (now a thin wrapper) and `scripts/sprt.sh rating-estimate` arm (now routes through the binary).
 
-**Requirements.**
+Usage: `cargo run --release --bin elo-iterate -- --engine <path> --opponent <path> --tc <TC> --max-games <N> --initial-elo <E> [...]`. See `--help` for all flags. `scripts/elo-iterate.sh` preserves the prior bash CLI surface as a wrapper.
 
-- Spawn clawfish once per run via `std::process::Command` with stdin/stdout pipes; keep the process alive across all batches. Same for Stockfish (or equivalent calibrated opponent).
-- Drive the UCI protocol from the harness side: send `uci`, `isready`, `setoption`, `position`, `go wtime/btime`, parse `bestmove`. Reuse clawfish's own `parse_uci_line` is fine for *parsing* opponent output, but the harness drives the FROM-engine direction with hand-built command strings.
-- Reuse `Position`, `make_move`, `unmake_move`, `generate_moves`, `in_check`, `is_repetition`, `is_fifty_move_draw` for the harness-side board state — these already exist in the crate.
-- Implement game-end adjudication: mate (no legal moves + check), stalemate (no legal moves + not in check), 50-move rule, 3-fold repetition, insufficient-material, plus optional resign-threshold and draw-threshold adjudication matching `scripts/match.sh`'s `-resign movecount=3 score=600 -draw movenumber=34 movecount=8 score=20 -maxmoves 200`.
-- Implement clock management per side: `wtime/btime/winc/binc` per UCI; track elapsed time per move; declare time-forfeit on overflow.
-- Re-configure the opponent's UCI options between games via `setoption name UCI_Elo value <new>` — single UCI command, no process restart.
-- Concurrency: support N parallel games via Tokio or `std::thread`; each game owns its own pair of engine processes. Match `fastchess`'s `-concurrency` semantics.
-- Per-game color-swap (a la fastchess `-repeat`); per-batch K-update against averaged score; final estimate at run end.
-- Output: per-batch summary line (compatible with `scripts/elo-iterate.sh`'s current format) plus a per-game PGN file for archival.
+### ELOH controller boundary testing — mock `EngineHandle` test harness
 
-**Advantages over the fastchess + bash approach.**
+**Purpose.** Close the integration-only gap left by ELOH.B's mutation-test triage. The synthetic-worker tests in `mod controller::tests` exercise happy-path dispatch + W/L/D aggregation + termination, but precise boundary distinctions in `controller::run_iteration`'s drain-loop dispatch gating (`pairs_dispatched < total_pairs`, `t < args.max_games`, in-flight-pair tracking math) are not covered. Surfaced during ELOH.B's pre-review mutation-survivor analysis (six `< → <=` and `+= → *=` mutants in `run_iteration` deferred via `.cargo/mutants.toml`).
 
-1. **Zero per-batch spawn overhead** — engine processes persist across the whole run. ~20% wallclock reduction at our current 10+0.1 TC; larger relative win at faster TCs.
-2. **Single-game updates** practical — without spawn overhead, updating after every individual game (instead of color-pairs) becomes feasible. Finer-grained Robbins-Monro schedule, faster convergence per game.
-3. **Adaptive K** based on running variance, not just the `1 + t/τ` schedule. The harness has the full estimator state in memory; can switch K dynamically.
-4. **Stopping criteria** — terminate when last 20 estimates have σ < threshold. Currently the bash version runs a fixed batch count.
-5. **Asymmetric time controls** trivially expressed: clawfish at 10+0.1, Stockfish at "effectively unlimited" (3600+0). Fastchess accepts asymmetric `tc=` per `-engine` block but the bash wrapper has to thread it explicitly.
-6. **Better instrumentation** — the harness can record per-game: clawfish's reported depth, score, time used, plus Stockfish's reported depth (when available). Surfacing this enables per-anchor diagnostics ("does clawfish reach depth 8 within budget at all anchors?") that fastchess's PGN format doesn't expose.
-7. **Reuses crate code** — `Position`, movegen, draw helpers all already exist and are exhaustively tested. The harness inherits the project's correctness guarantees on the board-side.
-8. **Per-game TC sampling for mixed-TC SPRT** — the harness drives clocks per side, so randomizing TC per game is a one-line addition to the game-setup phase: sample `(base, increment)` from a configured distribution before sending `go wtime/btime/winc/binc`. Enables true mixed-TC SPRT under the redefined game "draw TC from D, then play standard chess at that TC" (surfaced during the M4.D walkthrough on 2026-04-30). M4.D's fixed-TC discrete-sweep approximation can be retired once this lands, and per-(TC, outcome) regression becomes a continuous curve rather than 4 discrete points.
+**Scope.** ~150 LOC of test scaffolding: a fake `EngineHandle` that records the sequence of `send_line` calls, a fake `recv_until_bestmove` that emits canned `bestmove` responses driven by a per-game scripted outcome. Wires into the existing controller-test seam (`spawn_workers_with_fn`) so `production_worker_fn` can be unit-tested without real subprocesses.
 
-**Estimated size.** ~250-350 LOC of Rust at `src/bin/elo-iterate.rs` (or as a separate sub-crate if test isolation is preferred). Plus ~100 LOC of unit tests covering the adjudication logic and the K-update math.
+**Coverage closes:**
+- The 6 surviving boundary mutants in `controller::run_iteration` (per `.cargo/mutants.toml` ELOH.B exclusion block).
+- Plan §6.6's `controller_setoption_before_ucinewgame_pins_order` test (currently pinned only by inline comment in `production_worker_fn`).
+- The `pgn::format_pgn` move-pair-spacing boundary mutants when paired with a parametric move-count fixture sweep.
 
-**When to land.** Surfaces as worthwhile when M4+ runs more rating-estimation matches (each new milestone's baseline-tag SPRT closes with a rating-estimate run; the cumulative wallclock saved by a custom harness pays back the dev cost over ~10 runs). Reasonable to land at M4.A close, alongside the first TT-vs-no-TT rating delta measurement.
+**When to land.** Earliest is alongside ELOH.C (which adds `--go-nodes` mode and would benefit from the same mock infrastructure for nodes-mode verification). Latest is before any future controller refactor that would invalidate the deferred-detection commitments documented in `.cargo/mutants.toml`.
+
+**Estimated cost vs. payoff.** The current deferral is acceptable because (a) the ELOH.B back-validation gate (Part 1: 120-game online run vs M3.F's ~2114 ± 2σ) catches dispatch-level structural bugs end-to-end; (b) a future controller refactor with real bugs is also catchable by ELOH.C's self-play stress under `--go-nodes`. The mock harness pays back when running mutation tests against the controller surface becomes cheap enough that catching boundary mutants surfaces small bugs early.
 
 ### Hardware-invariant TC: `go nodes` mode + `VirtualClock` UCI extension
 
