@@ -3023,12 +3023,17 @@ mod tests {
     fn handle_go_with_wtime_btime_reaches_depth_3_on_kiwipete() {
         // Kiwipete (high branching) iter-3 visits ~26k nodes (debug) /
         // ~few-k nodes (release), exceeding the 4096 cancellation cadence
-        // either way. With wtime=20000 + default MoveOverhead=50, compute_caps
-        // produces (soft, hard) ≈ (950ms, 2850ms). Under correct
+        // either way. With wtime=60000 + default MoveOverhead=50, compute_caps
+        // produces (soft, hard) ≈ (2950ms, 8850ms). Under correct
         // `now + caps.hard` impl, the hard deadline lands in the future at
-        // ~2850ms, well past iter-3's wallclock (~400ms in debug, < 50ms in
-        // release). Iter 3 completes; soft check at 950ms then fires
-        // post-iter-3 in debug (and post-iter-N for some N in release).
+        // ~8850ms, well past iter-3's wallclock (~3-4s in debug under load,
+        // < 50ms in release). Iter 3 completes; soft check at 2950ms then
+        // fires post-iter-3 in debug (and post-iter-N for some N in release).
+        //
+        // wtime bumped from 20000 to 60000 (2026-04-30, ELOH.C landing): on
+        // a moderately loaded debug-mode build the original 2850ms hard cap
+        // was marginal and iter 3 wouldn't fit on a busy machine. The 8850ms
+        // hard cap gives ~3x headroom over observed iter-3 wallclock.
         //
         // Under the `now + caps.hard` → `now - caps.hard` MUTATION, the hard
         // deadline lands in the past. Iter 3's first 4096-aligned cadence poll
@@ -3036,8 +3041,7 @@ mod tests {
         // last_complete = (2, ...). Test observes no depth-3 info line.
         //
         // Pin: a `depth 3` info line must be emitted. Catches the hard-deadline
-        // `+ → -` mutation on engine.rs:225. wtime is large enough to fit iter 3
-        // in debug too (where the search is ~5x slower).
+        // `+ → -` mutation on engine.rs:225.
         const KIWIPETE_FEN: &str =
             "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -3046,13 +3050,13 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Command>();
         tx.send(parse_uci_line(&format!("position fen {KIWIPETE_FEN}")))
             .unwrap();
-        tx.send(parse_uci_line("go wtime 20000 btime 20000"))
+        tx.send(parse_uci_line("go wtime 60000 btime 60000"))
             .unwrap();
 
         let buf_clone = Arc::clone(&buf);
         let handle = std::thread::spawn(move || engine.run(rx));
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let snap = String::from_utf8(buf_clone.lock().unwrap().clone())
                 .expect("output is valid UTF-8");
@@ -3061,7 +3065,7 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "bestmove did not arrive within 5s;\noutput so far:\n{snap}"
+                "bestmove did not arrive within 15s;\noutput so far:\n{snap}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -3073,7 +3077,7 @@ mod tests {
         let depth_3_present = snap.lines().any(|l| l.starts_with("info depth 3 "));
         assert!(
             depth_3_present,
-            "depth-3 info line must be emitted on Kiwipete with wtime=20000 — \
+            "depth-3 info line must be emitted on Kiwipete with wtime=60000 — \
              a hard-deadline mutation that puts the deadline in the past would \
              abort iter 3 (~26k nodes > 4096 cadence) before it completes;\noutput:\n{snap}"
         );
