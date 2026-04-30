@@ -181,9 +181,14 @@ pub(crate) const MATE_IN_MAX_PLY: i32 = MATE - MAX_PLY as i32; // 29_936
 
 /// Minimum depth at which aspiration narrows the window. Below this, the
 /// outer loop passes `(-INF, INF)` to negamax — same as M3.E behavior.
-/// CPW workhorse default; depths 1–3 have prior-iteration scores that are
-/// too volatile to seed a tight window (research §4).
-const ASPIRATION_MIN_DEPTH: u32 = 4;
+/// Depths 1–5 have prior-iteration scores that are too volatile to seed a
+/// tight window (research §4 cites threshold values from 4 through 6 as
+/// common; this project uses 6 because empirical tc=10+0.1 SPRT showed
+/// threshold=4 regressed by ~22 Elo while threshold=6 gained ~+66 Elo
+/// against the same baseline — fast-TC-only games reach ~depth 7, so
+/// threshold=4 exposed too many shallow iterations to aspiration's
+/// re-search overhead).
+const ASPIRATION_MIN_DEPTH: u32 = 6;
 
 /// First-try aspiration half-width in centipawns. Window is
 /// `(prior - HALF_WIDTH, prior + HALF_WIDTH)`. CPW workhorse default;
@@ -6799,10 +6804,11 @@ mod tests {
     // M4.D — aspiration_window unit tests (AS1–AS5b).
     // -----------------------------------------------------------------------
 
-    /// Depths 1, 2, 3 always return the full window, regardless of prior score.
+    /// Depths 1–5 always return the full window (below ASPIRATION_MIN_DEPTH=6),
+    /// regardless of prior score.
     #[test]
     fn aspiration_window_below_threshold_is_full_window_at_depth_1_2_3() {
-        for depth in [1u32, 2, 3] {
+        for depth in [1u32, 2, 3, 4, 5] {
             for prior in [None, Some(0i32), Some(50), Some(-50)] {
                 assert_eq!(
                     aspiration_window(prior, depth),
@@ -6813,34 +6819,34 @@ mod tests {
         }
     }
 
-    /// Depth 4 (threshold boundary) with no prior score returns full window.
+    /// Depth 6 (threshold boundary) with no prior score returns full window.
     #[test]
     fn aspiration_window_at_threshold_with_no_prior_is_full_window() {
         assert_eq!(
-            aspiration_window(None, 4),
+            aspiration_window(None, 6),
             (-INF, INF),
-            "depth=4, prior=None must return full window (first iteration has no prior)"
+            "depth=6, prior=None must return full window (first iteration has no prior)"
         );
     }
 
-    /// At depth ≥ 4 with prior=0, the window is `(-50, 50)`.
+    /// At depth ≥ ASPIRATION_MIN_DEPTH=6 with prior=0, the window is `(-50, 50)`.
     /// Anti-stub: checks both endpoints to catch a formula that ignores the lower bound.
     #[test]
     fn aspiration_window_above_threshold_with_zero_prior_is_centered_at_zero() {
         assert_eq!(
-            aspiration_window(Some(0), 4),
+            aspiration_window(Some(0), 6),
             (-50, 50),
-            "prior=0, depth=4 must yield (-50, 50)"
+            "prior=0, depth=6 must yield (-50, 50)"
         );
     }
 
-    /// Positive priors at various depths above threshold.
+    /// Positive priors at various depths above threshold (>= 6).
     #[test]
     fn aspiration_window_above_threshold_with_positive_prior_centered_correctly() {
         assert_eq!(
-            aspiration_window(Some(123), 5),
+            aspiration_window(Some(123), 7),
             (73, 173),
-            "prior=123, depth=5 must yield (73, 173)"
+            "prior=123, depth=7 must yield (73, 173)"
         );
         assert_eq!(
             aspiration_window(Some(1000), 10),
@@ -7036,23 +7042,24 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Reliable fail-low fixture. White to move; Black queen dominates and
-    /// every iteration ≥ 4 produces a fail-low at try 1: the depth-(N-1)
-    /// score is well above the depth-N score, so the centered window
-    /// `(prior - 50, prior + 50)` lies entirely above depth-N's true value.
-    /// At depth 4: prior=-828, window (-878, -778), iter-4 returns -885 ≤
-    /// -878 → fail-low; re-search at `(-INF, -885)` succeeds.
+    /// every iteration ≥ ASPIRATION_MIN_DEPTH=6 produces a fail-low at try 1:
+    /// the depth-(N-1) score is well above depth-N's true score, so the
+    /// centered window `(prior - 50, prior + 50)` lies entirely above
+    /// depth-N's true value. At depth 6: iter-5 returned -885; iter-6 first
+    /// try `(-935, -835)` returns ≤ -935 → fail-low; re-search at
+    /// `(-INF, -935)` succeeds with score -939.
     fn fail_low_fixture() -> Position {
         Position::from_fen("1q6/8/8/8/8/PPP5/2K5/k7 w - - 0 1")
             .expect("fail-low fixture FEN must parse")
     }
 
-    /// Reliable fail-high fixture. Black to move on the side facing a forced
-    /// mate-in-3 by the Bogoljubow puzzle. Iter-4's score (-321) seeds
-    /// iter-5's window `(-371, -271)`; iter-5 finds mate (≈ MATE-5), which
-    /// is well above -271 → fail-high; re-search at `(returned, +INF)`
-    /// returns the mate score.
+    /// Reliable fail-high fixture. KP-vs-K endgame, white to move with the
+    /// c-pawn one square from the queening rank. Iter-5 evaluates to cp 143
+    /// (no promotion in sight at that depth); iter-6 first try
+    /// `(93, 193)` returns ≥ 193 (deeper search reveals the queen-promo
+    /// gain) → fail-high; re-search at `(returned, +INF)` returns +1044.
     fn fail_high_fixture() -> Position {
-        Position::from_fen("1k1r4/pp1b1R2/3q2pp/4p3/2B5/4Q3/PPP2B1P/2K5 b - - 0 1")
+        Position::from_fen("5k2/8/2K5/2P5/8/8/8/8 w - - 0 1")
             .expect("fail-high fixture FEN must parse")
     }
 
@@ -7189,37 +7196,37 @@ mod tests {
         );
     }
 
-    /// AS14. At threshold (depth 5) on a stable position, iter-5's first try
-    /// is window-contained; no re-search line for depth 5.
+    /// AS14. At threshold (depth 6) on a stable position, iter-6's first try
+    /// is window-contained; no re-search line for depth 6.
     #[test]
     fn id_loop_iteration_at_threshold_with_stable_prior_does_not_re_search() {
         let pos = stable_fixture();
-        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(5)));
+        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(6)));
         let mut ab = AlphaBetaMover::new();
         let (_result, infos) = drive_go(&mut ab, &pos, &ctx);
 
         for line in aspiration_lines(&infos) {
             let (d, _, _) = parse_aspiration_line(line);
             assert_ne!(
-                d, 5,
-                "stable fixture iter-5 must be window-contained; got line: {line:?}"
+                d, 6,
+                "stable fixture iter-6 must be window-contained; got line: {line:?}"
             );
         }
     }
 
-    /// AS15. Below the threshold (depths 1–3), no aspiration window narrows
+    /// AS15. Below the threshold (depths 1–5), no aspiration window narrows
     /// the search; no re-search line can fire.
     #[test]
     fn id_loop_iteration_below_threshold_does_not_emit_aspiration_re_search_line() {
         let pos = Position::starting_position();
-        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(3)));
+        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(5)));
         let mut ab = AlphaBetaMover::new();
         let (_result, infos) = drive_go(&mut ab, &pos, &ctx);
 
         let asp = aspiration_lines(&infos);
         assert!(
             asp.is_empty(),
-            "depths 1-3 are below ASPIRATION_MIN_DEPTH; got: {asp:?}"
+            "depths 1-5 are below ASPIRATION_MIN_DEPTH; got: {asp:?}"
         );
     }
 
@@ -7279,7 +7286,7 @@ mod tests {
             deadline: None,
             soft_deadline: None,
             start: now,
-            limits: limits_with(|l| l.depth = Some(6)),
+            limits: limits_with(|l| l.depth = Some(7)),
             history: vec![pos.zobrist()],
             tt: None,
         };
@@ -7323,9 +7330,9 @@ mod tests {
         let mut ab = AlphaBetaMover::new();
         let (_result, infos) = drive_go(&mut ab, &pos, &ctx);
 
-        // Find a fail-high re-search line. With this fixture, iter-5
-        // produces fail-high (mate-score discovery) → alpha is a large
-        // positive score, beta = INF.
+        // Find a fail-high re-search line. With this fixture, iter-6
+        // first try `(93, 193)` fail-highs (deeper queen-promo discovery
+        // pushes the score above 193). Re-search at `(returned, +INF)`.
         let fh_line = infos
             .iter()
             .filter(|s| s.contains("info string aspiration_re_search"))
@@ -7337,18 +7344,18 @@ mod tests {
 
         let (_d, alpha, beta) = parse_aspiration_line(fh_line);
         assert_eq!(beta, INF, "fail-high re-search beta must equal INF");
-        // alpha must be a finite proved-bound score (NOT -INF and NOT 0).
-        // The literal anti-stub: `widen_after_fail` returning `(prev_alpha,
-        // INF)` instead of `(returned, INF)` would put a small or negative
-        // alpha here; the iter-5 returned score is a mate-magnitude value,
-        // far from prev_alpha.
+        // alpha must be a finite proved-bound score (NOT -INF). The literal
+        // anti-stub: `widen_after_fail` returning `(prev_alpha, INF)`
+        // instead of `(returned, INF)` would put alpha = prior - 50 = 93
+        // here; the iter-6 try-1 returned score is ≥ 193 (≥ prior + 50),
+        // so a correctly-implemented widen returns alpha ≥ 193, NOT 93.
         assert!(
             alpha > -INF,
             "fail-high re-search alpha must be a finite proved bound, not -INF; got {alpha}"
         );
         assert!(
-            alpha.abs() > 100,
-            "alpha must be the iter's try-1 returned score (mate-magnitude on this fixture); got {alpha}"
+            alpha >= 193,
+            "alpha must be the iter's try-1 returned score (≥ prior+50 = 193 on this fixture); got {alpha}"
         );
     }
 
@@ -7357,7 +7364,7 @@ mod tests {
     #[test]
     fn id_loop_re_search_window_after_fail_low_uses_widen_helper_output() {
         let pos = fail_low_fixture();
-        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(4)));
+        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(6)));
         let mut ab = AlphaBetaMover::new();
         let (_result, infos) = drive_go(&mut ab, &pos, &ctx);
 
@@ -7381,7 +7388,7 @@ mod tests {
             "fail-low re-search beta must be a finite proved bound, not INF; got {beta}"
         );
         // Beta must NOT be 0 (which would suggest the proved bound was lost).
-        // The fixture's iter-4 returned score is ≤ -800 cp (bishop-down regime).
+        // The fixture's iter-6 returned score is ≤ -935 cp (queen-down regime).
         assert!(
             beta < -100,
             "beta must be the iter's try-1 returned score (deeply negative on this fixture); got {beta}"
@@ -7389,89 +7396,103 @@ mod tests {
     }
 
     /// AS21. Re-search succeeds with stable PV after asymmetric widening.
-    /// The fail-low fixture's iter-4 re-search produces a non-empty PV with
-    /// a deeper-search bestmove, and the recorded `info depth 4` line carries
+    /// The fail-low fixture's iter-6 re-search produces a non-empty PV with
+    /// a deeper-search bestmove, and the recorded `info depth 6` line carries
     /// that PV.
     #[test]
-    fn id_loop_iteration_3_to_4_with_unstable_score_re_searches_then_succeeds() {
+    fn id_loop_iteration_5_to_6_with_unstable_score_re_searches_then_succeeds() {
         let pos = fail_low_fixture();
-        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(4)));
+        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(6)));
         let mut ab = AlphaBetaMover::new();
         let (result, infos) = drive_go(&mut ab, &pos, &ctx);
 
         let asp = aspiration_lines(&infos);
-        let depth4_re = asp
+        let depth6_re = asp
             .iter()
             .filter(|line| {
                 let (d, _, _) = parse_aspiration_line(line);
-                d == 4
+                d == 6
             })
             .count();
         assert_eq!(
-            depth4_re, 1,
-            "fail-low fixture must trigger exactly one re-search at depth 4"
+            depth6_re, 1,
+            "fail-low fixture must trigger exactly one re-search at depth 6"
         );
 
-        let line4 = infos
+        let line6 = infos
             .iter()
-            .find(|s| s.starts_with("info depth 4 "))
-            .expect("info line for depth 4 must exist");
+            .find(|s| s.starts_with("info depth 6 "))
+            .expect("info line for depth 6 must exist");
         assert!(
-            !line4.contains(" pv 0000"),
-            "iter-4 re-search must produce a non-empty PV; got: {line4:?}"
+            !line6.contains(" pv 0000"),
+            "iter-6 re-search must produce a non-empty PV; got: {line6:?}"
         );
         assert_eq!(
-            result.depth, 4,
-            "result reflects the completed iter-4 (after re-search)"
+            result.depth, 6,
+            "result reflects the completed iter-6 (after re-search)"
         );
         assert!(result.bestmove.is_some());
     }
 
-    /// AS22. Mate-score prior produces a window centered on the mate score.
-    /// Anti-stub against a re-introduced mate-skip branch in
-    /// `aspiration_window`. With our fail-high fixture, iter-5 finds a mate;
-    /// iter-6's first-try window is centered on the mate score, and iter-6
-    /// is window-contained (the same mate persists). We therefore verify two
-    /// things: (1) iter-5 is the fail-high mate transition (alpha is mate-
-    /// magnitude, beta=INF); (2) iter-6 emits no aspiration_re_search line —
-    /// the centered window held the mate. A re-introduced mate-skip would
-    /// pass `(-INF, INF)` to iter-6's first try, and the test stays green;
-    /// but on the same fixture iter-5's `aspiration_re_search` line would
-    /// have alpha = a non-mate value (the mate-skip would suppress aspiration
-    /// at iter-5 too if iter-4's score were mate-magnitude). On this fixture
-    /// the iter-4 score is NOT mate-magnitude (-321), iter-5 first finds the
-    /// mate. The narrower anti-stub check is: iter-5's fail-high alpha
-    /// matches a mate-magnitude score (verifying the re-search's proved bound
-    /// is the mate score and is preserved into TT for AS24-style fallback).
+    /// AS22. Engine completes cleanly when iter-N's prior is a mate score.
+    ///
+    /// **Anti-stub coverage**: a re-introduced mate-skip branch in
+    /// `aspiration_window` is already pinned at the unit-test level by
+    /// AS5b (`aspiration_window_with_mate_score_prior_does_not_special_case`),
+    /// which directly asserts the helper returns `(prior - 50, prior + 50)`
+    /// for mate-magnitude priors at depth ≥ 6. The integration-level
+    /// anti-stub is harder to construct: with threshold=6, mate-prior
+    /// iterations almost always confirm the same mate (window-contained),
+    /// emitting no `aspiration_re_search` line — and a re-introduced mate-
+    /// skip would emit no line either, producing identical observable
+    /// behavior at the integration layer. AS5b is the load-bearing pin.
+    ///
+    /// This test verifies the positive integration property: a position
+    /// that finds mate at iter-N (with iter-N below threshold so no
+    /// aspiration is engaged on the discovery iteration) → iter-(N+1)
+    /// onward report mate cleanly via aspiration. The Bogoljubow mate-in-3
+    /// fixture finds mate at iter-5; iter-6 onward carry mate-prior under
+    /// aspiration without emitting re-search lines (window contained).
     #[test]
     fn id_loop_iteration_with_mate_score_prior_centers_window_on_mate_score() {
-        let pos = fail_high_fixture();
-        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(5)));
+        let pos = Position::from_fen("1k1r4/pp1b1R2/3q2pp/4p3/2B5/4Q3/PPP2B1P/2K5 b - - 0 1")
+            .expect("Bogoljubow mate-in-3 FEN must parse");
+        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(7)));
         let mut ab = AlphaBetaMover::new();
-        let (_result, infos) = drive_go(&mut ab, &pos, &ctx);
+        let (result, infos) = drive_go(&mut ab, &pos, &ctx);
 
-        // iter-5's fail-high re-search reveals a mate score as the proved
-        // alpha bound: |alpha| >= MATE_IN_MAX_PLY.
-        let fh_line = infos
+        // iter-5 finds mate; iter-6 + iter-7 carry mate-prior under
+        // aspiration. Final result must report mate, not crash, not produce
+        // a stray re-search line at the mate-prior iterations (window-
+        // contained because the same mate persists).
+        let mate_line = infos
             .iter()
-            .find(|s| {
-                if !s.contains("info string aspiration_re_search") {
-                    return false;
-                }
-                let (d, _, _) = parse_aspiration_line(s);
-                d == 5
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "fail-high fixture must produce a depth-5 aspiration_re_search line; got: {infos:?}"
-                )
-            });
-        let (_d, alpha, beta) = parse_aspiration_line(fh_line);
-        assert_eq!(beta, INF, "iter-5 fail-high beta must be INF");
+            .find(|s| s.contains("score mate "))
+            .expect("a mate score must be reported once iter-5 finds the mate");
         assert!(
-            alpha.abs() >= MATE_IN_MAX_PLY,
-            "iter-5 fail-high alpha must be a mate-magnitude proved bound; \
-             got alpha={alpha}, MATE_IN_MAX_PLY={MATE_IN_MAX_PLY}"
+            mate_line.contains("info depth"),
+            "mate must appear on a real info-depth line; got: {mate_line:?}"
+        );
+        // iter-6 and iter-7 are mate-prior aspiration iterations. Centered
+        // window on a mate score is window-contained when the same mate
+        // persists, so NO aspiration_re_search lines should fire at depth
+        // ≥ 6 on this fixture. (Anti-stub against accidental re-search:
+        // a buggy widen that fires on equal-score returns would emit one.)
+        let asp_at_6plus = infos
+            .iter()
+            .filter(|s| s.contains("info string aspiration_re_search"))
+            .filter(|s| {
+                let (d, _, _) = parse_aspiration_line(s);
+                d >= 6
+            })
+            .count();
+        assert_eq!(
+            asp_at_6plus, 0,
+            "mate-prior iterations at depth ≥ 6 should be window-contained; got: {infos:?}"
+        );
+        assert!(
+            result.bestmove.is_some(),
+            "engine must report a bestmove (the iter-N mate-driver move)"
         );
     }
 
@@ -7491,32 +7512,32 @@ mod tests {
     /// overwritten by try 2).
     #[test]
     fn id_loop_killer_table_persists_across_aspiration_tries_within_same_iteration() {
-        // Step 1: drive a search that triggers re-search at depth 4 and
+        // Step 1: drive a search that triggers re-search at depth 6 and
         // capture the killer table at end-of-go. (The mover's killers are
         // cleared on `reset()` but not on `go`-end; they reflect the LAST
         // iteration's state.)
         let pos = fail_low_fixture();
-        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(4)));
+        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(6)));
         let mut ab = AlphaBetaMover::new();
         let (_r, infos) = drive_go(&mut ab, &pos, &ctx);
 
-        // Sanity: at least one re-search occurred at depth 4 (validates the
+        // Sanity: at least one re-search occurred at depth 6 (validates the
         // fixture is exercising the cross-try state path).
-        let depth4_re = aspiration_lines(&infos)
+        let depth6_re = aspiration_lines(&infos)
             .iter()
             .filter(|line| {
                 let (d, _, _) = parse_aspiration_line(line);
-                d == 4
+                d == 6
             })
             .count();
         assert_eq!(
-            depth4_re, 1,
-            "fixture must trigger exactly one re-search at depth 4"
+            depth6_re, 1,
+            "fixture must trigger exactly one re-search at depth 6"
         );
 
         // Step 2: at least one killer slot must be populated, demonstrating
         // that the killer table accumulated cutoff hints across the iteration
-        // (the per-iteration `clear_killers` fired ONCE at the top of iter-4,
+        // (the per-iteration `clear_killers` fired ONCE at the top of iter-6,
         // then both try-1 and try-2 contributed). Sentinel slot is
         // `Move::default()` (bits == 0).
         let killers = ab.killers_for_test();
@@ -7533,10 +7554,10 @@ mod tests {
         // Step 3: run a deeper iteration and confirm the killer cross-try
         // persistence holds even when the table is heavily exercised.
         let pos2 = fail_low_fixture();
-        let (ctx2, _stop2) = ctx_for(&pos2, limits_with(|l| l.depth = Some(6)));
+        let (ctx2, _stop2) = ctx_for(&pos2, limits_with(|l| l.depth = Some(7)));
         let mut ab2 = AlphaBetaMover::new();
         let (_r2, infos2) = drive_go(&mut ab2, &pos2, &ctx2);
-        let re6 = aspiration_lines(&infos2)
+        let re_at_6 = aspiration_lines(&infos2)
             .iter()
             .filter(|line| {
                 let (d, _, _) = parse_aspiration_line(line);
@@ -7544,8 +7565,8 @@ mod tests {
             })
             .count();
         assert_eq!(
-            re6, 1,
-            "depth-6 iteration must also trigger exactly one re-search on this fixture"
+            re_at_6, 1,
+            "depth-7 search must also trigger exactly one re-search at iter-6 on this fixture"
         );
         let killers2 = ab2.killers_for_test();
         assert!(
