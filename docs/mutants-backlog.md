@@ -34,11 +34,11 @@ Per-unit `cargo mutants --in-diff` runs that are deferred from the unit's commit
 **Diff command** (resilient to working-tree state — uses commit hashes):
 
 ```sh
-git diff 33a0d0d..<M4.C-TIP> -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.bc.diff"
+git diff 33a0d0d..4886667 -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.bc.diff"
 ```
 
 - `33a0d0d` — M4.A follow-up (cargo-mutants survivors fix); M4.B's branching point on main and the joint range's start.
-- `<M4.C-TIP>` — the M4.C tip on `m4.c-history-heuristic` after rebase onto main; resolved to a concrete SHA (printed by `git rev-parse m4.c-history-heuristic` at campaign-start time, or by `git rev-list --max-count=1 baseline/alpha-beta-tt-killer-history` once that tag is created at the M4.C merge commit).
+- `4886667` — the M4.C tip on `m4.c-history-heuristic` after rebase onto main; resolved to a concrete SHA (printed by `git rev-parse m4.c-history-heuristic` at campaign-start time, or by `git rev-list --max-count=1 baseline/alpha-beta-tt-killer-history` once that tag is created at the M4.C merge commit).
 - Pathspec `'src/*.rs' 'tests/*.rs'` — single-star glob (git pathspec doesn't expand `**`); restricts to the source + integration-test surface. M4.B + M4.C modify `src/search.rs`, `src/history.rs` (new), `src/mov.rs`, `src/engine.rs`, `src/lib.rs`, `tests/uci_integration.rs` plus doc files; the doc files are out of scope for cargo-mutants.
 
 After landing the diff, run:
@@ -133,7 +133,7 @@ Update both `docs/milestones/m4.b.md`'s and `docs/milestones/m4.c.md`'s "Mutatio
 
 - **If `cargo mutants` reports `unviable` for the M4.C `Move::default()` sentinel `debug_assert!`**: that's expected — the assertion is in a path movegen never produces, so no chess fixture can drive it. Classify as caught-via-unreachable; no action needed.
 - **If the campaign hangs**: per `.cargo/mutants.toml` guidance, the timeout multiplier should be enough; if a specific mutation hangs the test suite, it's almost always the cancellation-poll cadence interacting with the mutated code. Cancel via Ctrl-C; the mutation is caught-via-timeout.
-- **If a survivor maps outside the M4.B/M4.C surface** (i.e., a mutation on a line outside `src/search.rs` killer / history logic, `src/history.rs`, or the M4.C-specific test surface): something's off with the diff scope. Re-check that `33a0d0d..<M4.C-TIP>` is the correct hash range and that no drift commits have landed.
+- **If a survivor maps outside the M4.B/M4.C surface** (i.e., a mutation on a line outside `src/search.rs` killer / history logic, `src/history.rs`, or the M4.C-specific test surface): something's off with the diff scope. Re-check that `33a0d0d..4886667` is the correct hash range and that no drift commits have landed.
 
 ## Done
 
