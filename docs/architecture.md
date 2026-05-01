@@ -22,11 +22,12 @@ Current architectural state. Decisions and their rationale live in `docs/decisio
 | Testing | TDD on rules layer (perft); property tests on search; SPRT on strength changes | `workflow.md` |
 | Perft oracle | Stockfish (Homebrew) is the sole external source for perft fixtures | ADR-0006 |
 | Benchmark baseline | `criterion 0.7` + per-machine `--save-baseline`; committed `bench/<milestone>.md` table | ADR-0010 |
-| Tournament harness | `fastchess` 1.8.0-alpha (pinned + SHA256-verified); `scripts/match.sh` wrapper | ADR-0012 |
+| Tournament harness | `fastchess` 1.8.0-alpha is retained for `scripts/match.sh compliance` only (the `--compliance` UCI shake-out has no in-house substitute). All other flows are harness-side. | ADR-0012 (amended), ADR-0022 |
+| In-process harness | `src/bin/elo-iterate.rs` drives SPRT, fixed-games match, smoke flows, and rating-estimate via persistent UCI subprocesses with native adjudication. Pentanomial-GSPRT verdict + post-hoc Δ Elo CI emitted in `summary.txt`; per-game PGN files + run-end `match.pgn`. | ADR-0020, ADR-0021, ADR-0022 |
 | Time management | `compute_caps` pure function (soft + hard caps); ID outer loop with abort-between-iterations + mid-iteration hard-cap abort; `MoveOverhead` UCI option (default 50 ms) | ADR-0017 |
 | Search time source | Wallclock by default; thread CPU time (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`) when `VirtualClock=true` per ADR-0021; ownership in the worker thread (per-thread counter semantics), not the orchestrator | ADR-0021 |
 | Bench regression baseline | `bench` UCI command iterates a 16-position vendored corpus (`src/bench.rs::BENCH_POSITIONS`) at default depth 7; sums node counts; emits `info string bench: <N> nodes <NPS> nps` signature line. M3.F end signature: `bench: 172312700 nodes 11489045 nps`. | M3.F |
-| SPRT runner | `scripts/sprt.sh sprt\|match\|rating-estimate` builds baseline binary in `git worktree`-isolated checkout; runs fastchess SPRT or fixed-game match. Field-standard historical-commit-baseline methodology. | `docs/workflow.md` §SPRT |
+| SPRT runner | `scripts/sprt.sh sprt\|match\|rating-estimate` builds baseline binary in `git worktree`-isolated checkout; runs the in-process harness (`elo-iterate`) for pentanomial-GSPRT, fixed-game match, or rating-estimate. Field-standard historical-commit-baseline methodology. | `docs/workflow.md` §SPRT, ADR-0022 |
 
 ## Current design surface
 
@@ -322,13 +323,13 @@ See `docs/plans/m3.b.md` and `docs/research/m3-search-basics.md` §8–§9.
 
 **Determinism scope.** The node-count signature is deterministic across runs from the same binary; per-position `time {ms}` and aggregate `<NPS>` are wallclock-dependent and explicitly excluded from the regression signature. Pinned by `bench_node_count_is_reproducible_across_invocations`. Within-run cross-position state isolation is a `Search::go` invariant (per-go reset at line 321 of `src/search.rs`) — already pinned by M3.E's ID tests.
 
-**SPRT runner.** `scripts/sprt.sh` wraps fastchess with three subcommands:
+**SPRT runner.** `scripts/sprt.sh` wraps the in-process `elo-iterate` harness (ELOH.E migration; previously fastchess) with three subcommands:
 
-- `sprt <baseline-tag>` — SPRT match HEAD vs baseline-tag (clawfish-vs-clawfish), bounds `elo0=0, elo1=10, alpha=0.05, beta=0.05`, up to 400 games default. M3 exit-criterion gate.
-- `match <baseline-tag>` — fixed-game-count match (200 games default), no SPRT termination.
-- `rating-estimate` — fixed-game-count match HEAD vs Stockfish UCI_Elo=1320 (200 games default; ADR-0012 reference point).
+- `sprt <baseline-tag>` — pentanomial-GSPRT match HEAD vs baseline-tag (clawfish-vs-clawfish), bounds `elo0=0, elo1=10, alpha=0.05, beta=0.05`, up to 400 games default. M3 exit-criterion gate. The verdict and post-hoc Δ Elo CI both land in `<out-dir>/summary.txt`.
+- `match <baseline-tag>` — fixed-game-count match (200 games default), no SPRT termination. Post-hoc CI emitted at run end.
+- `rating-estimate` — fixed-game-count match HEAD vs Stockfish UCI_Elo=1320 (200 games default; ADR-0012 reference point). Frozen-K + disabled-σ.
 
-The script builds the baseline binary in a `git worktree`-isolated checkout (`target/sprt-baselines/<tag-slug>/`), caches it across runs, and probes the result with `printf 'uci\nquit\n' | <bin> | grep '^uciok$'` before fastchess starts (catches stale-toolchain rebuilds). `SPRT_REBUILD=1` forces a fresh worktree. Forward-compatible with the historical `chess` → `clawfish` package rename: reads the package name from the baseline's `Cargo.toml` to derive the binary path.
+The script builds the baseline binary in a `git worktree`-isolated checkout (`target/sprt-baselines/<tag-slug>/`), caches it across runs, and probes the result with `printf 'uci\nquit\n' | <bin> | grep '^uciok$'` before the harness starts (catches stale-toolchain rebuilds). `SPRT_REBUILD=1` forces a fresh worktree. Forward-compatible with the historical `chess` → `clawfish` package rename: reads the package name from the baseline's `Cargo.toml` to derive the binary path.
 
 See `docs/plans/m3.f.md` and `bench/m3.md` M3.F section.
 

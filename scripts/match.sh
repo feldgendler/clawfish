@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# fastchess smoke runner for the chess engine.
+# Smoke runner for the chess engine.
 #
 # Subcommands:
-#   self-play    2-game self-play (GreedyMover seed=1 vs seed=2)
-#   vs-stockfish 2-game match against Stockfish 18 capped at UCI_Elo=1320
-#   compliance   fastchess --compliance UCI shake-out on target/release/clawfish
+#   self-play    2-game self-play, both sides built from HEAD with distinct Random_Seed
+#                via the in-process harness (`elo-iterate`).
+#   vs-stockfish 2-game match against Stockfish 18 capped at UCI_Elo=1320,
+#                via the in-process harness.
+#   compliance   fastchess --compliance UCI shake-out on target/release/clawfish.
+#                This is the only subcommand that still uses fastchess; all other
+#                flows have moved to the in-process harness as of ELOH.E.
 #
 # Usage: scripts/match.sh <subcommand>
 #        MATCH_DEBUG=1 scripts/match.sh <subcommand>   (enables set -x)
@@ -18,16 +22,6 @@ set -euo pipefail
 
 if [[ "${MATCH_DEBUG:-0}" == "1" ]]; then set -x; fi
 
-# fastchess opens many file descriptors per concurrent game; macOS's default
-# ulimit -n (often 256) is too low even at -concurrency 1. Raise to 4096
-# (best-effort; do not fail the whole match if the shell forbids the bump).
-ulimit -n 4096 2>/dev/null || true
-
-# -------------------------------------------------------------------------
-# Pinned fastchess version (must match scripts/install-fastchess.sh).
-# -------------------------------------------------------------------------
-EXPECTED_VERSION_LINE="alpha 1.8.0"
-
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # -------------------------------------------------------------------------
@@ -37,8 +31,8 @@ usage() {
     echo "Usage: scripts/match.sh <subcommand>"
     echo ""
     echo "Subcommands:"
-    echo "  self-play      2-game self-play, GreedyMover seed=1 vs seed=2"
-    echo "  vs-stockfish   2-game vs Stockfish 18 capped at UCI_Elo=1320"
+    echo "  self-play      2-game self-play (in-process harness; Random_Seed=1 vs Random_Seed=2)"
+    echo "  vs-stockfish   2-game vs Stockfish 18 capped at UCI_Elo=1320 (in-process harness)"
     echo "  compliance     fastchess --compliance UCI check on target/release/clawfish"
 }
 
@@ -50,42 +44,11 @@ fi
 SUBCMD="$1"
 
 # -------------------------------------------------------------------------
-# fastchess locator.  Prefer the repo-local vendor binary; fall back to PATH.
-# Whichever resolves, gate on the version line to catch stale installs.
-# -------------------------------------------------------------------------
-VENDOR_BINARY="$REPO_ROOT/vendor/fastchess/fastchess"
-if [[ -x "$VENDOR_BINARY" ]]; then
-    FASTCHESS="$VENDOR_BINARY"
-elif command -v fastchess >/dev/null 2>&1; then
-    FASTCHESS="$(command -v fastchess)"
-else
-    echo "ERROR: fastchess not found." >&2
-    echo "  Run: scripts/install-fastchess.sh" >&2
-    exit 1
-fi
-
-actual_ver="$("$FASTCHESS" --version 2>&1 || true)"
-if ! echo "$actual_ver" | grep -q "$EXPECTED_VERSION_LINE"; then
-    echo "ERROR: found fastchess at $FASTCHESS but it reports:" >&2
-    echo "  $actual_ver" >&2
-    echo "  expected to contain: $EXPECTED_VERSION_LINE" >&2
-    echo "  Run: scripts/install-fastchess.sh" >&2
-    exit 1
-fi
-echo "fastchess resolved: $FASTCHESS"
-
-# -------------------------------------------------------------------------
 # Build the engine binary.
 # -------------------------------------------------------------------------
 echo "Building engine..."
 cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" --quiet
 ENGINE="$REPO_ROOT/target/release/clawfish"
-
-# -------------------------------------------------------------------------
-# Adjudication flags shared by self-play and vs-stockfish.
-# No -draw: see header comment and ADR-0012.
-# -------------------------------------------------------------------------
-ADJUDICATION=(-maxmoves 300 -resign movecount=3 score=600)
 
 # -------------------------------------------------------------------------
 # Output directory.
@@ -98,6 +61,27 @@ SMOKE_DIR="$REPO_ROOT/target/matches/smoke"
 case "$SUBCMD" in
 
     compliance)
+        # fastchess locator (only used by this arm — all other flows are harness-side).
+        EXPECTED_VERSION_LINE="alpha 1.8.0"
+        VENDOR_BINARY="$REPO_ROOT/vendor/fastchess/fastchess"
+        if [[ -x "$VENDOR_BINARY" ]]; then
+            FASTCHESS="$VENDOR_BINARY"
+        elif command -v fastchess >/dev/null 2>&1; then
+            FASTCHESS="$(command -v fastchess)"
+        else
+            echo "ERROR: fastchess not found." >&2
+            echo "  Run: scripts/install-fastchess.sh" >&2
+            exit 1
+        fi
+        actual_ver="$("$FASTCHESS" --version 2>&1 || true)"
+        if ! echo "$actual_ver" | grep -q "$EXPECTED_VERSION_LINE"; then
+            echo "ERROR: found fastchess at $FASTCHESS but it reports:" >&2
+            echo "  $actual_ver" >&2
+            echo "  expected to contain: $EXPECTED_VERSION_LINE" >&2
+            echo "  Run: scripts/install-fastchess.sh" >&2
+            exit 1
+        fi
+        echo "fastchess resolved: $FASTCHESS"
         echo "# Running: $FASTCHESS --compliance $ENGINE"
         "$FASTCHESS" --compliance "$ENGINE"
         ;;
@@ -105,20 +89,21 @@ case "$SUBCMD" in
     self-play)
         mkdir -p "$SMOKE_DIR"
         TS="$(date +%Y%m%dT%H%M%S)"
-        PGN="$SMOKE_DIR/m2-self-play-${TS}.pgn"
-        LOG="$SMOKE_DIR/m2-self-play-${TS}.log"
-        echo "# Output: $PGN"
-        echo "# Log:    $LOG"
-        "$FASTCHESS" \
-            -engine cmd="$ENGINE" name=clawfish-W option.Random_Seed=1 \
-            -engine cmd="$ENGINE" name=clawfish-B option.Random_Seed=2 \
-            -each proto=uci tc=10+0.1 \
-            -rounds 1 -repeat \
-            "${ADJUDICATION[@]}" \
-            -pgnout file="$PGN" notation=san \
-            -log file="$LOG" level=info engine=true
-        echo "PGN: $PGN"
-        echo "Log: $LOG"
+        OUT_DIR="$SMOKE_DIR/m2-self-play-${TS}"
+        echo "# Output dir: $OUT_DIR"
+        cargo run --release --bin elo-iterate --manifest-path "$REPO_ROOT/Cargo.toml" --quiet -- \
+            --engine "$ENGINE" \
+            --opponent "$ENGINE" \
+            --engine-option "Random_Seed=1" \
+            --opponent-option "Random_Seed=2" \
+            --tc 10+0.1 \
+            --max-games 2 \
+            --initial-elo 0 \
+            --k0 0 --target-sigma 0 \
+            --resign-movecount 3 --resign-score 600 \
+            --max-moves 300 \
+            --out-dir "$OUT_DIR"
+        echo "Output dir: $OUT_DIR"
         ;;
 
     vs-stockfish)
@@ -130,20 +115,22 @@ case "$SUBCMD" in
         STOCKFISH="$(command -v stockfish)"
         mkdir -p "$SMOKE_DIR"
         TS="$(date +%Y%m%dT%H%M%S)"
-        PGN="$SMOKE_DIR/m2-vs-stockfish-${TS}.pgn"
-        LOG="$SMOKE_DIR/m2-vs-stockfish-${TS}.log"
-        echo "# Output: $PGN"
-        echo "# Log:    $LOG"
-        "$FASTCHESS" \
-            -engine cmd="$ENGINE" name=clawfish option.Random_Seed=1 \
-            -engine cmd="$STOCKFISH" name=sf18 option.UCI_LimitStrength=true option.UCI_Elo=1320 \
-            -each proto=uci tc=10+0.1 \
-            -rounds 1 -repeat \
-            "${ADJUDICATION[@]}" \
-            -pgnout file="$PGN" notation=san \
-            -log file="$LOG" level=info engine=true
-        echo "PGN: $PGN"
-        echo "Log: $LOG"
+        OUT_DIR="$SMOKE_DIR/m2-vs-stockfish-${TS}"
+        echo "# Output dir: $OUT_DIR"
+        cargo run --release --bin elo-iterate --manifest-path "$REPO_ROOT/Cargo.toml" --quiet -- \
+            --engine "$ENGINE" \
+            --opponent "$STOCKFISH" \
+            --engine-option "Random_Seed=1" \
+            --opponent-option UCI_LimitStrength=true \
+            --opponent-option UCI_Elo=1320 \
+            --tc 10+0.1 \
+            --max-games 2 \
+            --initial-elo 0 \
+            --k0 0 --target-sigma 0 \
+            --resign-movecount 3 --resign-score 600 \
+            --max-moves 300 \
+            --out-dir "$OUT_DIR"
+        echo "Output dir: $OUT_DIR"
         ;;
 
     *)

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Install the pinned fastchess release to vendor/fastchess/fastchess.
 #
+# Required for `scripts/match.sh compliance` only — all other harness flows
+# (sprt, match, self-play, vs-stockfish, rating-estimate) use the in-process
+# `elo-iterate` binary as of ELOH.E (see docs/decisions/0022-eloh-sprt-mechanics.md).
+#
 # Idempotent: re-running when the binary is already present prints a note and
 # exits 0 without downloading or verifying again.
 #

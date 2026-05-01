@@ -142,20 +142,20 @@ The reviewer then verifies the orchestrator's classifications are sound, checks 
 
 ## Running a match
 
-Tournament smoke runs are driven by `scripts/match.sh` per ADR-0012.
+Tournament smoke runs are driven by `scripts/match.sh`. As of ELOH.E (ADR-0022), the `self-play` and `vs-stockfish` arms invoke the in-process `elo-iterate` harness; only `compliance` still uses fastchess.
 
-- `scripts/match.sh self-play` — 2-game self-play (RandomMover seed=1 vs seed=2); artifacts in `target/matches/smoke/`.
-- `scripts/match.sh vs-stockfish` — 2-game match against Stockfish 18 capped at `UCI_Elo=1320`; artifacts in `target/matches/smoke/`.
+- `scripts/match.sh self-play` — 2-game self-play (Random_Seed=1 vs Random_Seed=2 via `--engine-option`/`--opponent-option`); artifacts in `target/matches/smoke/m2-self-play-<TS>/{summary.txt,match.pgn,games/}`.
+- `scripts/match.sh vs-stockfish` — 2-game match against Stockfish 18 capped at `UCI_Elo=1320`; artifacts in `target/matches/smoke/m2-vs-stockfish-<TS>/`.
 - `scripts/match.sh compliance` — fastchess `--compliance` UCI check; all 40 steps must pass on fastchess 1.8.0-alpha ("Engine passed all compliance checks.").
 
 Artifacts:
 
-- Raw PGN and log → `target/matches/smoke/` (gitignored).
+- Per-run output dir under `target/matches/smoke/` (gitignored): `summary.txt`, `match.pgn`, `games/<N>.pgn`.
 - Milestone summary → `bench/m2.md` (M2) or `bench/sprt/<dated>.md` (M3+ SPRT).
 
-First-time install: `scripts/install-fastchess.sh` (idempotent; downloads and SHA256-verifies the pinned binary into `vendor/fastchess/`).
+First-time install: `scripts/install-fastchess.sh` (idempotent; downloads and SHA256-verifies the pinned binary into `vendor/fastchess/`). Required for the `compliance` arm only — the other arms use the in-process harness binary.
 
-See ADR-0012 for layout details, adjudication parameters, and the fresh-clone bootstrap sequence.
+See ADR-0012 (amended) and ADR-0022 for layout details, adjudication parameters, and the fresh-clone bootstrap sequence.
 
 ## Online Elo iteration
 
@@ -348,23 +348,38 @@ Property tests (via `proptest`) and ordinary unit tests are **complementary**, n
 
 Sequential Probability Ratio Test. The standard for accepting/rejecting engine changes once games are playable (M3+).
 
-- Standard bounds: H0 elo0=0, H1 elo1=5 (conservative); or elo0=-3, elo1=3 for marginal changes.
-- Run via `fastchess` (per ADR-0012).
-- Fast time controls (e.g. 10+0.1) for many games.
-- Accept if SPRT crosses the upper bound; reject on lower.
+- Standard bounds: H0 elo0=0, H1 elo1=10 (default in `scripts/sprt.sh sprt`); tighten to elo0=0/elo1=5 for marginal changes by editing the invocation.
+- Run via the in-process `elo-iterate` harness (per ADR-0022). Pentanomial-GSPRT verdict + post-hoc Δ Elo CI both land in `<out-dir>/summary.txt`.
+- Fast time controls (e.g. `tc=10+0.1`) for many games — or `--tc-sample` for the mixed-TC SPRT shape (see below).
+- Accept if SPRT crosses the upper Wald bound (`H1`); reject on lower (`H0`).
+
+Worked example invocation:
+
+```sh
+scripts/sprt.sh sprt baseline/alpha-beta-tt-killer-history-aspiration
+```
+
+Output:
+- `target/matches/sprt/<TS>-<baseline-slug>-sprt/summary.txt` — `converged:` line, then `sprt: verdict=H1 llr=… elo0=0.0 elo1=10.0 alpha=0.050 beta=0.050 pairs=N ptnml=[...]` and `ci: elo=… [..., ...] pairs=N`.
+- `target/matches/sprt/<TS>-<baseline-slug>-sprt/match.pgn` — concatenated PGN of all games.
+- `target/matches/sprt/<TS>-<baseline-slug>-sprt/games/<N>.pgn` — per-game PGNs.
 
 ### SPRT methodology — baselines from historical commits, not feature flags
 
-The reference for any SPRT match is **a binary built from a prior git commit**, not a feature-flagged version of the current code. Build both binaries (current branch HEAD + the baseline commit's HEAD), pit them via fastchess, accept/reject on the SPRT bound.
+The reference for any SPRT match is **a binary built from a prior git commit**, not a feature-flagged version of the current code. Build both binaries (current branch HEAD + the baseline commit's HEAD), pit them via the in-process harness, accept/reject on the SPRT bound.
 
 - **Why not feature flags.** A flag-per-prior-behavior approach grows linearly with milestone count and produces a code surface where every search/eval function carries a "circa-M3" / "circa-M4" / … parametrization. The field universally rejects this pattern (Stockfish/Fishtest, Komodo, Ethereal all use historical-commit builds). The codebase always reflects the *current* engine; prior behaviors live only in git history.
 - **Build flow** (wired in `scripts/sprt.sh` since M3.F):
   - `git worktree add target/sprt-baselines/<sha> <sha>` — isolated checkout so cargo's `target/` doesn't conflict.
   - `cargo build --release` in the worktree → cached binary at `target/sprt-baselines/<sha>/target/release/clawfish`.
   - `cargo build --release` in the working tree.
-  - `fastchess` SPRT match between the two binaries.
+  - In-process harness SPRT match between the two binaries (ELOH.E migration; previously fastchess).
 - **Caching.** Built baselines are keyed by SHA; re-runs against the same baseline are free.
 - **Refactors don't need SPRT.** Functional equivalence is verified by `cargo test`; the deterministic `bench` UCI command (lands at M3.F) catches "did the search behavior accidentally change" in seconds. Reserve SPRT for changes that intend a strength delta or that touch search/eval where neutrality isn't trivially testable.
+
+### Compliance arm stays on fastchess
+
+`scripts/match.sh compliance` is the only flow that still calls fastchess. The fastchess `--compliance` UCI shake-out has no in-house substitute, so `scripts/install-fastchess.sh` remains the canonical bootstrap step for that one consumer. The in-tree `tests/uci_integration.rs` battery is the engine-side complement; it pins specific UCI invariants but doesn't substitute for the 40-step compliance walk.
 
 ### Baseline tag naming convention
 

@@ -2,12 +2,15 @@
 
 Industry-best-practice items surfaced during the 2026-04-27 workflow review but not yet adopted. **Listed in recommended implementation order** — pick from the top when the next slot opens for tooling work.
 
-### ~~Custom in-process Elo-iteration harness~~ — Done (ELOH.B, 2026-04-30)
+### ~~Custom in-process Elo-iteration harness~~ — Done (ELOH.B/C/D/E, 2026-04-30 / 2026-05-01)
 
-Landed as `src/bin/elo-iterate.rs` on branch `tooling/elo-harness`.
+Landed as `src/bin/elo-iterate.rs` on branches `tooling/elo-harness` (A/B/C), `tooling/eloh-d-mixed-tc` (D), `tooling/eloh-e-sprt` (E).
 
 - **ELOH.A** (harness foundation): persistent subprocesses, UCI driver, native adjudication, per-side clock management, color-paired match loop, PGN/summary output. ~2300 LOC + 139 tests.
 - **ELOH.B** (statistical layer): Robbins-Monro K-update at single-game cadence, σ-based stopping, N-parallel-pair concurrency via `std::thread` + `mpsc`, threshold adjudication (resign/draw/max-moves), convergence-progress output. Replaced `scripts/elo-iterate.sh` (now a thin wrapper) and `scripts/sprt.sh rating-estimate` arm (now routes through the binary).
+- **ELOH.C** (hardware-invariant TC): `VirtualClock` UCI option + harness `--virtual-clock` flag with handshake negotiation. ADR-0021.
+- **ELOH.D** (mixed-TC sampling): `--tc-sample <SPEC>` + `--seed N` for mixed-TC SPRT and Δ(TC) regression.
+- **ELOH.E** (in-process pentanomial-GSPRT): `mod sprt` (LLR + Wald bounds + pentanomial CI), `--sprt-elo0/elo1/alpha/beta` flags, per-worker pair-score buffers, run-end `sprt:` and `ci:` summary lines, `match.pgn` concatenation. `scripts/sprt.sh sprt|match` and `scripts/match.sh self-play|vs-stockfish` rewritten as harness wrappers; `scripts/match.sh compliance` keeps fastchess. ADR-0022.
 
 Usage: `cargo run --release --bin elo-iterate -- --engine <path> --opponent <path> --tc <TC> --max-games <N> --initial-elo <E> [...]`. See `--help` for all flags. `scripts/elo-iterate.sh` preserves the prior bash CLI surface as a wrapper.
 
@@ -25,6 +28,16 @@ Usage: `cargo run --release --bin elo-iterate -- --engine <path> --opponent <pat
 **When to land.** Earliest is alongside ELOH.C (which adds `--go-nodes` mode and would benefit from the same mock infrastructure for nodes-mode verification). Latest is before any future controller refactor that would invalidate the deferred-detection commitments documented in `.cargo/mutants.toml`.
 
 **Estimated cost vs. payoff.** The current deferral is acceptable because (a) the ELOH.B back-validation gate (Part 1: 120-game online run vs M3.F's ~2114 ± 2σ) catches dispatch-level structural bugs end-to-end; (b) a future controller refactor with real bugs is also catchable by ELOH.C's self-play stress under `--go-nodes`. The mock harness pays back when running mutation tests against the controller surface becomes cheap enough that catching boundary mutants surfaces small bugs early.
+
+### Split `src/bin/elo-iterate.rs` into a library + thin binary
+
+**Surfaced.** ELOH.E plan §11 file-size growth observation. After ELOH.E lands, `src/bin/elo-iterate.rs` is past 9000 lines (`mod cli` + `mod prng` + `mod tc_sample` + `mod driver` + `mod adjudicate` + `mod estimator` + `mod sigma` + `mod sprt` + `mod pgn` + `mod summary` + `mod progress` + `mod match_loop` + `mod controller` + `mod root_tests` + `mod e2e_smoke` all in one file). This is approaching the upper bound of comfortable single-file editing.
+
+**Scope.** Move the modules into `src/elo_iterate/<modname>.rs` files behind a `src/elo_iterate.rs` library crate; `src/bin/elo-iterate.rs` becomes a ~10-line entry point that calls `clawfish::elo_iterate::main()`. Test-site migrations across all of ELOH.A/B/C/D/E's existing tests would happen inside the same diff.
+
+**Why deferred.** Splitting it as part of ELOH.E would have inflated the unit's diff and forced churn across all the existing test files at the same time. A standalone refactor is reviewable on its own terms.
+
+**When to land.** Whenever the next contributor finds themselves frustrated by the file size. Not gating any milestone.
 
 ### ~~Per-game TC sampling for mixed-TC SPRT~~ — Done (ELOH.D, 2026-04-30)
 
