@@ -27,27 +27,25 @@ Per-unit `cargo mutants --in-diff` runs that are deferred from the unit's commit
 
 ## Pending
 
-### M4.B + M4.C + M4.D — Killer moves + History heuristic + Aspiration windows (joint campaign)
+### M4.B + M4.C + M4.D + M5.A — Killer moves + History + Aspiration + NMP (joint campaign)
 
-**Why combined:** M4.B and M4.C developed on parallel branches off M4.A; the user opted to defer their mutation campaigns and run them together as one overnight batch covering both diff ranges. M4.D landed on main after the M4.C merge; the user extended the deferral to include M4.D in the same batch. One single `cargo mutants --in-diff` invocation covers all three phases via the commit-range diff below.
+**Why combined:** M4.B and M4.C developed on parallel branches off M4.A; the user opted to defer their mutation campaigns and run them together as one overnight batch covering both diff ranges. M4.D landed on main after the M4.C merge; the user extended the deferral to include M4.D in the same batch. M5.A (NMP) landed on main after M4.D; per the M5.A plan §10 + ADR-0023, M5.A's mutants surface is appended to the same joint entry rather than scheduling a separate campaign.
 
 **Diff command** (resilient to working-tree state — uses commit hashes):
 
 ```sh
-git diff 33a0d0d..<m4.d-merge-sha> -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.bcd.diff"
+git diff 33a0d0d..<m5.a-merge-sha> -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4bcd-m5a.diff"
 ```
 
 - `33a0d0d` — M4.A follow-up (cargo-mutants survivors fix); M4.B's branching point on main and the joint range's start.
-- `<m4.d-merge-sha>` — the M4.D primary landing commit on main. Resolve at campaign-start time via `git rev-list --max-count=1 baseline/alpha-beta-tt-killer-history-aspiration` (the tag created at M4.D's merge commit) or `git log --grep='M4.D:' --max-count=1 --format='%H'`.
-- Pathspec `'src/*.rs' 'tests/*.rs'` — single-star glob (git pathspec doesn't expand `**`); restricts to the source + integration-test surface. M4.B + M4.C + M4.D modify `src/search.rs`, `src/history.rs` (new), `src/mov.rs`, `src/engine.rs`, `src/lib.rs`, `tests/uci_integration.rs` plus doc files; the doc files are out of scope for cargo-mutants.
+- `<m5.a-merge-sha>` — the M5.A primary landing commit on main. Resolve at campaign-start time via `git log --grep='M5.A:' --max-count=1 --format='%H'`.
+- Pathspec `'src/*.rs' 'tests/*.rs'` — single-star glob (git pathspec doesn't expand `**`); restricts to the source + integration-test surface. M4.B + M4.C + M4.D + M5.A modify `src/search.rs`, `src/history.rs` (new in M4.C), `src/mov.rs`, `src/movegen.rs` (M5.A `arb_position` lift), `src/position.rs` (M5.A delegators), `src/engine.rs`, `src/lib.rs`, `tests/uci_integration.rs` plus doc files; the doc files are out of scope for cargo-mutants.
 
 After landing the diff, run:
 
 ```sh
-cargo mutants --in-diff "$TMPDIR/m4.bcd.diff"
+cargo mutants --in-diff "$TMPDIR/m4bcd-m5a.diff"
 ```
-
-A tag-based regenerate is also available once `baseline/alpha-beta-tt-killer-history-aspiration` is in place: `git diff baseline/alpha-beta-tt..baseline/alpha-beta-tt-killer-history-aspiration -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.bcd.diff"`. Note that `baseline/alpha-beta-tt` points at `ecacf57` (M4.A landing, before the M4.A mutants follow-up), so a tag-baseline regenerate would also include `33a0d0d`'s S13 tightening + T20c boundary tests in the diff — wider than the M4.B+M4.C+M4.D-only surface above, but harmless.
 
 **Unit context** (read these before triaging):
 
@@ -61,6 +59,10 @@ A tag-based regenerate is also available once `baseline/alpha-beta-tt-killer-his
 - M4.D plan: [`docs/plans/m4.d.md`](plans/m4.d.md) — see §3 (helpers) and §11 (mutation-testing prep with anticipated catchable surface table).
 - M4.D research: [`docs/research/m4-aspiration-windows.md`](research/m4-aspiration-windows.md).
 - M4.D retrospective: [`docs/milestones/m4.d.md`](milestones/m4.d.md) — "Mutation-survivor analysis" section is the target for the post-triage update.
+- M5.A plan: [`docs/plans/m5.a.md`](plans/m5.a.md) — see §3 (NullUndo + helpers + NMP block pseudocode) and §10 (mutation-testing prep with anticipated catchable surface).
+- M5.A research: [`docs/research/m5-null-move-pruning.md`](research/m5-null-move-pruning.md).
+- M5.A ADR: [`docs/decisions/0023-null-move-pruning.md`](decisions/0023-null-move-pruning.md).
+- M5.A retrospective: [`docs/milestones/m5.a.md`](milestones/m5.a.md) — "Mutation-survivor analysis" section is the target for the post-triage update.
 - Code surface:
   - `src/search.rs` lines ~285 (killer field), ~870–945 (M4.B helpers), ~552–610 (negamax steps 10 + 11), ~320 / ~338 / ~426 (lifecycle reset call sites), the cutoff dispatch + `quiets_searched` accumulator + push site for M4.C, the aspiration-loop body in `Search::go` for M4.D (lines ~422–540), and the three M4.D helpers (`aspiration_window`, `widen_after_fail`, `extract_bestmove_or_tt_fallback`). Plus ~22 M4.B tests at S14–S29, ~16 M4.C tests at HS1–HS12 + HS3b/HS3c/HS4b/HS8b, and ~22 M4.D tests at AS1–AS24d (search for the `S14 —`, `HS1 —`, and `AS1 —` comment markers).
   - `src/history.rs` — the entire M4.C module + 12 H-tests.
@@ -134,6 +136,30 @@ A tag-based regenerate is also available once `baseline/alpha-beta-tt-killer-his
 | `aspiration_window` argument-order swap (depth vs prior) | call site in `Search::go` | AS3 / AS4 / AS5 must match exact prior×depth pairs |
 | `last_complete` snapshot bestmove source switched from helper to inline `(pv.lengths[0] > 0).then(...)` | call site at the snapshot line | AS24a–d (helper coverage) |
 
+**Anticipated catchable surface (M5.A portion, from M5.A plan §10):**
+
+| Mutation class | Where | Expected catch |
+|---|---|---|
+| `null_move_reduction` formula constants (`+ → -`, `* → /`, `1 → 2`) | `src/search.rs::null_move_reduction` body | 5 boundary tests at depths 3 / 5 / 6 / 11 / 12 (`null_move_reduction_at_depth_*`) |
+| `has_non_pawn_material` bitboard-union arms dropped/swapped | `src/search.rs::has_non_pawn_material` body | 5 fixture tests (`has_non_pawn_material_*`) including K-only, K+P, K+N, K+R |
+| Stacked-null flag inversion: NMP recursive `allow_null = false → true` | NMP block null-search call | `negamax_passes_allow_null_false_in_null_subsearch` direct kill via `nmp_firings == NMP_FIRINGS_PINNED = 34` |
+| NMP gate inversion (`&&` → `||`, `>=` → `>`, etc.) on the seven-condition gate | NMP block prologue | Seven sister-fixture gate-skip tests (`negamax_skips_nmp_when_*` + `negamax_skips_nmp_at_*`) |
+| Mate-cap inversion: `null_score >= MATE_IN_MAX_PLY` → `<` / `==` / `>` | NMP cutoff path | `negamax_caps_mate_score_to_beta_when_null_score_is_mate` (TT-seeded fixture); the `>=` → `>` BOUNDARY mutation at exact `MATE_IN_MAX_PLY = 29936` is **expected-survivor**: no chess fixture can produce that exact score (mate-in-MAX_PLY can't be searched). Documented as deferred / structurally-undetectable |
+| TT store bound inversion: `Bound::Lower` → `Upper` / `Exact` | NMP TT-store path | `negamax_stores_lower_bound_in_tt_after_nmp_cutoff` |
+| TT store best_move=0 inversion (would let NMP corrupt prior best_move) | NMP TT-store path | `negamax_with_nmp_preserves_existing_tt_best_move` (ADR-0018 §7 preservation rule) |
+| TT store score = `null_score` (raw) instead of `cutoff_score` (mate-capped) | NMP TT-store path | `negamax_caps_mate_score_to_beta_when_null_score_is_mate` (asserts returned == beta; mismatch on raw-store would fail) |
+| TT store depth = `depth - 1 - r` instead of `depth` | NMP TT-store path | `negamax_stores_lower_bound_in_tt_after_nmp_cutoff` (asserts `entry.depth == current_depth`) |
+| Halfmove-clock increment in `make_null_move`: `+ 1` → `+ 0` / `+ 2` | `src/mov.rs::make_null_move` | `null_move_increments_halfmove_clock` (sole test) |
+| Fullmove conditional: `if prior_side == Black` → `if prior_side == White` | `src/mov.rs::make_null_move` | `null_move_increments_fullmove_when_black_was_to_move` + `null_move_does_not_increment_fullmove_when_white_was_to_move` (paired tests cover both branches) |
+| EP clear: `pos.set_aux_state(..., None, ...)` → reuse prior EP | `src/mov.rs::make_null_move` | `null_move_clears_ep_target` |
+| Zobrist XOR omissions (missing turn_key or ep_file_key XOR) | `src/mov.rs::make_null_move` | `null_move_zobrist_*` tests + `null_move_zobrist_matches_from_scratch` round-trip |
+| `unmake_null_move` field-restore omissions | `src/mov.rs::unmake_null_move` | `unmake_null_move_round_trips_position` (Kiwipete) + `null_move_round_trip_property` (proptest via `arb_position`) + `unmake_null_move_round_trips_after_make_unmake_make` |
+| `negamax` `allow_null` propagation in move-loop recursive call (mistakenly `false`) | move-loop recursion site | `negamax_skips_nmp_when_allow_null_false` covers the gate-skip; an unintended `false` in the move-loop call would suppress NMP at descendants and produce different node counts vs the all-`true` baseline |
+| `ply > 0` gate inversion (NMP at root) | NMP gate prologue | `negamax_skips_nmp_at_ply_zero_even_when_is_pv_false` direct sister-fixture kill |
+| `nmp_firings += 1` deletion or replacement | NMP gate body | `negamax_passes_allow_null_false_in_null_subsearch` (counter assertion) |
+| `pos.unmake_null_move` deletion (forgotten unmake on abort path) | NMP block post-recursion | Existing `Search::go` post-search `debug_assert_eq!(pos_clone, *position)` (M3.E discipline; not M5.A test) — would trigger debug-build assert failure; release-mode survival depends on whether any test fixture aborts during NMP; classified at triage |
+| `self.history.push(pos.zobrist())` / `self.history.pop()` deletion | NMP block | `negamax_with_nmp_clears_history_correctly_on_unmake` (history-stack discipline) |
+
 **Triage protocol** (per `docs/workflow.md`):
 
 1. **Caught** — re-run `cargo test --lib <test_name>` to confirm; nothing to do.
@@ -145,21 +171,22 @@ Avoid `exclude_re` rules anchored to line numbers (per `.cargo/mutants.toml` gui
 
 ### Where the follow-up commit lands
 
-On `main` (M4.B + M4.C + M4.D will have merged by the time the campaign runs). The commit message follows the M4.A follow-up pattern (commit `33a0d0d`):
+On `main` (M4.B + M4.C + M4.D + M5.A will have merged by the time the campaign runs). The commit message follows the M4.A follow-up pattern (commit `33a0d0d`):
 
-> M4.B+M4.C+M4.D follow-up: address N cargo-mutants survivors
+> M4.B+M4.C+M4.D+M5.A follow-up: address N cargo-mutants survivors
 >
 > `cargo mutants --in-diff ...` produced K mutations: J caught + L
 > timeout (caught-via-hang) + M unviable + N missed. This commit addresses
 > all N: ...
 
-Update `docs/milestones/m4.b.md`'s, `docs/milestones/m4.c.md`'s, AND `docs/milestones/m4.d.md`'s "Mutation-survivor analysis" sections atomically with the commit. Remove this entry from the backlog.
+Update `docs/milestones/m4.b.md`'s, `docs/milestones/m4.c.md`'s, `docs/milestones/m4.d.md`'s, AND `docs/milestones/m5.a.md`'s "Mutation-survivor analysis" sections atomically with the commit. Remove this entry from the backlog.
 
 ### Edge cases
 
 - **If `cargo mutants` reports `unviable` for the M4.C `Move::default()` sentinel `debug_assert!`**: that's expected — the assertion is in a path movegen never produces, so no chess fixture can drive it. Classify as caught-via-unreachable; no action needed.
+- **If the M5.A mate-cap `>=` → `>` boundary at exact `MATE_IN_MAX_PLY = 29936` survives**: that's expected — no chess fixture can produce that exact score (mate-in-MAX_PLY can't be searched). Add `exclude_re` rule to `.cargo/mutants.toml` documenting the structural-undetectability per ADR-0023 §6 + plan §10's expected-survivor entry; surface in `docs/milestones/m5.a.md`'s "Mutation-survivor analysis" section.
 - **If the campaign hangs**: per `.cargo/mutants.toml` guidance, the timeout multiplier should be enough; if a specific mutation hangs the test suite, it's almost always the cancellation-poll cadence interacting with the mutated code. Cancel via Ctrl-C; the mutation is caught-via-timeout.
-- **If a survivor maps outside the M4.B/M4.C/M4.D surface** (i.e., a mutation on a line outside `src/search.rs` killer / history / aspiration logic, `src/history.rs`, `src/mov.rs::from_bits`, the M4.C-specific test surface, or the M4.D-specific test surface): something's off with the diff scope. Re-check that `33a0d0d..<m4.d-merge-sha>` is the correct hash range and that no drift commits have landed.
+- **If a survivor maps outside the M4.B/M4.C/M4.D/M5.A surface** (i.e., a mutation on a line outside `src/search.rs` killer / history / aspiration / NMP logic, `src/history.rs`, `src/mov.rs::from_bits` / null-move primitives, `src/movegen.rs::test_strategies` lift, `src/position.rs` delegators, the M4.C/M4.D/M5.A-specific test surface): something's off with the diff scope. Re-check that `33a0d0d..<m5.a-merge-sha>` is the correct hash range and that no drift commits have landed.
 
 ## Done
 

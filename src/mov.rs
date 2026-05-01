@@ -472,6 +472,33 @@ pub struct Undo {
 }
 
 // ---------------------------------------------------------------------------
+// NullUndo — token returned by `make_null_move` and consumed by
+// `unmake_null_move`.
+// ---------------------------------------------------------------------------
+
+/// Reversal token for a previous `make_null_move` call. Records only the
+/// fields a null move mutates and that aren't trivially derivable from the
+/// post-make state. Side-to-move is recoverable (XOR-flip); fullmove
+/// number is recoverable from the post-make side via the same pattern as
+/// `unmake_move` at `src/mov.rs:803` (`us == Black ⇒ decrement; else leave`).
+///
+/// Separate from `Undo` (which carries piece-capture + castling deltas)
+/// because no pieces move and no castling rights change — reusing `Undo`
+/// would carry irrelevant zeroed state and blur the call-site semantics.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct NullUndo {
+    /// En-passant target square before the null move, or `None` if EP was
+    /// unavailable. Null move always clears EP; `unmake_null_move` restores it.
+    pub prior_ep: Option<Square>,
+    /// Half-move clock value before the null move. Null move increments it;
+    /// `unmake_null_move` restores it.
+    pub prior_halfmove: u8,
+    /// Polyglot Zobrist hash of the position before the null move. Restored
+    /// directly by `unmake_null_move` (same structural guarantee as `Undo`).
+    pub prior_zobrist: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Castling-rights mask table (Decision §6).
 // ---------------------------------------------------------------------------
 
@@ -834,6 +861,110 @@ pub fn unmake_move(pos: &mut Position, mv: Move, undo: Undo) {
             "unmake restored static_eval disagrees with from_scratch",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// make_null_move / unmake_null_move (M5.A)
+// ---------------------------------------------------------------------------
+
+/// Apply a null move (pass the turn) to `pos`, returning a [`NullUndo`]
+/// sufficient to reverse the change.
+///
+/// State changes:
+/// - `side_to_move` flips.
+/// - `ep_target` clears (a null move forfeits any pending EP capture).
+/// - `halfmove_clock` increments by 1 (null is not a capture or pawn push).
+/// - `fullmove_number` increments iff `prior_side == Black`.
+/// - `zobrist` updates incrementally: XOR `turn_key()` AND XOR
+///   `ep_file_key(file)` for each `Some(file)` in
+///   `zobrist::ep_file_to_hash(pos)` BEFORE the EP clear.
+/// - `static_eval_white`, pieces, mailbox, king squares, castling: untouched.
+///
+/// **Trusts the caller** that `pos` is not in check — searching a null-move
+/// position when in check is undefined; NMP's gate must screen this out
+/// (ADR-0023 §5). Debug builds add a `from_scratch` Zobrist round-trip assert.
+pub fn make_null_move(pos: &mut Position) -> NullUndo {
+    let prior_ep = pos.ep_target();
+    let prior_halfmove = pos.halfmove_clock();
+    let prior_zobrist = pos.zobrist();
+    let prior_side = pos.side_to_move();
+
+    // Zobrist: XOR the EP key BEFORE clearing EP (EP key depends on
+    // side-to-move's pawns being adjacent to the EP square, which the
+    // pre-null state satisfies). Then XOR the turn key to flip side-to-move.
+    let mut new_zobrist = prior_zobrist;
+    if let Some(file) = zobrist::ep_file_to_hash(pos) {
+        new_zobrist ^= zobrist::ep_file_key(file);
+    }
+    new_zobrist ^= zobrist::turn_key();
+
+    let new_side = prior_side.flip();
+    let new_fullmove = if prior_side == Color::Black {
+        pos.fullmove_number() + 1
+    } else {
+        pos.fullmove_number()
+    };
+
+    pos.set_aux_state(
+        new_side,
+        pos.castling_rights(),
+        None, // EP always cleared
+        prior_halfmove.saturating_add(1),
+        new_fullmove,
+    );
+    pos.refresh_zobrist_from(new_zobrist);
+
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        pos.zobrist(),
+        zobrist::from_scratch(pos),
+        "make_null_move incremental zobrist disagrees with from_scratch",
+    );
+
+    NullUndo {
+        prior_ep,
+        prior_halfmove,
+        prior_zobrist,
+    }
+}
+
+/// Reverse a previous [`make_null_move`]. Restores all fields the make
+/// mutated. Debug builds assert the post-unmake Zobrist matches `from_scratch`.
+///
+/// The `us` side (the side that made the null move, i.e., the side-to-move
+/// BEFORE the null) is derived from the post-make `pos.side_to_move()`:
+/// after the null, side-to-move is the opponent, so `us = pos.side_to_move().flip()`
+/// (which equals the pre-null side). The fullmove decrement mirrors the
+/// pattern at `src/mov.rs:803` in `unmake_move`.
+pub fn unmake_null_move(pos: &mut Position, undo: NullUndo) {
+    // After make_null_move, pos.side_to_move() is the opponent of who made
+    // the null. The side that made the null (prior side) is:
+    let prior_side = pos.side_to_move().flip();
+
+    // Fullmove was incremented iff prior_side == Black; reverse that.
+    let restored_fullmove = if prior_side == Color::Black {
+        pos.fullmove_number() - 1
+    } else {
+        pos.fullmove_number()
+    };
+
+    pos.set_aux_state(
+        prior_side,
+        pos.castling_rights(),
+        undo.prior_ep,
+        undo.prior_halfmove,
+        restored_fullmove,
+    );
+    // Restore zobrist directly from undo — same structural guarantee as
+    // unmake_move: we captured prior_zobrist at make-time.
+    pos.refresh_zobrist_from(undo.prior_zobrist);
+
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        pos.zobrist(),
+        zobrist::from_scratch(pos),
+        "unmake_null_move restored zobrist disagrees with from_scratch",
+    );
 }
 
 /// Apply the incremental Zobrist delta after `make_move` has completed
@@ -3350,6 +3481,221 @@ mod tests {
                     depth,
                 );
             }
+        }
+    }
+
+    // =======================================================================
+    // M5.A — null-move primitive tests (§5.1 of docs/plans/m5.a.md).
+    // =======================================================================
+
+    // FEN for a position where it is Black's turn and EP is active on e3.
+    // Black pawn on d4 is adjacent to white's pawn on e4, so phantom-EP
+    // sanitization keeps the EP target.
+    const EP_AFTER_E4: &str = "rnbqkbnr/ppp1pppp/8/8/3pP3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 2";
+
+    // Kiwipete — rich middlegame position used for pieces/castling checks.
+    const KIWIPETE: &str = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+
+    #[test]
+    fn null_move_flips_side_to_move() {
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        assert_eq!(pos.side_to_move(), Color::White);
+        let _undo = make_null_move(&mut pos);
+        assert_eq!(pos.side_to_move(), Color::Black);
+    }
+
+    #[test]
+    fn null_move_clears_ep_target() {
+        let mut pos = Position::from_fen(EP_AFTER_E4).unwrap();
+        assert!(pos.ep_target().is_some(), "pre-condition: EP active");
+        let _undo = make_null_move(&mut pos);
+        assert_eq!(pos.ep_target(), None);
+    }
+
+    #[test]
+    fn null_move_increments_halfmove_clock() {
+        // Use a FEN where halfmove_clock = 5.
+        let mut pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 5 1",
+        )
+        .unwrap();
+        assert_eq!(pos.halfmove_clock(), 5);
+        let _undo = make_null_move(&mut pos);
+        assert_eq!(pos.halfmove_clock(), 6);
+    }
+
+    #[test]
+    fn null_move_increments_fullmove_when_black_was_to_move() {
+        // Black to move, fullmove = 7.
+        let mut pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R b KQkq - 0 7",
+        )
+        .unwrap();
+        assert_eq!(pos.fullmove_number(), 7);
+        let _undo = make_null_move(&mut pos);
+        assert_eq!(pos.fullmove_number(), 8);
+    }
+
+    #[test]
+    fn null_move_does_not_increment_fullmove_when_white_was_to_move() {
+        // White to move, fullmove = 7.
+        let mut pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 7",
+        )
+        .unwrap();
+        assert_eq!(pos.fullmove_number(), 7);
+        let _undo = make_null_move(&mut pos);
+        assert_eq!(pos.fullmove_number(), 7);
+    }
+
+    #[test]
+    fn null_move_does_not_change_pieces_or_castling() {
+        let mut pos = Position::from_fen(KIWIPETE).unwrap();
+        let snapshot = pos;
+
+        let _undo = make_null_move(&mut pos);
+
+        // All piece bitboards must be identical.
+        for kind in [
+            PieceKind::Pawn,
+            PieceKind::Knight,
+            PieceKind::Bishop,
+            PieceKind::Rook,
+            PieceKind::Queen,
+            PieceKind::King,
+        ] {
+            for color in [Color::White, Color::Black] {
+                assert_eq!(
+                    pos.pieces_colored(color, kind),
+                    snapshot.pieces_colored(color, kind),
+                    "{color:?} {kind:?} bitboard changed after null move"
+                );
+            }
+        }
+
+        // Mailbox must be identical.
+        for idx in 0u8..64 {
+            let sq = Square::new_unchecked(idx);
+            assert_eq!(
+                pos.piece_at(sq),
+                snapshot.piece_at(sq),
+                "mailbox at {sq:?} changed after null move"
+            );
+        }
+
+        // Castling rights must be unchanged.
+        assert_eq!(pos.castling_rights(), snapshot.castling_rights());
+    }
+
+    #[test]
+    fn null_move_does_not_change_static_eval_white() {
+        let mut pos = Position::from_fen(KIWIPETE).unwrap();
+        let pre_eval = pos.static_eval_white();
+        let _undo = make_null_move(&mut pos);
+        assert_eq!(pos.static_eval_white(), pre_eval);
+    }
+
+    #[test]
+    fn null_move_zobrist_xors_turn_key_when_no_active_ep() {
+        // Startpos has no EP target; only the turn key should be XORed.
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        assert!(
+            crate::zobrist::ep_file_to_hash(&pos).is_none(),
+            "pre-condition: no active EP"
+        );
+        let prior = pos.zobrist();
+        let _undo = make_null_move(&mut pos);
+        let expected = prior ^ crate::zobrist::turn_key();
+        assert_eq!(pos.zobrist(), expected);
+    }
+
+    #[test]
+    fn null_move_zobrist_xors_turn_key_and_ep_file_key_when_active_ep() {
+        // EP_AFTER_E4: black to move, EP on e3. ep_file_to_hash should
+        // return Some(4) (e-file = index 4) only if a black pawn capturer
+        // is adjacent. Startpos has no black pawn on d4 or f4, so the
+        // Polyglot pseudo-legal predicate returns None here. Use a position
+        // that has an adjacent pawn capturer.
+        //
+        // FEN: black to move after 1.e4, with a black pawn on d4 adjacent
+        // to white's e-pawn on e4 (capturer exists).
+        let fen = "rnbqkbnr/ppp1pppp/8/8/3pP3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 2";
+        let mut pos = Position::from_fen(fen).unwrap();
+        let ep_file = crate::zobrist::ep_file_to_hash(&pos);
+        // If for some reason no capturer is adjacent in this FEN, skip the
+        // EP-key part of this test (the from_scratch round-trip test below
+        // still covers correctness).
+        if let Some(file) = ep_file {
+            let prior = pos.zobrist();
+            let _undo = make_null_move(&mut pos);
+            let expected = prior ^ crate::zobrist::turn_key() ^ crate::zobrist::ep_file_key(file);
+            assert_eq!(pos.zobrist(), expected);
+        } else {
+            // Fall back to a position where we know a pawn is adjacent.
+            // "rnbqkbnr/pppp1ppp/8/8/4Pp2/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
+            // has a black pawn on f4 that can capture e.p. on e3.
+            let fen2 = "rnbqkbnr/pppp1ppp/8/8/4Pp2/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1";
+            let mut pos2 = Position::from_fen(fen2).unwrap();
+            let ep_file2 = crate::zobrist::ep_file_to_hash(&pos2)
+                .expect("fen2 must have pseudo-legal EP capturer on f4");
+            let prior2 = pos2.zobrist();
+            let _undo2 = make_null_move(&mut pos2);
+            let expected2 =
+                prior2 ^ crate::zobrist::turn_key() ^ crate::zobrist::ep_file_key(ep_file2);
+            assert_eq!(pos2.zobrist(), expected2);
+        }
+    }
+
+    #[test]
+    fn null_move_zobrist_matches_from_scratch() {
+        let mut pos = Position::from_fen(KIWIPETE).unwrap();
+        let _undo = make_null_move(&mut pos);
+        assert_eq!(pos.zobrist(), crate::zobrist::from_scratch(&pos));
+    }
+
+    #[test]
+    fn unmake_null_move_round_trips_position() {
+        let mut pos = Position::from_fen(KIWIPETE).unwrap();
+        let snapshot = pos;
+        let undo = make_null_move(&mut pos);
+        unmake_null_move(&mut pos, undo);
+        assert_eq!(
+            pos, snapshot,
+            "position not restored after make+unmake null"
+        );
+    }
+
+    #[test]
+    fn unmake_null_move_round_trips_after_make_unmake_make() {
+        let mut pos = Position::from_fen(KIWIPETE).unwrap();
+        let snapshot = pos;
+
+        // make → unmake → make → unmake — catches off-by-one on increment/decrement
+        let undo1 = make_null_move(&mut pos);
+        unmake_null_move(&mut pos, undo1);
+        let undo2 = make_null_move(&mut pos);
+        unmake_null_move(&mut pos, undo2);
+
+        assert_eq!(
+            pos, snapshot,
+            "position not restored after double make+unmake null"
+        );
+    }
+
+    // Property test: for arbitrary non-check positions, make_null_move +
+    // unmake_null_move restores the position byte-for-byte.
+    proptest! {
+        #[test]
+        fn null_move_round_trip_property(pos in crate::movegen::test_strategies::arb_position()) {
+            use crate::movegen::in_check;
+            prop_assume!(!in_check(&pos));
+            let snapshot = pos;
+            let mut mutable = pos;
+            let undo = make_null_move(&mut mutable);
+            unmake_null_move(&mut mutable, undo);
+            prop_assert_eq!(mutable, snapshot, "null move round-trip failed");
         }
     }
 }

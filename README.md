@@ -9,11 +9,12 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > per ply + history-rated quiets), butterfly history heuristic
 > (`[side][from][to]` i16; `+= depth*depth` bonus + matching malus),
 > two-tier asymmetric aspiration windows (±50 cp first try; depth ≥ 6),
+> null-move pruning (`R = 2 + depth/6`; seven-condition gate; mate-cap),
 > mate-distance pruning, PeSTO middlegame piece-square tables, and
 > `compute_caps`-driven time management. `bench` UCI command for
 > deterministic node-count regression baselines. The rest of the strength
-> path (PVS, NMP, LMR, futility; eval improvements; NNUE) is tracked in
-> [`docs/roadmap.md`](docs/roadmap.md).
+> path (RFP, LMR, futility, singular extensions; eval improvements; NNUE)
+> is tracked in [`docs/roadmap.md`](docs/roadmap.md).
 >
 > **Current strength: 2300–2531 Elo on Stockfish 18 UCI_LimitStrength scale,
 > varying with TC.** Direct rating estimates from the in-process ELOH
@@ -47,12 +48,12 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > Latest SPRT methodology + caveats:
 > [`bench/sprt/2026-04-30-m4.d-vs-history-mixed-tc.md`](bench/sprt/2026-04-30-m4.d-vs-history-mixed-tc.md).
 >
-> **Current bench:** `bench: 15863206 nodes <NPS> nps` at default depth 7
-> (M4.D end; node count is deterministic, NPS is wallclock-dependent).
-> Down from M4.C's 17,650,332 nodes — ~10% additional reduction from
-> aspiration windows tightening the iterative-deepening outer loop;
-> down from M3.F's 172,312,700 — ~91% cumulative reduction from
-> TT + killer + history + aspiration. Run
+> **Current bench:** `bench: 5345534 nodes <NPS> nps` at default depth 7
+> (M5.A end; node count is deterministic, NPS is wallclock-dependent).
+> Down from M4.D's 15,863,206 nodes — −66.3% additional reduction from
+> null-move pruning composing with M4's TT/killer/history/aspiration
+> ordering; down from M3.F's 172,312,700 — ~97% cumulative reduction
+> from TT + killer + history + aspiration + NMP. Run
 > `printf 'bench\nquit\n' | ./target/release/clawfish` to reproduce
 > the node count.
 
