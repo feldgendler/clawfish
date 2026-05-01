@@ -48,6 +48,15 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > Latest SPRT methodology + caveats:
 > [`bench/sprt/2026-04-30-m4.d-vs-history-mixed-tc.md`](bench/sprt/2026-04-30-m4.d-vs-history-mixed-tc.md).
 >
+> M5.A's mixed-TC SPRT vs the same M4.D baseline produced an extreme +400.00
+> Elo gain (pentanomial 95% CI [+285.52, +677.51]) in 22 games / 11 pairs,
+> with zero losses across all four TC buckets — a load-bearing positive
+> result, but the +400 magnitude exceeds the literature prior of +30–70 by
+> ~5×. The chained per-TC anchors above are pre-M5.A (M4.D-end direct
+> measurements); they will be re-measured at M5.A end via a follow-up
+> `scripts/sprt.sh rating-estimate` campaign.
+> [`bench/sprt/2026-05-01-m5.a-vs-aspiration-mixed-tc.md`](bench/sprt/2026-05-01-m5.a-vs-aspiration-mixed-tc.md).
+>
 > **Current bench:** `bench: 5345534 nodes <NPS> nps` at default depth 7
 > (M5.A end; node count is deterministic, NPS is wallclock-dependent).
 > Down from M4.D's 15,863,206 nodes — −66.3% additional reduction from
