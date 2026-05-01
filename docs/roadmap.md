@@ -218,7 +218,74 @@ A → B → C → D is sequential. B and C are conceptually independent each (se
 The descriptive slugs are long but consistent with the convention's behavior-descriptive rule; future readers parsing an SPRT log can read the engine's full search composition off the tag name without consulting the roadmap.
 
 ### M5 — Search advanced
-Null-move pruning, late move reductions, futility pruning, singular extensions, single-reply extension in qsearch (search the unique legal move when the not-in-check filter would otherwise return stand-pat — closes the M3.D horizon hole on legally-forced quiet moves), stalemate-conditional rook/bishop under-promotion in qsearch (after a queen-promo move, if the post-promo position has zero legal moves and is not in check, also search `RookPromo` / `BishopPromo` variants of the same move — closes the rare stalemate-avoidance under-promo case missed by M3.D's queen-only filter; knight-promo's fork-tactic motivation remains uncovered), **qsearch participation in TT** (deferred from M4.A — see the M4.A `Open: whether qsearch participates in TT` bullet for the +5–15 Elo gap and the "probe-but-don't-store" intermediate), **staged movegen** (lazy/incremental yield architecture replacing M4's full-generation score-then-select-sort: TT move yielded without generation, then captures generated lazily and yielded MVV-LVA-sorted, then killer slots with explicit legality check, then non-killer quiets generated lazily and yielded history-sorted; early cutoffs skip move generation entirely; +5–15 Elo prior over the simpler architecture, deferred to M5 to keep M4's per-phase ordering-quality SPRTs separable from generation-economy effects), and **third aspiration tier** (deferred from M4.D — explore an intermediate widening step between the M4.D first-try ±50 cp window and the asymmetric full-on-failure fallback. Conditional EV depends on TT priming yielding `c_intermediate < p · c_full_after_fail` ≈ 0.6 of a cold full search; tight margin per the 2026-04-30 walkthrough analysis. Run as a parameter A/B once the M4.D two-tier baseline has SPRT-validated and a window-width tune has settled the first-try half-width). Each gated by SPRT.
+Pruning and extension layer over M4's bookkeeping foundation (TT, killers, history, aspiration). Each piece individually SPRT-gated.
+
+**M4 vs. M5 dividing line (recap).** M4 was the *bookkeeping* layer — caches, ordering tables, window discipline. M5 is the *pruning / extension* layer — cutting and extending the search tree using M4's infrastructure as a substrate.
+
+**Exit criteria.**
+
+- Each phase commits its own SPRT-positive change vs. the prior phase's baseline tag, using `elo0=0, elo1=5` bounds at `tc=10+0.1` (or mixed-TC per ELOH.D + the M4.D mixed-TC precedent) per `docs/workflow.md` §SPRT. Per-phase plan picks fast-TC vs mixed-TC at planning time; the default for M5-class changes (deeper-search-amplifying) is mixed-TC.
+- Cumulative M5-vs-M4 fixed-game match at M5 close against `baseline/alpha-beta-tt-killer-history-aspiration` (the M4.D end tag) for rating-delta estimation. Documentation, not a gate.
+- `bench/m5.md` milestone summary per ADR-0010, recording per-phase deterministic `bench` node counts and SPRT/fixed-match deltas across the sub-phases.
+
+**Status — prior-art research pending.** Per-phase research notes will land before each phase enters plan mode (M4 precedent: a `research/m5-<topic>.md` brief per binding ADR). The Elo and LOC numbers in the sub-phase table below are CPW literature priors, not project-validated; treat as planning estimates only. The sub-phase decomposition itself is a planning artifact and may be revised when each phase's research lands.
+
+**ADRs likely to bind per-phase, as each lands.**
+
+- **NMP parameters + zugzwang policy.** Binds on M5.A.
+  - Open: depth-formula constants for `R = ...` (CPW workhorse: `R = 2 + depth/6` or similar log-style); zugzwang guard (skip when side-to-move has only K+P; prevent stacked nulls; minimum-depth and minimum-eval-margin gates).
+- **LMR reduction table + skip-list policy.** Binds on M5.C.
+  - Open: log-log table constants vs simple linear; per-move-class skip rules (TT/killer/in-check/checking-move/high-history); fail-high re-search depth.
+- **Singular extensions verification policy.** Binds on M5.G.
+  - Open: depth threshold; `β_singular` margin; bound-type gating (exact only vs lower-bound also); maximum extension stacking.
+- **Staged movegen iterator design.** Binds on M5.H.
+  - Open: stage state machine; legality-check placement (killer slots cross-position; quiets in-iteration); whether MVV-LVA captures yielded incrementally or as a sorted batch.
+
+(ADR numbers allocated at landing time; numeric slots may slide if other ADRs land sooner.)
+
+**Sub-phases.** M5 is decomposed into nine plan-and-execute cycles, sized to the workflow's 300–800 LOC unit target with ~500 typical (`docs/workflow.md` §"Unit sizing"). Each phase gets its own plan-mode pass with the self-review loop, runs an SPRT match against the previous phase's baseline tag, and lands its own commit(s). Suggested implementation order: **A → B → C → D → E → F → G → H**, with **I parallelizable** to any of them — see "Parallelization" below.
+
+| Phase | Scope | Approx size |
+|---|---|---|
+| **M5.A** — Null-move pruning | `null_move_search` helper at non-PV interior nodes; static-eval-vs-β gate + zugzwang guard (skip when side-to-move has only K+P; disable stacked nulls); depth-reduction `R = 2 + depth/6` (CPW workhorse default, SPRT-tune); β-cutoff on `−null_search ≥ β`. Adjusts `negamax` prologue between MDP and TT probe (probe-order pinned by ADR-0018). Expected +30–70 Elo (CPW prior). | ~300 |
+| **M5.B** — Reverse futility / static null-move pruning | Cheap β-cutoff at non-PV shallow depths when `static_eval − margin·depth ≥ β`. Per-depth margin table tuned (CPW: 100/150/250 cp at d=1/2/3). Composes additively with M5.A's free-move recursion. **Bundle candidate:** if M5.A's research finds RFP and NMP cleanly separable in code (different depth ranges, distinct SPRT signals), keep separate; otherwise fold into M5.A as a single "early β-cutoff layer" phase. Decision at M5.A plan time. Expected +20–50 Elo standalone. | ~150 |
+| **M5.C** — Late move reductions | Per-quiet-move depth reduction `R = base + log(depth)·log(move_index)/divisor` (Stockfish-style log-log table, tune from CPW defaults); re-search at full depth on fail-high; reduction skipped for TT-move, killers, in-check, and high-history quiets. Per-ply `quiets_searched` already in place from M4.C. Expected +50–100 Elo. | ~350 |
+| **M5.D** — Frontier futility pruning | Skip quiet moves at `depth ≤ 2` when `static_eval + margin·depth < α`; per-depth margin table tuned (CPW: 100/150/250 cp at d=1/2/3). Layered into the per-quiet-move decision next to M5.C's reduce/skip choice. Expected +20–40 Elo. | ~200 |
+| **M5.E** — Qsearch correctness | Single-reply extension when the legal-move filter would otherwise return stand-pat (closes the M3.D horizon hole on legally-forced quiet moves); stalemate-conditional rook/bishop under-promo (after a queen-promo with zero legal replies and not in check, also search `RookPromo` / `BishopPromo` variants of the same move — closes the rare stalemate-avoidance under-promo case missed by M3.D's queen-only filter; knight-promo's fork-tactic motivation remains uncovered). Both touch `qsearch`; bundled because each is < 100 LOC standalone. SPRT signal expected small (<10 Elo combined); primary motivation is correctness + must land **before** M5.F so the TT doesn't memoize qsearch holes. | ~200 |
+| **M5.F** — Qsearch in TT | Probe + (optionally) store inside `qsearch`, with mate-score adjustment from ADR-0018 §3 unchanged. Plan-time decision: full probe-and-store vs the M4.A "probe-but-don't-store" intermediate noted in the M4.A open-questions list. Closes the +5–15 Elo gap deferred from M4.A. | ~400 |
+| **M5.G** — Singular extensions | At non-PV nodes with TT exact bound and sufficient depth, run a verification search at `(β_singular − 1, β_singular)` excluding the TT move; if every other move fails low, extend the TT move by 1. Reads `bestmove` + `bound` + `depth` from the TT entry preserved per ADR-0018 §7. Expected +10–30 Elo. | ~400 |
+| **M5.H** — Staged movegen | Lazy/incremental yield architecture replacing M4's full-generation-then-sort: `MoveStager` iterator yields TT move (no generation) → captures (generated lazily, MVV-LVA-sorted) → killer slots (with explicit legality check, since killers are cross-position) → non-killer quiets (generated lazily, history-sorted). Early cutoffs skip generation entirely. Expected +5–15 Elo. Deferred to M5 to keep M4's per-phase ordering-quality SPRTs separable from generation-economy effects. **May split into H1 (behaviour-equivalent refactor, bench-neutral verification) + H2 (enable lazy generation + cutoff-before-generation, SPRT-gated)** if H lands above ~700 LOC at plan time. | ~600 (or ~400 + ~300) |
+| **M5.I** — Third aspiration tier | Intermediate widening step between M4.D's ±50 cp first try and the asymmetric full-on-failure fallback. Conditional EV depends on TT priming yielding `c_intermediate < p · c_full_after_fail` ≈ 0.6 of a cold full search; tight margin per the 2026-04-30 walkthrough analysis. Run as a parameter A/B once the M4.D two-tier baseline has SPRT-validated and a window-width tune has settled the first-try half-width. Touches only `aspiration_window` / `widen_after_fail`. SPRT may come back inconclusive; that's an expected outcome and lands as a no-change retrospective rather than a failure. Deferred from M4.D. | ~150 + tune |
+
+**Sequencing rationale.** A → B → C → D → E → F → G → H prioritises biggest-Elo-first (NMP, LMR), keeps qsearch work (E, F) downstream of pruning so qsearch-in-TT measures against a stable cutoff regime, places singular extensions after qsearch-in-TT to read stable scores, and lands the staged-movegen refactor last since it touches `order_moves` and the move-loop iterator surface — running the refactor on a moving target multiplies churn. M5.I is parallelizable to any phase: it's isolated to the ID outer loop and conflicts with no negamax-body changes.
+
+**Parallelization opportunities.**
+
+- **Research and planning fan out freely.** SPRT gates are inherently sequential (each phase needs a stable predecessor baseline tag, and SPRT wallclock is ~10 hours mixed-TC), but the upstream `research → plan → tests` work for downstream phases can run concurrently with earlier phases' implementation and SPRT runs. Concretely: while M5.A is in SPRT, kick off M5.B research + plan-mode in parallel.
+- **Phases with no code-region overlap can be implemented in parallel.** M5.I (aspiration tier) is fully isolated from the negamax body. M5.E (qsearch correctness) and any negamax-body phase don't conflict in code surface.
+- **Phases with code-region overlap must sequence:**
+  - **A, B** both add prologue guards in `negamax` between MDP and TT probe.
+  - **C, D** both modify the per-quiet-move decision in the move loop.
+  - **E, F** both edit `qsearch`.
+  - **G** lives at the top of `negamax` for non-PV interior nodes — coupled to TT-entry quality, so land after F.
+  - **H** refactors `order_moves` and the move-loop iterator surface — conflicts with effectively all of A–G.
+- **Practical recommendation:** process the SPRT chain serially A–H to keep Elo attribution clean and minimise merge churn against `order_moves`. Plan and write tests for I, E, and one of {A, B} concurrently with earlier phases' SPRT runs so the agent isn't idle during long SPRT wallclock.
+
+**Baseline tags expected** (one per phase boundary; created at the close of the named phase, per `docs/workflow.md` §"Baseline tag naming convention"). The compounding-descriptive-slug convention from M1–M4 is getting unwieldy by M5; the per-phase landing may switch to a shorter `baseline/m5<letter>-<feature>` form. Either is acceptable; the plan call at the first SPRT-landing phase decides for the milestone.
+
+| Tag | Marks |
+|---|---|
+| `baseline/alpha-beta-tt-killer-history-aspiration` | M4.D end. Reference for M5.A's SPRT. |
+| (M5.A end) | Reference for M5.B's SPRT. (Skipped if B folds into A per M5.B's bundle decision.) |
+| (M5.B end) | Reference for M5.C's SPRT. |
+| (M5.C end) | Reference for M5.D's SPRT. |
+| (M5.D end) | Reference for M5.E's SPRT. |
+| (M5.E end) | Reference for M5.F's SPRT. |
+| (M5.F end) | Reference for M5.G's SPRT. |
+| (M5.G end) | Reference for M5.H's SPRT. |
+| (M5.H end) | Reference for M6's first SPRT (and for M5.I if scheduled after H). |
+
+(M5.I's predecessor baseline is whichever phase precedes it in actual landing order — flexible because of its isolation. Its closing tag exists only if M5.I's SPRT accepts; an inconclusive M5.I lands as a no-change retrospective with no new tag.)
 
 ### M6 — Eval improvements
 Tapered eval, pawn structure, king safety, mobility, passed pawn evaluation. Texel-tuned where possible.
