@@ -15,20 +15,35 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > path (PVS, NMP, LMR, futility; eval improvements; NNUE) is tracked in
 > [`docs/roadmap.md`](docs/roadmap.md).
 >
-> **Current strength: ~2962 Elo on a mixed game (uniform over tc ∈
-> {10+0.1, 20+0.2, 40+0.4, 60+0.6})** (chained estimate: M3.F's ~2114
-> anchor at tc=10+0.1 + M4.A's measured Δ +282 + M4.B's measured Δ +488
-> + M4.C's measured Δ +36 at tc=60+0.6 + M4.D's measured Δ +42 at
-> mixed-TC). Apple M4 P-cores, single thread, no pondering, ±~160 Elo
-> combined uncertainty. The chained estimate sits in the upper end of
-> the "fast-TC amplifies ordering gains" band; actual strength against
-> calibrated opponents at slow TC may be 100–200 Elo lower. M4.D's
-> mixed-TC SPRT vs `baseline/alpha-beta-tt-killer-history` is the
-> load-bearing M4.D measurement: 138-90-172 in 400 games / 200 pairs,
-> Δ +41.9 Elo with pentanomial 95% CI [+18.2, +65.6], `Ptnml(0-2) =
-> [5, 40, 78, 56, 21]`. The fast-TC-only run at threshold=6 (+65.9 ±
-> 26.5 Elo, run 3 of the M4.D fast-TC SPRT log) cross-validates the
-> 10+0.1 bucket within ~1σ.
+> **Current strength: 2300–2531 Elo on Stockfish 18 UCI_LimitStrength scale,
+> varying with TC.** Direct rating estimates from the in-process ELOH
+> harness (Robbins-Monro iteration of Stockfish's `UCI_Elo` to parity):
+>
+> | TC | Elo | σ | Games | W-L-D |
+> |---|---|---|---|---|
+> | 10+0.1 | 2300 | ±12 | 54 | 24-22-8 |
+> | 20+0.2 | 2466 | ±8 | 64 | 35-20-9 |
+> | 40+0.4 | 2531 | ±9 | 78 | 32-36-10 |
+> | 60+0.6 | 2483 | ±13 | 70 | 26-34-10 |
+>
+> Apple M4 P-cores (utility QoS), single thread, no pondering, virtual
+> clock on clawfish. Methodology + per-trajectory consistency checks:
+> [`bench/sprt/2026-05-01-m4.d-per-tc-rating-estimate.md`](bench/sprt/2026-05-01-m4.d-per-tc-rating-estimate.md).
+>
+> The TC-to-Elo curve is not monotonic at the slow end (60+0.6 < 40+0.4
+> by ~48 Elo, within combined ~2σ noise) — Stockfish's UCI_LimitStrength
+> reduction mechanism saturates with TC differently than full Stockfish,
+> so per-TC numbers are not directly comparable across TCs. **These
+> direct measurements are substantially below the previously-reported
+> chained estimate of ~2962 mixed-TC** (M3.F's 2114 anchor + M4 SPRT Δs
+> summed). The discrepancy is explained by Stockfish UCI_Elo
+> non-linearity in the 2200-2400 transition zone (flagged in the M3.F
+> anchor doc): chaining clawfish-vs-clawfish Δ-SPRTs onto an anchor below
+> the zone compounds calibration error. The within-project Δ-SPRTs
+> (M4.A–M4.D) remain trustworthy as relative measurements; the
+> load-bearing M4.D SPRT vs `baseline/alpha-beta-tt-killer-history`
+> stands at 138-90-172 in 400 games / 200 pairs, Δ +41.9 Elo with
+> pentanomial 95% CI [+18.2, +65.6], `Ptnml(0-2) = [5, 40, 78, 56, 21]`.
 > Latest SPRT methodology + caveats:
 > [`bench/sprt/2026-04-30-m4.d-vs-history-mixed-tc.md`](bench/sprt/2026-04-30-m4.d-vs-history-mixed-tc.md).
 >
