@@ -4,7 +4,7 @@ Milestone plan. Update as we complete or revise.
 
 ## Status
 
-**M1 complete; M2 complete; M3 complete; M4 complete — aspiration windows landed at M4.D. ELOH tooling milestone complete (ELOH.A–ELOH.E). M5 (search-advanced: NMP / LMR / futility / staged movegen / qsearch-in-TT / third aspiration tier) is next.**
+**M1 complete; M2 complete; M3 complete; M4 complete; M5.A complete — null-move pruning landed 2026-05-01. ELOH tooling milestone complete (ELOH.A–ELOH.E). M5.B (RFP / reverse-futility) is next.**
 
 For per-phase retrospectives (what landed, implementation highlights, verification numbers), see [`milestones/`](milestones/). The latest landed strength phase is M4.D (aspiration windows); M4.C's retrospective is at [`milestones/m4.c.md`](milestones/m4.c.md). The latest landed tooling phase is ELOH.E (in-process pentanomial-GSPRT + fastchess deprecation, retained only for `--compliance` — closes the ELOH milestone).
 
@@ -247,7 +247,7 @@ Pruning and extension layer over M4's bookkeeping foundation (TT, killers, histo
 
 | Phase | Scope | Approx size |
 |---|---|---|
-| **M5.A** — Null-move pruning | `null_move_search` helper at non-PV interior nodes; static-eval-vs-β gate + zugzwang guard (skip when side-to-move has only K+P; disable stacked nulls); depth-reduction `R = 2 + depth/6` (CPW workhorse default, SPRT-tune); β-cutoff on `−null_search ≥ β`. Slots into the `negamax` prologue **after** the TT probe + cutoff check, before the move loop — preserving ADR-0018's pinned order (repetition/50-move → MDP tighten → TT probe → bound comparison → cutoff-or-fall-through). Adds a static-eval read (M3.A's incremental `static_eval_white` field, sign-flipped for STM) between the TT cutoff check and the NMP gate; this is the first prologue static-eval consumer (M5.B/M5.D will reuse it). Expected +30–70 Elo (CPW prior). | ~300 |
+| **M5.A** ✓ — Null-move pruning | `make_null_move` / `unmake_null_move` in `src/mov.rs` + `NullUndo` (prior_ep + prior_halfmove + prior_zobrist; fullmove derived from post-make STM per the `unmake_move:803` precedent). Seven-condition gate (`ply > 0`, `allow_null`, `!is_pv`, `depth >= 3`, `!in_check`, `has_non_pawn_material`, `static_eval >= beta`); reduction `R = 2 + depth/6` via `null_move_reduction(depth)` helper; mate-cap on cutoff (`null_score >= MATE_IN_MAX_PLY → beta`); TT store as `Bound::Lower` at current depth with `best_move = 0` and mate-capped score. Slots into the `negamax` prologue between TT probe + cutoff (step 7) and movegen (step 9) as new step 8. Static-eval read is **lazy** (inside the gate, after `has_non_pawn_material` passes) — first negamax static-eval consumer; M5.B/RFP may hoist when its plan lands. `negamax` signature gains `allow_null: bool` after `is_pv` (~45 call sites mechanically migrated). `#[cfg(test)] nmp_firings` counter on `AlphaBetaMover` for the stacked-null direct-kill test. ADR-0023. Bench: `bench: 5345534 nodes <NPS> nps` (-66.3% vs M4.D). SPRT vs `baseline/alpha-beta-tt-killer-history-aspiration` deferred to user-scheduled mixed-TC campaign. Retrospective: [`milestones/m5.a.md`](milestones/m5.a.md). | ~300 (actual ~1100 incl. 23 new tests) |
 | **M5.B** — Reverse futility / static null-move pruning | Cheap β-cutoff at non-PV shallow depths when `static_eval − margin·depth ≥ β`. Per-depth margin table tuned (CPW: 100/150/250 cp at d=1/2/3). Composes additively with M5.A's free-move recursion. **Bundle candidate:** if M5.A's research finds RFP and NMP cleanly separable in code (different depth ranges, distinct SPRT signals), keep separate; otherwise fold into M5.A as a single "early β-cutoff layer" phase. Decision at M5.A plan time. Expected +20–50 Elo standalone. | ~150 |
 | **M5.C** — Late move reductions | Per-quiet-move depth reduction `R = base + log(depth)·log(move_index)/divisor` (Stockfish-style log-log table, tune from CPW defaults); re-search at full depth on fail-high; reduction skipped for TT-move, killers, in-check, and high-history quiets. Per-ply `quiets_searched` already in place from M4.C. Expected +50–100 Elo. | ~350 |
 | **M5.D** — Frontier futility pruning | Skip quiet moves at `depth ≤ 2` when `static_eval + margin·depth < α`; per-depth margin table tuned (CPW: 100/150/250 cp at d=1/2/3). Layered into the per-quiet-move decision next to M5.C's reduce/skip choice. Expected +20–40 Elo. | ~200 |
@@ -275,8 +275,8 @@ Pruning and extension layer over M4's bookkeeping foundation (TT, killers, histo
 
 | Tag | Marks |
 |---|---|
-| `baseline/alpha-beta-tt-killer-history-aspiration` | M4.D end. Reference for M5.A's SPRT. |
-| (M5.A end) | Reference for M5.B's SPRT. (Skipped if B folds into A per M5.B's bundle decision.) |
+| `baseline/alpha-beta-tt-killer-history-aspiration` | M4.D end. Reference for M5.A's SPRT (deferred). |
+| `baseline/alpha-beta-tt-killer-history-aspiration-nmp` (or shorter `baseline/m5a-nmp`) | M5.A end (commit pending; baseline tag created post-SPRT-validation). Reference for M5.B's SPRT. M5.A research §13 resolved the bundle question: keep M5.A and M5.B separate (independent SPRT signals; sequential `if` blocks share only `static_eval`). |
 | (M5.B end) | Reference for M5.C's SPRT. |
 | (M5.C end) | Reference for M5.D's SPRT. |
 | (M5.D end) | Reference for M5.E's SPRT. |

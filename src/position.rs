@@ -529,6 +529,20 @@ impl Position {
         crate::mov::unmake_move(self, mv, undo)
     }
 
+    /// Apply a null move (pass the turn) to `self`, returning a
+    /// [`NullUndo`](crate::mov::NullUndo) token sufficient to reverse the
+    /// change. Equivalent to
+    /// [`crate::mov::make_null_move(self)`](crate::mov::make_null_move).
+    pub fn make_null_move(&mut self) -> crate::mov::NullUndo {
+        crate::mov::make_null_move(self)
+    }
+
+    /// Reverse a previous [`make_null_move`](Self::make_null_move). Equivalent
+    /// to [`crate::mov::unmake_null_move(self, undo)`](crate::mov::unmake_null_move).
+    pub fn unmake_null_move(&mut self, undo: crate::mov::NullUndo) {
+        crate::mov::unmake_null_move(self, undo)
+    }
+
     pub(crate) fn validate_post_parse(&self) -> Result<(), FenError> {
         let white_kings = self.pieces_colored(Color::White, PieceKind::King).count();
         match white_kings {

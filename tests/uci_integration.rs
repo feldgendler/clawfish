@@ -787,3 +787,91 @@ fn bench_signature_deterministic_across_two_runs_with_aspiration() {
          start state from reset_for_new_game); got {nodes1} vs {nodes2}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// E48 — bench is deterministic across two consecutive runs in the same
+// engine session with M5.A null-move pruning active (re-pin of the M3.F /
+// M4.A / M4.C / M4.D determinism contract).
+// ---------------------------------------------------------------------------
+
+/// `bench / bench` from a single engine subprocess must produce the same
+/// total node count both times, even with NMP cutting branches inside
+/// negamax. NMP itself doesn't introduce any non-determinism — its gate
+/// reads pure functions of `Position` (zobrist, side_to_move, in_check,
+/// has_non_pawn_material, static_eval_white) and its TT store + ADR-0018
+/// §7's preservation rule keeps ordering hints deterministic across runs.
+/// Per-position `reset_for_new_game()` continues to clear all per-game
+/// state (TT + game_history + killers + history table) so iteration 1 of
+/// position N starts from the same state regardless of whether earlier
+/// positions ran in the same session.
+#[test]
+fn bench_signature_deterministic_across_two_runs_with_nmp() {
+    let mut child = spawn_engine();
+    let stdout = child.stdout.take().expect("stdout handle");
+    let line_rx = drain_stdout(stdout);
+
+    let mut stdin = child.stdin.take().expect("stdin handle");
+    // E48 uses `bench 4` to keep the test wallclock low; the determinism
+    // contract holds at every depth (the default-depth signature is exercised
+    // by `bench/m5.md`). E46's 60-second per-run timeout pattern is preserved.
+    stdin.write_all(b"bench 4\nbench 4\n").unwrap();
+
+    let mut lines: Vec<String> = Vec::new();
+    let bench_deadline_1 = Instant::now() + Duration::from_secs(60);
+    wait_for_line_starting_with(
+        &line_rx,
+        "info string bench: ",
+        bench_deadline_1,
+        &mut lines,
+    );
+    let bench_deadline_2 = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < bench_deadline_2 {
+        match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                let matched = line.starts_with("info string bench: ");
+                lines.push(line);
+                if matched {
+                    break;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    stdin.write_all(b"quit\n").unwrap();
+    drop(stdin);
+
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    let exited = wait_for_exit(&mut child, exit_deadline);
+    lines.extend(collect_lines(&line_rx));
+    let output = lines.join("\n");
+
+    assert!(exited, "E48: engine did not exit within 5 s after quit");
+
+    let signatures: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("info string bench: "))
+        .collect();
+    assert_eq!(
+        signatures.len(),
+        2,
+        "E48: expected exactly two bench signature lines; got {}.\nfull output:\n{output}",
+        signatures.len()
+    );
+
+    let parse_nodes = |sig: &str| -> u64 {
+        let rest = sig.strip_prefix("info string bench: ").unwrap();
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        assert_eq!(parts.len(), 4, "E48: signature shape wrong; {sig:?}");
+        parts[0].parse::<u64>().expect("E48: nodes must parse")
+    };
+    let nodes1 = parse_nodes(signatures[0]);
+    let nodes2 = parse_nodes(signatures[1]);
+    assert_eq!(
+        nodes1, nodes2,
+        "E48: bench node counts must match across two runs in the same session \
+         with NMP active (NMP gate is a pure function of Position; its TT store \
+         + ADR-0018 §7 preservation rule keeps ordering deterministic); \
+         got {nodes1} vs {nodes2}"
+    );
+}

@@ -58,29 +58,19 @@ pub fn in_check(pos: &Position) -> bool {
     !masks::checkers_of(pos, us, king_sq, pos.occupied_all()).is_empty()
 }
 
+/// Test-only helpers for constructing arbitrary `Position` values via a
+/// random walk from seed FENs. Exposed as `pub(crate)` so that other test
+/// modules (e.g. `src/mov.rs::tests`) can import `arb_position` without
+/// duplicating the strategy.
 #[cfg(test)]
-mod tests {
-    //! Crate-private property tests for `generate_moves`.
-    //!
-    //! Property tests that need access to `checkers_of` (which is
-    //! `pub(crate)`) live here, not in `tests/movegen.rs`. The integration
-    //! test crate cannot see crate-private symbols.
-    //!
-    //! Tests will be RED until the M1.F implementation pass lands; that's
-    //! the project's TDD posture.
-
-    use super::*;
-    use crate::mov::Move;
-    use crate::movegen::masks::checkers_of;
-    use crate::piece::Color;
-
+pub(crate) mod test_strategies {
+    use crate::movegen::{MoveList, generate_moves};
+    use crate::position::Position;
     use proptest::prelude::*;
 
     /// Edge-class seed FENs from `docs/research/m1-engine-architecture.md`
-    /// §6 plus the canonical 6 perft positions. The strategy below walks
-    /// 0..50 random legal plies from one of these seeds, returning the
-    /// reached `Position`.
-    const SEED_FENS: &[&str] = &[
+    /// §6 plus the canonical 6 perft positions.
+    pub(crate) const SEED_FENS: &[&str] = &[
         // Canonical 6.
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
@@ -97,7 +87,7 @@ mod tests {
 
     /// Tiny SplitMix64 — deterministic PRNG. Used to drive a random walk
     /// from a seed FEN through legal moves.
-    fn next_u64(state: &mut u64) -> u64 {
+    pub(crate) fn next_u64(state: &mut u64) -> u64 {
         *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = *state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -107,7 +97,7 @@ mod tests {
 
     /// Random-walk a Position from a seed FEN. Picks legal moves from the
     /// `generate_moves` output. Stops early on mate/stalemate.
-    fn walk(seed: &str, walk_len: usize, rng_seed: u64) -> Position {
+    pub(crate) fn walk(seed: &str, walk_len: usize, rng_seed: u64) -> Position {
         let mut pos = Position::from_fen(seed).expect("seed FEN must parse");
         let mut state = rng_seed.wrapping_add(1);
         for _ in 0..walk_len {
@@ -123,10 +113,32 @@ mod tests {
         pos
     }
 
-    fn arb_position() -> impl Strategy<Value = Position> {
+    /// Proptest strategy that produces arbitrary `Position` values by
+    /// walking 0–50 random legal plies from one of the seed FENs.
+    pub(crate) fn arb_position() -> impl Strategy<Value = Position> {
         (0..SEED_FENS.len(), 0usize..50, any::<u64>())
             .prop_map(|(idx, walk_len, rng_seed)| walk(SEED_FENS[idx], walk_len, rng_seed))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Crate-private property tests for `generate_moves`.
+    //!
+    //! Property tests that need access to `checkers_of` (which is
+    //! `pub(crate)`) live here, not in `tests/movegen.rs`. The integration
+    //! test crate cannot see crate-private symbols.
+    //!
+    //! Tests will be RED until the M1.F implementation pass lands; that's
+    //! the project's TDD posture.
+
+    use super::test_strategies::*;
+    use super::*;
+    use crate::mov::Move;
+    use crate::movegen::masks::checkers_of;
+    use crate::piece::Color;
+
+    use proptest::prelude::*;
 
     proptest! {
         /// Per ADR-0007 §"Why legal-direct": `generate_moves` emits the

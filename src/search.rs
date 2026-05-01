@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::history::{HistoryTable, MAX_HISTORY};
 use crate::tt::{TranspositionTable, TtBound, TtData, score_from_tt, score_to_tt};
-use crate::{Color, Move, Position};
+use crate::{Color, Move, PieceKind, Position};
 
 // ---------------------------------------------------------------------------
 // ELOH.C — VirtualClock UCI option: SearchInstant + SearchClock + libc shim.
@@ -425,6 +425,18 @@ const ASPIRATION_MIN_DEPTH: u32 = 6;
 /// over ±25 / ±75 / ±100.
 const ASPIRATION_HALF_WIDTH: i32 = 50;
 
+/// Minimum depth at which NMP is attempted. Below this, the null-search's
+/// `depth - 1 - R` would be ≤ 0, dispatching to qsearch — defeating the
+/// cost/benefit calculation. ADR-0023 §2.
+pub(crate) const NMP_MIN_DEPTH: u32 = 3;
+
+/// NMP base reduction: `R = NMP_BASE_R + depth / NMP_DEPTH_DIVISOR`.
+/// CPW workhorse default. ADR-0023 §1.
+pub(crate) const NMP_BASE_R: u32 = 2;
+
+/// NMP depth divisor in the reduction formula. ADR-0023 §1.
+pub(crate) const NMP_DEPTH_DIVISOR: u32 = 6;
+
 /// Construct the "iteration-1 aborted before any root improvement" fallback
 /// result for `Search::go` (M3.E).
 ///
@@ -539,6 +551,26 @@ fn extract_bestmove_or_tt_fallback(
     Some(Move::from_bits(entry.best_move))
 }
 
+/// NMP depth reduction. Returns `NMP_BASE_R + depth / NMP_DEPTH_DIVISOR`
+/// (= `2 + depth/6`). Pure function. Extracted as a named helper so
+/// mutations on the formula constants are directly unit-testable
+/// (M3.D `negate_window` precedent).
+pub(crate) fn null_move_reduction(depth: u32) -> u32 {
+    NMP_BASE_R + depth / NMP_DEPTH_DIVISOR
+}
+
+/// True iff `side` has at least one non-pawn, non-king piece on the board.
+/// NMP zugzwang guard (ADR-0023 §4): zugzwang is dominantly a K+P-ending
+/// phenomenon, so the presence of any minor or major piece reduces
+/// zugzwang risk to near-zero.
+pub(crate) fn has_non_pawn_material(pos: &Position, side: Color) -> bool {
+    let pieces = pos.pieces_colored(side, PieceKind::Knight)
+        | pos.pieces_colored(side, PieceKind::Bishop)
+        | pos.pieces_colored(side, PieceKind::Rook)
+        | pos.pieces_colored(side, PieceKind::Queen);
+    !pieces.is_empty()
+}
+
 /// Triangular PV table. Holds the best line found at each ply.
 ///
 /// `moves[ply]` is a slot-array; `lengths[ply]` is how many moves are populated.
@@ -608,6 +640,12 @@ pub(crate) struct AlphaBetaMover {
     /// `go` invocations within a game. Cleared by `Search::reset()` (called
     /// from `Engine::reset_for_new_game()` on `ucinewgame` and per bench position).
     history_table: HistoryTable,
+    /// M5.A: per-`go` count of NMP firings (number of times the null sub-search
+    /// was attempted, regardless of cutoff). Test-only instrumentation for the
+    /// stacked-null `negamax_passes_allow_null_false_in_null_subsearch` test;
+    /// gated by `#[cfg(test)]` so production builds don't carry the field.
+    #[cfg(test)]
+    nmp_firings: u32,
 }
 
 impl AlphaBetaMover {
@@ -622,6 +660,8 @@ impl AlphaBetaMover {
             tt: None,
             killers: [[Move::default(); 2]; MAX_PLY],
             history_table: HistoryTable::new(),
+            #[cfg(test)]
+            nmp_firings: 0,
         }
     }
 }
@@ -644,6 +684,10 @@ impl Search for AlphaBetaMover {
         self.nodes = 0;
         self.aborted = false;
         self.root_score = None;
+        #[cfg(test)]
+        {
+            self.nmp_firings = 0;
+        }
         // M4.A: install the TT and advance its generation once per `go` (ADR-0018 §9).
         self.tt = ctx.tt.clone();
         if let Some(tt) = &self.tt {
@@ -695,7 +739,17 @@ impl Search for AlphaBetaMover {
                     self.pv.lengths[i] = 0;
                 }
 
-                returned = self.negamax(&mut pos_clone, depth, 0, alpha, beta, true, ctx, &clock);
+                returned = self.negamax(
+                    &mut pos_clone,
+                    depth,
+                    0,
+                    alpha,
+                    beta,
+                    true,
+                    true,
+                    ctx,
+                    &clock,
+                );
 
                 if self.aborted {
                     break;
@@ -830,6 +884,11 @@ impl AlphaBetaMover {
     /// (ADR-0018 §11). `true` at the root and at the first child of a PV
     /// parent (recursion-order index 0); `false` everywhere else. PVS at M4.D
     /// will replace it with the window-based `beta - alpha == 1` check.
+    ///
+    /// `allow_null` (M5.A) gates the NMP block at step 8. `true` from the
+    /// top-level `Search::go` call and from the move-loop recursive call;
+    /// `false` only in the NMP null-search recursive call (stacked-null
+    /// prevention — ADR-0023 §5).
     #[allow(clippy::too_many_arguments)]
     fn negamax(
         &mut self,
@@ -839,6 +898,7 @@ impl AlphaBetaMover {
         mut alpha: i32,
         mut beta: i32,
         is_pv: bool,
+        allow_null: bool,
         ctx: &SearchContext,
         clock: &SearchClock,
     ) -> i32 {
@@ -917,7 +977,93 @@ impl AlphaBetaMover {
             }
         }
 
-        // 8. Generate moves.
+        // 8. Null-move pruning (M5.A — ADR-0023). Seven-condition gate:
+        //    `ply > 0` first as a structural-root guard (defense-in-depth
+        //    against a future PVS refactor that would change `is_pv`'s
+        //    semantics); cheap predicates next; the static-eval read pulled
+        //    inside the gate as a lazy late predicate so it fires only
+        //    when the cheaper gates have already passed. On `null_score >=
+        //    beta`, return a fail-high (mate-capped) and store a Lower
+        //    bound at the current depth in the TT.
+        if ply > 0 && allow_null && !is_pv && depth >= NMP_MIN_DEPTH && !in_check(pos) {
+            let stm = pos.side_to_move();
+            if has_non_pawn_material(pos, stm) {
+                let static_eval = if stm == Color::White {
+                    pos.static_eval_white()
+                } else {
+                    -pos.static_eval_white()
+                };
+                if static_eval >= beta {
+                    #[cfg(test)]
+                    {
+                        self.nmp_firings += 1;
+                    }
+                    let r = null_move_reduction(depth);
+                    let null_undo = pos.make_null_move();
+                    self.history.push(pos.zobrist());
+                    let null_score = -self.negamax(
+                        pos,
+                        depth - 1 - r,
+                        ply + 1,
+                        -beta,
+                        -beta + 1,
+                        false, // is_pv
+                        false, // allow_null (stacked-null prevention — ADR-0023 §5)
+                        ctx,
+                        clock,
+                    );
+                    self.history.pop();
+                    pos.unmake_null_move(null_undo);
+
+                    // Abort discipline matches the move loop: unmake before
+                    // checking aborted, so the balanced-make/unmake debug-
+                    // assert at the top of `Search::go` holds even on the
+                    // abort path. (M3.E abort discipline; ADR-0023 §6.)
+                    if self.aborted {
+                        return 0;
+                    }
+
+                    if null_score >= beta {
+                        // Mate-cap (ADR-0023 §6): NMP doesn't prove mate.
+                        // A `null_score >= MATE_IN_MAX_PLY` means the
+                        // opponent mates after we pass — dangerous, but
+                        // not a real mate proof. Returning the mate
+                        // magnitude would mis-rank in the parent search
+                        // and propagate unsoundness via the TT.
+                        let cutoff_score = if null_score >= MATE_IN_MAX_PLY {
+                            beta
+                        } else {
+                            null_score
+                        };
+                        // TT store as Lower at the CURRENT depth (the
+                        // cutoff proves a lower bound at this node, not at
+                        // the reduced child — ADR-0018 §3 + §1; ADR-0023 §7).
+                        // Stored score is the mate-CAPPED value; best_move
+                        // = 0 (NMP didn't pick a move) is preserved-against-
+                        // overwrite by ADR-0018 §7's rule.
+                        if let Some(tt) = &self.tt {
+                            let adjusted = score_to_tt(cutoff_score, ply as i32);
+                            debug_assert!(
+                                adjusted == adjusted as i16 as i32,
+                                "TT score overflow on NMP store: adjusted={adjusted}"
+                            );
+                            tt.store(
+                                pos.zobrist(),
+                                TtData {
+                                    score: adjusted as i16,
+                                    depth: depth as u8,
+                                    bound: TtBound::Lower,
+                                    best_move: 0,
+                                },
+                            );
+                        }
+                        return cutoff_score;
+                    }
+                }
+            }
+        }
+
+        // 9. Generate moves.
         let mut ml = MoveList::new();
         generate_moves(pos, &mut ml);
         let mut moves_vec = ml.iter().collect::<Vec<_>>();
@@ -929,11 +1075,11 @@ impl AlphaBetaMover {
             moves_vec.retain(|m| filter.contains(m));
         }
 
-        // 9. Terminal: no legal moves.
-        //    At ply==0 with searchmoves filter active, an empty list is a degenerate
-        //    user input (all-illegal or empty filter). Short-circuit BEFORE the
-        //    in_check triage — otherwise a check position with a degenerate filter
-        //    would falsely return -MATE.
+        // 10. Terminal: no legal moves.
+        //     At ply==0 with searchmoves filter active, an empty list is a degenerate
+        //     user input (all-illegal or empty filter). Short-circuit BEFORE the
+        //     in_check triage — otherwise a check position with a degenerate filter
+        //     would falsely return -MATE.
         if moves_vec.is_empty() {
             if ply == 0 && ctx.limits.searchmoves.is_some() {
                 return 0;
@@ -945,7 +1091,7 @@ impl AlphaBetaMover {
             }
         }
 
-        // 10. Order: killer-aware scoring (captures > killers > history-scored
+        // 11. Order: killer-aware scoring (captures > killers > history-scored
         //     quiets) descending via `order_moves` (extended for M4.C to consult
         //     the history table); then promote the TT move (if any) to index 0.
         //     `Move::default().bits() == 0` is the no-move sentinel and is
@@ -963,8 +1109,8 @@ impl AlphaBetaMover {
             tt_move,
         );
 
-        // 11. Recurse fail-soft. `child_is_pv = is_pv && i == 0` per ADR-0018 §11
-        //     where `i` is the recursion-order index (post-step-10 reorder).
+        // 12. Recurse fail-soft. `child_is_pv = is_pv && i == 0` per ADR-0018 §11
+        //     where `i` is the recursion-order index (post-step-11 reorder).
         let mut best = -INF;
         let mut cutoff_move: Option<Move> = None;
         // M4.C: quiets that complete recursion without cutting; used for malus on cutoff.
@@ -981,6 +1127,7 @@ impl AlphaBetaMover {
                 child_alpha,
                 child_beta,
                 child_is_pv,
+                true, // allow_null: move-loop children may attempt NMP
                 ctx,
                 clock,
             );
@@ -1044,7 +1191,7 @@ impl AlphaBetaMover {
             }
         }
 
-        // 12. Store on completion. Skip on abort (partial bounds are not real)
+        // 13. Store on completion. Skip on abort (partial bounds are not real)
         //     and never mid-loop (the abort path returns above without storing).
         //     Together this guarantees aborted iterations never overwrite a
         //     prior iteration's entry. Bound classification compares against
@@ -1088,6 +1235,10 @@ impl AlphaBetaMover {
     /// Test-only entry point that forwards verbatim to `negamax`. Exists
     /// because tests cannot call private methods directly; production code
     /// never calls this.
+    ///
+    /// `allow_null` (M5.A) gates the NMP block. Tests that don't care about
+    /// NMP behavior pass `true`; NMP-behavior tests in §5.3 control it
+    /// explicitly to drive gate-pass / gate-skip sister fixtures.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn negamax_for_test(
@@ -1098,10 +1249,19 @@ impl AlphaBetaMover {
         alpha: i32,
         beta: i32,
         is_pv: bool,
+        allow_null: bool,
         ctx: &SearchContext,
     ) -> i32 {
         let clock = SearchClock::start_for(ctx.virtual_clock, ctx.caps);
-        self.negamax(pos, depth, ply, alpha, beta, is_pv, ctx, &clock)
+        self.negamax(pos, depth, ply, alpha, beta, is_pv, allow_null, ctx, &clock)
+    }
+
+    /// Test-only accessor for the per-`go` NMP firings counter (M5.A).
+    /// Mirrors `killers_for_test`. Production code never reads the counter
+    /// through this accessor.
+    #[cfg(test)]
+    pub(super) fn nmp_firings_for_test(&self) -> u32 {
+        self.nmp_firings
     }
 
     /// Test-only setter to install a TT directly without going through
@@ -1734,6 +1894,17 @@ pub fn is_fifty_move_draw(halfmove_clock: u8) -> bool {
     halfmove_clock >= 100
 }
 
+/// Pinned NMP firings count for the
+/// `negamax_passes_allow_null_false_in_null_subsearch` test (M5.A).
+/// Empirically observed at impl time on the chosen fixture
+/// (`r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9` at
+/// depth 8, ply 1, beta = `static_eval - 100`). The value is the number of
+/// NMP firings observed across the entire search subtree under stacked-null
+/// prevention; mutating the inner null-search's `allow_null = false` to
+/// `true` would let nested nulls fire and inflate this count.
+#[cfg(test)]
+const NMP_FIRINGS_PINNED: u32 = 34;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2341,7 +2512,7 @@ mod tests {
         let other_zobrist: u64 = 0xDEAD_BEEF_CAFE_0000;
         ab.history = vec![pos.zobrist(), other_zobrist, pos.zobrist()];
 
-        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, true, &ctx_depth2);
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, true, true, &ctx_depth2);
         assert_eq!(
             score, 0,
             "repetition at ply > 0 must return score 0; got {score}"
@@ -2359,7 +2530,7 @@ mod tests {
         let mut ab = AlphaBetaMover::new();
         ab.history = vec![pos.zobrist()];
 
-        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, true, &ctx_depth2);
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, true, true, &ctx_depth2);
         assert_eq!(
             score, 0,
             "50-move draw at halfmove=100 must return score 0; got {score}"
@@ -3361,7 +3532,7 @@ mod tests {
         let mut ab = AlphaBetaMover::new();
         ab.history = vec![pos.zobrist()];
         let (ctx, _stop) = non_aborting_ctx();
-        let score = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, true, &ctx);
 
         assert!(
             score < 700,
@@ -4575,7 +4746,7 @@ mod tests {
         ab.history = vec![pos.zobrist()];
         ab.set_tt_for_test(Some(tt.clone()));
 
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, -100, -99, false, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, -100, -99, false, true, &ctx);
 
         let entry = tt
             .probe(pos.zobrist())
@@ -4631,7 +4802,7 @@ mod tests {
         ab2.history = vec![pos2.zobrist()];
         ab2.set_tt_for_test(Some(tt2.clone()));
         ab2.aborted = true;
-        let _ = ab2.negamax_for_test(&mut pos2.clone(), 2, 0, -INF, INF, true, &ctx2);
+        let _ = ab2.negamax_for_test(&mut pos2.clone(), 2, 0, -INF, INF, true, true, &ctx2);
         assert!(
             tt2.probe(pos2.zobrist()).is_none(),
             "negamax with self.aborted=true must not store a TT entry"
@@ -4743,7 +4914,7 @@ mod tests {
         ab.set_tt_for_test(Some(tt.clone()));
 
         let nodes_before = ab.nodes;
-        let score = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, true, &ctx);
         let nodes_consumed = ab.nodes - nodes_before;
 
         assert_eq!(
@@ -4779,7 +4950,7 @@ mod tests {
         ab.set_tt_for_test(Some(tt.clone()));
 
         let nodes_before = ab.nodes;
-        let score = ab.negamax_for_test(&mut pos.clone(), 3, 0, -100, INF, false, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 3, 0, -100, INF, false, true, &ctx);
         let nodes_consumed = ab.nodes - nodes_before;
 
         assert_eq!(
@@ -4819,7 +4990,7 @@ mod tests {
         ab.set_tt_for_test(Some(tt.clone()));
 
         let nodes_before = ab.nodes;
-        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx);
         let nodes_consumed = ab.nodes - nodes_before;
 
         assert!(
@@ -4871,7 +5042,7 @@ mod tests {
         let mut ab_a = AlphaBetaMover::new();
         ab_a.history = vec![pos.zobrist()];
         ab_a.set_tt_for_test(Some(tt_a.clone()));
-        let _ = ab_a.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx_a);
+        let _ = ab_a.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx_a);
         let nodes_unhinted = ab_a.nodes;
 
         // Run (b): pre-populate TT with last_move at insufficient depth so
@@ -4890,7 +5061,7 @@ mod tests {
         let mut ab_b = AlphaBetaMover::new();
         ab_b.history = vec![pos.zobrist()];
         ab_b.set_tt_for_test(Some(tt_b.clone()));
-        let _ = ab_b.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx_b);
+        let _ = ab_b.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx_b);
         let nodes_hinted = ab_b.nodes;
 
         assert_ne!(
@@ -5007,7 +5178,7 @@ mod tests {
         ab.history = vec![pos.zobrist(), other_zobrist, pos.zobrist()];
         ab.set_tt_for_test(Some(tt.clone()));
 
-        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, false, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, false, true, &ctx);
         assert_eq!(
             score, 0,
             "repetition (returns 0) must run BEFORE TT probe; got {score} (TT score=999)"
@@ -5038,7 +5209,7 @@ mod tests {
         ab.history = vec![pos.zobrist()];
         ab.set_tt_for_test(Some(tt.clone()));
 
-        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, false, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, false, true, &ctx);
         assert_eq!(
             score, 0,
             "50-move draw (returns 0) must run BEFORE TT probe; got {score} (TT score=999)"
@@ -5071,7 +5242,7 @@ mod tests {
         ab1.history = vec![pos.zobrist()];
         ab1.set_tt_for_test(Some(tt.clone()));
         let nodes_before_a = ab1.nodes;
-        let _ = ab1.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, &ctx);
+        let _ = ab1.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, true, &ctx);
         let nodes_with_hit = ab1.nodes - nodes_before_a;
 
         tt.clear();
@@ -5080,7 +5251,7 @@ mod tests {
         ab2.history = vec![pos.zobrist()];
         ab2.set_tt_for_test(Some(tt.clone()));
         let nodes_before_b = ab2.nodes;
-        let _ = ab2.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, &ctx);
+        let _ = ab2.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, true, &ctx);
         let nodes_after_clear = ab2.nodes - nodes_before_b;
 
         assert!(
@@ -5117,7 +5288,7 @@ mod tests {
         ab.history = vec![pos.zobrist()];
         ab.set_tt_for_test(Some(tt.clone()));
 
-        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, true, &ctx);
 
         let pv = ab.pv_root_for_test();
         assert!(
@@ -5169,7 +5340,7 @@ mod tests {
         let mut ab_ref = AlphaBetaMover::new();
         ab_ref.history = vec![pos.zobrist()];
         ab_ref.set_tt_for_test(Some(tt_ref.clone()));
-        let _ = ab_ref.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx_ref);
+        let _ = ab_ref.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx_ref);
         let nodes_ref = ab_ref.nodes;
 
         // Pre-populated run: every child of root has an Exact, depth=10
@@ -5194,7 +5365,7 @@ mod tests {
         let mut ab = AlphaBetaMover::new();
         ab.history = vec![pos.zobrist()];
         ab.set_tt_for_test(Some(tt.clone()));
-        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx);
         let nodes_with_tt = ab.nodes;
 
         assert!(
@@ -5911,7 +6082,7 @@ mod tests {
         let (ctx, _stop) = non_aborting_ctx_at_depth(2);
 
         // Narrow window forces a quick beta cutoff at some ply.
-        let _ = mover.negamax_for_test(&mut pos.clone(), 2, 0, -100, -50, true, &ctx);
+        let _ = mover.negamax_for_test(&mut pos.clone(), 2, 0, -100, -50, true, true, &ctx);
 
         // Find the first ply with a populated killer slot.
         let killers = mover.killers_for_test();
@@ -5969,7 +6140,7 @@ mod tests {
         // Run with a tight fail-high window: any capture will overshoot and
         // produce a beta cutoff. The gate `if is_quiet(mv)` must prevent
         // the capture from populating killers[0][0].
-        let _ = mover.negamax_for_test(&mut pos.clone(), 1, 0, 10000, 10001, false, &ctx);
+        let _ = mover.negamax_for_test(&mut pos.clone(), 1, 0, 10000, 10001, false, true, &ctx);
 
         // killers[0][0] must remain the default sentinel (no capture recorded).
         assert_eq!(
@@ -6018,7 +6189,7 @@ mod tests {
         let mut mover_a = AlphaBetaMover::new();
         mover_a.history = vec![pos.zobrist()];
         let (ctx_a, _stop_a) = non_aborting_ctx_at_depth(3);
-        let _ = mover_a.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx_a);
+        let _ = mover_a.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx_a);
         let nodes_a = mover_a.nodes;
 
         // Pick the lexicographically-last white quiet move from startpos
@@ -6074,7 +6245,7 @@ mod tests {
         init_killers[2][0] = chosen_quiet;
         mover_b.set_killers_for_test(init_killers);
         let (ctx_b, _stop_b) = non_aborting_ctx_at_depth(3);
-        let _ = mover_b.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, &ctx_b);
+        let _ = mover_b.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx_b);
         let nodes_b = mover_b.nodes;
 
         assert_ne!(
@@ -6247,7 +6418,7 @@ mod tests {
         let (ctx, _stop) = non_aborting_ctx();
         // Tight window at zero centipawns: any move with positive eval will
         // immediately fail-high, producing a quiet beta-cutoff.
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, true, &ctx);
 
         // After the cutoff fires, exactly one quiet `(side, from, to)` triple
         // must hold the +4 bonus (depth=2, depth*depth=4). Sweep all entries
@@ -6305,7 +6476,7 @@ mod tests {
         ab.history = vec![pos.zobrist()];
         let (ctx, _stop) = non_aborting_ctx();
         // Tighten the window so Qxd4 (winning material) fail-highs.
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, true, &ctx);
 
         for side in [Color::White, Color::Black] {
             for from in 0..64u8 {
@@ -6350,7 +6521,7 @@ mod tests {
         ab.history = vec![pos.zobrist()];
         ab.set_tt_for_test(Some(tt.clone()));
 
-        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, true, &ctx);
 
         for side in [Color::White, Color::Black] {
             for from in 0..64u8 {
@@ -6392,7 +6563,7 @@ mod tests {
         ab.history_table.clear();
         ab.history = history;
         let (ctx, _stop) = non_aborting_ctx();
-        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, true, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, true, true, &ctx);
 
         assert_eq!(score, 0, "rep-return at ply > 0 must yield 0");
         for side in [Color::White, Color::Black] {
@@ -6435,7 +6606,7 @@ mod tests {
             "fixture preconditions: alpha={alpha}, mating_value={mating_value} — \
              alpha must be >= mating_value to trigger upper-bound MD pruning"
         );
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, ply, alpha, beta, false, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, ply, alpha, beta, false, true, &ctx);
 
         for side in [Color::White, Color::Black] {
             for from in 0..64u8 {
@@ -6477,7 +6648,7 @@ mod tests {
         ab.history = vec![pos.zobrist()];
         let (ctx, _stop) = non_aborting_ctx();
         let depth: u32 = 2;
-        let _ = ab.negamax_for_test(&mut pos.clone(), depth, 0, 0, 1, false, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), depth, 0, 0, 1, false, true, &ctx);
 
         let bonus = (depth as i32) * (depth as i32); // = 4
         let mut plus_count = 0;
@@ -6541,7 +6712,7 @@ mod tests {
         let (ctx, _stop) = non_aborting_ctx();
         // Wide-ish window so multiple cutoffs fire at varying plies but
         // not so wide as to suppress all cuts.
-        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -50, 50, false, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -50, 50, false, true, &ctx);
 
         let mut has_negative = false;
         let mut has_positive = false;
@@ -6621,7 +6792,7 @@ mod tests {
         let (ctx, _stop) = non_aborting_ctx();
         // Window (0, 1): Qxe7+ → Kxe7 returns 0 (no cut); any quiet
         // returns ~+688 (cut).
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, true, &ctx);
 
         assert_eq!(
             ab.history_table.score(Color::White, cap_from, cap_to),
@@ -6682,7 +6853,7 @@ mod tests {
         // depth=2 is NOT safe here: root's second and later children are
         // searched with a narrowed window (negate(updated_alpha, INF)) and
         // their depth=1 children CAN cut, updating history.
-        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, true, &ctx);
 
         for side in [Color::White, Color::Black] {
             for from in 0..64u8 {
@@ -6719,7 +6890,7 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         // Pre-set aborted as well so the post-recursion check fires.
         ab.aborted = true;
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, -INF, INF, false, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, -INF, INF, false, true, &ctx);
 
         for side in [Color::White, Color::Black] {
             for from in 0..64u8 {
@@ -6755,7 +6926,7 @@ mod tests {
         ab.history_table.clear();
         ab.history = vec![pos.zobrist()];
         let (ctx, _stop) = non_aborting_ctx();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, true, &ctx);
 
         let mut white_nonzero = 0;
         let mut black_nonzero = 0;
@@ -6808,7 +6979,7 @@ mod tests {
         ab.history = vec![pos.zobrist()];
         let (ctx, _stop) = non_aborting_ctx();
         // Tight window forces a quick quiet cutoff at ply=1.
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 1, 0, 1, false, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 1, 0, 1, false, true, &ctx);
 
         let mut white_nonzero = 0;
         let mut black_nonzero = 0;
@@ -6930,7 +7101,7 @@ mod tests {
         }
         ab.history = vec![pos.zobrist()];
         let (ctx, _stop) = non_aborting_ctx();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 0, 0, 1, false, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 0, 0, 1, false, true, &ctx);
 
         // The cutter's entry must clamp at MAX_HISTORY. Sweep all White
         // quiets and find at least one entry equal to MAX_HISTORY (the
@@ -8266,5 +8437,756 @@ mod tests {
 
         // Score must still be the mate-in-1 score on the wall side.
         assert_eq!(r_wall.score_cp, Some(MATE - 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // M5.A Slice B — null_move_reduction helper tests (5 tests).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn null_move_reduction_at_depth_3_is_2() {
+        assert_eq!(null_move_reduction(3), 2);
+    }
+
+    #[test]
+    fn null_move_reduction_at_depth_5_is_2() {
+        // 2 + 5/6 = 2 + 0 = 2 (boundary just below first bump).
+        assert_eq!(null_move_reduction(5), 2);
+    }
+
+    #[test]
+    fn null_move_reduction_at_depth_6_is_3() {
+        // 2 + 6/6 = 2 + 1 = 3 (first bump).
+        assert_eq!(null_move_reduction(6), 3);
+    }
+
+    #[test]
+    fn null_move_reduction_at_depth_11_is_3() {
+        // 2 + 11/6 = 2 + 1 = 3 (boundary just below second bump).
+        assert_eq!(null_move_reduction(11), 3);
+    }
+
+    #[test]
+    fn null_move_reduction_at_depth_12_is_4() {
+        // 2 + 12/6 = 2 + 2 = 4 (second bump).
+        assert_eq!(null_move_reduction(12), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // M5.A Slice B — has_non_pawn_material helper tests (5 tests).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn has_non_pawn_material_starting_position_true_for_both_sides() {
+        let pos = Position::starting_position();
+        assert!(
+            has_non_pawn_material(&pos, Color::White),
+            "starting position must have non-pawn material for White"
+        );
+        assert!(
+            has_non_pawn_material(&pos, Color::Black),
+            "starting position must have non-pawn material for Black"
+        );
+    }
+
+    #[test]
+    fn has_non_pawn_material_kings_only_returns_false() {
+        let pos = Position::from_fen("8/8/8/4k3/4K3/8/8/8 w - - 0 1").expect("FEN must parse");
+        assert!(
+            !has_non_pawn_material(&pos, Color::White),
+            "kings-only position must return false for White"
+        );
+        assert!(
+            !has_non_pawn_material(&pos, Color::Black),
+            "kings-only position must return false for Black"
+        );
+    }
+
+    #[test]
+    fn has_non_pawn_material_kings_and_pawns_only_returns_false() {
+        let pos = Position::from_fen("8/4p3/8/4k3/4K3/8/4P3/8 w - - 0 1").expect("FEN must parse");
+        assert!(
+            !has_non_pawn_material(&pos, Color::White),
+            "K+P-only position must return false for White"
+        );
+        assert!(
+            !has_non_pawn_material(&pos, Color::Black),
+            "K+P-only position must return false for Black"
+        );
+    }
+
+    #[test]
+    fn has_non_pawn_material_with_white_knight_only() {
+        let pos = Position::from_fen("8/8/8/4k3/4K3/8/4N3/8 w - - 0 1").expect("FEN must parse");
+        assert!(
+            has_non_pawn_material(&pos, Color::White),
+            "position with white knight must return true for White"
+        );
+        assert!(
+            !has_non_pawn_material(&pos, Color::Black),
+            "position with no black non-pawn material must return false for Black"
+        );
+    }
+
+    #[test]
+    fn has_non_pawn_material_endgame_with_rook() {
+        // KRk position: White rook on e2, kings on e4 and e5.
+        let pos = Position::from_fen("8/8/8/4k3/4K3/8/4R3/8 w - - 0 1").expect("FEN must parse");
+        assert!(
+            has_non_pawn_material(&pos, Color::White),
+            "KRk position must return true for White"
+        );
+        assert!(
+            !has_non_pawn_material(&pos, Color::Black),
+            "KRk position must return false for Black (only king)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M5.A — NMP behavior in negamax (plan §5.3).
+    //
+    // Sister-fixture pattern: every gate-skip test pairs with a positive
+    // fixture and asserts a node-count delta. A no-op NMP impl trivially
+    // "skips NMP" everywhere; the gate-skip tests therefore must compare
+    // against a fixture where the gate's *opposite* condition fires and
+    // demonstrate observable behavior change.
+    //
+    // All NMP-behavior tests drive `negamax_for_test` directly (not via
+    // `Search::go`) so the test author controls `is_pv`, `allow_null`,
+    // depth, and the `(alpha, beta)` window precisely.
+    // -----------------------------------------------------------------------
+
+    /// Helper: STM-perspective static eval (mirrors the inline sign-flip
+    /// inside the NMP block at step 8 of `negamax`). Reads the same
+    /// `static_eval_white` field; sign-flips for Black STM.
+    fn stm_static_eval(pos: &Position) -> i32 {
+        if pos.side_to_move() == Color::White {
+            pos.static_eval_white()
+        } else {
+            -pos.static_eval_white()
+        }
+    }
+
+    /// NMP gate-skip at ply 0 even when synthetically called with `is_pv = false`.
+    /// Defends against a future PVS refactor that would change `is_pv`'s
+    /// semantics — the `ply > 0` guard fires structurally regardless.
+    /// Sister fixture: same call with `ply = 1`.
+    #[test]
+    fn negamax_skips_nmp_at_ply_zero_even_when_is_pv_false() {
+        // Quiet middlegame position; White-to-move with non-pawn material.
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        // Choose beta well below static_eval so the gate passes.
+        let beta = static_eval - 100;
+        let alpha = -INF;
+
+        let mut ab_skip = AlphaBetaMover::new();
+        let _ = ab_skip.negamax_for_test(&mut pos.clone(), 4, 0, alpha, beta, false, true, &ctx);
+        let nodes_skip = ab_skip.nodes;
+
+        let mut ab_pass = AlphaBetaMover::new();
+        let _ = ab_pass.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let nodes_pass = ab_pass.nodes;
+
+        assert!(
+            nodes_skip != nodes_pass,
+            "ply-0 must skip NMP regardless of is_pv; node counts must differ \
+             from the ply>0 sister fixture (got skip={nodes_skip}, pass={nodes_pass})"
+        );
+        assert!(
+            nodes_skip > nodes_pass,
+            "ply-0 (NMP-skip) must visit more nodes than the gate-pass sister; \
+             got skip={nodes_skip}, pass={nodes_pass}"
+        );
+    }
+
+    /// NMP gate-skip when in check. Sister fixture: same skeleton, attacker
+    /// moved off the attack square. Discriminator: node count — the
+    /// in-check version visits the full evasion move loop; the not-in-check
+    /// version fires NMP cutoff. Both fixtures retain non-pawn material so
+    /// the zugzwang gate cannot be the differentiator.
+    #[test]
+    fn negamax_skips_nmp_when_in_check() {
+        use crate::movegen::in_check;
+
+        // In-check fixture: White K g1, Q d4, P f2/g2/h2. Black K h8, N e2
+        // (knight on e2 attacks g1). White is in check. Reused from
+        // `qsearch_does_not_stand_pat_in_check`.
+        let pos_check = Position::from_fen("7k/8/8/8/3Q4/8/4nPPP/6K1 w - - 0 1")
+            .expect("in-check FEN must parse");
+        // Sister: same skeleton, knight moved from e2 to h6 (attacks none of
+        // White's pieces; not check). White still has its queen as non-pawn
+        // material, so the zugzwang gate passes in both fixtures.
+        let pos_no_check = Position::from_fen("7k/8/7n/8/3Q4/8/5PPP/6K1 w - - 0 1")
+            .expect("no-check FEN must parse");
+
+        // Programmatically verify the check / no-check property of the
+        // chosen fixtures. Failing here means the test author needs to
+        // adjust the FEN, not that NMP is broken.
+        assert!(
+            in_check(&pos_check),
+            "fixture pos_check must actually be in check"
+        );
+        assert!(
+            !in_check(&pos_no_check),
+            "fixture pos_no_check must NOT be in check"
+        );
+        assert!(
+            has_non_pawn_material(&pos_check, Color::White),
+            "in-check fixture must have White non-pawn material"
+        );
+        assert!(
+            has_non_pawn_material(&pos_no_check, Color::White),
+            "no-check fixture must have White non-pawn material"
+        );
+
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let alpha = -INF;
+        // Pick beta below both fixtures' static_eval so the static-eval gate
+        // passes in both. The discriminator is then purely the in-check gate.
+        let beta_in = stm_static_eval(&pos_check) - 50;
+        let beta_no = stm_static_eval(&pos_no_check) - 50;
+        let beta = beta_in.min(beta_no);
+
+        let mut ab_in = AlphaBetaMover::new();
+        let _ =
+            ab_in.negamax_for_test(&mut pos_check.clone(), 3, 1, alpha, beta, false, true, &ctx);
+        let nodes_in = ab_in.nodes;
+
+        let mut ab_no = AlphaBetaMover::new();
+        let _ = ab_no.negamax_for_test(
+            &mut pos_no_check.clone(),
+            3,
+            1,
+            alpha,
+            beta,
+            false,
+            true,
+            &ctx,
+        );
+        let nodes_no = ab_no.nodes;
+
+        assert!(
+            nodes_in != nodes_no,
+            "in-check vs no-check must produce different node counts; \
+             got in_check={nodes_in}, no_check={nodes_no}"
+        );
+    }
+
+    /// NMP gate-skip at PV nodes. Primary assertion: distinct node counts.
+    /// Score equality is permitted under fail-soft (both can return scores
+    /// >= beta via different paths).
+    #[test]
+    fn negamax_skips_nmp_at_pv_node() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let beta = static_eval - 100;
+        let alpha = -INF;
+
+        let mut ab_pv = AlphaBetaMover::new();
+        let _ = ab_pv.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, true, true, &ctx);
+        let nodes_pv = ab_pv.nodes;
+
+        let mut ab_nonpv = AlphaBetaMover::new();
+        let _ = ab_nonpv.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let nodes_nonpv = ab_nonpv.nodes;
+
+        assert!(
+            nodes_pv != nodes_nonpv,
+            "PV vs non-PV must produce different node counts; \
+             got pv={nodes_pv}, nonpv={nodes_nonpv}"
+        );
+        assert!(
+            nodes_pv > nodes_nonpv,
+            "PV node (NMP-skip) must visit more nodes than the non-PV \
+             sister (NMP-cutoff); got pv={nodes_pv}, nonpv={nodes_nonpv}"
+        );
+    }
+
+    /// NMP gate-skip when `allow_null = false` (the parameter directly).
+    /// The `false` case must visit more nodes since the NMP block is
+    /// unconditionally skipped.
+    #[test]
+    fn negamax_skips_nmp_when_allow_null_false() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(6);
+        let static_eval = stm_static_eval(&pos);
+        let beta = static_eval - 100;
+        let alpha = -INF;
+
+        let mut ab_allow = AlphaBetaMover::new();
+        let _ = ab_allow.negamax_for_test(&mut pos.clone(), 6, 1, alpha, beta, false, true, &ctx);
+        let nodes_allow = ab_allow.nodes;
+
+        let mut ab_deny = AlphaBetaMover::new();
+        let _ = ab_deny.negamax_for_test(&mut pos.clone(), 6, 1, alpha, beta, false, false, &ctx);
+        let nodes_deny = ab_deny.nodes;
+
+        assert!(
+            nodes_allow != nodes_deny,
+            "allow_null=true vs allow_null=false must produce different node \
+             counts; got allow={nodes_allow}, deny={nodes_deny}"
+        );
+        assert!(
+            nodes_deny > nodes_allow,
+            "allow_null=false (NMP-skip) must visit more nodes than \
+             allow_null=true (NMP-cutoff); got allow={nodes_allow}, deny={nodes_deny}"
+        );
+    }
+
+    /// NMP gate-skip when static_eval < beta. Same position; beta is set
+    /// above static_eval in the skip case, below in the pass case.
+    #[test]
+    fn negamax_skips_nmp_when_static_eval_below_beta() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let alpha = -INF;
+
+        // Skip case: beta > static_eval (gate fails).
+        let beta_skip = static_eval + 100;
+        let mut ab_skip = AlphaBetaMover::new();
+        let _ =
+            ab_skip.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta_skip, false, true, &ctx);
+        let nodes_skip = ab_skip.nodes;
+
+        // Pass case: beta < static_eval (gate passes).
+        let beta_pass = static_eval - 50;
+        let mut ab_pass = AlphaBetaMover::new();
+        let _ =
+            ab_pass.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta_pass, false, true, &ctx);
+        let nodes_pass = ab_pass.nodes;
+
+        assert!(
+            nodes_skip != nodes_pass,
+            "static_eval<beta vs static_eval>=beta must produce different \
+             node counts; got skip={nodes_skip}, pass={nodes_pass}"
+        );
+        assert!(
+            nodes_skip > nodes_pass,
+            "skip case (NMP-skip via gate fail) must visit more nodes than \
+             pass case (NMP-cutoff); got skip={nodes_skip}, pass={nodes_pass}"
+        );
+    }
+
+    /// NMP gate-skip when STM has no non-pawn material (zugzwang guard).
+    /// Sister fixture: identical K+P endgame plus one white knight, which
+    /// gives STM non-pawn material and lets NMP fire.
+    #[test]
+    fn negamax_skips_nmp_when_no_non_pawn_material() {
+        let kp_only =
+            Position::from_fen("8/4p3/8/8/4k3/8/4P3/4K3 w - - 0 1").expect("K+P FEN must parse");
+        let kp_with_n = Position::from_fen("8/4p3/8/8/4k3/3N4/4P3/4K3 w - - 0 1")
+            .expect("K+P+N FEN must parse");
+
+        let (ctx, _stop) = non_aborting_ctx_at_depth(3);
+        let alpha = -INF;
+        // Use a beta safely below both static evals so the static-eval gate
+        // passes in both fixtures; the discriminator is then has_non_pawn_material.
+        let beta_kp = stm_static_eval(&kp_only) - 200;
+        let beta_n = stm_static_eval(&kp_with_n) - 200;
+        let beta = beta_kp.min(beta_n);
+
+        let mut ab_kp = AlphaBetaMover::new();
+        let _ = ab_kp.negamax_for_test(&mut kp_only.clone(), 3, 1, alpha, beta, false, true, &ctx);
+        let nodes_kp = ab_kp.nodes;
+
+        let mut ab_n = AlphaBetaMover::new();
+        let _ = ab_n.negamax_for_test(&mut kp_with_n.clone(), 3, 1, alpha, beta, false, true, &ctx);
+        let nodes_n = ab_n.nodes;
+
+        assert!(
+            nodes_kp != nodes_n,
+            "K+P-only vs K+P+N must produce different node counts; \
+             got kp_only={nodes_kp}, kp_with_n={nodes_n}"
+        );
+        assert!(
+            nodes_kp > nodes_n,
+            "K+P-only (NMP-skip via has_non_pawn_material) must visit more \
+             nodes than K+P+N sister (NMP-cutoff); got kp_only={nodes_kp}, \
+             kp_with_n={nodes_n}"
+        );
+    }
+
+    /// NMP gate-skip at depth < NMP_MIN_DEPTH (= 3). Sister fixture: same
+    /// position at depth 4. Discriminator is depth alone.
+    #[test]
+    fn negamax_skips_nmp_when_depth_below_3() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let beta = static_eval - 100;
+        let alpha = -INF;
+
+        let mut ab_2 = AlphaBetaMover::new();
+        let _ = ab_2.negamax_for_test(&mut pos.clone(), 2, 1, alpha, beta, false, true, &ctx);
+        let firings_2 = ab_2.nmp_firings_for_test();
+
+        let mut ab_4 = AlphaBetaMover::new();
+        let _ = ab_4.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let firings_4 = ab_4.nmp_firings_for_test();
+
+        // Depth-2 must produce zero NMP firings at this node (the depth gate
+        // fails). Depth-4 must produce at least one firing.
+        assert_eq!(
+            firings_2, 0,
+            "depth=2 (< NMP_MIN_DEPTH=3) must skip NMP; got {firings_2} firings"
+        );
+        assert!(
+            firings_4 > 0,
+            "depth=4 sister fixture must fire NMP at least once; got {firings_4} firings"
+        );
+    }
+
+    /// On a successful NMP cutoff, returned score must be >= beta (fail-soft).
+    /// Drives the cutoff explicitly via a window where static_eval >> beta.
+    #[test]
+    fn negamax_returns_beta_cutoff_on_successful_nmp() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let beta = static_eval - 200;
+        let alpha = -INF;
+
+        let mut ab = AlphaBetaMover::new();
+        let score = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+
+        assert!(
+            score >= beta,
+            "successful NMP cutoff must return fail-soft score >= beta; \
+             got score={score}, beta={beta}"
+        );
+        // Confirm NMP actually fired (not some other path that produces score >= beta).
+        assert!(
+            ab.nmp_firings_for_test() > 0,
+            "NMP must have fired at least once; got 0 firings"
+        );
+    }
+
+    /// Mate-cap: when null_score >= MATE_IN_MAX_PLY, returned cutoff is `beta`
+    /// (mate-capped), not the mate-magnitude.
+    ///
+    /// **Construction**: Driving a real chess search to return mate-magnitude
+    /// from the null sub-search is brittle (the zero-window `(-beta,
+    /// -beta+1)` causes capture-first move ordering to fail-high before the
+    /// mating line is found). Instead, **pre-populate the TT** with a
+    /// mate-magnitude Exact entry at the post-null zobrist with stored depth
+    /// at least equal to the sub-search depth. The null sub-search's negamax
+    /// invocation probes the TT, hits the cutoff, and returns the mate score
+    /// directly, exercising the parent's mate-cap branch deterministically.
+    ///
+    /// Three-step structure:
+    ///   1. Compute the post-null zobrist; pre-seed the TT.
+    ///   2. Drive parent `negamax_for_test`; NMP fires; null sub-search hits
+    ///      the seeded TT entry; null_score >= MATE_IN_MAX_PLY.
+    ///   3. Assert returned == beta (mate-capped), not mate magnitude.
+    #[test]
+    fn negamax_caps_mate_score_to_beta_when_null_score_is_mate() {
+        // Quiet middlegame fixture with non-pawn material on both sides;
+        // any non-stalemate, non-check, queen-up-ish position works since
+        // the mate score arrives via the TT seed, not via the search.
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+
+        // Parent depth >= NMP_MIN_DEPTH so NMP fires.
+        let parent_depth = 4_u32;
+        let parent_ply = 1_u32;
+        let child_ply = parent_ply + 1;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _stop) = non_aborting_ctx_at_depth_with_tt(parent_depth + 2, Arc::clone(&tt));
+
+        // Compute the post-null zobrist by applying make_null_move on a
+        // clone, reading the zobrist, then unmaking. Avoids any stateful
+        // contamination of `pos`.
+        let post_null_zobrist = {
+            let mut p = pos;
+            let undo = p.make_null_move();
+            let z = p.zobrist();
+            p.unmake_null_move(undo);
+            z
+        };
+
+        // Seed: NEGATIVE mate-magnitude Exact entry at the post-null
+        // zobrist, depth >= child_depth so the child's TT probe returns it
+        // early. The TT entry's score is from the STM's perspective at the
+        // entry's position; STM after the null is the OPPONENT (the side
+        // who would be mated). A "the opponent is being mated" position
+        // therefore stores a NEGATIVE mate-magnitude score from the
+        // opponent's perspective. The child returns this negative score;
+        // the parent's `null_score = -child_score` becomes positive
+        // mate-magnitude, triggering the mate-cap branch.
+        let mate_score_for_child_stm = -(MATE - child_ply as i32); // negative mate
+        let stored_score = score_to_tt(mate_score_for_child_stm, child_ply as i32);
+        debug_assert!(
+            stored_score == stored_score as i16 as i32,
+            "stored_score must fit i16; got {stored_score}"
+        );
+        tt.new_search();
+        tt.store(
+            post_null_zobrist,
+            TtData {
+                score: stored_score as i16,
+                depth: parent_depth as u8, // >= child_depth, satisfies probe gate
+                bound: TtBound::Exact,
+                best_move: 0,
+            },
+        );
+
+        // ===== Drive the parent search. Choose `beta` below the parent's
+        // STM static_eval so the NMP gate's `static_eval >= beta` predicate
+        // passes; choose `beta` finite (well below MATE_IN_MAX_PLY) so the
+        // mate-cap collapse to `beta` is observable.
+        let alpha = -INF;
+        let static_eval_parent = stm_static_eval(&pos);
+        let beta = static_eval_parent - 100;
+        assert!(
+            beta < MATE_IN_MAX_PLY,
+            "test invariant: chosen beta must be a finite, non-mate value"
+        );
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let returned = ab.negamax_for_test(
+            &mut pos.clone(),
+            parent_depth,
+            parent_ply,
+            alpha,
+            beta,
+            false,
+            true,
+            &ctx,
+        );
+
+        assert!(
+            ab.nmp_firings_for_test() > 0,
+            "NMP must have fired; got 0 firings"
+        );
+        assert!(
+            returned < MATE_IN_MAX_PLY,
+            "mate-capped NMP return must NOT be mate magnitude; got {returned}, \
+             MATE_IN_MAX_PLY={MATE_IN_MAX_PLY}"
+        );
+        assert!(
+            returned >= beta,
+            "mate-capped NMP return must be >= beta (fail-soft cutoff); \
+             got {returned}, beta={beta}"
+        );
+        assert_eq!(
+            returned, beta,
+            "mate-cap collapses cutoff_score to beta exactly; got {returned}, beta={beta}"
+        );
+    }
+
+    /// Stacked-null prevention: the NMP null-search recursive call passes
+    /// `allow_null = false`. Direct kill via the `nmp_firings` counter:
+    /// if the `false` were a `true`, stacked nulls would fire more times.
+    /// The pinned K (= 12 at impl time) is the empirical firings count for
+    /// the chosen fixture+depth; mutating to `true` increases this to >= 13.
+    #[test]
+    fn negamax_passes_allow_null_false_in_null_subsearch() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(8);
+        let static_eval = stm_static_eval(&pos);
+        let beta = static_eval - 100;
+        let alpha = -INF;
+
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 8, 1, alpha, beta, false, true, &ctx);
+        let firings = ab.nmp_firings_for_test();
+
+        // The pinned firings count is observed at impl time; the assertion
+        // is `firings == K`, where K is the stable count for this fixture
+        // under stacked-null prevention. Mutating the inner null-search's
+        // `allow_null = false` to `true` would let inner NMPs fire,
+        // increasing the count past K.
+        const PINNED_FIRINGS: u32 = NMP_FIRINGS_PINNED;
+
+        assert_eq!(
+            firings, PINNED_FIRINGS,
+            "NMP firings count must match pinned K={PINNED_FIRINGS}; got {firings}. \
+             A larger value indicates stacked-null prevention has regressed \
+             (the inner null-search recursive call's `allow_null = false` \
+             may have been changed to `true`)."
+        );
+    }
+
+    /// After an NMP cutoff, the TT contains a Lower-bound entry at the
+    /// current depth, with best_move=0 and the mate-capped score.
+    #[test]
+    fn negamax_stores_lower_bound_in_tt_after_nmp_cutoff() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _stop) = non_aborting_ctx_at_depth_with_tt(4, Arc::clone(&tt));
+        let static_eval = stm_static_eval(&pos);
+        let beta = static_eval - 200;
+        let alpha = -INF;
+        let depth = 4_u32;
+        let ply = 1_u32;
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let returned =
+            ab.negamax_for_test(&mut pos.clone(), depth, ply, alpha, beta, false, true, &ctx);
+        // Sanity: NMP fired and produced a cutoff at this node.
+        assert!(
+            returned >= beta,
+            "expected fail-high return; got {returned}, beta={beta}"
+        );
+        assert!(
+            ab.nmp_firings_for_test() > 0,
+            "NMP must have fired; got 0 firings"
+        );
+
+        let entry = tt
+            .probe(pos.zobrist())
+            .expect("TT must have an entry at the parent zobrist after NMP cutoff");
+        assert_eq!(
+            entry.bound(),
+            TtBound::Lower,
+            "NMP-cutoff TT entry must be Lower-bound; got {:?}",
+            entry.bound()
+        );
+        assert_eq!(
+            entry.best_move, 0,
+            "NMP-cutoff TT entry must carry best_move=0 (NMP didn't pick a move); \
+             got {}",
+            entry.best_move
+        );
+        assert_eq!(
+            entry.depth as u32, depth,
+            "NMP-cutoff TT entry depth must be the CURRENT depth (not depth-1-R); \
+             got {}, expected {depth}",
+            entry.depth
+        );
+        // Stored score is score_to_tt(cutoff_score, ply) where cutoff_score is
+        // the mate-capped value. With finite beta and a non-mate cutoff path,
+        // cutoff_score == returned, and score_from_tt round-trips it.
+        let recovered = score_from_tt(entry.score as i32, ply as i32);
+        assert_eq!(
+            recovered, returned,
+            "TT round-trip: score_from_tt(stored, ply) must equal returned; \
+             got recovered={recovered}, returned={returned}"
+        );
+    }
+
+    /// ADR-0018 §7's preservation rule: an NMP cutoff stores best_move=0,
+    /// but the tt.store implementation preserves any prior non-zero
+    /// best_move on the same key. Pre-populate the TT, fire NMP, re-probe;
+    /// the entry's bound must be Lower (NMP overwrote) BUT best_move must
+    /// be the original non-zero move.
+    #[test]
+    fn negamax_with_nmp_preserves_existing_tt_best_move() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _stop) = non_aborting_ctx_at_depth_with_tt(4, Arc::clone(&tt));
+        let static_eval = stm_static_eval(&pos);
+        let beta = static_eval - 200;
+        let alpha = -INF;
+        let depth = 4_u32;
+        let ply = 1_u32;
+
+        // Pre-populate the TT at the parent key with bound=Exact and a
+        // non-zero best_move. We pick a dummy `best_move` value that is
+        // a valid 16-bit encoding (the bits represent a Move; for the
+        // preservation test, any non-zero u16 suffices since we re-read
+        // the raw u16 field).
+        let preserved_best_move: u16 = 0x1234;
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 0,
+                depth: 1,
+                bound: TtBound::Exact,
+                best_move: preserved_best_move,
+            },
+        );
+        // tt.new_search() advances the generation so the depth-preferred
+        // replacement allows the NMP store to overwrite the seeded entry's
+        // bound/depth. ADR-0018 §1 + §9.
+        tt.new_search();
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(&mut pos.clone(), depth, ply, alpha, beta, false, true, &ctx);
+
+        let entry = tt
+            .probe(pos.zobrist())
+            .expect("TT must still have an entry after NMP cutoff");
+        assert_eq!(
+            entry.bound(),
+            TtBound::Lower,
+            "NMP cutoff must overwrite prior bound to Lower; got {:?}",
+            entry.bound()
+        );
+        assert_eq!(
+            entry.best_move, preserved_best_move,
+            "ADR-0018 §7 preservation: NMP store with best_move=0 must \
+             preserve the prior non-zero best_move; got {}, expected {}",
+            entry.best_move, preserved_best_move
+        );
+    }
+
+    /// Push-and-pop balance: after an NMP cutoff, `self.history.len()`
+    /// matches the pre-NMP length. Exercise the NMP path; assert that
+    /// `negamax_for_test` returns with history balanced (matches the
+    /// `Search::go` post-search debug-assert position-balance discipline,
+    /// but specifically for the history Vec).
+    #[test]
+    fn negamax_with_nmp_clears_history_correctly_on_unmake() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let beta = static_eval - 200;
+        let alpha = -INF;
+
+        let mut ab = AlphaBetaMover::new();
+        // Seed history with a couple of arbitrary entries to make len > 0
+        // and check that the NMP push/pop doesn't corrupt the prior contents.
+        ab.history.push(0xDEAD_BEEF_CAFE_0001);
+        ab.history.push(0xDEAD_BEEF_CAFE_0002);
+        let pre_len = ab.history.len();
+        let pre_history = ab.history.clone();
+
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+
+        // Sanity: NMP actually fired (otherwise this test would trivially pass).
+        assert!(
+            ab.nmp_firings_for_test() > 0,
+            "NMP must have fired at least once; got 0 firings"
+        );
+        assert_eq!(
+            ab.history.len(),
+            pre_len,
+            "history length must match pre-NMP length after balanced \
+             push/pop; got {}, expected {pre_len}",
+            ab.history.len()
+        );
+        assert_eq!(
+            ab.history, pre_history,
+            "history Vec contents must be byte-identical after balanced push/pop"
+        );
     }
 }
