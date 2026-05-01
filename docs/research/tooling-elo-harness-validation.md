@@ -177,3 +177,42 @@ The Part 2 back-validation gate — degenerate single-TC mix self-back-test repr
 
 - `mod prng::tests` and `mod tc_sample::tests` in `src/bin/elo-iterate.rs` — the assertions are committed in-tree and run on every `cargo test` invocation.
 - This file — Part 1 result archive, committed.
+
+# ELOH.E Part 1 — Synthetic Bernoulli + draw-heavy SPRT back-test (in-tree)
+
+**Date:** 2026-05-01.
+**Branch:** `tooling/eloh-e-sprt` at the ELOH.E landing commit.
+**Tests:** `mod sprt::tests` in `src/bin/elo-iterate.rs`.
+
+The Part 1 back-validation gate verifies that the new pentanomial-GSPRT machinery converges to the correct verdict at the correct sample size when fed a synthetic stream with known Elo gap. Four streams cover the no-draw and draw-heavy cases:
+
+| Test | Stream | True Δ Elo | Expected verdict | Sample cap |
+|---|---|---|---|---|
+| `sprt_back_test_h1_accept_at_known_elo_gap` | No-draw Bernoulli (each game W with p≈0.572) | +50 | AcceptH1 | 2000 pairs |
+| `sprt_back_test_h0_reject_at_zero_elo_gap` | No-draw Bernoulli (p≈0.4569) | -30 | AcceptH0 | 2000 pairs |
+| `sprt_back_test_drawheavy_h1_accept_at_known_elo_gap` | Draw-heavy {W:0.30, D:0.50, L:0.20} | +35 | AcceptH1 | 2000 pairs |
+| `sprt_back_test_drawheavy_h0_reject_at_zero_elo_gap` | Draw-heavy {W:0.25, D:0.50, L:0.25} | 0 | AcceptH0 | 2000 pairs |
+
+All four pass deterministically against fixed SplitMix64 seeds (`0xC1AB_F15A_E10D_5757`, `…5758`, `…DA01`, `…DA02`).
+
+**Note on parameter choice.** The plan's original recommendation of "+20 Elo H1 / 0 Elo H0" cannot converge in the 2000-pair cap with the no-draw stream because no-draw pair-variance is ~2× draw-heavy variance (0.498 vs 0.245); the asymptotic LLR/pair at +20 Elo on the no-draw stream is only ~+0.0012, requiring ~2400 pairs to reach +2.944. Widening the gaps to +50 / -30 keeps the test reliable while still being "well inside" the H1 / H0 acceptance regions. The draw-heavy variants exercise the realistic-distribution path with smaller gaps.
+
+## Part 2a — math-deterministic gate (in-tree, atomic with the unit)
+
+`pentanomial_ci_hand_computed_example` in `mod sprt::tests` feeds M4.D's historical bin counts `pair_counts = [5, 40, 78, 56, 21]` (200 pairs) through `pentanomial_ci` and asserts the result matches the historical fastchess CI `+41.89 [+18.18, +65.61]` to within ±0.5 Elo on each of the three Elo numbers (the only slack is f64 rounding through `log10`/`powf`). Pass — separately validates that the in-tree implementation and fastchess use the same logistic Elo convention. Hard merge-blocker.
+
+## Part 2b — replay gate (deferred manual run)
+
+The Part 2b back-validation gate — re-run the M4.D mixed-TC SPRT through the new in-process SPRT mode and confirm statistical equivalence to the historical fastchess outcome — runs as a follow-up commit after the manual replay completes. Per ELOH.B/ELOH.C/ELOH.D precedent.
+
+Configuration: `baseline/alpha-beta-tt-killer-history` vs HEAD, `--tc-sample 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1`, α=β=0.05, elo0=0 elo1=5 (M4.D's actual bounds), startpos-only, `taskpolicy` P-core pinning, `--virtual-clock`.
+
+Pass criteria (statistical, not bit-equivalence, since both PRNG and pair-scheduling differ from fastchess):
+- (a) Verdict is H1 accepted (matches the historical fastchess result).
+- (b) Pentanomial counts within ±30% relative of the historical `[5, 40, 78, 56, 21]`; CI endpoints within ±15 Elo of historical `[+18.18, +65.61]`.
+
+## Artefacts
+
+- `mod sprt::tests` in `src/bin/elo-iterate.rs` — the assertions are committed in-tree and run on every `cargo test` invocation.
+- `mod summary::tests::format_pentanomial_ci_two_decimal_elo` (companion test in `mod summary::tests`) verifies the formatter wraps the same numbers into the canonical `ci: elo=… [..., ...] pairs=N` line.
+- This file — Part 1 + Part 2a result archive, committed atomic with the unit.

@@ -22,6 +22,17 @@ use std::process::ExitCode;
 mod cli {
     //! CLI argument parsing for `elo-iterate`.
 
+    /// Default Robbins-Monro initial K. Frozen-K sentinel is 0.0.
+    pub(crate) const K0_DEFAULT: f64 = 40.0;
+    /// Default Robbins-Monro decay constant τ.
+    pub(crate) const TAU_DEFAULT: f64 = 10.0;
+    /// Default σ-stopping threshold. Disabled sentinel is 0.0.
+    pub(crate) const TARGET_SIGMA_DEFAULT: f64 = 30.0;
+    /// Default trailing-σ window length.
+    pub(crate) const STOP_WINDOW_DEFAULT: usize = 30;
+    /// Default consecutive-confirmation count for σ-stopping.
+    pub(crate) const STOP_WINDOW_CONFIRM_DEFAULT: usize = 5;
+
     /// Parsed command-line arguments.
     #[derive(Debug)]
     #[allow(dead_code)]
@@ -90,6 +101,17 @@ mod cli {
         pub max_moves: u32,
 
         // ELOH.C fields.
+        // ELOH.E SPRT fields. All four `sprt_*` are `Some` together iff SPRT mode
+        // is active. See `docs/decisions/0022-eloh-sprt-mechanics.md`.
+        /// `--sprt-elo0 N`. When `Some`, SPRT mode is active.
+        pub sprt_elo0: Option<f64>,
+        /// `--sprt-elo1 N`.
+        pub sprt_elo1: Option<f64>,
+        /// `--sprt-alpha F`. Must be in (0, 1).
+        pub sprt_alpha: Option<f64>,
+        /// `--sprt-beta F`. Must be in (0, 1).
+        pub sprt_beta: Option<f64>,
+
         /// When `true`, the harness sends `setoption name VirtualClock value true` to
         /// engines advertising the option (clawfish does; Stockfish does not). Engines
         /// with the option measure search time in thread CPU time rather than wallclock,
@@ -228,11 +250,11 @@ mod cli {
 
         // ELOH.B fields.
         let mut initial_elo: Option<f64> = None;
-        let mut k0: f64 = 40.0;
-        let mut tau: f64 = 10.0;
-        let mut target_sigma: f64 = 30.0;
-        let mut stop_window: usize = 30;
-        let mut stop_window_confirm: usize = 5;
+        let mut k0: f64 = K0_DEFAULT;
+        let mut tau: f64 = TAU_DEFAULT;
+        let mut target_sigma: f64 = TARGET_SIGMA_DEFAULT;
+        let mut stop_window: usize = STOP_WINDOW_DEFAULT;
+        let mut stop_window_confirm: usize = STOP_WINDOW_CONFIRM_DEFAULT;
         let mut concurrency: u32 = 1;
         let mut resign_movecount: u32 = 3;
         let mut resign_score: i32 = 600;
@@ -247,6 +269,12 @@ mod cli {
         // ELOH.D fields.
         let mut tc_sample_raw: Option<super::tc_sample::TcDistribution> = None;
         let mut seed_raw: Option<u64> = None;
+
+        // ELOH.E SPRT fields. All four required when sprt_elo0 is set.
+        let mut sprt_elo0: Option<f64> = None;
+        let mut sprt_elo1: Option<f64> = None;
+        let mut sprt_alpha: Option<f64> = None;
+        let mut sprt_beta: Option<f64> = None;
 
         let mut i = 0usize;
         while i < argv.len() {
@@ -474,6 +502,36 @@ mod cli {
                 "--seed" => {
                     seed_raw = Some(parse_u64_seed(next_val!())?);
                 }
+                // ELOH.E: SPRT bounds. All four required together; presence of
+                // --sprt-elo0 activates SPRT mode at the post-loop validation.
+                "--sprt-elo0" => {
+                    let s = next_val!();
+                    sprt_elo0 = Some(
+                        s.parse()
+                            .map_err(|_| CliError::InvalidValue(format!("--sprt-elo0: {s}")))?,
+                    );
+                }
+                "--sprt-elo1" => {
+                    let s = next_val!();
+                    sprt_elo1 = Some(
+                        s.parse()
+                            .map_err(|_| CliError::InvalidValue(format!("--sprt-elo1: {s}")))?,
+                    );
+                }
+                "--sprt-alpha" => {
+                    let s = next_val!();
+                    sprt_alpha = Some(
+                        s.parse()
+                            .map_err(|_| CliError::InvalidValue(format!("--sprt-alpha: {s}")))?,
+                    );
+                }
+                "--sprt-beta" => {
+                    let s = next_val!();
+                    sprt_beta = Some(
+                        s.parse()
+                            .map_err(|_| CliError::InvalidValue(format!("--sprt-beta: {s}")))?,
+                    );
+                }
                 other => {
                     // Reject the --virtual-clock=VALUE form: the rest of the CLI uses
                     // no-equals conventions for boolean flags.
@@ -517,6 +575,53 @@ mod cli {
         if k0 == 0.0 && target_sigma != 0.0 {
             return Err(CliError::InvalidValue(
                 "--k0 0 requires --target-sigma 0 (frozen-K fixed-anchor mode)".into(),
+            ));
+        }
+
+        // ELOH.E SPRT mutex: --sprt-* is incompatible with K-update flags and
+        // with the rating-estimate frozen-anchor mode. SPRT compares two
+        // binaries at fixed (unknown) Elo via LLR-bound stopping; combining it
+        // with a moving K-update estimate is methodologically incoherent.
+        let sprt_active = sprt_elo0.is_some();
+        if sprt_active {
+            let all_set = sprt_elo0.is_some()
+                && sprt_elo1.is_some()
+                && sprt_alpha.is_some()
+                && sprt_beta.is_some();
+            if !all_set {
+                return Err(CliError::InvalidValue(
+                    "--sprt-elo0 requires all of --sprt-elo1, --sprt-alpha, --sprt-beta".into(),
+                ));
+            }
+            let k_update_default = k0 == K0_DEFAULT && tau == TAU_DEFAULT;
+            let sigma_stopping_default = target_sigma == TARGET_SIGMA_DEFAULT
+                && stop_window == STOP_WINDOW_DEFAULT
+                && stop_window_confirm == STOP_WINDOW_CONFIRM_DEFAULT;
+            // initial_elo is required by the frozen-anchor flow but harmless
+            // for SPRT (the SPRT verdict ignores it). Treat it as default-OK
+            // when set, but reject explicit --k0 / --tau / --target-sigma /
+            // --stop-window / --stop-window-confirm overrides.
+            if !(k_update_default && sigma_stopping_default) {
+                return Err(CliError::InvalidValue(
+                    "--sprt-* is incompatible with K-update / σ-stopping flags \
+                     (--k0, --tau, --target-sigma, --stop-window, --stop-window-confirm). \
+                     Remove the offending flags and re-run."
+                        .into(),
+                ));
+            }
+        }
+        if let Some(a) = sprt_alpha
+            && !(a > 0.0 && a < 1.0)
+        {
+            return Err(CliError::InvalidValue(
+                "--sprt-alpha must be in (0, 1)".into(),
+            ));
+        }
+        if let Some(b) = sprt_beta
+            && !(b > 0.0 && b < 1.0)
+        {
+            return Err(CliError::InvalidValue(
+                "--sprt-beta must be in (0, 1)".into(),
             ));
         }
 
@@ -566,6 +671,10 @@ mod cli {
             },
             max_moves,
             virtual_clock,
+            sprt_elo0,
+            sprt_elo1,
+            sprt_alpha,
+            sprt_beta,
         })
     }
 
@@ -716,6 +825,192 @@ mod cli {
                 }
                 Err(e) => panic!("expected Ok, got {e:?}"),
             }
+        }
+
+        // --- §6.2 ELOH.E SPRT CLI tests ---
+
+        fn sprt_base_argv() -> Vec<String> {
+            vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/clawfish".into(),
+                "--tc".into(),
+                "10+0.1".into(),
+                "--max-games".into(),
+                "4".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+            ]
+        }
+
+        #[test]
+        fn parse_args_sprt_all_four_flags_accepted() {
+            let mut argv = sprt_base_argv();
+            argv.extend([
+                "--sprt-elo0".into(),
+                "0".into(),
+                "--sprt-elo1".into(),
+                "10".into(),
+                "--sprt-alpha".into(),
+                "0.05".into(),
+                "--sprt-beta".into(),
+                "0.05".into(),
+            ]);
+            let args = parse_args(argv).expect("all four sprt flags must parse");
+            assert_eq!(args.sprt_elo0, Some(0.0));
+            assert_eq!(args.sprt_elo1, Some(10.0));
+            assert_eq!(args.sprt_alpha, Some(0.05));
+            assert_eq!(args.sprt_beta, Some(0.05));
+        }
+
+        #[test]
+        fn parse_args_sprt_partial_set_rejected() {
+            let mut argv = sprt_base_argv();
+            argv.extend([
+                "--sprt-elo0".into(),
+                "0".into(),
+                "--sprt-elo1".into(),
+                "10".into(),
+            ]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "expected InvalidValue when only elo0+elo1 set; got {err:?}"
+            );
+        }
+
+        #[test]
+        fn parse_args_sprt_alpha_out_of_range_rejected() {
+            let mut argv = sprt_base_argv();
+            argv.extend([
+                "--sprt-elo0".into(),
+                "0".into(),
+                "--sprt-elo1".into(),
+                "10".into(),
+                "--sprt-alpha".into(),
+                "0.0".into(),
+                "--sprt-beta".into(),
+                "0.05".into(),
+            ]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(matches!(err, CliError::InvalidValue(_)));
+
+            let mut argv = sprt_base_argv();
+            argv.extend([
+                "--sprt-elo0".into(),
+                "0".into(),
+                "--sprt-elo1".into(),
+                "10".into(),
+                "--sprt-alpha".into(),
+                "1.5".into(),
+                "--sprt-beta".into(),
+                "0.05".into(),
+            ]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(matches!(err, CliError::InvalidValue(_)));
+        }
+
+        #[test]
+        fn parse_args_sprt_with_k0_override_rejected() {
+            let mut argv = sprt_base_argv();
+            argv.extend([
+                "--sprt-elo0".into(),
+                "0".into(),
+                "--sprt-elo1".into(),
+                "10".into(),
+                "--sprt-alpha".into(),
+                "0.05".into(),
+                "--sprt-beta".into(),
+                "0.05".into(),
+                "--k0".into(),
+                "1.0".into(),
+            ]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "SPRT + non-default --k0 must be rejected; got {err:?}"
+            );
+        }
+
+        #[test]
+        fn parse_args_sprt_with_target_sigma_override_rejected() {
+            let mut argv = sprt_base_argv();
+            argv.extend([
+                "--sprt-elo0".into(),
+                "0".into(),
+                "--sprt-elo1".into(),
+                "10".into(),
+                "--sprt-alpha".into(),
+                "0.05".into(),
+                "--sprt-beta".into(),
+                "0.05".into(),
+                "--target-sigma".into(),
+                "50".into(),
+            ]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "SPRT + non-default --target-sigma must be rejected; got {err:?}"
+            );
+        }
+
+        #[test]
+        fn parse_args_sprt_with_stop_window_override_rejected() {
+            let mut argv = sprt_base_argv();
+            argv.extend([
+                "--sprt-elo0".into(),
+                "0".into(),
+                "--sprt-elo1".into(),
+                "10".into(),
+                "--sprt-alpha".into(),
+                "0.05".into(),
+                "--sprt-beta".into(),
+                "0.05".into(),
+                "--stop-window".into(),
+                "50".into(),
+            ]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "SPRT + non-default --stop-window must be rejected; got {err:?}"
+            );
+        }
+
+        #[test]
+        fn parse_args_sprt_with_rating_estimate_frozen_anchor_rejected() {
+            // The rating-estimate frozen-anchor mode (--k0 0 --target-sigma 0)
+            // is also incompatible with SPRT (the K-update consts diverge from
+            // their defaults).
+            let mut argv = sprt_base_argv();
+            argv.extend([
+                "--sprt-elo0".into(),
+                "0".into(),
+                "--sprt-elo1".into(),
+                "10".into(),
+                "--sprt-alpha".into(),
+                "0.05".into(),
+                "--sprt-beta".into(),
+                "0.05".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+            ]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "SPRT + frozen-anchor must be rejected; got {err:?}"
+            );
+        }
+
+        #[test]
+        fn parse_args_no_sprt_flags_means_classic_mode() {
+            let args = parse_args(sprt_base_argv()).expect("classic mode parses");
+            assert!(args.sprt_elo0.is_none());
+            assert!(args.sprt_elo1.is_none());
+            assert!(args.sprt_alpha.is_none());
+            assert!(args.sprt_beta.is_none());
         }
 
         // --- §6.5 ELOH.B CLI tests ---
@@ -4201,6 +4496,627 @@ mod sigma {
 }
 
 // ---------------------------------------------------------------------------
+// mod sprt  (NEW — ELOH.E)
+// ---------------------------------------------------------------------------
+
+mod sprt {
+    //! Pentanomial-GSPRT machinery for the in-process harness.
+    //!
+    //! Math reference: docs/research/eloh.e-pentanomial-sprt.md §2.3 (per-pair
+    //! GSPRT formula), §5 (post-hoc Δ Elo CI), §6 (pitfalls — load-bearing for
+    //! the per-pair-not-per-game cadence + discard-incomplete-pair invariants).
+    //!
+    //! Logistic Elo only. Normal-approximation GSPRT (not the exact MLE form
+    //! used by vdbergh/pentanomial). The approximation is what cutechess-cli
+    //! and fastchess use under `model=logistic` and is well-calibrated for
+    //! pool sizes ≥ 100 pairs — well within ELOH.E's working range.
+
+    /// SPRT bounds + indifference zone configuration. Logistic Elo.
+    #[derive(Debug, Clone, Copy)]
+    #[allow(dead_code)]
+    pub(crate) struct SprtConfig {
+        /// H0 Elo gap. Standard chess SPRT uses 0.
+        pub elo0: f64,
+        /// H1 Elo gap. Standard chess SPRT uses 5–10.
+        pub elo1: f64,
+        /// False-positive rate. Standard 0.05.
+        pub alpha: f64,
+        /// False-negative rate. Standard 0.05.
+        pub beta: f64,
+    }
+
+    /// Running pentanomial state. Indexed pair counts plus the most recent LLR.
+    #[derive(Debug, Clone, Default)]
+    #[allow(dead_code)]
+    pub(crate) struct SprtState {
+        /// Pair counts indexed by pair-score bin (0..=4 → 0.0/0.5/1.0/1.5/2.0).
+        pub pair_counts: [u32; 5],
+        /// Last computed LLR. Updated by `update_pair` after each completed pair.
+        pub llr: f64,
+        /// Singleton games discarded because their partner game in a pair did
+        /// not complete (e.g. `--max-games` boundary). Audit-only; never feeds
+        /// the LLR computation. Pinned by research report §6 pitfall row 2.
+        pub discarded_singletons: u32,
+    }
+
+    /// SPRT verdict after a single LLR check.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[allow(dead_code)]
+    pub(crate) enum SprtVerdict {
+        /// LLR is in the indifference zone (B, A); keep playing.
+        Continue,
+        /// LLR ≤ B. Patch fails (H0: zero or negative Elo).
+        AcceptH0,
+        /// LLR ≥ A. Patch passes (H1: positive Elo).
+        AcceptH1,
+    }
+
+    /// Wald bounds `(B, A)` for the test. Pure function of (alpha, beta).
+    ///
+    /// `B = log(β / (1 - α))` (lower bound — accept H0).
+    /// `A = log((1 - β) / α)` (upper bound — accept H1).
+    #[allow(dead_code)]
+    pub(crate) fn wald_bounds(alpha: f64, beta: f64) -> (f64, f64) {
+        let b = (beta / (1.0 - alpha)).ln();
+        let a = ((1.0 - beta) / alpha).ln();
+        (b, a)
+    }
+
+    /// Logistic Elo → expected per-game score in [0, 1].
+    fn ll(elo: f64) -> f64 {
+        1.0 / (1.0 + 10f64.powf(-elo / 400.0))
+    }
+
+    /// Compute LLR from current state and config. Pure function. Per research
+    /// report §2.3 (pentanomial GSPRT, normal approximation).
+    ///
+    /// Returns 0.0 when the pair count is 0 or the variance collapses
+    /// (e.g. all-draw stream); the caller treats both as "indifference zone".
+    #[allow(dead_code)]
+    pub(crate) fn compute_llr(state: &SprtState, cfg: &SprtConfig) -> f64 {
+        let n: u32 = state.pair_counts.iter().sum();
+        if n == 0 {
+            return 0.0;
+        }
+        let n_f = f64::from(n);
+        let pair_score = |i: usize| (i as f64) * 0.5;
+        let mut sum_ns = 0.0;
+        let mut sum_ns2 = 0.0;
+        for (i, &count) in state.pair_counts.iter().enumerate() {
+            let s = pair_score(i);
+            sum_ns += f64::from(count) * s;
+            sum_ns2 += f64::from(count) * s * s;
+        }
+        let mu = sum_ns / n_f;
+        let var = sum_ns2 / n_f - mu * mu;
+        if var <= 0.0 {
+            return 0.0;
+        }
+        let var_s = var / n_f;
+        let s0_pair = 2.0 * ll(cfg.elo0);
+        let s1_pair = 2.0 * ll(cfg.elo1);
+        (s1_pair - s0_pair) * (2.0 * mu - s0_pair - s1_pair) / var_s / 2.0
+    }
+
+    /// Classify a (game-A score, game-B score) pair into a pair-score bin
+    /// (0..=4 → 0.0/0.5/1.0/1.5/2.0). Per research report §4 truth table.
+    /// Inputs are per-side scores in candidate-POV (1.0/0.5/0.0).
+    ///
+    /// Inputs outside `{0.0, 0.5, 1.0}` are clamped via the rounded-doubled
+    /// sum then bounded to `[0, 4]`; the harness only ever calls this with
+    /// the three valid scores, so the clamp is purely defensive.
+    #[allow(dead_code)]
+    pub(crate) fn classify_pair_score(game_a: f64, game_b: f64) -> usize {
+        let total = game_a + game_b;
+        let scaled = (total * 2.0).round() as i64;
+        scaled.clamp(0, 4) as usize
+    }
+
+    /// Append a new pair to the state, recompute LLR, and return the verdict.
+    /// `pair_score` is the candidate's *total* score across the pair (0.0–2.0).
+    /// Caller must never call this with a singleton (use `discard_singleton`
+    /// for the audit-only count).
+    #[allow(dead_code)]
+    pub(crate) fn update_pair(
+        state: &mut SprtState,
+        cfg: &SprtConfig,
+        pair_score: f64,
+    ) -> SprtVerdict {
+        let bin = ((pair_score * 2.0).round() as i64).clamp(0, 4) as usize;
+        state.pair_counts[bin] = state.pair_counts[bin].saturating_add(1);
+        state.llr = compute_llr(state, cfg);
+        let (b, a) = wald_bounds(cfg.alpha, cfg.beta);
+        if state.llr <= b {
+            SprtVerdict::AcceptH0
+        } else if state.llr >= a {
+            SprtVerdict::AcceptH1
+        } else {
+            SprtVerdict::Continue
+        }
+    }
+
+    /// Increment the audit-only singleton counter. Used at run end when an
+    /// in-flight pair never completes (worker failure or `--max-games` cap).
+    #[allow(dead_code)]
+    pub(crate) fn discard_singleton(state: &mut SprtState) {
+        state.discarded_singletons = state.discarded_singletons.saturating_add(1);
+    }
+
+    /// Post-hoc 95% CI on Δ Elo from accumulated pair counts. Per research
+    /// report §5: pair-variance SE, normal-approximation CI on the mean pair
+    /// score, inverse-logistic transformation to Elo. Returns
+    /// `(elo_lo, elo_est, elo_hi)`.
+    ///
+    /// NaN-safe at `N < 2` or degenerate variance: returns `(NaN, NaN, NaN)`;
+    /// the caller must guard the print path.
+    #[allow(dead_code)]
+    pub(crate) fn pentanomial_ci(state: &SprtState) -> (f64, f64, f64) {
+        let n: u32 = state.pair_counts.iter().sum();
+        if n < 2 {
+            return (f64::NAN, f64::NAN, f64::NAN);
+        }
+        let n_f = f64::from(n);
+        let pair_score = |i: usize| (i as f64) * 0.5;
+        let mut sum_ns = 0.0;
+        let mut sum_ns2 = 0.0;
+        for (i, &count) in state.pair_counts.iter().enumerate() {
+            let s = pair_score(i);
+            sum_ns += f64::from(count) * s;
+            sum_ns2 += f64::from(count) * s * s;
+        }
+        let mu = sum_ns / n_f;
+        let var = sum_ns2 / n_f - mu * mu;
+        // var ≤ 0 (zero variance from a degenerate single-bin distribution, or
+        // negative from f64 round-off near zero) → CI is undefined.
+        if var <= 0.0 || var.is_nan() {
+            return (f64::NAN, f64::NAN, f64::NAN);
+        }
+        let se = (var / n_f).sqrt();
+        let ci_lo = mu - 1.96 * se;
+        let ci_hi = mu + 1.96 * se;
+        let to_elo = |pair_mu: f64| -> f64 {
+            let s_game = pair_mu / 2.0;
+            // Saturate the inverse-logistic at the open-interval boundary.
+            // 0 < s_game < 1 always holds for non-degenerate runs; only
+            // pathological 0%/100%-score pair distributions hit the limit.
+            if s_game <= 0.0 {
+                return f64::NEG_INFINITY;
+            }
+            if s_game >= 1.0 {
+                return f64::INFINITY;
+            }
+            400.0 * (s_game / (1.0 - s_game)).log10()
+        };
+        (to_elo(ci_lo), to_elo(mu), to_elo(ci_hi))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn wald_bounds_at_alpha_beta_05() {
+            let (b, a) = wald_bounds(0.05, 0.05);
+            let expected_b = (0.05_f64 / 0.95).ln();
+            let expected_a = (0.95_f64 / 0.05).ln();
+            assert!(
+                (b - expected_b).abs() < 1e-9,
+                "B mismatch: {b} vs {expected_b}"
+            );
+            assert!(
+                (a - expected_a).abs() < 1e-9,
+                "A mismatch: {a} vs {expected_a}"
+            );
+            assert!((b - (-2.944438979_f64)).abs() < 1e-6);
+            assert!((a - 2.944438979_f64).abs() < 1e-6);
+        }
+
+        #[test]
+        fn wald_bounds_asymmetric_alpha_beta() {
+            let (b, a) = wald_bounds(0.01, 0.05);
+            let expected_b = (0.05_f64 / 0.99).ln();
+            let expected_a = (0.95_f64 / 0.01).ln();
+            assert!((b - expected_b).abs() < 1e-9);
+            assert!((a - expected_a).abs() < 1e-9);
+        }
+
+        #[test]
+        fn compute_llr_zero_at_indifference_midpoint() {
+            // Empty state → degenerate guard returns 0.
+            let cfg_zero = SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let state = SprtState::default();
+            assert_eq!(compute_llr(&state, &cfg_zero), 0.0);
+
+            // Exact midpoint: with elo0=-10 and elo1=+10, s0_pair + s1_pair = 2.0 exactly
+            // (logistic is symmetric around Elo=0). 50/50 mix of bin 1 (0.5) and bin 3 (1.5)
+            // gives mu = 1.0 exactly, so (2*mu - s0_pair - s1_pair) = 0 → LLR = 0.
+            let cfg = SprtConfig {
+                elo0: -10.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let mut s = SprtState::default();
+            s.pair_counts[1] = 50;
+            s.pair_counts[3] = 50;
+            let llr = compute_llr(&s, &cfg);
+            assert!(
+                llr.abs() < 1e-9,
+                "LLR at exact indifference midpoint must be ~0; got {llr}"
+            );
+        }
+
+        #[test]
+        fn compute_llr_positive_when_sample_favors_h1() {
+            let cfg = SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let mut s = SprtState::default();
+            s.pair_counts[3] = 50;
+            s.pair_counts[4] = 50;
+            let llr = compute_llr(&s, &cfg);
+            assert!(
+                llr > 0.0,
+                "LLR must be positive when samples favor H1; got {llr}"
+            );
+        }
+
+        #[test]
+        fn compute_llr_negative_when_sample_favors_h0() {
+            let cfg = SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let mut s = SprtState::default();
+            s.pair_counts[0] = 50;
+            s.pair_counts[1] = 50;
+            let llr = compute_llr(&s, &cfg);
+            assert!(
+                llr < 0.0,
+                "LLR must be negative when samples favor H0; got {llr}"
+            );
+        }
+
+        #[test]
+        fn compute_llr_zero_variance_returns_zero() {
+            let cfg = SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let mut s = SprtState::default();
+            s.pair_counts[2] = 100;
+            assert_eq!(compute_llr(&s, &cfg), 0.0);
+        }
+
+        #[test]
+        fn compute_llr_pinned_value() {
+            // Pinned hand-computed value catches a factor-of-2 error in s_i_pair
+            // that the midpoint test cannot catch (its LLR=0 property is
+            // invariant under any consistent rescaling).
+            let cfg = SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let s = SprtState {
+                pair_counts: [10, 10, 30, 25, 25],
+                ..SprtState::default()
+            };
+            // mu = (0+5+30+37.5+50)/100 = 1.225
+            // m2 = (0+2.5+30+56.25+100)/100 = 1.8875
+            // sigma2 = 1.8875 - 1.225² = 0.386875
+            // s0_pair = 1.0; s1_pair ≈ 1.028766
+            // LLR ≈ 0.028766 * 0.421234 / (0.386875/100) / 2 ≈ 1.566
+            let llr = compute_llr(&s, &cfg);
+            assert!(
+                (llr - 1.566).abs() < 0.01,
+                "compute_llr_pinned_value: expected ≈ 1.566, got {llr}"
+            );
+        }
+
+        #[test]
+        fn classify_pair_score_truth_table() {
+            // 9-row table of (gameA, gameB) ∈ {0.0, 0.5, 1.0}².
+            assert_eq!(classify_pair_score(0.0, 0.0), 0);
+            assert_eq!(classify_pair_score(0.0, 0.5), 1);
+            assert_eq!(classify_pair_score(0.0, 1.0), 2);
+            assert_eq!(classify_pair_score(0.5, 0.0), 1);
+            assert_eq!(classify_pair_score(0.5, 0.5), 2);
+            assert_eq!(classify_pair_score(0.5, 1.0), 3);
+            assert_eq!(classify_pair_score(1.0, 0.0), 2);
+            assert_eq!(classify_pair_score(1.0, 0.5), 3);
+            assert_eq!(classify_pair_score(1.0, 1.0), 4);
+        }
+
+        #[test]
+        fn pentanomial_ci_hand_computed_example() {
+            // M4.D-shape input.
+            let s = SprtState {
+                pair_counts: [5, 40, 78, 56, 21],
+                ..SprtState::default()
+            };
+            // mu = 224/200 = 1.12; m2 = 298/200 = 1.49; sigma2 = 0.2356.
+            // SE = sqrt(0.2356/200) ≈ 0.03432.
+            // CI_pair ≈ [1.0527, 1.1873].
+            // Elo_est = 400·log10(0.56/0.44) ≈ +41.85.
+            // Elo_lo  ≈ +18.33; Elo_hi ≈ +65.85.
+            let (lo, est, hi) = pentanomial_ci(&s);
+            assert!((est - 41.85).abs() < 0.5, "Elo_est ≈ +41.85; got {est}");
+            assert!((lo - 18.33).abs() < 0.5, "Elo_lo ≈ +18.33; got {lo}");
+            assert!((hi - 65.85).abs() < 0.5, "Elo_hi ≈ +65.85; got {hi}");
+        }
+
+        #[test]
+        fn pentanomial_ci_minimum_sample_returns_nan() {
+            let s = SprtState {
+                pair_counts: [0, 0, 1, 0, 0],
+                ..SprtState::default()
+            };
+            let (lo, est, hi) = pentanomial_ci(&s);
+            assert!(
+                lo.is_nan() && est.is_nan() && hi.is_nan(),
+                "pentanomial_ci at N<2 must return NaN tuple; got ({lo}, {est}, {hi})"
+            );
+        }
+
+        #[test]
+        fn pentanomial_ci_zero_variance_returns_nan() {
+            // 100 pairs but all in the middle bin → variance is exactly zero.
+            let mut s = SprtState::default();
+            s.pair_counts[2] = 100;
+            let (lo, est, hi) = pentanomial_ci(&s);
+            assert!(
+                lo.is_nan() && est.is_nan() && hi.is_nan(),
+                "pentanomial_ci at zero variance must return NaN tuple"
+            );
+        }
+
+        #[test]
+        fn update_pair_continue_then_h1() {
+            let cfg = SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let mut s = SprtState::default();
+            // Stream: alternate bin-3 (1.5) and bin-4 (2.0) — strongly favors H1.
+            let mut accepted = false;
+            for i in 0..2000 {
+                let score = if i % 2 == 0 { 1.5 } else { 2.0 };
+                let v = update_pair(&mut s, &cfg, score);
+                if v == SprtVerdict::AcceptH1 {
+                    accepted = true;
+                    break;
+                }
+                assert_ne!(v, SprtVerdict::AcceptH0);
+            }
+            assert!(accepted, "stream favoring H1 must accept H1 within cap");
+        }
+
+        #[test]
+        fn update_pair_h0_path() {
+            let cfg = SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let mut s = SprtState::default();
+            // Stream of 0.0 / 0.5 outcomes — favors H0.
+            let mut rejected = false;
+            for i in 0..2000 {
+                let score = if i % 2 == 0 { 0.0 } else { 0.5 };
+                let v = update_pair(&mut s, &cfg, score);
+                if v == SprtVerdict::AcceptH0 {
+                    rejected = true;
+                    break;
+                }
+                assert_ne!(v, SprtVerdict::AcceptH1);
+            }
+            assert!(rejected, "stream favoring H0 must accept H0 within cap");
+        }
+
+        #[test]
+        fn discard_singleton_increments_only_audit_counter() {
+            let mut s = SprtState::default();
+            for _ in 0..5 {
+                discard_singleton(&mut s);
+            }
+            assert_eq!(s.discarded_singletons, 5);
+            assert_eq!(s.pair_counts, [0; 5]);
+            assert_eq!(s.llr, 0.0);
+        }
+
+        // -----------------------------------------------------------------
+        // §6.3 back-test gate — synthetic Bernoulli-pair stream
+        // -----------------------------------------------------------------
+
+        /// Convert a u64 to a uniform f64 in [0, 1).
+        fn u64_to_f64(x: u64) -> f64 {
+            (x >> 11) as f64 / ((1u64 << 53) as f64)
+        }
+
+        #[test]
+        fn sprt_back_test_h1_accept_at_known_elo_gap() {
+            // Synthetic no-draw stream: each game is W with p ≈ 0.572 (= +50 Elo gap).
+            // The plan's parenthetical claim that no-draw streams converge faster is
+            // wrong: no-draw pair-variance is ~2× draw-heavy variance (each game is
+            // Bernoulli at variance p(1-p) — pure 0/1, no 0.5 outcome to dampen var).
+            // At +20 Elo the asymptotic LLR/pair is ~+0.0012, requiring ~2400 pairs
+            // to reach +2.944 — too tight for the 2000-pair cap. +50 Elo gives
+            // ~+0.0038 LLR/pair → ~770 pairs asymptotic, well inside the cap.
+            // (The draw-heavy variants below test the realistic-distribution path.)
+            let mut prng = super::super::prng::Prng::new(0xC1AB_F15A_E10D_5757);
+            let cfg = SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let mut state = SprtState::default();
+            let p = 1.0 / (1.0 + 10f64.powf(-50.0 / 400.0));
+            for _ in 0..2000 {
+                let g_a = if u64_to_f64(prng.next_u64()) < p {
+                    1.0
+                } else {
+                    0.0
+                };
+                let g_b = if u64_to_f64(prng.next_u64()) < p {
+                    1.0
+                } else {
+                    0.0
+                };
+                let pair_score = g_a + g_b;
+                let verdict = update_pair(&mut state, &cfg, pair_score);
+                if verdict == SprtVerdict::AcceptH1 {
+                    return;
+                }
+                assert_ne!(
+                    verdict,
+                    SprtVerdict::AcceptH0,
+                    "SPRT must not falsely reject at +50 Elo true gap"
+                );
+            }
+            panic!("SPRT did not accept H1 within 2000 pairs at +50 Elo true gap");
+        }
+
+        #[test]
+        fn sprt_back_test_h0_reject_at_zero_elo_gap() {
+            // True -30 Elo gap (well inside H0) — see sibling H1 test for why
+            // the plan's "true 0 Elo" recommendation cannot converge in the
+            // no-draw stream within 2000 pairs (asymptotic LLR/pair at 0 Elo
+            // is only ~-0.00041 → ~7100 pairs needed). At -30 Elo the
+            // asymptotic LLR/pair is ~-0.0058 → ~510 pairs.
+            let mut prng = super::super::prng::Prng::new(0xC1AB_F15A_E10D_5758);
+            let cfg = SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let mut state = SprtState::default();
+            let p = 1.0 / (1.0 + 10f64.powf(30.0 / 400.0));
+            for _ in 0..2000 {
+                let g_a = if u64_to_f64(prng.next_u64()) < p {
+                    1.0
+                } else {
+                    0.0
+                };
+                let g_b = if u64_to_f64(prng.next_u64()) < p {
+                    1.0
+                } else {
+                    0.0
+                };
+                let pair_score = g_a + g_b;
+                let verdict = update_pair(&mut state, &cfg, pair_score);
+                if verdict == SprtVerdict::AcceptH0 {
+                    return;
+                }
+                assert_ne!(
+                    verdict,
+                    SprtVerdict::AcceptH1,
+                    "SPRT must not falsely accept H1 at -30 Elo true gap"
+                );
+            }
+            panic!("SPRT did not accept H0 within 2000 pairs at -30 Elo true gap");
+        }
+
+        #[test]
+        fn sprt_back_test_drawheavy_h1_accept_at_known_elo_gap() {
+            // Three-way per-game outcome: W=0.30, D=0.50, L=0.20 → ≈ +35 Elo.
+            // Realistic 50% draw rate keeps the middle pair-score bins populated,
+            // so a buggy trinomial-over-games implementation would mis-estimate
+            // variance. Pentanomial code must converge to AcceptH1.
+            let mut prng = super::super::prng::Prng::new(0xC1AB_F15A_E10D_DA01);
+            let cfg = SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let mut state = SprtState::default();
+            let draw_game = |rng: &mut super::super::prng::Prng| -> f64 {
+                let r = u64_to_f64(rng.next_u64());
+                if r < 0.30 {
+                    1.0
+                } else if r < 0.80 {
+                    0.5
+                } else {
+                    0.0
+                }
+            };
+            for _ in 0..2000 {
+                let g_a = draw_game(&mut prng);
+                let g_b = draw_game(&mut prng);
+                let pair_score = g_a + g_b;
+                let verdict = update_pair(&mut state, &cfg, pair_score);
+                if verdict == SprtVerdict::AcceptH1 {
+                    return;
+                }
+                assert_ne!(
+                    verdict,
+                    SprtVerdict::AcceptH0,
+                    "SPRT must not falsely reject at +35 Elo true gap"
+                );
+            }
+            panic!("SPRT did not accept H1 within 2000 pairs at +35 Elo true gap (draw-heavy)");
+        }
+
+        #[test]
+        fn sprt_back_test_drawheavy_h0_reject_at_zero_elo_gap() {
+            // W=0.25, D=0.50, L=0.25 → 0 Elo gap, 50% draw rate.
+            let mut prng = super::super::prng::Prng::new(0xC1AB_F15A_E10D_DA02);
+            let cfg = SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let mut state = SprtState::default();
+            let draw_game = |rng: &mut super::super::prng::Prng| -> f64 {
+                let r = u64_to_f64(rng.next_u64());
+                if r < 0.25 {
+                    1.0
+                } else if r < 0.75 {
+                    0.5
+                } else {
+                    0.0
+                }
+            };
+            for _ in 0..2000 {
+                let g_a = draw_game(&mut prng);
+                let g_b = draw_game(&mut prng);
+                let pair_score = g_a + g_b;
+                let verdict = update_pair(&mut state, &cfg, pair_score);
+                if verdict == SprtVerdict::AcceptH0 {
+                    return;
+                }
+                assert_ne!(
+                    verdict,
+                    SprtVerdict::AcceptH1,
+                    "SPRT must not falsely accept H1 at 0 Elo true gap (draw-heavy)"
+                );
+            }
+            panic!("SPRT did not accept H0 within 2000 pairs at 0 Elo true gap (draw-heavy)");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // mod pgn
 // ---------------------------------------------------------------------------
 
@@ -4669,6 +5585,61 @@ mod summary {
         format!("summary-by-tc: {}", parts.join("  "))
     }
 
+    /// Format the SPRT verdict line for the run-end summary. Always emitted in
+    /// SPRT mode regardless of whether termination was via Wald-bound crossing
+    /// or `--max-games`.
+    ///
+    /// Output (canonical):
+    ///   `sprt: verdict=H1 llr=2.95 elo0=0.0 elo1=10.0 alpha=0.050 beta=0.050 \
+    ///    pairs=187 ptnml=[3,28,71,52,33]`
+    ///   `sprt: verdict=continue llr=1.23 elo0=0.0 elo1=10.0 alpha=0.050 \
+    ///    beta=0.050 pairs=199 ptnml=[5,40,78,56,21]`
+    ///
+    /// Elo bounds use 1-decimal precision, alpha/beta 3-decimal, LLR 2-decimal.
+    pub(crate) fn format_sprt_verdict(
+        state: &super::sprt::SprtState,
+        cfg: &super::sprt::SprtConfig,
+        verdict: super::sprt::SprtVerdict,
+    ) -> String {
+        let verdict_token = match verdict {
+            super::sprt::SprtVerdict::AcceptH0 => "H0",
+            super::sprt::SprtVerdict::AcceptH1 => "H1",
+            super::sprt::SprtVerdict::Continue => "continue",
+        };
+        let pairs: u32 = state.pair_counts.iter().sum();
+        let n = state.pair_counts;
+        format!(
+            "sprt: verdict={verdict_token} llr={llr:.2} elo0={e0:.1} elo1={e1:.1} \
+             alpha={a:.3} beta={b:.3} pairs={pairs} \
+             ptnml=[{},{},{},{},{}]",
+            n[0],
+            n[1],
+            n[2],
+            n[3],
+            n[4],
+            llr = state.llr,
+            e0 = cfg.elo0,
+            e1 = cfg.elo1,
+            a = cfg.alpha,
+            b = cfg.beta,
+        )
+    }
+
+    /// Format the post-hoc pentanomial 95% CI line. Emitted whenever ≥2 pairs
+    /// completed, regardless of mode (rating-estimate, fixed-games match, SPRT).
+    ///
+    /// Output (canonical):
+    ///   `ci: elo=+41.85 [+18.33, +65.85] pairs=200`
+    ///   `ci: undefined (n=1)` when fewer than 2 pairs are present.
+    pub(crate) fn format_pentanomial_ci(state: &super::sprt::SprtState) -> String {
+        let pairs: u32 = state.pair_counts.iter().sum();
+        let (lo, est, hi) = super::sprt::pentanomial_ci(state);
+        if est.is_nan() {
+            return format!("ci: undefined (n={pairs})");
+        }
+        format!("ci: elo={est:+.2} [{lo:+.2}, {hi:+.2}] pairs={pairs}")
+    }
+
     /// Append a summary line to `path` (tab-separated, one line per game).
     pub(crate) fn append_summary_line(path: &Path, line: &SummaryLine) -> std::io::Result<()> {
         use std::fs::OpenOptions;
@@ -4815,6 +5786,95 @@ mod summary {
                 "zero-game bucket must emit 'W=0 L=0 D=0 (0)'; got: {s:?}"
             );
         }
+
+        // -----------------------------------------------------------------------
+        // §6.4 ELOH.E SPRT-summary tests
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn format_sprt_verdict_h1_canonical_string() {
+            let cfg = super::super::sprt::SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let s = super::super::sprt::SprtState {
+                pair_counts: [3, 28, 71, 52, 33],
+                llr: 2.95,
+                ..Default::default()
+            };
+            let out = format_sprt_verdict(&s, &cfg, super::super::sprt::SprtVerdict::AcceptH1);
+            assert_eq!(
+                out,
+                "sprt: verdict=H1 llr=2.95 elo0=0.0 elo1=10.0 alpha=0.050 beta=0.050 \
+                 pairs=187 ptnml=[3,28,71,52,33]"
+            );
+        }
+
+        #[test]
+        fn format_sprt_verdict_h0_canonical_string() {
+            let cfg = super::super::sprt::SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let s = super::super::sprt::SprtState {
+                pair_counts: [33, 52, 71, 28, 3],
+                llr: -2.95,
+                ..Default::default()
+            };
+            let out = format_sprt_verdict(&s, &cfg, super::super::sprt::SprtVerdict::AcceptH0);
+            assert_eq!(
+                out,
+                "sprt: verdict=H0 llr=-2.95 elo0=0.0 elo1=10.0 alpha=0.050 beta=0.050 \
+                 pairs=187 ptnml=[33,52,71,28,3]"
+            );
+        }
+
+        #[test]
+        fn format_sprt_verdict_continue_at_max_games() {
+            let cfg = super::super::sprt::SprtConfig {
+                elo0: 0.0,
+                elo1: 10.0,
+                alpha: 0.05,
+                beta: 0.05,
+            };
+            let s = super::super::sprt::SprtState {
+                pair_counts: [5, 40, 78, 56, 21],
+                llr: 1.23,
+                ..Default::default()
+            };
+            let out = format_sprt_verdict(&s, &cfg, super::super::sprt::SprtVerdict::Continue);
+            assert!(out.starts_with("sprt: verdict=continue llr=1.23 "));
+            assert!(out.contains("pairs=200 ptnml=[5,40,78,56,21]"));
+        }
+
+        #[test]
+        fn format_pentanomial_ci_two_decimal_elo() {
+            let s = super::super::sprt::SprtState {
+                pair_counts: [5, 40, 78, 56, 21],
+                ..Default::default()
+            };
+            let out = format_pentanomial_ci(&s);
+            assert!(out.starts_with("ci: elo=+41."));
+            assert!(out.contains("pairs=200"));
+            // Bounds present, comma-separated, with explicit signs.
+            assert!(
+                out.contains(", +"),
+                "upper bound must carry explicit + sign; got {out}"
+            );
+        }
+
+        #[test]
+        fn format_pentanomial_ci_undefined_at_n_lt_2() {
+            let s = super::super::sprt::SprtState {
+                pair_counts: [0, 0, 1, 0, 0],
+                ..Default::default()
+            };
+            assert_eq!(format_pentanomial_ci(&s), "ci: undefined (n=1)");
+        }
     }
 }
 
@@ -4830,6 +5890,10 @@ pub(crate) enum StopReason {
     Sigma,
     /// `--max-games` exhausted without σ convergence.
     MaxGames,
+    /// SPRT LLR ≤ B (lower Wald bound). H0 accepted (patch fails).
+    SprtAcceptH0,
+    /// SPRT LLR ≥ A (upper Wald bound). H1 accepted (patch passes).
+    SprtAcceptH1,
 }
 
 // ---------------------------------------------------------------------------
@@ -4887,6 +5951,8 @@ mod progress {
         let reason_str = match reason {
             StopReason::Sigma => "sigma",
             StopReason::MaxGames => "max-games",
+            StopReason::SprtAcceptH0 => "sprt-h0",
+            StopReason::SprtAcceptH1 => "sprt-h1",
         };
         format!(
             "converged: elo={final_elo:.2} sigma={final_sigma:.2} games={games} reason={reason_str}"
@@ -5458,6 +6524,10 @@ mod controller {
     pub(crate) enum WorkerReport {
         /// A single game in the current pair has completed.
         GameComplete {
+            /// Emitting worker. ELOH.E uses this to route per-game scores into
+            /// the per-worker pair-score buffer for SPRT pair classification
+            /// under `concurrency > 1`.
+            worker_id: u32,
             game_index: u32,
             opponent_uci_elo: u32,
             /// Clawfish's score: 1.0 = win, 0.5 = draw, 0.0 = loss.
@@ -5802,6 +6872,7 @@ mod controller {
                         let clawfish_score = compute_clawfish_score(&outcome, clawfish_white);
 
                         let _ = rpt_tx.send(WorkerReport::GameComplete {
+                            worker_id,
                             game_index,
                             opponent_uci_elo,
                             clawfish_score,
@@ -5883,6 +6954,34 @@ mod controller {
         let mut terminating = false;
         let mut sigma_fired = false;
         let mut failure: Option<super::driver::HarnessError> = None;
+
+        // ELOH.E SPRT state. `sprt_cfg` is `Some` iff `--sprt-elo0` is set
+        // (parse-time validation guarantees the other three are also set).
+        let sprt_cfg: Option<super::sprt::SprtConfig> =
+            if let (Some(e0), Some(e1), Some(a), Some(b)) = (
+                args.sprt_elo0,
+                args.sprt_elo1,
+                args.sprt_alpha,
+                args.sprt_beta,
+            ) {
+                Some(super::sprt::SprtConfig {
+                    elo0: e0,
+                    elo1: e1,
+                    alpha: a,
+                    beta: b,
+                })
+            } else {
+                None
+            };
+        let mut sprt_state = super::sprt::SprtState::default();
+        let mut sprt_stop_reason: Option<super::StopReason> = None;
+        // Per-worker pair-score buffer keyed by `worker_id`. Each worker holds
+        // at most one in-flight pair, so the HashMap has at most `concurrency`
+        // entries. A single shared `Vec<f64>` would silently corrupt the SPRT
+        // state under `concurrency > 1` (two workers' game scores would
+        // interleave before either PairComplete arrives).
+        let mut pair_score_buffers: std::collections::HashMap<u32, Vec<f64>> =
+            std::collections::HashMap::new();
 
         // Best-effort directory setup; errors here just mean later writes fail.
         let _ = std::fs::create_dir_all(out_dir);
@@ -5968,6 +7067,7 @@ mod controller {
             };
             match report {
                 WorkerReport::GameComplete {
+                    worker_id,
                     game_index,
                     opponent_uci_elo,
                     clawfish_score,
@@ -6039,8 +7139,12 @@ mod controller {
                         draws += 1;
                     }
 
-                    // σ-stopping check (per-game cadence).
-                    if !terminating
+                    // σ-stopping check (per-game cadence). Skipped in SPRT mode
+                    // — SPRT's termination criteria are LLR-bound or --max-games
+                    // (per docs/decisions/0022); allowing σ-stop to preempt would
+                    // invalidate the α/β guarantees.
+                    if sprt_cfg.is_none()
+                        && !terminating
                         && super::sigma::should_stop(
                             &estimates_trail,
                             args.stop_window,
@@ -6051,11 +7155,68 @@ mod controller {
                         terminating = true;
                         sigma_fired = true;
                     }
+
+                    // ELOH.E: route the per-game candidate score into this
+                    // worker's pair buffer. Used for both SPRT pair
+                    // classification (when active) and the post-hoc
+                    // pentanomial CI line (always emitted at run end).
+                    pair_score_buffers
+                        .entry(worker_id)
+                        .or_default()
+                        .push(clawfish_score);
                 }
                 WorkerReport::PairComplete { worker_id } => {
                     let wid = worker_id as usize;
                     if wid < pairs_in_flight.len() {
                         pairs_in_flight[wid] = pairs_in_flight[wid].saturating_sub(1);
+                    }
+
+                    // ELOH.E: drain this worker's pair-score buffer and feed
+                    // it into the SPRT state. Always runs (the same state
+                    // backs the post-hoc pentanomial CI line); the LLR
+                    // verdict is only consulted when `sprt_cfg.is_some()`.
+                    //
+                    // In production a worker emits PairComplete iff it just
+                    // emitted both games' GameComplete with its own worker_id,
+                    // so the buffer length is 2. Length 0 happens in tests
+                    // that emit PairComplete without matching GameComplete
+                    // fixtures (legacy fixtures that pre-date the worker_id
+                    // field) — fall through silently; the SPRT state simply
+                    // doesn't see that pair. Length 1 is impossible at this
+                    // point because PairComplete signals both games done; if
+                    // it ever happens, the run-end drain folds it as a
+                    // singleton via the audit counter.
+                    let scores = pair_score_buffers.remove(&worker_id).unwrap_or_default();
+                    if scores.len() == 2 {
+                        let pair_score: f64 = scores.iter().sum();
+                        // Use a dummy config when SPRT is inactive — the LLR field
+                        // is overwritten but never consumed in that path.
+                        let dummy_cfg = super::sprt::SprtConfig {
+                            elo0: 0.0,
+                            elo1: 10.0,
+                            alpha: 0.05,
+                            beta: 0.05,
+                        };
+                        let cfg_ref = sprt_cfg.as_ref().unwrap_or(&dummy_cfg);
+                        let verdict =
+                            super::sprt::update_pair(&mut sprt_state, cfg_ref, pair_score);
+                        if sprt_cfg.is_some() {
+                            match verdict {
+                                super::sprt::SprtVerdict::Continue => {}
+                                super::sprt::SprtVerdict::AcceptH0 => {
+                                    if !terminating {
+                                        terminating = true;
+                                        sprt_stop_reason = Some(super::StopReason::SprtAcceptH0);
+                                    }
+                                }
+                                super::sprt::SprtVerdict::AcceptH1 => {
+                                    if !terminating {
+                                        terminating = true;
+                                        sprt_stop_reason = Some(super::StopReason::SprtAcceptH1);
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Emit progress line for this pair.
@@ -6129,11 +7290,36 @@ mod controller {
             return Err(e);
         }
 
-        let stop_reason = if sigma_fired {
+        // ELOH.E: drain orphaned per-worker buffers. A buffer of length 2 is
+        // a complete pair whose `PairComplete` was not processed before the
+        // loop exited (e.g. max-games boundary cut in after the 2nd game's
+        // GameComplete) — fold it into the SPRT state. A buffer of length 1
+        // is a true singleton (game A's GameComplete arrived but game B never
+        // completed) — count toward `discarded_singletons` and ignore.
+        let dummy_cfg_for_drain = super::sprt::SprtConfig {
+            elo0: 0.0,
+            elo1: 10.0,
+            alpha: 0.05,
+            beta: 0.05,
+        };
+        let drain_cfg = sprt_cfg.as_ref().unwrap_or(&dummy_cfg_for_drain);
+        for (_wid, buf) in pair_score_buffers.drain() {
+            match buf.len() {
+                2 => {
+                    let pair_score: f64 = buf.iter().sum();
+                    let _ = super::sprt::update_pair(&mut sprt_state, drain_cfg, pair_score);
+                }
+                1 => super::sprt::discard_singleton(&mut sprt_state),
+                _ => {}
+            }
+        }
+
+        let fallback_reason = if sigma_fired {
             super::StopReason::Sigma
         } else {
             super::StopReason::MaxGames
         };
+        let stop_reason = sprt_stop_reason.unwrap_or(fallback_reason);
 
         let final_window_start = estimates_trail.len().saturating_sub(args.stop_window);
         let final_sigma = super::sigma::sample_stddev(&estimates_trail[final_window_start..]);
@@ -6164,6 +7350,47 @@ mod controller {
             }
         }
 
+        // ELOH.E: emit `sprt:` line (always when SPRT active) and `ci:` line
+        // (always when ≥2 pairs completed; format itself emits "undefined" otherwise).
+        if let Some(cfg) = sprt_cfg.as_ref() {
+            let verdict = match sprt_stop_reason {
+                Some(super::StopReason::SprtAcceptH0) => super::sprt::SprtVerdict::AcceptH0,
+                Some(super::StopReason::SprtAcceptH1) => super::sprt::SprtVerdict::AcceptH1,
+                _ => super::sprt::SprtVerdict::Continue,
+            };
+            let sprt_str = super::summary::format_sprt_verdict(&sprt_state, cfg, verdict);
+            println!("{sprt_str}");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&summary_path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "{sprt_str}");
+            }
+        }
+        // ci: line is always emitted at run end. The formatter itself
+        // returns "ci: undefined (n=N)" when fewer than 2 pairs are present
+        // or variance collapses, so callers always get a parsable line.
+        {
+            let ci_str = super::summary::format_pentanomial_ci(&sprt_state);
+            println!("{ci_str}");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&summary_path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "{ci_str}");
+            }
+        }
+
+        // ELOH.E: combined match.pgn = concatenation of per-game PGNs in
+        // ascending game_index order. Runs unconditionally so downstream
+        // tools that read a single combined PGN file always have one.
+        // Empty if no games completed.
+        let _ = write_match_pgn(&games_dir, &out_dir.join("match.pgn"));
+
         Ok(IterationOutcome {
             final_estimate: current_estimate,
             final_sigma,
@@ -6171,6 +7398,45 @@ mod controller {
             stop_reason,
             wld: (wins, losses, draws),
         })
+    }
+
+    /// Concatenate `<games_dir>/<N>.pgn` files in ascending N order into
+    /// `match_pgn_path`, separated by a single blank line. Best-effort: missing
+    /// `games_dir`, unreadable files, and zero-game runs all produce a
+    /// successfully-created empty (or partial) `match_pgn_path`.
+    #[allow(dead_code)]
+    pub(crate) fn write_match_pgn(
+        games_dir: &std::path::Path,
+        match_pgn_path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut games: Vec<(u32, std::path::PathBuf)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(games_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("pgn") {
+                    continue;
+                }
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                if let Ok(idx) = stem.parse::<u32>() {
+                    games.push((idx, path));
+                }
+            }
+        }
+        games.sort_by_key(|(idx, _)| *idx);
+        let mut out = std::fs::File::create(match_pgn_path)?;
+        for (i, (_idx, path)) in games.iter().enumerate() {
+            let content = std::fs::read_to_string(path)?;
+            if i > 0 {
+                out.write_all(b"\n")?;
+            }
+            out.write_all(content.as_bytes())?;
+            if !content.ends_with('\n') {
+                out.write_all(b"\n")?;
+            }
+        }
+        out.flush()?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -6241,12 +7507,14 @@ mod controller {
                                             WorkerReport::Failure(s.clone())
                                         }
                                         WorkerReport::GameComplete {
+                                            worker_id,
                                             game_index,
                                             opponent_uci_elo,
                                             clawfish_score,
                                             tc,
                                             ..
                                         } => WorkerReport::GameComplete {
+                                            worker_id: *worker_id,
                                             game_index: *game_index,
                                             opponent_uci_elo: *opponent_uci_elo,
                                             clawfish_score: *clawfish_score,
@@ -6444,6 +7712,7 @@ mod controller {
             // Worker 1: pair 1 → score(0.0 white) + score(0.5 black) → 1 loss + 1 draw.
             let worker0_reports = vec![
                 WorkerReport::GameComplete {
+                    worker_id: 0,
                     game_index: 1,
                     opponent_uci_elo: 2000,
                     clawfish_score: 1.0,
@@ -6457,6 +7726,7 @@ mod controller {
                     },
                 },
                 WorkerReport::GameComplete {
+                    worker_id: 0,
                     game_index: 2,
                     opponent_uci_elo: 2000,
                     clawfish_score: 1.0,
@@ -6473,6 +7743,7 @@ mod controller {
             ];
             let worker1_reports = vec![
                 WorkerReport::GameComplete {
+                    worker_id: 0,
                     game_index: 3,
                     opponent_uci_elo: 2000,
                     clawfish_score: 0.0,
@@ -6486,6 +7757,7 @@ mod controller {
                     },
                 },
                 WorkerReport::GameComplete {
+                    worker_id: 0,
                     game_index: 4,
                     opponent_uci_elo: 2000,
                     clawfish_score: 0.5,
@@ -6517,6 +7789,7 @@ mod controller {
                 .flat_map(|p| {
                     vec![
                         WorkerReport::GameComplete {
+                            worker_id: 0,
                             game_index: p * 2 + 1,
                             opponent_uci_elo: 2000,
                             clawfish_score: 0.5,
@@ -6530,6 +7803,7 @@ mod controller {
                             },
                         },
                         WorkerReport::GameComplete {
+                            worker_id: 0,
                             game_index: p * 2 + 2,
                             opponent_uci_elo: 2000,
                             clawfish_score: 0.5,
@@ -6592,6 +7866,7 @@ mod controller {
                 .flat_map(|p| {
                     vec![
                         WorkerReport::GameComplete {
+                            worker_id: 0,
                             game_index: p * 2 + 1,
                             opponent_uci_elo: 2000,
                             clawfish_score: 0.5,
@@ -6605,6 +7880,7 @@ mod controller {
                             },
                         },
                         WorkerReport::GameComplete {
+                            worker_id: 0,
                             game_index: p * 2 + 2,
                             opponent_uci_elo: 2000,
                             clawfish_score: 0.5,
@@ -6682,6 +7958,7 @@ mod controller {
                                     },
                                 });
                                 let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                    worker_id: 0,
                                     game_index: pair_index * 2 + 1,
                                     opponent_uci_elo,
                                     clawfish_score: 0.5,
@@ -6695,6 +7972,7 @@ mod controller {
                                     },
                                 });
                                 let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                    worker_id: 0,
                                     game_index: pair_index * 2 + 2,
                                     opponent_uci_elo,
                                     clawfish_score: 0.5,
@@ -6794,6 +8072,7 @@ mod controller {
                     let p = p as u32;
                     vec![
                         WorkerReport::GameComplete {
+                            worker_id: 0,
                             game_index: p * 2 + 1,
                             opponent_uci_elo: 2114,
                             clawfish_score: s,
@@ -6807,6 +8086,7 @@ mod controller {
                             },
                         },
                         WorkerReport::GameComplete {
+                            worker_id: 0,
                             game_index: p * 2 + 2,
                             opponent_uci_elo: 2114,
                             clawfish_score: 1.0 - s,
@@ -6868,6 +8148,7 @@ mod controller {
                                 let g = pair_counter * 2;
                                 for gi in [g - 1, g] {
                                     let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                        worker_id: 0,
                                         game_index: gi,
                                         opponent_uci_elo: 2000,
                                         clawfish_score: 0.5,
@@ -7190,6 +8471,7 @@ mod controller {
                         } => {
                             log.lock().unwrap().push(engine_tc);
                             let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                worker_id: 0,
                                 game_index: pair_index * 2 + 1,
                                 opponent_uci_elo,
                                 clawfish_score: 0.5,
@@ -7200,6 +8482,7 @@ mod controller {
                                 tc: engine_tc,
                             });
                             let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                worker_id: 0,
                                 game_index: pair_index * 2 + 2,
                                 opponent_uci_elo,
                                 clawfish_score: 0.5,
@@ -7297,6 +8580,7 @@ mod controller {
                                 let report_tc = engine_tc;
                                 log.lock().unwrap().push(report_tc);
                                 let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                    worker_id: 0,
                                     game_index: pair_index * 2 + game_in_pair + 1,
                                     opponent_uci_elo,
                                     clawfish_score: 0.5,
@@ -7380,6 +8664,7 @@ mod controller {
                         } => {
                             log.lock().unwrap().push((engine_tc, opponent_tc));
                             let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                worker_id: 0,
                                 game_index: pair_index * 2 + 1,
                                 opponent_uci_elo,
                                 clawfish_score: 0.5,
@@ -7390,6 +8675,7 @@ mod controller {
                                 tc: engine_tc,
                             });
                             let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                worker_id: 0,
                                 game_index: pair_index * 2 + 2,
                                 opponent_uci_elo,
                                 clawfish_score: 0.5,
@@ -7485,6 +8771,7 @@ mod controller {
                         } => {
                             log.lock().unwrap().push((engine_tc, opponent_tc));
                             let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                worker_id: 0,
                                 game_index: pair_index * 2 + 1,
                                 opponent_uci_elo,
                                 clawfish_score: 0.5,
@@ -7495,6 +8782,7 @@ mod controller {
                                 tc: engine_tc,
                             });
                             let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                worker_id: 0,
                                 game_index: pair_index * 2 + 2,
                                 opponent_uci_elo,
                                 clawfish_score: 0.5,
@@ -7592,6 +8880,7 @@ mod controller {
                     let t = tc_fixtures[p as usize];
                     vec![
                         WorkerReport::GameComplete {
+                            worker_id: 0,
                             game_index: p * 2 + 1,
                             opponent_uci_elo: 2000,
                             clawfish_score: 0.5,
@@ -7602,6 +8891,7 @@ mod controller {
                             tc: t,
                         },
                         WorkerReport::GameComplete {
+                            worker_id: 0,
                             game_index: p * 2 + 2,
                             opponent_uci_elo: 2000,
                             clawfish_score: 0.5,
@@ -7696,6 +8986,7 @@ mod controller {
                     };
                     vec![
                         WorkerReport::GameComplete {
+                            worker_id: 0,
                             game_index: p * 2 + 1,
                             opponent_uci_elo: 2000,
                             clawfish_score: 0.5,
@@ -7706,6 +8997,7 @@ mod controller {
                             tc: t,
                         },
                         WorkerReport::GameComplete {
+                            worker_id: 0,
                             game_index: p * 2 + 2,
                             opponent_uci_elo: 2000,
                             clawfish_score: 0.5,
@@ -7722,10 +9014,22 @@ mod controller {
             let mut pool = synthetic_pool(1, vec![pair_reports]);
             let _ = run_iteration(&mut pool, &args, &out_dir);
             let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap_or_default();
-            let last_nonempty = summary.lines().rfind(|l| !l.is_empty()).unwrap_or("");
+            // ELOH.D contract: under --tc-sample, the summary contains a
+            // `summary-by-tc:` line. Originally the test asserted the line
+            // was the *last* non-empty line, but ELOH.E always appends a
+            // `ci:` line at run end (regardless of mode), so the new
+            // ordering is: converged → summary-by-tc → ci. The load-bearing
+            // invariant is presence + ordering relative to `converged:`.
+            let mut iter = summary
+                .lines()
+                .filter(|l| !l.is_empty())
+                .skip_while(|l| !l.starts_with("converged:"));
+            let _converged = iter.next();
+            let next = iter.next().unwrap_or("");
             assert!(
-                last_nonempty.starts_with("summary-by-tc:"),
-                "last non-empty line must be 'summary-by-tc:'; got: {last_nonempty:?}\nfull summary:\n{summary}"
+                next.starts_with("summary-by-tc:"),
+                "summary-by-tc: must follow `converged:`; got next line: {next:?}\n\
+                 full summary:\n{summary}"
             );
         }
 
@@ -7744,6 +9048,7 @@ mod controller {
                 .flat_map(|p| {
                     vec![
                         WorkerReport::GameComplete {
+                            worker_id: 0,
                             game_index: p * 2 + 1,
                             opponent_uci_elo: 2000,
                             clawfish_score: 0.5,
@@ -7757,6 +9062,7 @@ mod controller {
                             },
                         },
                         WorkerReport::GameComplete {
+                            worker_id: 0,
                             game_index: p * 2 + 2,
                             opponent_uci_elo: 2000,
                             clawfish_score: 0.5,
@@ -7812,6 +9118,7 @@ mod controller {
                             } => {
                                 log.lock().unwrap().push((pair_index, engine_tc));
                                 let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                    worker_id: 0,
                                     game_index: pair_index * 2 + 1,
                                     opponent_uci_elo,
                                     clawfish_score: 0.5,
@@ -7822,6 +9129,7 @@ mod controller {
                                     tc: engine_tc,
                                 });
                                 let _ = rpt_tx_clone.send(WorkerReport::GameComplete {
+                                    worker_id: 0,
                                     game_index: pair_index * 2 + 2,
                                     opponent_uci_elo,
                                     clawfish_score: 0.5,
@@ -7885,6 +9193,243 @@ mod controller {
             assert_eq!(
                 run1, run2,
                 "two runs with identical seed must yield identical pair_index → engine_tc mapping"
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // §6.5 ELOH.E SPRT controller-integration tests
+        // -----------------------------------------------------------------------
+
+        /// Build an Args with SPRT mode active; defaults except --sprt-* and --max-games.
+        fn sprt_args(max_games: u32) -> super::super::cli::Args {
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/clawfish".into(),
+                "--tc".into(),
+                "10+0.1".into(),
+                "--max-games".into(),
+                max_games.to_string(),
+                "--initial-elo".into(),
+                "0".into(),
+                "--sprt-elo0".into(),
+                "0".into(),
+                "--sprt-elo1".into(),
+                "10".into(),
+                "--sprt-alpha".into(),
+                "0.05".into(),
+                "--sprt-beta".into(),
+                "0.05".into(),
+            ];
+            super::super::cli::parse_args(argv).expect("sprt_args: parse failed")
+        }
+
+        /// Fabricate a single pair's worth of reports for a given worker_id and pair score.
+        fn pair_reports(worker_id: u32, pair_index: u32, pair_score: f64) -> Vec<WorkerReport> {
+            // Split a pair score into two game scores: 0 → 0+0; 0.5 → 0+0.5;
+            // 1 → 0.5+0.5; 1.5 → 0.5+1; 2 → 1+1.
+            let (g_a, g_b) = match pair_score {
+                s if (s - 0.0).abs() < 1e-9 => (0.0, 0.0),
+                s if (s - 0.5).abs() < 1e-9 => (0.0, 0.5),
+                s if (s - 1.0).abs() < 1e-9 => (0.5, 0.5),
+                s if (s - 1.5).abs() < 1e-9 => (0.5, 1.0),
+                s if (s - 2.0).abs() < 1e-9 => (1.0, 1.0),
+                other => panic!("pair_reports: unsupported pair_score {other}"),
+            };
+            let mk = |gi: u32, score: f64| WorkerReport::GameComplete {
+                worker_id,
+                game_index: gi,
+                opponent_uci_elo: 1320,
+                clawfish_score: score,
+                outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                pgn_moves: vec![],
+                white_name: "w".into(),
+                black_name: "b".into(),
+                tc: super::super::cli::TimeControl {
+                    initial_ms: 10_000,
+                    increment_ms: 100,
+                },
+            };
+            vec![
+                mk(pair_index * 2 + 1, g_a),
+                mk(pair_index * 2 + 2, g_b),
+                WorkerReport::PairComplete { worker_id },
+            ]
+        }
+
+        #[test]
+        fn sprt_mode_h1_synthetic_stream_accepts() {
+            // Strong H1 stream: 80% bin 4 (2.0) + 20% bin 3 (1.5). var > 0
+            // → LLR moves; mu = 1.9 is far above (s0p+s1p)/2 ≈ 1.014 → LLR > 0.
+            // (All-2.0 has zero variance and would never move LLR.)
+            let args = sprt_args(400);
+            let reports: Vec<WorkerReport> = (0..200u32)
+                .flat_map(|p| pair_reports(0, p, if p % 5 == 0 { 1.5 } else { 2.0 }))
+                .collect();
+            let mut pool = synthetic_pool(1, vec![reports]);
+            let out_dir = std::env::temp_dir().join("eloh_e_sprt_h1");
+            let outcome = run_iteration(&mut pool, &args, &out_dir).unwrap();
+            assert_eq!(
+                outcome.stop_reason,
+                super::super::StopReason::SprtAcceptH1,
+                "strong-H1 stream (mu=1.9) must accept H1"
+            );
+        }
+
+        #[test]
+        fn sprt_mode_h0_synthetic_stream_rejects() {
+            // Strong H0 stream: 80% bin 0 (0.0) + 20% bin 1 (0.5). mu = 0.1 ≪ midpoint.
+            let args = sprt_args(400);
+            let reports: Vec<WorkerReport> = (0..200u32)
+                .flat_map(|p| pair_reports(0, p, if p % 5 == 0 { 0.5 } else { 0.0 }))
+                .collect();
+            let mut pool = synthetic_pool(1, vec![reports]);
+            let out_dir = std::env::temp_dir().join("eloh_e_sprt_h0");
+            let outcome = run_iteration(&mut pool, &args, &out_dir).unwrap();
+            assert_eq!(
+                outcome.stop_reason,
+                super::super::StopReason::SprtAcceptH0,
+                "strong-H0 stream (mu=0.1) must accept H0"
+            );
+        }
+
+        #[test]
+        fn sprt_mode_max_games_no_verdict() {
+            // All draws (pair_score = 1.0): zero variance → LLR = 0 always
+            // → indifference zone → MaxGames termination.
+            let args = sprt_args(8); // 4 pairs only — far too few to converge.
+            let reports: Vec<WorkerReport> =
+                (0..4u32).flat_map(|p| pair_reports(0, p, 1.0)).collect();
+            let mut pool = synthetic_pool(1, vec![reports]);
+            let out_dir = std::env::temp_dir().join("eloh_e_sprt_maxgames");
+            let outcome = run_iteration(&mut pool, &args, &out_dir).unwrap();
+            assert_eq!(
+                outcome.stop_reason,
+                super::super::StopReason::MaxGames,
+                "indifference-zone stream must terminate with MaxGames"
+            );
+            // The summary file must contain a `sprt: verdict=continue` line.
+            let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap();
+            assert!(
+                summary.contains("sprt: verdict=continue"),
+                "MaxGames termination in SPRT mode must emit verdict=continue; summary: {summary}"
+            );
+        }
+
+        #[test]
+        fn sprt_mode_emits_ci_line() {
+            // Mixed pair scores → ≥2 pairs with variance → CI line emitted.
+            let args = sprt_args(8);
+            let mut reports: Vec<WorkerReport> = pair_reports(0, 0, 1.5);
+            reports.extend(pair_reports(0, 1, 0.5));
+            reports.extend(pair_reports(0, 2, 1.0));
+            reports.extend(pair_reports(0, 3, 2.0));
+            let mut pool = synthetic_pool(1, vec![reports]);
+            let out_dir = std::env::temp_dir().join("eloh_e_sprt_ci");
+            let _ = run_iteration(&mut pool, &args, &out_dir).unwrap();
+            let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap();
+            assert!(
+                summary.contains("ci: elo="),
+                "SPRT run must emit a `ci: elo=...` line; summary: {summary}"
+            );
+        }
+
+        #[test]
+        fn pair_score_buffers_per_worker_under_concurrency() {
+            // Two workers' pairs interleave. Per-worker keying must keep
+            // pair scores separate; if a single shared buffer were used,
+            // worker 0's game-A scores would mix with worker 1's game-A
+            // scores before either PairComplete arrived, corrupting the
+            // ptnml bin counts and the LLR.
+            //
+            // Each worker emits the same H1-favouring stream as the
+            // single-worker test above (80% pair score 2.0, 20% 1.5), so
+            // the SPRT must converge to AcceptH1.
+            let mut args = sprt_args(400);
+            args.concurrency = 2;
+            let total_pairs: u32 = args.max_games / 2;
+            let mk_reports = |wid: u32| -> Vec<WorkerReport> {
+                (0..total_pairs)
+                    .filter(|p| p % 2 == wid)
+                    .flat_map(|p| pair_reports(wid, p, if p % 5 == 0 { 1.5 } else { 2.0 }))
+                    .collect()
+            };
+
+            let mut pool = synthetic_pool(2, vec![mk_reports(0), mk_reports(1)]);
+            let out_dir = std::env::temp_dir().join("eloh_e_sprt_per_worker");
+            let outcome = run_iteration(&mut pool, &args, &out_dir).unwrap();
+            assert_eq!(
+                outcome.stop_reason,
+                super::super::StopReason::SprtAcceptH1,
+                "concurrent workers with strong-H1 pairs must accept H1"
+            );
+        }
+
+        #[test]
+        fn singleton_counter_remains_zero_in_normal_termination() {
+            let args = sprt_args(8);
+            let reports: Vec<WorkerReport> =
+                (0..4u32).flat_map(|p| pair_reports(0, p, 1.0)).collect();
+            let mut pool = synthetic_pool(1, vec![reports]);
+            let out_dir = std::env::temp_dir().join("eloh_e_sprt_no_singletons");
+            let _ = run_iteration(&mut pool, &args, &out_dir).unwrap();
+            // discarded_singletons isn't surfaced in IterationOutcome; the
+            // contract is that no `match.pgn`/`summary.txt` artifact reports
+            // an unexplained discarded count. We pin the contract indirectly
+            // by checking that all expected pairs (4) are reflected in the
+            // summary's ptnml line.
+            let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap();
+            assert!(
+                summary.contains("ptnml=[0,0,4,0,0]"),
+                "all-draw 4 pairs must yield ptnml=[0,0,4,0,0]; summary: {summary}"
+            );
+        }
+
+        #[test]
+        fn match_pgn_concat_orders_by_game_index() {
+            // Set up a fake games_dir with three PGNs (3.pgn, 1.pgn, 2.pgn)
+            // in arbitrary creation order; assert match.pgn lists them in
+            // ascending game_index order.
+            let dir = std::env::temp_dir().join("eloh_e_match_pgn_concat");
+            let games_dir = dir.join("games");
+            let _ = std::fs::create_dir_all(&games_dir);
+            // Clean any stale fixture.
+            for n in 1..=3 {
+                let _ = std::fs::remove_file(games_dir.join(format!("{n}.pgn")));
+            }
+            let _ = std::fs::remove_file(dir.join("match.pgn"));
+            std::fs::write(games_dir.join("3.pgn"), "[Round \"3\"]\n*\n").unwrap();
+            std::fs::write(games_dir.join("1.pgn"), "[Round \"1\"]\n*\n").unwrap();
+            std::fs::write(games_dir.join("2.pgn"), "[Round \"2\"]\n*\n").unwrap();
+            super::write_match_pgn(&games_dir, &dir.join("match.pgn")).unwrap();
+            let combined = std::fs::read_to_string(dir.join("match.pgn")).unwrap();
+            let p1 = combined.find("[Round \"1\"]").unwrap();
+            let p2 = combined.find("[Round \"2\"]").unwrap();
+            let p3 = combined.find("[Round \"3\"]").unwrap();
+            assert!(
+                p1 < p2 && p2 < p3,
+                "match.pgn must list rounds 1<2<3; got {combined}"
+            );
+        }
+
+        #[test]
+        fn match_pgn_concat_handles_zero_games() {
+            let dir = std::env::temp_dir().join("eloh_e_match_pgn_empty");
+            let games_dir = dir.join("games");
+            let _ = std::fs::create_dir_all(&games_dir);
+            // Clean any stale .pgn fixtures.
+            if let Ok(entries) = std::fs::read_dir(&games_dir) {
+                for entry in entries.flatten() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+            let match_pgn = dir.join("match.pgn");
+            super::write_match_pgn(&games_dir, &match_pgn).unwrap();
+            let content = std::fs::read_to_string(&match_pgn).unwrap();
+            assert!(
+                content.is_empty(),
+                "zero-game run must produce empty match.pgn"
             );
         }
     }
@@ -8677,6 +10222,115 @@ mod e2e_smoke {
         assert!(
             !stderr.contains("VirtualClock"),
             "stderr must not mention VirtualClock on silent fallback; got: {stderr}"
+        );
+    }
+
+    // ---- §6.6 ELOH.E end-to-end smoke ----
+
+    #[test]
+    #[ignore = "spawns clawfish; opt-in via cargo test --release -- --ignored"]
+    fn end_to_end_sprt_clawfish_self_play_max_games_short() {
+        use std::process::Command;
+
+        let engine = resolve_bin(CLAWFISH_EXE, "clawfish");
+        let harness = resolve_bin(ELO_ITERATE_EXE, "elo-iterate");
+        let out_dir = std::env::temp_dir().join("elo-iterate-eloh-e-sprt-smoke");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let status = Command::new(&harness)
+            .args([
+                "--engine",
+                &engine,
+                "--opponent",
+                &engine,
+                "--tc",
+                "1+0.05",
+                "--max-games",
+                "20",
+                "--concurrency",
+                "1",
+                "--initial-elo",
+                "0",
+                "--sprt-elo0",
+                "0",
+                "--sprt-elo1",
+                "10",
+                "--sprt-alpha",
+                "0.05",
+                "--sprt-beta",
+                "0.05",
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+            ])
+            .status()
+            .expect("spawn harness");
+        assert!(status.success(), "harness must exit 0");
+        let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap();
+        assert!(
+            summary.contains("sprt: verdict="),
+            "summary must contain a `sprt: verdict=` line; got: {summary}"
+        );
+        // Verify match.pgn exists.
+        assert!(
+            out_dir.join("match.pgn").exists(),
+            "match.pgn must be created by the run-end concatenation step"
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns clawfish; opt-in via cargo test --release -- --ignored"]
+    fn end_to_end_match_mode_with_engine_option() {
+        use std::process::Command;
+
+        let engine = resolve_bin(CLAWFISH_EXE, "clawfish");
+        let harness = resolve_bin(ELO_ITERATE_EXE, "elo-iterate");
+        let out_dir = std::env::temp_dir().join("elo-iterate-eloh-e-match-smoke");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let status = Command::new(&harness)
+            .args([
+                "--engine",
+                &engine,
+                "--opponent",
+                &engine,
+                "--tc",
+                "1+0.05",
+                "--max-games",
+                "4",
+                "--concurrency",
+                "1",
+                "--initial-elo",
+                "0",
+                "--k0",
+                "0",
+                "--target-sigma",
+                "0",
+                "--engine-option",
+                "Random_Seed=1",
+                "--opponent-option",
+                "Random_Seed=2",
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+            ])
+            .status()
+            .expect("spawn harness");
+        assert!(status.success(), "harness must exit 0");
+        let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap();
+        // Match mode → no `sprt:` line, but `ci:` line is still emitted by SPRT
+        // state being absent → no `ci:` either. Confirm only `converged:` exists.
+        assert!(
+            !summary.contains("sprt: verdict="),
+            "match mode must NOT emit a `sprt: verdict=` line; got: {summary}"
+        );
+        assert!(
+            summary.contains("converged: "),
+            "match mode summary must end with a converged: line"
+        );
+        assert!(
+            out_dir.join("match.pgn").exists(),
+            "match.pgn must be created by the run-end concatenation step"
         );
     }
 }

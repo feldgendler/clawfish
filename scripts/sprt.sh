@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# SPRT match runner using historical-commit baselines per docs/workflow.md.
+# SPRT match runner using the in-process harness (`elo-iterate`).
+#
+# All three subcommands invoke `target/release/elo-iterate`; fastchess is no
+# longer used by this script (it stays on disk only for `scripts/match.sh
+# compliance`). The historical-commit baseline worktree+build flow is kept
+# verbatim — only the runner inside the methodology changed.
 #
 # Subcommands:
-#   sprt <baseline-tag>      — SPRT match: HEAD vs baseline-tag (clawfish-vs-clawfish)
-#   match <baseline-tag>     — fixed-game-count match HEAD vs baseline-tag; 200 games default
+#   sprt <baseline-tag>      — pentanomial-GSPRT match: HEAD vs baseline-tag
+#                              (clawfish-vs-clawfish), elo0=0 elo1=10
+#                              alpha=beta=0.05; up to SPRT_GAMES games (400 default).
+#   match <baseline-tag>     — fixed-game-count match HEAD vs baseline-tag;
+#                              200 games default.
 #   rating-estimate          — fixed-game-count match HEAD vs Stockfish UCI_Elo=$STOCKFISH_ELO
 #                              (default 1320 — the ADR-0012 reference point); 200 games default.
 #                              No tag arg — Stockfish from PATH (brew install stockfish).
@@ -29,14 +37,6 @@ set -euo pipefail
 
 if [[ "${SPRT_DEBUG:-0}" == "1" ]]; then set -x; fi
 
-# fastchess opens many file descriptors per concurrent game; raise from the
-# macOS default (often 256) which is too low even at -concurrency 1.
-ulimit -n 4096 2>/dev/null || true
-
-# -----------------------------------------------------------------------------
-# Pinned fastchess version (must match scripts/match.sh + scripts/install-fastchess.sh).
-# -----------------------------------------------------------------------------
-EXPECTED_VERSION_LINE="alpha 1.8.0"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SUBCMD="${1:-}"
 BASELINE_TAG="${2:-}"
@@ -56,7 +56,7 @@ usage() {
     echo "  SPRT_REBUILD=1       force rebuild of cached baseline worktree"
     echo "  SPRT_DEBUG=1         enable set -x"
     echo ""
-    echo "Output: target/matches/sprt/<dated>-<baseline-slug>-<subcmd>.{pgn,log}"
+    echo "Output: target/matches/sprt/<dated>-<baseline-slug>-<subcmd>/{summary.txt,match.pgn,games/}"
 }
 
 if [[ -z "$SUBCMD" ]] || [[ "$SUBCMD" == "--help" ]] || [[ "$SUBCMD" == "-h" ]]; then
@@ -70,31 +70,12 @@ if [[ "$SUBCMD" != "rating-estimate" ]] && [[ -z "$BASELINE_TAG" ]]; then
 fi
 
 # -----------------------------------------------------------------------------
-# fastchess locator (mirror match.sh).
-# -----------------------------------------------------------------------------
-VENDOR_BINARY="$REPO_ROOT/vendor/fastchess/fastchess"
-if [[ -x "$VENDOR_BINARY" ]]; then
-    FASTCHESS="$VENDOR_BINARY"
-elif command -v fastchess >/dev/null 2>&1; then
-    FASTCHESS="$(command -v fastchess)"
-else
-    echo "ERROR: fastchess not found." >&2
-    echo "  Run: scripts/install-fastchess.sh" >&2
-    exit 1
-fi
-actual_ver="$("$FASTCHESS" --version 2>&1 || true)"
-if ! echo "$actual_ver" | grep -q "$EXPECTED_VERSION_LINE"; then
-    echo "ERROR: fastchess version mismatch. Expected to contain '$EXPECTED_VERSION_LINE'; got: $actual_ver" >&2
-    exit 1
-fi
-echo "fastchess resolved: $FASTCHESS"
-
-# -----------------------------------------------------------------------------
 # Build current-tree binary (incremental — fast on no-op rebuild).
 # -----------------------------------------------------------------------------
 echo "Building HEAD binary..."
 cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" --quiet
 CURRENT_BINARY="$REPO_ROOT/target/release/clawfish"
+HARNESS_BINARY="$REPO_ROOT/target/release/elo-iterate"
 
 # -----------------------------------------------------------------------------
 # Resolve baseline (clawfish-tag-from-worktree, or stockfish-1320 sentinel).
@@ -147,9 +128,9 @@ else
         echo "Baseline binary cached at $BASELINE_BINARY"
     fi
 
-    # Sanity-check the baseline binary speaks UCI before fastchess starts.
+    # Sanity-check the baseline binary speaks UCI before the harness starts.
     # Catches "binary built with stale toolchain / corrupt cache" failures up
-    # front, mirroring match.sh's fastchess version-line gate.
+    # front.
     if ! printf 'uci\nquit\n' | "$BASELINE_BINARY" 2>/dev/null | grep -q '^uciok$'; then
         echo "ERROR: baseline binary at $BASELINE_BINARY did not emit 'uciok' on a basic uci probe." >&2
         echo "  Try: SPRT_REBUILD=1 scripts/sprt.sh $SUBCMD $BASELINE_TAG" >&2
@@ -163,37 +144,27 @@ fi
 SPRT_DIR="$REPO_ROOT/target/matches/sprt"
 mkdir -p "$SPRT_DIR"
 TS="$(date +%Y%m%dT%H%M%S)"
-PGN="$SPRT_DIR/${TS}-${BASELINE_SLUG}-${SUBCMD}.pgn"
-LOG="$SPRT_DIR/${TS}-${BASELINE_SLUG}-${SUBCMD}.log"
+OUT_DIR="$SPRT_DIR/${TS}-${BASELINE_SLUG}-${SUBCMD}"
 
 # -----------------------------------------------------------------------------
 # Match parameters.
 # -----------------------------------------------------------------------------
 TC="${SPRT_TC:-10+0.1}"
 CONCURRENCY="${SPRT_CONCURRENCY:-6}"
-ADJUDICATION=(-maxmoves 200 -resign movecount=3 score=600 -draw movenumber=34 movecount=8 score=20)
 
-# Per-engine line for the BASELINE side. For clawfish baselines: just `cmd name`.
-# For Stockfish rating-estimate: append the UCI_LimitStrength + UCI_Elo options.
-if [[ "$SUBCMD" == "rating-estimate" ]]; then
-    BASELINE_ENGINE_ARGS=(
-        -engine cmd="$BASELINE_BINARY" name="$BASELINE_LABEL"
-        option.UCI_LimitStrength=true "option.UCI_Elo=$STOCKFISH_ELO_VALUE"
-    )
-else
-    BASELINE_ENGINE_ARGS=(-engine cmd="$BASELINE_BINARY" name="$BASELINE_LABEL")
-fi
-
-COMMON=(
-    -engine cmd="$CURRENT_BINARY" name=clawfish-head
-    "${BASELINE_ENGINE_ARGS[@]}"
-    -each proto=uci tc="$TC"
-    -concurrency "$CONCURRENCY"
-    -repeat
-    "${ADJUDICATION[@]}"
-    -pgnout file="$PGN" notation=san
-    -log file="$LOG" level=info engine=true
-    -report penta=true
+# Common harness invocation. Adjudication thresholds match the historical
+# fastchess settings the SPRT runs were calibrated against.
+COMMON_HARNESS_ARGS=(
+    --engine "$CURRENT_BINARY"
+    --opponent "$BASELINE_BINARY"
+    --engine-launch-prefix "taskpolicy -c utility"
+    --opponent-launch-prefix "taskpolicy -c utility"
+    --tc "$TC"
+    --concurrency "$CONCURRENCY"
+    --resign-movecount 3 --resign-score 600
+    --draw-movenumber 34 --draw-movecount 8 --draw-score 20
+    --max-moves 200
+    --out-dir "$OUT_DIR"
 )
 
 # -----------------------------------------------------------------------------
@@ -202,22 +173,23 @@ COMMON=(
 case "$SUBCMD" in
     sprt)
         GAMES="${SPRT_GAMES:-400}"
-        ROUNDS=$((GAMES / 2))
-        echo "Running SPRT: tc=$TC, up to $GAMES games, elo0=0 elo1=10 alpha=0.05 beta=0.05"
+        echo "Running SPRT (in-process harness): tc=$TC, up to $GAMES games, elo0=0 elo1=10 alpha=0.05 beta=0.05"
         echo "  HEAD vs $BASELINE_LABEL"
-        "$FASTCHESS" \
-            "${COMMON[@]}" \
-            -rounds "$ROUNDS" \
-            -sprt elo0=0 elo1=10 alpha=0.05 beta=0.05
+        cargo run --release --bin elo-iterate --manifest-path "$REPO_ROOT/Cargo.toml" --quiet -- \
+            "${COMMON_HARNESS_ARGS[@]}" \
+            --max-games "$GAMES" \
+            --initial-elo 0 \
+            --sprt-elo0 0 --sprt-elo1 10 --sprt-alpha 0.05 --sprt-beta 0.05
         ;;
     match)
         GAMES="${SPRT_GAMES:-200}"
-        ROUNDS=$((GAMES / 2))
-        echo "Running fixed-game match: tc=$TC, $GAMES games"
+        echo "Running fixed-game match (in-process harness): tc=$TC, $GAMES games"
         echo "  HEAD vs $BASELINE_LABEL"
-        "$FASTCHESS" \
-            "${COMMON[@]}" \
-            -rounds "$ROUNDS"
+        cargo run --release --bin elo-iterate --manifest-path "$REPO_ROOT/Cargo.toml" --quiet -- \
+            "${COMMON_HARNESS_ARGS[@]}" \
+            --max-games "$GAMES" \
+            --initial-elo 0 \
+            --k0 0 --target-sigma 0
         ;;
     rating-estimate)
         GAMES="${SPRT_GAMES:-200}"
@@ -226,25 +198,13 @@ case "$SUBCMD" in
         # ELOH.B harness with --k0 0 --target-sigma 0 freezes both K and σ-stopping,
         # producing a fixed-anchor measurement equivalent to the prior fastchess
         # invocation. Per-game adjudication thresholds match scripts/match.sh defaults.
-        OUT_DIR="$SPRT_DIR/${TS}-${BASELINE_SLUG}-${SUBCMD}-out"
         cargo run --release --bin elo-iterate --manifest-path "$REPO_ROOT/Cargo.toml" --quiet -- \
-            --engine "$CURRENT_BINARY" \
-            --opponent "$BASELINE_BINARY" \
-            --engine-launch-prefix "taskpolicy -c utility" \
-            --opponent-launch-prefix "taskpolicy -c utility" \
+            "${COMMON_HARNESS_ARGS[@]}" \
             --opponent-option UCI_LimitStrength=true \
             --opponent-option "UCI_Elo=$STOCKFISH_ELO_VALUE" \
-            --tc "$TC" \
             --max-games "$GAMES" \
-            --concurrency "$CONCURRENCY" \
             --initial-elo "$STOCKFISH_ELO_VALUE" \
-            --k0 0 \
-            --target-sigma 0 \
-            --resign-movecount 3 --resign-score 600 \
-            --draw-movenumber 34 --draw-movecount 8 --draw-score 20 \
-            --max-moves 200 \
-            --out-dir "$OUT_DIR"
-        echo "Output dir: $OUT_DIR"
+            --k0 0 --target-sigma 0
         ;;
     *)
         echo "ERROR: unknown subcommand '$SUBCMD'" >&2
@@ -254,5 +214,7 @@ case "$SUBCMD" in
 esac
 
 echo ""
-echo "PGN: $PGN"
-echo "Log: $LOG"
+echo "Output dir: $OUT_DIR"
+echo "  summary.txt   per-game summary + final converged: / sprt: / ci: lines"
+echo "  match.pgn     concatenated PGN of all games (run-end)"
+echo "  games/<N>.pgn per-game PGN files"

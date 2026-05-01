@@ -53,6 +53,7 @@ ADR numbers allocated at landing time. ELOH.B and ELOH.D may land without an ADR
 | **ELOH.B** ✓ — Online iteration + concurrency + progress + threshold adjudication | Robbins-Monro K-update + σ-stopping + concurrency (N parallel game-pairs) + convergence-progress output + resign/draw/max-moves threshold adjudication. Replaces `scripts/elo-iterate.sh` (thin wrapper) and `scripts/sprt.sh rating-estimate` arm end-to-end. **Landed 2026-04-30.** Plan: `docs/plans/eloh.b.md`. Actual landing size: ~5917 LOC total binary (ELOH.A+B combined) + 139 in-tree tests passing. Back-test gate (Part 1: online run vs M3.F ~2114 Elo; Part 2: synthetic Bernoulli σ-stopping) deferred to post-merge manual run. | ~150 binary + ~80 tests (actual ~650 new LOC across `estimator`, `sigma`, `progress`, `adjudicate` extension, `match_loop` extension, `controller`, `main` rewrite) |
 | **ELOH.C** ✓ — Hardware-invariant TC | VirtualClock UCI option (`option name VirtualClock type check default false`) in clawfish: swaps `Instant::now()` for per-thread `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` in the worker-owned `SearchClock`; harness `--virtual-clock` flag + handshake-driven `setoption` negotiation (sent only to engines that advertise the option). `--go-nodes N` dropped per user decision 2026-04-30. ADR-0019. Back-test gate Part 1 deferred to post-merge manual run. **Landed 2026-04-30.** Plan: `docs/plans/eloh.c.md`. Actual landing size: ~190 prod LOC + ~140 test LOC = ~330 LOC. | ~190 prod + ~140 tests (actual) |
 | **ELOH.D** ✓ — Mixed-TC sampling | Per-pair TC sampling for mixed-TC SPRT and Δ(TC) regression. New `--tc-sample <SPEC>` flag accepting a discrete weighted list of TCs (e.g. `10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1`); new `--seed N` flag (decimal or `0x`-prefixed hex). Master `Prng` (SplitMix64) pre-materialises all per-pair TCs into a `Vec<(TimeControl, TimeControl)>` indexed by pair_index *before* the bootstrap loop, so the sampler advance order is deterministic regardless of subprocess scheduling under N>1 concurrency. PGN `TimeControl` tag + per-game summary `tc=` field record the sampled TC; `summary-by-tc:` aggregate emitted at run end (input-spec order) only under `--tc-sample`. Mutually exclusive with `--tc` at parse time. Decision-rule (mixed-game SPRT verdict, Δ(TC) regression fit) computed by downstream tooling — harness emits data only. **Landed 2026-04-30.** Plan: `docs/plans/eloh.d.md`. Actual landing size: prod + tests within plan estimate. Back-test gate Part 1 (chi-squared sampler, fully in-tree) included; Part 2 (degenerate single-TC self-back-test) deferred to post-merge manual run per ELOH.B/ELOH.C precedent. | ~120 harness + ~50 tests (actual ~245 LOC) |
+| **ELOH.E** ✓ — In-process pentanomial-GSPRT | Pentanomial-GSPRT (LLR + Wald bounds + per-pair classification + post-hoc Δ Elo CI) inside `mod sprt` of `src/bin/elo-iterate.rs`; `--sprt-elo0/elo1/alpha/beta` CLI flags + parse-time mutex against K-update / σ-stopping flags; per-worker `pair_score_buffers: HashMap<u32, Vec<f64>>` keyed by `worker_id` (load-bearing under concurrency >1); `WorkerReport::GameComplete` extended with `worker_id`; new `StopReason::SprtAcceptH0/H1`; run-end `sprt: verdict=…` and `ci: elo=…` summary lines; `match.pgn` concatenation step. `scripts/sprt.sh sprt|match` and `scripts/match.sh self-play|vs-stockfish` rewritten as harness wrappers; `scripts/match.sh compliance` keeps fastchess. ADR-0022. ADR-0012 amended. **Landed 2026-05-01.** Plan: `docs/plans/eloh.e.md`. Back-test Part 1 (synthetic Bernoulli + draw-heavy streams) included in-tree; Part 2 (M4.D mixed-TC SPRT statistical-equivalence replay) deferred to post-merge manual run. | ~280 prod + ~225 tests (actual) |
 
 ELOH.A → B → C is sequential. ELOH.D depends on ELOH.B (must have); is parallel-compatible with ELOH.C at the type-system level (TC sampling and time-source primitive are orthogonal axes — TC sampling sets the *base + increment* before clock initialisation; ELOH.C swaps the *time-source primitive* under those clocks); but is sequenced *after* ELOH.C to avoid match-loop merge conflicts and to inherit hardware-invariant TC for the Δ(TC) curve fit (less wallclock noise → tighter per-TC confidence bands). Each phase's back-validation gate must pass before the next is planned.
 
@@ -194,10 +195,55 @@ The two gates exercise the sampler (Part 1, deterministic) and the integration-w
 - `docs/research/tooling-elo-harness-validation.md` — Part 1 + Part 2 results appended.
 - `docs/architecture.md` — none expected (no engine-side change).
 
+## ELOH.E scope detail
+
+ELOH.E is the harness's **SPRT layer**: it adds pentanomial-GSPRT verdict computation and post-hoc Δ Elo CI emission inside the harness, plus rewrites `scripts/sprt.sh sprt|match` and `scripts/match.sh self-play|vs-stockfish` as thin wrappers around `cargo run --release --bin elo-iterate`. fastchess is retained for `scripts/match.sh compliance` only — the `--compliance` UCI shake-out has no in-house substitute. Closes the ELOH milestone.
+
+**In scope.**
+1. **`mod sprt` (pure functions, ~100 prod LOC):** `SprtConfig`, `SprtState`, `SprtVerdict`; `wald_bounds(α, β)`; `compute_llr(state, cfg)`; `classify_pair_score(g_a, g_b)`; `update_pair(state, cfg, pair_score)`; `pentanomial_ci(state)`; `discard_singleton(state)`. Logistic Elo, normal-approximation GSPRT (matches cutechess-cli / fastchess `model=logistic`).
+2. **CLI (`mod cli`):** `--sprt-elo0/elo1/alpha/beta` flags. Parse-time mutex rejects any non-default `--k0`/`--tau`/`--target-sigma`/`--stop-window`/`--stop-window-confirm` combined with SPRT mode.
+3. **Controller integration:** per-worker `pair_score_buffers: HashMap<u32, Vec<f64>>` keyed by `worker_id` (single shared `Vec` would silently corrupt SPRT state under `concurrency > 1`). On each `WorkerReport::PairComplete`: drain buffer, run `sprt::update_pair`, set `terminating` + `sprt_stop_reason` if a Wald bound is crossed. On run-end drain: complete-but-unreported pairs (length 2) feed update_pair; true singletons (length 1) increment `discarded_singletons`. σ-stopping is skipped in SPRT mode (preempting LLR termination would invalidate α/β).
+4. **`WorkerReport::GameComplete` extension:** new `worker_id: u32` field for routing scores into the per-worker buffer.
+5. **New `StopReason` variants:** `SprtAcceptH0` and `SprtAcceptH1`.
+6. **Summary formatters (`mod summary`):** `format_sprt_verdict` emits `sprt: verdict=H1 llr=… elo0=… elo1=… alpha=… beta=… pairs=N ptnml=[…]`; `format_pentanomial_ci` emits `ci: elo=±N.NN [±N.NN, ±N.NN] pairs=N` (or `ci: undefined (n=N)` at <2 pairs / zero variance). `ci:` line emitted always at run end; `sprt:` line emitted when SPRT mode is active.
+7. **`match.pgn` concatenation:** `controller::write_match_pgn` concatenates `<out-dir>/games/<N>.pgn` files in ascending `game_index` order into `<out-dir>/match.pgn` at run end. Empty file when no games completed.
+8. **Script rewrites:** `scripts/sprt.sh sprt|match` and `scripts/match.sh self-play|vs-stockfish` invoke `cargo run --release --bin elo-iterate -- ...`. fastchess locator removed from `sprt.sh`; `match.sh` retains it scoped to the `compliance` arm.
+
+**Out of scope.**
+- BayesElo / nElo / `--sprt-model` flag.
+- Opening books beyond startpos (no `--openings PGN_FILE` / `--openings EPD_FILE`).
+- Resume-from-checkpoint.
+- Mid-LLR diagnostic in the per-pair progress line (invites premature human stopping → invalidates α/β).
+- Trinomial-over-games SPRT.
+- Refactor of `src/bin/elo-iterate.rs` into a lib + bin split (deferred; the file has grown past 9000 lines).
+
+**Open questions resolved at landing.**
+- One binary or two? **Resolved: single `elo-iterate` binary with `--sprt-*` flags.** Avoids breaking the existing `scripts/sprt.sh rating-estimate` invocation contract.
+- Flag spelling? **Resolved: separate `--sprt-elo0/elo1/alpha/beta` flags** (mirrors fastchess `-sprt elo0=… elo1=… …` form; consistent with existing `--k0`/`--tau`/`--target-sigma` separate-flag convention).
+- `-pgnout`/`-log` parity? **Resolved: per-game PGNs at `<out-dir>/games/<N>.pgn` plus a run-end concatenated `<out-dir>/match.pgn`.** No `-log` parity needed (the harness emits its own structured `summary.txt`).
+- Pentanomial CI vs SPRT verdict? **Resolved: both reported in distinct fields at run end.** CI applies in fixed-games match mode too.
+- K-update + fixed-games match mode coexistence? **Resolved: fixed-games match mode never uses K-update.** The four-mode CLI taxonomy (rating-estimate online / frozen-anchor / fixed-games / SPRT) is documented in ADR-0022.
+
+**Back-validation gate.** Two parts. Part 1 lands atomic with the unit; Part 2 deferred to post-merge manual run per ELOH.B/C/D precedent.
+- **Part 1 — synthetic Bernoulli + draw-heavy stream (in-tree, deterministic).** SPRT converges to the correct verdict at the correct sample size given a synthetic stream with known Elo gap. Uses ELOH.D's `Prng` (SplitMix64) seeded with a fixed value. No-draw H1 stream at +50 Elo and H0 stream at -30 Elo (the plan's no-draw +20/0 Elo recommendation cannot converge in 2000 pairs because no-draw pair-variance is ~2× draw-heavy variance). Draw-heavy variants at +35 Elo (50% draw rate) and 0 Elo (50% draw rate) cover the realistic-distribution path. Hard merge-blocker.
+- **Part 2a — math-deterministic gate (in-tree).** `pentanomial_ci_hand_computed_example` against M4.D's historical bin counts `[5, 40, 78, 56, 21]` matches the historical fastchess CI `+41.89 [+18.18, +65.61]` to ±0.5 Elo (only slack is f64 rounding through `log10`/`powf`). Lands atomic with the unit.
+- **Part 2b — replay gate (deferred manual run).** Re-run the M4.D mixed-TC SPRT (`baseline/alpha-beta-tt-killer-history` vs HEAD, `--tc-sample 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1`, α=β=0.05, elo0=0 elo1=5, startpos-only, `--virtual-clock`, P-core pinned) through the new in-process SPRT mode. Statistical-equivalence pass criteria: (a) verdict is H1 accepted; (b) ptnml bin counts within ±30% relative of historical, CI endpoints within ±15 Elo. Not bit-equivalence (different PRNGs, different scheduling).
+
+**Doc-delta updated at landing.**
+- `docs/architecture.md` — tournament-harness row updated; new in-process-harness row.
+- `docs/workflow.md` — SPRT section reworked (worked example invocation through `scripts/sprt.sh sprt`; `--compliance`-stays-on-fastchess subsection); "Running a match" section updated.
+- `docs/tooling/elo-iteration-harness.md` — ELOH.E sub-phase row in §"Sub-phases"; this scope-detail section.
+- `docs/decisions/0012-tournament-harness.md` — `## 2026-05-01 amendment` section + status header note.
+- `docs/decisions/0022-eloh-sprt-mechanics.md` — new ADR.
+- `docs/roadmap.md`, `CLAUDE.md` — ELOH.E added to status / sub-phase table.
+- `bench/eloh-e.md` — new milestone bench file.
+- `scripts/install-fastchess.sh` — header comment updated (compliance-only).
+
 ## Branches and worktrees
 
 - **ELOH.A, ELOH.B, and ELOH.C.** Branch `tooling/elo-harness`, worktree `/Users/alex/clawfish-elo-harness`. (ELOH.C landed on the same branch as A and B rather than its own branch, per user directive to work in the existing worktree; ELOH.B had not merged to main when ELOH.C planning started.)
 - **ELOH.D.** Harness-only branch, default name `tooling/eloh-d-mixed-tc`. Branched off `main` after ELOH.C has merged so the match-loop's TC-sampling addition layers on top of the time-source seam without merge-conflict risk. Worktree path TBD at ELOH.D plan time.
+- **ELOH.E.** Harness-only branch, default name `tooling/eloh-e-sprt`. Branched off `main` after ELOH.D has merged. The unit's source surface is `src/bin/elo-iterate.rs` only — no engine surface change — so ELOH.E can run parallel with M5 plan-mode if the milestone clock asks for it.
 
 ## Sequencing relative to M4
 
