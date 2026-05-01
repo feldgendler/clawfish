@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M5.A complete — null-move pruning landed 2026-05-01 with mixed-TC SPRT validation (Δ Elo +400.00 [+285.52, +677.51] pentanomial 95% CI; H1 accepted in 22 games, all four TC buckets positive); M4 fully closed (aspiration at M4.D); ELOH tooling milestone closed at ELOH.E; M5.B (RFP / reverse-futility) is next.** Architectural commitments settled (see `docs/decisions/`). M5.A bench: `bench: 5345534 nodes <NPS> nps` (-66.3% vs M4.D's 15863206). The `baseline/m5a-nmp` tag (at `e63eb15`, M5.A landing) is the M5.B SPRT reference. The `baseline/m5<letter>-<feature>` shorter convention is the M5 milestone's adopted form; the descriptive-slug form was getting unwieldy by M5.
+**Phase: M5.A complete — null-move pruning landed 2026-05-01 with mixed-TC SPRT validation (Δ Elo +400.00 [+285.52, +677.51] pentanomial 95% CI; H1 accepted in 22 games, all four TC buckets positive) and Stockfish UCI_LimitStrength rating estimate (2601.45 ± 10.51 mixed-TC, fast-TC-weighted); M4 fully closed (aspiration at M4.D); ELOH tooling milestone closed at ELOH.E; M5.B (RFP / reverse-futility) is next.** Architectural commitments settled (see `docs/decisions/`). M5.A bench: `bench: 5345534 nodes <NPS> nps` (-66.3% vs M4.D's 15863206). The `baseline/m5a-nmp` tag (at `e63eb15`, M5.A landing) is the M5.B SPRT reference. The `baseline/m5<letter>-<feature>` shorter convention is the M5 milestone's adopted form; the descriptive-slug form was getting unwieldy by M5.
 
 | Phase | Status | One-line summary |
 |---|---|---|
