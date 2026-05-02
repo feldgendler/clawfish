@@ -875,3 +875,92 @@ fn bench_signature_deterministic_across_two_runs_with_nmp() {
          got {nodes1} vs {nodes2}"
     );
 }
+
+// E49 — bench is deterministic across two consecutive runs in the same
+// engine session with M5.B reverse-futility pruning active (re-pin of the
+// M5.A determinism contract, mirroring E48's shape).
+// ---------------------------------------------------------------------------
+
+/// `bench / bench` from a single engine subprocess must produce the same
+/// total node count both times, even with RFP cutting branches inside
+/// negamax. RFP is purely static (no sub-search, no TT store) so it
+/// introduces no non-determinism across identical positions. Node count is
+/// pinned to 3355270 (M5.B signature; −37.2% vs M5.A's 5345534).
+#[test]
+fn bench_signature_deterministic_across_two_runs_with_rfp() {
+    let mut child = spawn_engine();
+    let stdout = child.stdout.take().expect("stdout handle");
+    let line_rx = drain_stdout(stdout);
+
+    let mut stdin = child.stdin.take().expect("stdin handle");
+    // E49 uses `bench 4` to keep the test wallclock low; the determinism
+    // contract holds at every depth (the default-depth signature is exercised
+    // by `bench/m5.md`). E48's 60-second per-run timeout pattern is preserved.
+    stdin.write_all(b"bench 4\nbench 4\n").unwrap();
+
+    let mut lines: Vec<String> = Vec::new();
+    let bench_deadline_1 = Instant::now() + Duration::from_secs(60);
+    wait_for_line_starting_with(
+        &line_rx,
+        "info string bench: ",
+        bench_deadline_1,
+        &mut lines,
+    );
+    let bench_deadline_2 = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < bench_deadline_2 {
+        match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                let matched = line.starts_with("info string bench: ");
+                lines.push(line);
+                if matched {
+                    break;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    stdin.write_all(b"quit\n").unwrap();
+    drop(stdin);
+
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    let exited = wait_for_exit(&mut child, exit_deadline);
+    lines.extend(collect_lines(&line_rx));
+    let output = lines.join("\n");
+
+    assert!(exited, "E49: engine did not exit within 5 s after quit");
+
+    let signatures: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("info string bench: "))
+        .collect();
+    assert_eq!(
+        signatures.len(),
+        2,
+        "E49: expected exactly two bench signature lines; got {}.\nfull output:\n{output}",
+        signatures.len()
+    );
+
+    let parse_nodes = |sig: &str| -> u64 {
+        let rest = sig.strip_prefix("info string bench: ").unwrap();
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        assert_eq!(parts.len(), 4, "E49: signature shape wrong; {sig:?}");
+        parts[0].parse::<u64>().expect("E49: nodes must parse")
+    };
+    let nodes1 = parse_nodes(signatures[0]);
+    let nodes2 = parse_nodes(signatures[1]);
+    assert_eq!(
+        nodes1, nodes2,
+        "E49: bench node counts must match across two runs in the same session \
+         with RFP active (RFP gate is a pure function of Position + depth; \
+         static-only check, no sub-search, no TT store → deterministic); \
+         got {nodes1} vs {nodes2}"
+    );
+    // Pin to M5.B bench 4 signature (137174 nodes at depth=4).
+    // For the full default-depth signature (3355270 nodes at depth=8), see bench/m5.md.
+    assert_eq!(
+        nodes1, 137_174,
+        "E49: bench node count changed from M5.B pin (137174 at depth=4); \
+         re-pin if intentional; got {nodes1}"
+    );
+}
