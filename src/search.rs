@@ -437,6 +437,20 @@ pub(crate) const NMP_BASE_R: u32 = 2;
 /// NMP depth divisor in the reduction formula. ADR-0023 §1.
 pub(crate) const NMP_DEPTH_DIVISOR: u32 = 6;
 
+/// Upper depth bound for reverse-futility pruning. At depths above this,
+/// `static_eval - margin*depth >= beta` is rarely true (the margin grows
+/// faster than realistic eval surplus), and the tactical-blindness risk
+/// from a depth-7+ refutation grows. Stockfish DD historical: `depth < 7`
+/// (i.e., depth ≤ 6); ADR-0024 §1.
+pub(crate) const RFP_MAX_DEPTH: u32 = 6;
+
+/// Linear coefficient for reverse-futility pruning's depth-scaled margin.
+/// `margin = RFP_MARGIN_PER_DEPTH * depth`. At depth=1, 100 cp (≈ one
+/// pawn); at depth=6, 600 cp (≈ a rook). Conservative v1 starting value;
+/// CPW workhorse alternative is 150 (post-landing SPRT-tune candidate).
+/// ADR-0024 §1.
+pub(crate) const RFP_MARGIN_PER_DEPTH: i32 = 100;
+
 /// Construct the "iteration-1 aborted before any root improvement" fallback
 /// result for `Search::go` (M3.E).
 ///
@@ -559,6 +573,17 @@ pub(crate) fn null_move_reduction(depth: u32) -> u32 {
     NMP_BASE_R + depth / NMP_DEPTH_DIVISOR
 }
 
+/// RFP depth-scaled margin. Returns `RFP_MARGIN_PER_DEPTH * depth as i32`.
+/// Pure function. Extracted as a named helper so mutations on the formula
+/// constants are directly unit-testable (M3.D `negate_window` /
+/// M3.E `aborted_fallback_result` / M5.A `null_move_reduction` precedent).
+///
+/// `RFP_MARGIN_PER_DEPTH * depth as i32` cannot overflow `i32` at any depth
+/// below ~21M; the `depth <= RFP_MAX_DEPTH = 6` gate makes this trivially safe.
+pub(crate) fn reverse_futility_margin(depth: u32) -> i32 {
+    RFP_MARGIN_PER_DEPTH * depth as i32
+}
+
 /// True iff `side` has at least one non-pawn, non-king piece on the board.
 /// NMP zugzwang guard (ADR-0023 §4): zugzwang is dominantly a K+P-ending
 /// phenomenon, so the presence of any minor or major piece reduces
@@ -646,6 +671,12 @@ pub(crate) struct AlphaBetaMover {
     /// gated by `#[cfg(test)]` so production builds don't carry the field.
     #[cfg(test)]
     nmp_firings: u32,
+    /// M5.B: per-`go` count of RFP cutoff firings (number of times
+    /// `static_eval - margin >= beta` caused an early return). Test-only
+    /// instrumentation for gate-skip / ordering tests; gated by `#[cfg(test)]`
+    /// so production builds don't carry the field.
+    #[cfg(test)]
+    rfp_firings: u32,
 }
 
 impl AlphaBetaMover {
@@ -662,6 +693,8 @@ impl AlphaBetaMover {
             history_table: HistoryTable::new(),
             #[cfg(test)]
             nmp_firings: 0,
+            #[cfg(test)]
+            rfp_firings: 0,
         }
     }
 }
@@ -687,6 +720,7 @@ impl Search for AlphaBetaMover {
         #[cfg(test)]
         {
             self.nmp_firings = 0;
+            self.rfp_firings = 0;
         }
         // M4.A: install the TT and advance its generation once per `go` (ADR-0018 §9).
         self.tt = ctx.tt.clone();
@@ -977,14 +1011,49 @@ impl AlphaBetaMover {
             }
         }
 
-        // 8. Null-move pruning (M5.A — ADR-0023). Seven-condition gate:
-        //    `ply > 0` first as a structural-root guard (defense-in-depth
+        // 8. Reverse futility pruning (M5.B — ADR-0024). Independent of NMP: own
+        //    cheap-gate, own lazy `static_eval` read, own cutoff. M5.A's NMP block
+        //    at step 9 below is byte-identical to its M5.A form (it has its own
+        //    static_eval read inside its own gate; the duplicated read is a
+        //    deliberate plan choice over a shared eager hoist — see plan §1).
+        //    Order: RFP fires before NMP because it's cheaper (no sub-search).
+        //    On the d=3..6 overlap, an RFP cutoff skips NMP's sub-search entirely.
+        if ply > 0
+            && !is_pv
+            && !in_check(pos)
+            && depth <= RFP_MAX_DEPTH
+            && beta.abs() < MATE_IN_MAX_PLY
+        {
+            let stm = pos.side_to_move();
+            let static_eval = if stm == Color::White {
+                pos.static_eval_white()
+            } else {
+                -pos.static_eval_white()
+            };
+            let margin = reverse_futility_margin(depth);
+            if static_eval - margin >= beta {
+                #[cfg(test)]
+                {
+                    self.rfp_firings += 1;
+                }
+                // Fail-soft proved lower bound: even after discounting `margin*depth`
+                // cp from `static_eval`, we still beat beta. No TT store (research
+                // §6/§7): the proof is depth-specific to the margin, not a
+                // search-quality bound.
+                return static_eval - margin;
+            }
+        }
+
+        // 9. Null-move pruning (M5.A — ADR-0023, unchanged from M5.A). Seven-condition
+        //    gate: `ply > 0` first as a structural-root guard (defense-in-depth
         //    against a future PVS refactor that would change `is_pv`'s
         //    semantics); cheap predicates next; the static-eval read pulled
         //    inside the gate as a lazy late predicate so it fires only
         //    when the cheaper gates have already passed. On `null_score >=
         //    beta`, return a fail-high (mate-capped) and store a Lower
-        //    bound at the current depth in the TT.
+        //    bound at the current depth in the TT. The step-8 RFP block above
+        //    has its own independent `static_eval` read (lazy-dup by design —
+        //    ADR-0024); this NMP block's read is preserved verbatim.
         if ply > 0 && allow_null && !is_pv && depth >= NMP_MIN_DEPTH && !in_check(pos) {
             let stm = pos.side_to_move();
             if has_non_pawn_material(pos, stm) {
@@ -1063,7 +1132,7 @@ impl AlphaBetaMover {
             }
         }
 
-        // 9. Generate moves.
+        // 10. Generate moves.
         let mut ml = MoveList::new();
         generate_moves(pos, &mut ml);
         let mut moves_vec = ml.iter().collect::<Vec<_>>();
@@ -1075,7 +1144,7 @@ impl AlphaBetaMover {
             moves_vec.retain(|m| filter.contains(m));
         }
 
-        // 10. Terminal: no legal moves.
+        // 11. Terminal: no legal moves.
         //     At ply==0 with searchmoves filter active, an empty list is a degenerate
         //     user input (all-illegal or empty filter). Short-circuit BEFORE the
         //     in_check triage — otherwise a check position with a degenerate filter
@@ -1091,7 +1160,7 @@ impl AlphaBetaMover {
             }
         }
 
-        // 11. Order: killer-aware scoring (captures > killers > history-scored
+        // 12. Order: killer-aware scoring (captures > killers > history-scored
         //     quiets) descending via `order_moves` (extended for M4.C to consult
         //     the history table); then promote the TT move (if any) to index 0.
         //     `Move::default().bits() == 0` is the no-move sentinel and is
@@ -1109,8 +1178,8 @@ impl AlphaBetaMover {
             tt_move,
         );
 
-        // 12. Recurse fail-soft. `child_is_pv = is_pv && i == 0` per ADR-0018 §11
-        //     where `i` is the recursion-order index (post-step-11 reorder).
+        // 13. Recurse fail-soft. `child_is_pv = is_pv && i == 0` per ADR-0018 §11
+        //     where `i` is the recursion-order index (post-step-12 reorder).
         let mut best = -INF;
         let mut cutoff_move: Option<Move> = None;
         // M4.C: quiets that complete recursion without cutting; used for malus on cutoff.
@@ -1191,7 +1260,7 @@ impl AlphaBetaMover {
             }
         }
 
-        // 13. Store on completion. Skip on abort (partial bounds are not real)
+        // 14. Store on completion. Skip on abort (partial bounds are not real)
         //     and never mid-loop (the abort path returns above without storing).
         //     Together this guarantees aborted iterations never overwrite a
         //     prior iteration's entry. Bound classification compares against
@@ -1262,6 +1331,14 @@ impl AlphaBetaMover {
     #[cfg(test)]
     pub(super) fn nmp_firings_for_test(&self) -> u32 {
         self.nmp_firings
+    }
+
+    /// Test-only accessor for the per-`go` RFP firings counter (M5.B).
+    /// Mirrors `nmp_firings_for_test`. Production code never reads the counter
+    /// through this accessor.
+    #[cfg(test)]
+    pub(super) fn rfp_firings_for_test(&self) -> u32 {
+        self.rfp_firings
     }
 
     /// Test-only setter to install a TT directly without going through
@@ -1902,6 +1979,16 @@ pub fn is_fifty_move_draw(halfmove_clock: u8) -> bool {
 /// NMP firings observed across the entire search subtree under stacked-null
 /// prevention; mutating the inner null-search's `allow_null = false` to
 /// `true` would let nested nulls fire and inflate this count.
+///
+/// M5.B re-pin: K is unchanged from M5.A's value of 34. RFP is gated by
+/// `depth <= RFP_MAX_DEPTH = 6`, so the test's depth-8 root frame trivially
+/// fails the RFP depth predicate before any margin computation. The pin's
+/// load-bearing claim — that across the entire search subtree no descendant
+/// frame at `depth <= 6` satisfies the RFP gate's structural cheap-gates AND
+/// `static_eval - margin*d >= beta_at_that_node` AT a frame where M5.A's NMP
+/// would otherwise have fired — is empirical, verified by the test passing
+/// at impl time. M5.C's LMR may reshape the descendant set; if K drifts on
+/// a future phase's run, re-pin to the new observed value.
 #[cfg(test)]
 const NMP_FIRINGS_PINNED: u32 = 34;
 
@@ -6978,8 +7065,11 @@ mod tests {
         ab.history_table.clear();
         ab.history = vec![pos.zobrist()];
         let (ctx, _stop) = non_aborting_ctx();
-        // Tight window forces a quick quiet cutoff at ply=1.
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 1, 0, 1, false, true, &ctx);
+        // M5.B course-correction: beta raised from 1 to 350 so RFP does not
+        // fire (static_eval ≈ 477 for K+R vs K; margin at depth=2 is 200;
+        // 477−200=277 < 350 → gate fails). Window still tight enough to
+        // trigger a quiet beta-cutoff (first rook move returns ≈477 > 350).
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 1, 0, 350, false, true, &ctx);
 
         let mut white_nonzero = 0;
         let mut black_nonzero = 0;
@@ -8543,6 +8633,41 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // M5.B — reverse_futility_margin helper tests (5 tests).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reverse_futility_margin_at_depth_0_is_0() {
+        // Boundary: depth=0 → margin=0. Catches sign-flip / non-zero constant bugs.
+        assert_eq!(reverse_futility_margin(0), 0);
+    }
+
+    #[test]
+    fn reverse_futility_margin_at_depth_1_is_100() {
+        // Catches `+ → -`, `* → /` mutations on the formula.
+        assert_eq!(reverse_futility_margin(1), 100);
+    }
+
+    #[test]
+    fn reverse_futility_margin_at_depth_3_is_300() {
+        // Mid-range; catches off-by-one constant mutations.
+        assert_eq!(reverse_futility_margin(3), 300);
+    }
+
+    #[test]
+    fn reverse_futility_margin_at_depth_6_is_600() {
+        // RFP_MAX_DEPTH boundary.
+        assert_eq!(reverse_futility_margin(6), 600);
+    }
+
+    #[test]
+    fn reverse_futility_margin_at_depth_7_is_700() {
+        // Just above RFP_MAX_DEPTH; the gate prevents this from being called
+        // in production, but the helper is still well-defined and testable.
+        assert_eq!(reverse_futility_margin(7), 700);
+    }
+
+    // -----------------------------------------------------------------------
     // M5.A — NMP behavior in negamax (plan §5.3).
     //
     // Sister-fixture pattern: every gate-skip test pairs with a positive
@@ -8557,7 +8682,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: STM-perspective static eval (mirrors the inline sign-flip
-    /// inside the NMP block at step 8 of `negamax`). Reads the same
+    /// inside the NMP block at step 9 of `negamax`). Reads the same
     /// `static_eval_white` field; sign-flips for Black STM.
     fn stm_static_eval(pos: &Position) -> i32 {
         if pos.side_to_move() == Color::White {
@@ -9187,6 +9312,529 @@ mod tests {
         assert_eq!(
             ab.history, pre_history,
             "history Vec contents must be byte-identical after balanced push/pop"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M5.B — RFP behavior in negamax (plan §5.2).
+    //
+    // Sister-fixture pattern, counter-based discriminators. All tests drive
+    // `negamax_for_test` directly so the author controls `is_pv`, depth,
+    // and the `(alpha, beta)` window precisely.
+    //
+    // Winning fixture used across most tests:
+    //   `8/8/4k3/8/4K3/8/8/Q7 w - - 0 1` — White K+Q vs Black K.
+    //   `stm_static_eval` ≈ +1000 cp (queen material + PST ≈ 1025 ± 50).
+    //   At depth=4, margin=400: `1000 - 400 = 600 >= beta=100` → RFP fires.
+    //
+    // Balanced fixture used where RFP must NOT fire:
+    //   `r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9`
+    //   `stm_static_eval` ≈ 0 cp.
+    // -----------------------------------------------------------------------
+
+    /// RFP gate-skip at PV node (`is_pv = true`).
+    /// Sister fixture: same parameters with `is_pv = false` → RFP fires.
+    /// Discriminator: `rfp_firings` counter.
+    ///
+    /// depth=1 so children go to qsearch (no negamax recursion) — the counter
+    /// stays isolated to the one root frame.
+    #[test]
+    fn negamax_skips_rfp_at_pv_node() {
+        let pos =
+            Position::from_fen("8/8/4k3/8/4K3/8/8/Q7 w - - 0 1").expect("K+Q vs K FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        // depth=1 → margin=100. beta set below static_eval−100 so the margin
+        // condition passes when !is_pv.
+        let beta = static_eval - reverse_futility_margin(1) - 100;
+        let alpha = -INF;
+
+        let mut ab_pv = AlphaBetaMover::new();
+        let _ = ab_pv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, true, true, &ctx);
+
+        let mut ab_nonpv = AlphaBetaMover::new();
+        let _ = ab_nonpv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+
+        assert_eq!(
+            ab_pv.rfp_firings_for_test(),
+            0,
+            "PV node must skip RFP; got {} rfp_firings",
+            ab_pv.rfp_firings_for_test()
+        );
+        assert_eq!(
+            ab_nonpv.rfp_firings_for_test(),
+            1,
+            "non-PV node must fire RFP exactly once; got {} rfp_firings",
+            ab_nonpv.rfp_firings_for_test()
+        );
+    }
+
+    /// RFP gate-skip when in check.
+    /// Sister fixture: same skeleton with attacker removed.
+    /// Discriminator: `rfp_firings` counter.
+    ///
+    /// depth=1 so children go to qsearch (no negamax recursion) — the counter
+    /// stays isolated to the one root frame.
+    #[test]
+    fn negamax_skips_rfp_when_in_check() {
+        use crate::movegen::in_check;
+
+        // In-check fixture: White K g1, Q d4, P f2/g2/h2. Black K h8, N e2
+        // (knight on e2 attacks g1). White is in check. Same as NMP check-skip test.
+        let pos_check = Position::from_fen("7k/8/8/8/3Q4/8/4nPPP/6K1 w - - 0 1")
+            .expect("in-check FEN must parse");
+        // Sister: knight moved to h6 (not checking). White still has queen (non-pawn material).
+        let pos_no_check = Position::from_fen("7k/8/7n/8/3Q4/8/5PPP/6K1 w - - 0 1")
+            .expect("no-check FEN must parse");
+
+        assert!(in_check(&pos_check), "fixture must be in check");
+        assert!(
+            !in_check(&pos_no_check),
+            "sister fixture must NOT be in check"
+        );
+
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let alpha = -INF;
+        // depth=1 → margin=100. beta set below no-check eval−100 so the margin
+        // condition passes there; in-check case must skip regardless (gate fails).
+        let beta = stm_static_eval(&pos_no_check) - reverse_futility_margin(1) - 50;
+
+        let mut ab_check = AlphaBetaMover::new();
+        let _ =
+            ab_check.negamax_for_test(&mut pos_check.clone(), 1, 1, alpha, beta, false, true, &ctx);
+
+        let mut ab_no = AlphaBetaMover::new();
+        let _ = ab_no.negamax_for_test(
+            &mut pos_no_check.clone(),
+            1,
+            1,
+            alpha,
+            beta,
+            false,
+            true,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab_check.rfp_firings_for_test(),
+            0,
+            "in-check node must skip RFP; got {} rfp_firings",
+            ab_check.rfp_firings_for_test()
+        );
+        assert_eq!(
+            ab_no.rfp_firings_for_test(),
+            1,
+            "not-in-check node must fire RFP; got {} rfp_firings",
+            ab_no.rfp_firings_for_test()
+        );
+    }
+
+    /// RFP gate-skip at ply 0 even when `is_pv = false` (defense-in-depth
+    /// structural-root guard, parallels M5.A's NMP `ply > 0` gate).
+    /// Sister fixture: same arguments with ply = 1.
+    ///
+    /// depth=1 so children go to qsearch (no negamax recursion) — the counter
+    /// stays isolated to the one root frame.
+    #[test]
+    fn negamax_skips_rfp_at_ply_zero_even_when_is_pv_false() {
+        let pos =
+            Position::from_fen("8/8/4k3/8/4K3/8/8/Q7 w - - 0 1").expect("K+Q vs K FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        // depth=1 → margin=100. beta below static_eval−100 so ply=1 fires.
+        let beta = static_eval - reverse_futility_margin(1) - 100;
+        let alpha = -INF;
+
+        let mut ab_ply0 = AlphaBetaMover::new();
+        let _ = ab_ply0.negamax_for_test(&mut pos.clone(), 1, 0, alpha, beta, false, true, &ctx);
+
+        let mut ab_ply1 = AlphaBetaMover::new();
+        let _ = ab_ply1.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+
+        assert_eq!(
+            ab_ply0.rfp_firings_for_test(),
+            0,
+            "ply=0 must skip RFP regardless of is_pv; got {} rfp_firings",
+            ab_ply0.rfp_firings_for_test()
+        );
+        assert_eq!(
+            ab_ply1.rfp_firings_for_test(),
+            1,
+            "ply=1 sister must fire RFP; got {} rfp_firings",
+            ab_ply1.rfp_firings_for_test()
+        );
+    }
+
+    /// RFP gate-skip at depth above `RFP_MAX_DEPTH` (= 6).
+    /// Sister fixture: same position at depth = 6 (fires).
+    /// Discriminator: `rfp_firings` counter. Catches `<=` → `<` boundary mutation.
+    ///
+    /// Two separate betas are required for single-ply isolation:
+    ///
+    /// - depth=6, beta = `static_eval - margin*6 - 1` (just below the RFP
+    ///   threshold): root fires once (single-ply: RFP returns before movegen,
+    ///   so no children are ever spawned → rfp_firings exactly 1).
+    ///
+    /// - depth=7, beta = `static_eval + 928` (experimentally confirmed ≥ 850 on
+    ///   this position): root depth gate fails (7 > 6); direct children have
+    ///   beta=INF (abs gate fails); with this beta, grandchildren cannot satisfy
+    ///   `static_eval − margin*d >= beta_at_node` — confirmed experimentally at
+    ///   beta=850+, rfp_firings=0 for this K+Q vs K position + depth=7.
+    ///   If alpha tightens toward beta=950, the first child exceeds beta and
+    ///   causes an immediate cutoff (score 29998 > 950), limiting exposure to
+    ///   one in-check child (which skips RFP via the in_check gate).
+    ///
+    /// The `<= → >=` mutation (would fire at all depths ≥ 6) is caught by
+    /// `negamax_skips_rfp_when_static_eval_below_beta_plus_margin` at depth=4.
+    #[test]
+    fn negamax_skips_rfp_at_depth_above_max() {
+        let pos =
+            Position::from_fen("8/8/4k3/8/4K3/8/8/Q7 w - - 0 1").expect("K+Q vs K FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(8);
+        let static_eval = stm_static_eval(&pos);
+        let alpha = -INF;
+
+        // depth=7: gate fails (7 > RFP_MAX_DEPTH=6). beta=950 is above the
+        // maximum RFP threshold for any reachable descendant node (confirmed
+        // empirically: rfp_firings=0 for all betas 850..1000 on this position
+        // at depth=7).
+        let beta_d7 = 950;
+        let mut ab_d7 = AlphaBetaMover::new();
+        let _ = ab_d7.negamax_for_test(&mut pos.clone(), 7, 1, alpha, beta_d7, false, true, &ctx);
+
+        // depth=6: gate passes (6 == RFP_MAX_DEPTH). beta just below threshold
+        // so root fires and immediately returns (no movegen → no children →
+        // rfp_firings exactly 1). Catches `<= → <` mutation.
+        let beta_d6 = static_eval - reverse_futility_margin(6) - 1;
+        let mut ab_d6 = AlphaBetaMover::new();
+        let _ = ab_d6.negamax_for_test(&mut pos.clone(), 6, 1, alpha, beta_d6, false, true, &ctx);
+
+        assert_eq!(
+            ab_d7.rfp_firings_for_test(),
+            0,
+            "depth=7 (> RFP_MAX_DEPTH=6) must skip RFP; got {} rfp_firings",
+            ab_d7.rfp_firings_for_test()
+        );
+        assert_eq!(
+            ab_d6.rfp_firings_for_test(),
+            1,
+            "depth=6 (== RFP_MAX_DEPTH=6) must fire RFP; got {} rfp_firings",
+            ab_d6.rfp_firings_for_test()
+        );
+    }
+
+    /// RFP gate-skip when `beta` is a mate score (`abs(beta) >= MATE_IN_MAX_PLY`).
+    /// Sister fixture: same position with finite beta.
+    /// Discriminator: `rfp_firings` counter.
+    ///
+    /// depth=1 so children go to qsearch (no negamax recursion) — the counter
+    /// stays isolated to the one root frame.
+    #[test]
+    fn negamax_skips_rfp_when_mate_beta() {
+        let pos =
+            Position::from_fen("8/8/4k3/8/4K3/8/8/Q7 w - - 0 1").expect("K+Q vs K FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let alpha = -INF;
+
+        // Mate-score beta: well above MATE_IN_MAX_PLY. RFP gate must fail.
+        let beta_mate = MATE - 5; // a mate-in-5 score, abs >= MATE_IN_MAX_PLY
+        assert!(
+            beta_mate.abs() >= MATE_IN_MAX_PLY,
+            "test invariant: beta_mate must be a mate-magnitude score"
+        );
+
+        // Finite beta: below static_eval − margin so the margin condition passes.
+        // depth=1 → margin=100.
+        let static_eval = stm_static_eval(&pos);
+        let beta_finite = static_eval - reverse_futility_margin(1) - 100;
+        assert!(
+            beta_finite.abs() < MATE_IN_MAX_PLY,
+            "test invariant: beta_finite must be a centipawn score"
+        );
+
+        let mut ab_mate = AlphaBetaMover::new();
+        let _ = ab_mate.negamax_for_test(
+            &mut pos.clone(),
+            1,
+            1,
+            -(MATE - 6), // alpha below mate beta
+            beta_mate,
+            false,
+            true,
+            &ctx,
+        );
+
+        let mut ab_finite = AlphaBetaMover::new();
+        let _ = ab_finite.negamax_for_test(
+            &mut pos.clone(),
+            1,
+            1,
+            alpha,
+            beta_finite,
+            false,
+            true,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab_mate.rfp_firings_for_test(),
+            0,
+            "mate-score beta must skip RFP; got {} rfp_firings",
+            ab_mate.rfp_firings_for_test()
+        );
+        assert_eq!(
+            ab_finite.rfp_firings_for_test(),
+            1,
+            "finite beta (below threshold) must fire RFP; got {} rfp_firings",
+            ab_finite.rfp_firings_for_test()
+        );
+    }
+
+    /// RFP gate-skip when `static_eval - margin < beta` (margin condition fails).
+    /// Sister fixture: same position with beta set so margin condition passes.
+    /// Discriminator: `rfp_firings` counter.
+    #[test]
+    fn negamax_skips_rfp_when_static_eval_below_beta_plus_margin() {
+        let pos =
+            Position::from_fen("8/8/4k3/8/4K3/8/8/Q7 w - - 0 1").expect("K+Q vs K FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let alpha = -INF;
+        let static_eval = stm_static_eval(&pos);
+        let margin = reverse_futility_margin(4);
+
+        // Skip case: beta = static_eval - margin + 50 (gate fails: S - M < S - M + 50).
+        let beta_skip = static_eval - margin + 50;
+        let mut ab_skip = AlphaBetaMover::new();
+        let _ =
+            ab_skip.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta_skip, false, true, &ctx);
+
+        // Pass case: beta = static_eval - margin - 50 (gate passes: S - M >= S - M - 50).
+        let beta_pass = static_eval - margin - 50;
+        let mut ab_pass = AlphaBetaMover::new();
+        let _ =
+            ab_pass.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta_pass, false, true, &ctx);
+
+        assert_eq!(
+            ab_skip.rfp_firings_for_test(),
+            0,
+            "static_eval < beta + margin must skip RFP; got {} rfp_firings",
+            ab_skip.rfp_firings_for_test()
+        );
+        assert_eq!(
+            ab_pass.rfp_firings_for_test(),
+            1,
+            "static_eval >= beta + margin must fire RFP; got {} rfp_firings",
+            ab_pass.rfp_firings_for_test()
+        );
+    }
+
+    /// On a successful RFP cutoff, returned score equals `static_eval - margin*depth`
+    /// exactly (fail-soft proved lower bound). Catches `→ static_eval`, `→ beta`,
+    /// `→ static_eval + margin` return-value mutations.
+    #[test]
+    fn negamax_returns_proved_lower_bound_on_successful_rfp() {
+        let pos =
+            Position::from_fen("8/8/4k3/8/4K3/8/8/Q7 w - - 0 1").expect("K+Q vs K FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let margin = reverse_futility_margin(4); // 400
+        let beta = static_eval - margin - 100;
+        let alpha = -INF;
+
+        let mut ab = AlphaBetaMover::new();
+        let score = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+
+        assert_eq!(
+            ab.rfp_firings_for_test(),
+            1,
+            "RFP must have fired exactly once; got {} rfp_firings",
+            ab.rfp_firings_for_test()
+        );
+        assert_eq!(
+            score,
+            static_eval - margin,
+            "RFP must return proved lower bound `static_eval - margin`; \
+             got score={score}, expected={}, static_eval={static_eval}, margin={margin}",
+            static_eval - margin
+        );
+    }
+
+    /// After an RFP cutoff, the TT does NOT have an entry at the node's Zobrist key.
+    /// RFP is a static heuristic; its proof is depth-specific to the margin and
+    /// must NOT be stored (research §6/§7).
+    #[test]
+    fn negamax_rfp_does_not_store_in_tt() {
+        let pos =
+            Position::from_fen("8/8/4k3/8/4K3/8/8/Q7 w - - 0 1").expect("K+Q vs K FEN must parse");
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _stop) = non_aborting_ctx_at_depth_with_tt(4, Arc::clone(&tt));
+        let static_eval = stm_static_eval(&pos);
+        let margin = reverse_futility_margin(4);
+        let beta = static_eval - margin - 100;
+        let alpha = -INF;
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+
+        assert_eq!(
+            ab.rfp_firings_for_test(),
+            1,
+            "RFP must have fired; got 0 rfp_firings"
+        );
+        assert!(
+            tt.probe(pos.zobrist()).is_none(),
+            "TT must NOT have an entry for this position after RFP cutoff \
+             (no TT store on RFP — research §6/§7)"
+        );
+    }
+
+    /// When RFP's structural gates pass but the margin condition fails, the
+    /// search falls through to the NMP block. NMP fires if its own gate passes.
+    /// Verifies the lazy-dup design: RFP's miss doesn't suppress NMP.
+    /// Discriminator: `rfp_firings == 0 AND nmp_firings >= 1`.
+    #[test]
+    fn negamax_passes_static_eval_through_to_nmp_when_rfp_misses() {
+        // Balanced middlegame position; static_eval ≈ 0 cp.
+        // At depth=4, margin=400. RFP gate: `0 - 400 = -400 >= beta`.
+        // Choose beta = static_eval - 200 (between static_eval−400 and static_eval):
+        //   RFP: -400 >= -200? No → gate fails.
+        //   NMP: static_eval=0 >= beta=-200? Yes → gate passes (assuming non-pawn material).
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        // beta = static_eval - 200: RFP needs beta <= static_eval - 400; -200 > -400, so RFP fails.
+        let beta = static_eval - 200;
+        let alpha = -INF;
+
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+
+        assert_eq!(
+            ab.rfp_firings_for_test(),
+            0,
+            "RFP must not fire (margin condition fails); got {} rfp_firings",
+            ab.rfp_firings_for_test()
+        );
+        assert!(
+            ab.nmp_firings_for_test() >= 1,
+            "NMP must fire at least once (falls through from RFP miss); \
+             got {} nmp_firings",
+            ab.nmp_firings_for_test()
+        );
+    }
+
+    /// Direct counter increment: `rfp_firings` increases by 1 on a successful
+    /// RFP cutoff. Direct kill for the counter-increment path mutation.
+    #[test]
+    fn rfp_firings_counter_increments_on_cutoff() {
+        let pos =
+            Position::from_fen("8/8/4k3/8/4K3/8/8/Q7 w - - 0 1").expect("K+Q vs K FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let margin = reverse_futility_margin(4);
+        let beta = static_eval - margin - 100;
+        let alpha = -INF;
+
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+
+        assert_eq!(
+            ab.rfp_firings_for_test(),
+            1,
+            "rfp_firings must be 1 after exactly one RFP cutoff; \
+             got {}",
+            ab.rfp_firings_for_test()
+        );
+    }
+
+    /// RFP takes precedence over NMP at the depth=3..6 overlap.
+    /// At depth=4: both RFP and NMP gates pass. RFP fires first (cheaper),
+    /// NMP is skipped. Assert `rfp_firings == 1 AND nmp_firings == 0`.
+    ///
+    /// Fixture: K+Q vs K (White), static_eval ≈ +1000 cp, beta=100, depth=4.
+    ///   RFP: 1000 - 4*100 = 600 >= 100 ✓ (passes by 500 cp)
+    ///   NMP (if reached): 1000 >= 100 ✓ (passes by 900 cp)
+    /// Both gates pass with >400 cp safety margin.
+    #[test]
+    fn rfp_takes_precedence_over_nmp_at_overlapping_depth() {
+        let pos =
+            Position::from_fen("8/8/4k3/8/4K3/8/8/Q7 w - - 0 1").expect("K+Q vs K FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        // beta = 100: well below static_eval (≈1000) so NMP would also pass,
+        // and well below static_eval − 400 = 600 so RFP passes too.
+        let beta = 100;
+        let alpha = -INF;
+        assert!(
+            static_eval - reverse_futility_margin(4) >= beta,
+            "test invariant: RFP must pass (static_eval={static_eval}, margin=400, beta={beta})"
+        );
+        assert!(
+            static_eval >= beta,
+            "test invariant: NMP would also pass (static_eval={static_eval} >= beta={beta})"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+
+        assert_eq!(
+            ab.rfp_firings_for_test(),
+            1,
+            "RFP must fire exactly once at depth=4; got {} rfp_firings",
+            ab.rfp_firings_for_test()
+        );
+        assert_eq!(
+            ab.nmp_firings_for_test(),
+            0,
+            "NMP must not fire (RFP took precedence and returned early); \
+             got {} nmp_firings",
+            ab.nmp_firings_for_test()
+        );
+    }
+
+    /// Boundary: at depth=1, margin=100. RFP fires when
+    /// `static_eval - 100 >= beta` (i.e., beta <= static_eval − 100).
+    /// `beta = static_eval - 100` → fires (>=); `beta = static_eval - 99` → does not.
+    ///
+    /// // pins margin-comparison operator >=; intentionally 1-cp boundary
+    #[test]
+    fn negamax_at_depth_one_passes_rfp_gate_when_eval_surplus_is_at_least_one_pawn() {
+        let pos =
+            Position::from_fen("8/8/4k3/8/4K3/8/8/Q7 w - - 0 1").expect("K+Q vs K FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(1);
+        let static_eval = stm_static_eval(&pos);
+        let alpha = -INF;
+
+        // At depth=1, margin=100. Gate: static_eval - 100 >= beta.
+        // Pass case: beta = static_eval - 100 → fires (boundary equality: S - 100 >= S - 100).
+        let beta_pass = static_eval - 100;
+        let mut ab_pass = AlphaBetaMover::new();
+        let _ =
+            ab_pass.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta_pass, false, true, &ctx);
+
+        // Skip case: beta = static_eval - 99 → does not fire (S - 100 >= S - 99 is false).
+        // pins margin-comparison operator >=; intentionally 1-cp boundary
+        let beta_skip = static_eval - 99;
+        let mut ab_skip = AlphaBetaMover::new();
+        let _ =
+            ab_skip.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta_skip, false, true, &ctx);
+
+        assert_eq!(
+            ab_pass.rfp_firings_for_test(),
+            1,
+            "depth=1, beta = static_eval - 100 must fire RFP (>= boundary); \
+             got {} rfp_firings",
+            ab_pass.rfp_firings_for_test()
+        );
+        assert_eq!(
+            ab_skip.rfp_firings_for_test(),
+            0,
+            "depth=1, beta = static_eval - 99 must NOT fire RFP (strictly less); \
+             got {} rfp_firings",
+            ab_skip.rfp_firings_for_test()
         );
     }
 }

@@ -10,10 +10,12 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > (`[side][from][to]` i16; `+= depth*depth` bonus + matching malus),
 > two-tier asymmetric aspiration windows (±50 cp first try; depth ≥ 6),
 > null-move pruning (`R = 2 + depth/6`; seven-condition gate; mate-cap),
+> reverse futility pruning (`margin = 100*depth`; depth ≤ 6; non-PV,
+> non-check; no TT store),
 > mate-distance pruning, PeSTO middlegame piece-square tables, and
 > `compute_caps`-driven time management. `bench` UCI command for
 > deterministic node-count regression baselines. The rest of the strength
-> path (RFP, LMR, futility, singular extensions; eval improvements; NNUE)
+> path (LMR, futility, singular extensions; eval improvements; NNUE)
 > is tracked in [`docs/roadmap.md`](docs/roadmap.md).
 >
 > **Current strength: ~2601 Elo on Stockfish 18 UCI_LimitStrength scale
@@ -54,12 +56,12 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > + the M5.A mixed-TC anchor 2601 cross-validate at fast-TC: 2300 (M4.D
 > 10+0.1) + ~300 (M5.A SPRT score 87.5% at 10+0.1) ≈ 2600. ✓
 >
-> **Current bench:** `bench: 5345534 nodes <NPS> nps` at default depth 7
-> (M5.A end; node count is deterministic, NPS is wallclock-dependent).
-> Down from M4.D's 15,863,206 nodes — −66.3% additional reduction from
-> null-move pruning composing with M4's TT/killer/history/aspiration
-> ordering; down from M3.F's 172,312,700 — ~97% cumulative reduction
-> from TT + killer + history + aspiration + NMP. Run
+> **Current bench:** `bench: 3355270 nodes <NPS> nps` at default depth 8
+> (M5.B end; node count is deterministic, NPS is wallclock-dependent).
+> Down from M5.A's 5,345,534 nodes — −37.2% additional reduction from
+> reverse futility pruning composing with NMP + M4's TT/killer/history/
+> aspiration ordering; down from M3.F's 172,312,700 — ~98% cumulative
+> reduction from TT + killer + history + aspiration + NMP + RFP. Run
 > `printf 'bench\nquit\n' | ./target/release/clawfish` to reproduce
 > the node count.
 
