@@ -27,7 +27,11 @@ Per-unit `cargo mutants --in-diff` runs that are deferred from the unit's commit
 
 ## Pending
 
-### M4.B + M4.C + M4.D + M5.A + M5.B — Killer moves + History + Aspiration + NMP + RFP (joint campaign)
+_(no pending campaigns)_
+
+---
+
+### Archived entry — M4.B + M4.C + M4.D + M5.A + M5.B — Killer moves + History + Aspiration + NMP + RFP (joint campaign, now done)
 
 **Why combined:** M4.B and M4.C developed on parallel branches off M4.A; the user opted to defer their mutation campaigns and run them together as one overnight batch covering both diff ranges. M4.D landed on main after the M4.C merge; the user extended the deferral to include M4.D in the same batch. M5.A (NMP) landed on main after M4.D; per the M5.A plan §10 + ADR-0023, M5.A's mutants surface is appended to the same joint entry rather than scheduling a separate campaign. M5.B (RFP) landed on main after M5.A; per the M5.B plan §10 + ADR-0024, M5.B's mutants surface is appended to the same joint entry, extending the diff range to cover the M5.B landing commit.
 
@@ -216,6 +220,34 @@ Update `docs/milestones/m4.b.md`'s, `docs/milestones/m4.c.md`'s, `docs/milestone
 - **If a survivor maps outside the M4.B/M4.C/M4.D/M5.A/M5.B surface** (i.e., a mutation on a line outside `src/search.rs` killer / history / aspiration / NMP / RFP logic, `src/history.rs`, `src/mov.rs::from_bits` / null-move primitives, `src/movegen.rs::test_strategies` lift, `src/position.rs` delegators, the M4.C/M4.D/M5.A/M5.B-specific test surface): something's off with the diff scope. Re-check that `33a0d0d..<m5.b-merge-sha>` is the correct hash range and that no drift commits have landed.
 
 ## Done
+
+### M4.B+M4.C+M4.D+M5.A+M5.B — joint campaign (ran 2026-05-02 on branch `mutants/m4bcd-m5ab`)
+
+748 mutants: 669 caught + 15 timeout-caught + 33 unviable + **31 missed** (89.4% catch rate). Diff range `33a0d0d..7d99ccc -- src/*.rs tests/*.rs`.
+
+**31 survivors triaged in two commits on branch `mutants/m4bcd-m5ab`:**
+
+1. Tests added (11 new tests catching real gaps):
+   - `src/search.rs`: 4 tests — `search_clock_elapsed_at_returns_exact_duration`, `search_clock_same_variant_returns_false_for_mismatched_deadline_variant`, `search_clock_same_variant_returns_false_for_mismatched_soft_deadline_variant`, `search_clock_same_variant_returns_true_for_consistent_wall_clock`.
+   - `src/bin/elo-iterate.rs`: 7 tests — `parse_args_draw_score_positive_accepted`, `parse_args_sprt_alpha_exactly_one_rejected`, `parse_args_sprt_beta_out_of_range_rejected` (3 sub-cases), `insufficient_kbkb_same_colour_b2_a1_pins_xor_parity_formula`, `pentanomial_ci_two_pairs_non_zero_variance_returns_valid_ci`, `match_pgn_separator_newline_between_games`, `match_pgn_trailing_newline_added_when_missing`.
+
+2. `exclude_re` rules added (8 rules):
+   - `has_non_pawn_material` `|→^` — equivalent (disjoint piece bitboards).
+   - `negamax` `&→|` and `&→^` — equivalent (cancellation-cadence gate never fires in tests).
+   - `negamax` `<→<=` — structurally undetectable (`beta.abs() == MATE_IN_MAX_PLY` unreachable; also covers M5.A NMP `>=→>` boundary at same value).
+   - `negamax` `+→*` — deferred (NMP `ply+1 → ply*1`, 1-ply shift invisible to existing tests; deferred to M5.C).
+   - `go` `+=→*=` — deferred (`tries += 1 → tries *= 1`, performance-only, double-fail fixture impractical; deferred to M5.C).
+   - Driver whole-fn replacements (4 patterns): `driver::send_line`, `driver::wait_for_uciok`, `driver::wait_for_readyok`, `driver::shutdown` — smoke-test-only gap (ELOH.A precedent).
+   - `get_hostname` — smoke-test-only (FFI syscall wrapper).
+
+3. Permanent equivalent misses (no rule, audit comment in mutants.toml):
+   - `is_insufficient_material` second `&&→||` — provably equivalent under the (1,1) minor-count filter.
+   - `unix_days_to_date_str` two `-→+` — `.min(3)` absorbs the shift + `year_in_cycle/4=0` identity. Function-level exclusion would suppress a non-equivalent caught mutation; accepted permanent miss.
+
+4. Deferred structural gaps (no rule; noted for M5.C or later):
+   - AS23 (`clear_killers` between-tries placement): weak pin only; behavioral impact below SPRT noise floor.
+
+See `docs/milestones/m4.b.md`, `m4.c.md`, `m4.d.md`, `m5.a.md`, `m5.b.md` for per-phase survivor breakdowns.
 
 ### M4.A — Transposition table (campaign ran 2026-04-29 on main as commit `33a0d0d`)
 
