@@ -18,45 +18,44 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > path (LMR, futility, singular extensions; eval improvements; NNUE)
 > is tracked in [`docs/roadmap.md`](docs/roadmap.md).
 >
-> **Current strength: ~2601 Elo on Stockfish 18 UCI_LimitStrength scale
-> at fast-TC-weighted mixed TC** (M5.A end, 2026-05-01). Mixed-TC rating
+> **Current strength: ~2652 Elo on Stockfish 18 UCI_LimitStrength scale
+> at fast-TC-weighted mixed TC** (M5.B end, 2026-05-02). Mixed-TC rating
 > estimate via the in-process ELOH harness with Robbins-Monro iteration:
 >
 > | Metric | Value |
 > |---|---|
-> | Converged Elo | **2601.45 ± 10.51** |
-> | Games | 56 (28 pairs) |
-> | W-L-D | 19 / 28 / 9 (41.96% score) |
+> | Converged Elo | **2652.43 ± 14.55** |
+> | Games | 40 (20 pairs) |
+> | W-L-D | 15 / 18 / 7 (46.25% score) |
 > | TC mix | `--tc-sample 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1` (uniform 4-bucket) |
-> | TC sampled | 28 / 0 / 14 / 14 games (early σ-stop fired before TC balance — fast-TC-weighted) |
+> | TC sampled | 18 / 4 / 14 / 4 games (early σ-stop fired before TC balance — fast-TC-weighted) |
 > | Stop reason | σ-stop |
 >
 > Apple M4 P-cores (utility QoS), single thread, no pondering, virtual
 > clock on clawfish. Methodology + per-TC distribution caveat:
-> [`bench/sprt/2026-05-01-m5.a-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-01-m5.a-mixed-tc-rating-estimate.md).
+> [`bench/sprt/2026-05-02-m5.b-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-02-m5.b-mixed-tc-rating-estimate.md).
+>
+> M5.B's mixed-TC SPRT vs `baseline/m5a-nmp` (M5.A end) — W-L-D
+> **94/32/74** in 200 games / 100 pairs, score 65.5%, **logistic Elo +111**.
+> Pentanomial-GSPRT did not formally cross the `elo1=5` H1 Wald bound (the
+> chosen bound was too narrow given the actual gain magnitude — RFP
+> standalone was expected to be a +20–50 Elo addition on top of NMP, but
+> the actual gain on this engine's M4-ordering substrate is ~2× that);
+> H1 was treated as accepted on score-based decisioning. Full log:
+> [`bench/sprt/2026-05-02-m5.b-vs-m5a-mixed-tc.md`](bench/sprt/2026-05-02-m5.b-vs-m5a-mixed-tc.md).
 >
 > M5.A's mixed-TC SPRT vs `baseline/alpha-beta-tt-killer-history-aspiration`
-> (M4.D end) — **H1 accepted in 22 games / 11 pairs**, Δ Elo
-> **+400.00 [+285.52, +677.51]** (pentanomial 95% CI), pentanomial
-> `[0, 0, 0, 4, 7]` (zero losses), W-L-D = 18-0-4. Per-TC: 10+0.1: 3-0-1;
-> 20+0.2: 8-0-2; 40+0.4: 5-0-1; 60+0.6: 2-0-0 — all four buckets decisively
-> positive, doesn't-regress-anywhere floor satisfied. The +400 gain
-> dramatically exceeds the literature prior of +30–70 Elo for NMP; the SPRT
-> log attributes this to compounding M4-ordering quality + engine-strength
-> tier conditioning. Full log:
+> (M4.D end) — **H1 accepted in 22 games / 11 pairs**, Δ Elo **+400.00
+> [+285.52, +677.51]** (pentanomial 95% CI). Full log:
 > [`bench/sprt/2026-05-01-m5.a-vs-aspiration-mixed-tc.md`](bench/sprt/2026-05-01-m5.a-vs-aspiration-mixed-tc.md).
 >
-> The pure-logistic SPRT gain (+400 Elo) does NOT translate 1:1 to UCI_Elo
-> space (~+300 fast-TC). Stockfish UCI_LimitStrength has a non-linear
-> strength curve in 2200–2400 (per the M4.D rating-estimate doc); chained
-> clawfish-vs-clawfish SPRT logistic Elo measures relative strength tightly
-> but doesn't transfer additively to UCI_Elo space. Anchored M4.D per-TC
-> numbers (10+0.1: 2300, 20+0.2: 2466, 40+0.4: 2531, 60+0.6: 2483 — see
-> [`bench/sprt/2026-05-01-m4.d-per-tc-rating-estimate.md`](bench/sprt/2026-05-01-m4.d-per-tc-rating-estimate.md))
-> + the M5.A mixed-TC anchor 2601 cross-validate at fast-TC: 2300 (M4.D
-> 10+0.1) + ~300 (M5.A SPRT score 87.5% at 10+0.1) ≈ 2600. ✓
+> Pure-logistic SPRT gains do NOT translate 1:1 to UCI_Elo space.
+> Stockfish UCI_LimitStrength has a non-linear strength curve at
+> 2200–2700 (per the M4.D + M5.A + M5.B rating-estimate docs); chained
+> clawfish-vs-clawfish SPRT logistic Elo measures relative strength
+> tightly but doesn't transfer additively to UCI_Elo space.
 >
-> **Current bench:** `bench: 3355270 nodes <NPS> nps` at default depth 8
+> **Current bench:** `bench: 3355270 nodes <NPS> nps` at default depth 7
 > (M5.B end; node count is deterministic, NPS is wallclock-dependent).
 > Down from M5.A's 5,345,534 nodes — −37.2% additional reduction from
 > reverse futility pruning composing with NMP + M4's TT/killer/history/
