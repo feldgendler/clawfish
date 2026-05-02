@@ -8385,6 +8385,78 @@ mod tests {
         assert!(clock.is_soft_reached_at(now));
     }
 
+    /// `elapsed_at` returns the exact duration between `start` and `now`.
+    /// Pins the mutation `elapsed_at → Duration::default()` which would
+    /// always return zero instead of the true elapsed duration.
+    #[test]
+    fn search_clock_elapsed_at_returns_exact_duration() {
+        // Use Cpu instants so the arithmetic is exact (no OS scheduling jitter).
+        let start = SearchInstant::Cpu(0);
+        let clock = SearchClock {
+            start,
+            deadline: None,
+            soft_deadline: None,
+        };
+        let now = SearchInstant::Cpu(1_000_000); // 1 ms in nanoseconds
+        assert_eq!(
+            clock.elapsed_at(now),
+            Duration::from_nanos(1_000_000),
+            "elapsed_at must return now.duration_since(start), not a constant zero"
+        );
+    }
+
+    /// `same_variant` returns `false` when `start` is Cpu but `deadline` is Wall.
+    /// Pins the `same_variant → true` whole-function mutation and the
+    /// `&&→||` body mutation. The `&&→||` mutant returns `deadline_ok ||
+    /// soft_ok`; with deadline_ok=false and soft_ok=true (no soft_deadline),
+    /// it returns `true` instead of the correct `false`.
+    #[test]
+    fn search_clock_same_variant_returns_false_for_mismatched_deadline_variant() {
+        let clock = SearchClock {
+            start: SearchInstant::Cpu(0),
+            deadline: Some(SearchInstant::Wall(std::time::Instant::now())),
+            soft_deadline: None, // soft_ok = true (None branch)
+        };
+        assert!(
+            !clock.same_variant(),
+            "mismatched Cpu start / Wall deadline must yield same_variant() == false"
+        );
+    }
+
+    /// `same_variant` returns `false` when `start` is Wall but `soft_deadline` is Cpu.
+    /// Pins the `&&→||` body mutation on the soft_ok branch: with
+    /// deadline_ok=true (None) and soft_ok=false, the `||` mutant returns
+    /// `true || false = true` instead of the correct `false`.
+    #[cfg(unix)]
+    #[test]
+    fn search_clock_same_variant_returns_false_for_mismatched_soft_deadline_variant() {
+        let clock = SearchClock {
+            start: SearchInstant::Wall(std::time::Instant::now()),
+            deadline: None,                             // deadline_ok = true
+            soft_deadline: Some(SearchInstant::Cpu(0)), // soft_ok = false
+        };
+        assert!(
+            !clock.same_variant(),
+            "mismatched Wall start / Cpu soft_deadline must yield same_variant() == false"
+        );
+    }
+
+    /// `same_variant` returns `true` for a consistently-typed Wall clock.
+    /// Positive control ensuring the method is not hardwired to `false`.
+    #[test]
+    fn search_clock_same_variant_returns_true_for_consistent_wall_clock() {
+        let now = std::time::Instant::now();
+        let clock = SearchClock {
+            start: SearchInstant::Wall(now),
+            deadline: Some(SearchInstant::Wall(now)),
+            soft_deadline: Some(SearchInstant::Wall(now)),
+        };
+        assert!(
+            clock.same_variant(),
+            "all-Wall SearchClock must yield same_variant() == true"
+        );
+    }
+
     // --- §6.3 Search time-source integration tests ---
 
     #[cfg(unix)]

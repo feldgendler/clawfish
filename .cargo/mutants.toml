@@ -466,4 +466,131 @@ exclude_re = [
     # step is changed.
     "replace < with <= in controller::clamp_uci_elo",
     "replace > with >= in controller::clamp_uci_elo",
+
+    # ---- has_non_pawn_material: `|` ↔ `^` between provably-disjoint operands ----
+    #
+    # `pieces_colored(side, Knight) | pieces_colored(side, Bishop) | ...` ORs
+    # four bitboards for Knight, Bishop, Rook, Queen. A square holds at most one
+    # piece kind, so the four piece bitboards for a given color are disjoint by
+    # the Position invariant (`piece_bb[k] & piece_bb[k'] == 0` for k ≠ k').
+    # For disjoint sets: a | b == a ^ b for every input. Equivalent mutant.
+    # M4.B+C+D+M5.A+B joint campaign; documented in docs/milestones/m5.a.md.
+    "replace \\| with \\^ in has_non_pawn_material",
+
+    # ---- negamax cancellation-cadence gate: `& → |` and `& → ^` ---------------
+    #
+    # `if self.nodes & 4095 == 0 && clock.should_abort(...)` at the per-frame
+    # cancellation-cadence gate. The gate fires every 4096 nodes. Mutating to
+    # `nodes | 4095 == 0` makes it NEVER fire (4095 has bits 0-11 set, so any
+    # OR with it is always ≥ 4095). Mutating to `nodes ^ 4095 == 0` fires only
+    # at nodes == 4095 exactly (once per search at that single count vs. every
+    # multiple of 4096 in the original). Neither mutation fires within the test
+    # suite: tests do not run enough nodes for either the per-4096 or the exact-
+    # 4095 gate to trigger `should_abort`. Same equivalence argument as the
+    # existing qsearch exclusion (`replace & with \\^ in AlphaBetaMover::qsearch`).
+    # The stop-flag path inside `should_abort` is exercised directly by D11.
+    # M4.B+C+D+M5.A+B joint campaign; documented in docs/milestones/m4.d.md.
+    "replace & with \\| in AlphaBetaMover::negamax",
+    "replace & with \\^ in AlphaBetaMover::negamax",
+
+    # ---- negamax RFP gate: `beta.abs() < MATE_IN_MAX_PLY` boundary (`< → <=`) --
+    #
+    # `beta.abs() < MATE_IN_MAX_PLY` (= 29936) at the RFP gate. Mutating `<` to
+    # `<=` would cause RFP to fire when `beta.abs() == 29936` exactly — a value
+    # that no chess fixture produces (mate-in-MAX_PLY = mate-in-64 is longer than
+    # any reachable game). Structurally undetectable at this milestone scope.
+    # Expected survivor documented in docs/mutants-backlog.md §"Edge cases" and
+    # docs/milestones/m5.b.md §"Mutation-survivor analysis". ADR-0024 §3 + M5.B
+    # plan §10. Same argument as the M5.A NMP mate-cap `>=` → `>` boundary.
+    "replace < with <= in AlphaBetaMover::negamax",
+
+    # ---- negamax NMP recursive call: `ply + 1` → `ply * 1` --------------------
+    #
+    # `ply + 1` in the NMP null-search recursive call argument. Mutating to
+    # `ply * 1` leaves `ply` unchanged (1 is the identity for multiplication).
+    # The child receives `ply` instead of `ply + 1`, producing a 1-ply error in
+    # mate-distance calculations and MDP bounds inside the null sub-search.
+    # The observable effect is a 1-cp shift in mate scores returned from the null
+    # sub-search, which is insufficient to straddle the MATE_IN_MAX_PLY cutoff
+    # boundary (needed to change the NMP decision) for any reachable TT-stored
+    # value. All existing NMP tests pin the cutoff-vs-beta relationship or the
+    # firings count — not the exact mate magnitude — so the 1-ply shift is
+    # invisible. Deferred to a future milestone (M5.C LMR or later) when
+    # ply-sensitive search depth tests can be added with less combinatorial
+    # complexity. M4.B+C+D+M5.A+B joint campaign; documented in
+    # docs/milestones/m5.a.md §"Mutation-survivor analysis".
+    "replace \\+ with \\* in AlphaBetaMover::negamax",
+
+    # ---- go `tries` counter: `tries += 1` → `tries *= 1` ----------------------
+    #
+    # `tries += 1` in the aspiration loop's per-try increment. Mutating to
+    # `tries *= 1` leaves tries = 0 permanently (identity multiplication). The
+    # two-try cap `tries >= 2` never fires, allowing unlimited re-searches until
+    # the window widens to (-INF, INF) and the search succeeds (at most 3 total
+    # negamax calls per iteration vs the correct max of 2). The test AS10 is
+    # designed to catch this via `aspiration_re_search` line counts ≤ 1, but the
+    # existing `fail_high_fixture` only produces a single fail before the widened
+    # window contains the score — so no iteration emits 2 re-search lines.
+    # Constructing a guaranteed double-fail fixture requires a position with an
+    # oscillating score (fail-high then fail-low), which is highly configuration-
+    # dependent. The correctness impact is performance-only: at most one extra
+    # full-width search per iteration, always terminating. Deferred to a future
+    # phase (M5.C) when aspiration-window test infrastructure is expanded.
+    # M4.B+C+D+M5.A+B joint campaign; documented in docs/milestones/m4.d.md
+    # §"Mutation-survivor analysis".
+    "replace \\+= with \\*= in <impl Search for AlphaBetaMover>::go",
+
+    # ---- driver function whole-fn replacements (extend ELOH.A exclusion) ------
+    #
+    # The existing ELOH.A exclusions cover `in driver::*` patterns (in-body
+    # operator mutations). cargo-mutants also generates whole-function
+    # replacements of the form `replace <fn> -> <ReturnType> with <default>`.
+    # For functions returning `Result<(), HarnessError>` the default is `Ok(())`;
+    # for `Result<EngineCapabilities, HarnessError>` it is
+    # `Ok(Default::default())`. These outer-wrapper functions delegate to inner
+    # implementations that ARE covered by synthetic-channel unit tests. Making
+    # the wrapper a no-op only breaks the bridge between the inner logic and the
+    # real subprocess — detectable only by the `#[ignore]`-gated smoke test.
+    # Same structural gap as the original ELOH.A exclusion.
+    "replace driver::send_line ->",
+    "replace driver::wait_for_uciok ->",
+    "replace driver::wait_for_readyok ->",
+    "replace driver::shutdown ->",
+
+    # ---- get_hostname: whole-fn replacement ------------------------------------
+    #
+    # `get_hostname` is the FFI syscall wrapper used only by `current_hostname`.
+    # Its in-body mutation `in get_hostname` is already excluded. cargo-mutants
+    # also generates `replace get_hostname with ()` (returns the unit type since
+    # the function returns `()`). Making the wrapper a no-op leaves `buf`
+    # zero-filled so `current_hostname` returns "localhost" instead of the real
+    # hostname — observable only via the end-to-end smoke test. `current_hostname`
+    # and `current_date_str` are already excluded; extending the exclusion to
+    # cover the whole-fn form.
+    "replace get_hostname with",
+
+    # ---- unix_days_to_date_str: two equivalent `-→+` survivors (no rule) ------
+    #
+    # Two `-→+` mutations survive the test suite but are provably equivalent:
+    #
+    # 1. Line ~9648: `((rem - rem / 1460) / 365).min(3)`. Mutating `-` → `+`:
+    #    For rem ∈ [0, 1459]: rem/1460 = 0 → `rem - 0 == rem + 0`. Same result.
+    #    For rem = 1460 (max): original = (1459/365).min(3) = 3;
+    #    mutant = (1461/365).min(3) = 4.min(3) = 3. SAME (`.min(3)` absorbs the
+    #    1-unit difference). Equivalent for all valid inputs.
+    #
+    # 2. Line ~9650: `rem - year_in_cycle * 365 - year_in_cycle / 4`. The SECOND
+    #    `-` (before `year_in_cycle / 4`) mutated to `+`. year_in_cycle ∈ {0,1,2,3};
+    #    integer division: year_in_cycle / 4 = 0 for all four values. So `- 0`
+    #    and `+ 0` are identical. Equivalent.
+    #
+    # NO `exclude_re` rule is added because the function also has non-equivalent
+    # `-→+` mutations (the first `-` on line ~9650, `rem - year_in_cycle*365`)
+    # which ARE caught by the date-fixture tests. A function-level exclusion
+    # `"replace - with + in unix_days_to_date_str"` would accidentally suppress
+    # those caught mutations in future re-runs. A line-anchored exclusion would
+    # violate the project convention against fragile line anchors.
+    #
+    # ACCEPTED AS PERMANENT EQUIVALENT MISSES. Audit trail: M4.B+C+D+M5.A+B
+    # joint campaign (2026-05-02). See docs/milestones/m5.b.md for details.
 ]

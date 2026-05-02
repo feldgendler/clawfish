@@ -912,6 +912,93 @@ mod cli {
         }
 
         #[test]
+        fn parse_args_sprt_alpha_exactly_one_rejected() {
+            // --sprt-alpha 1.0 is out of the open interval (0, 1) and must
+            // be rejected. Pins the `< → <=` mutation on `a < 1.0` which
+            // would accept 1.0 as if it were within (0, 1].
+            let mut argv = sprt_base_argv();
+            argv.extend([
+                "--sprt-elo0".into(),
+                "0".into(),
+                "--sprt-elo1".into(),
+                "10".into(),
+                "--sprt-alpha".into(),
+                "1.0".into(),
+                "--sprt-beta".into(),
+                "0.05".into(),
+            ]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "--sprt-alpha 1.0 must be rejected (open interval); got Ok"
+            );
+        }
+
+        #[test]
+        fn parse_args_sprt_beta_out_of_range_rejected() {
+            // Three boundary mutations on the sprt_beta guard `!(b > 0.0 && b < 1.0)`:
+            //   1. `&& → ||` would accept b=1.5 (outer false iff b <= 0 AND b >= 1).
+            //   2. `> → >=` would accept b=0.0 (>= 0.0 is true, allowing the zero boundary).
+            //   3. `< → <=` would accept b=1.0 (the exact upper boundary).
+            // Each subtest asserts the value is rejected. The beta guard mirrors
+            // the alpha guard but has no corresponding test in the existing suite.
+
+            // Case 1: b > 1.0 — caught by `&&→||` mutant.
+            let mut argv = sprt_base_argv();
+            argv.extend([
+                "--sprt-elo0".into(),
+                "0".into(),
+                "--sprt-elo1".into(),
+                "10".into(),
+                "--sprt-alpha".into(),
+                "0.05".into(),
+                "--sprt-beta".into(),
+                "1.5".into(),
+            ]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "--sprt-beta 1.5 must be rejected; got Ok"
+            );
+
+            // Case 2: b = 0.0 — caught by `>→>=` mutant.
+            let mut argv = sprt_base_argv();
+            argv.extend([
+                "--sprt-elo0".into(),
+                "0".into(),
+                "--sprt-elo1".into(),
+                "10".into(),
+                "--sprt-alpha".into(),
+                "0.05".into(),
+                "--sprt-beta".into(),
+                "0.0".into(),
+            ]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "--sprt-beta 0.0 must be rejected (open interval); got Ok"
+            );
+
+            // Case 3: b = 1.0 — caught by `<→<=` mutant.
+            let mut argv = sprt_base_argv();
+            argv.extend([
+                "--sprt-elo0".into(),
+                "0".into(),
+                "--sprt-elo1".into(),
+                "10".into(),
+                "--sprt-alpha".into(),
+                "0.05".into(),
+                "--sprt-beta".into(),
+                "1.0".into(),
+            ]);
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, CliError::InvalidValue(_)),
+                "--sprt-beta 1.0 must be rejected (open interval); got Ok"
+            );
+        }
+
+        #[test]
         fn parse_args_sprt_with_k0_override_rejected() {
             let mut argv = sprt_base_argv();
             argv.extend([
@@ -1215,6 +1302,17 @@ mod cli {
             argv.extend(["--draw-score".into(), "0".into()]);
             let args = parse_args(argv).expect("--draw-score 0 must be accepted");
             assert_eq!(args.thresholds.draw_score, 0);
+        }
+
+        #[test]
+        fn parse_args_draw_score_positive_accepted() {
+            // --draw-score 5 is a valid positive value. Pins the `< → >`
+            // mutation on `if draw_score < 0` which would reject positive
+            // values instead of only negative ones.
+            let mut argv = base_argv();
+            argv.extend(["--draw-score".into(), "5".into()]);
+            let args = parse_args(argv).expect("--draw-score 5 must be accepted");
+            assert_eq!(args.thresholds.draw_score, 5);
         }
 
         #[test]
@@ -3559,6 +3657,26 @@ mod adjudicate {
             );
         }
 
+        #[test]
+        fn insufficient_kbkb_same_colour_b2_a1_pins_xor_parity_formula() {
+            // Bw on b2 (file=1, rank=1, LERF index=9): dark square — (1+1)%2 = 0.
+            // Bb on a1 (file=0, rank=0, LERF index=0): dark square — (0+0)%2 = 0.
+            // Same colour: position is insufficient material.
+            //
+            // This specifically pins the `(idx ^ (idx >> 3)) & 1` formula against
+            // the `^ → |` mutation. For index=9: (9 ^ 1) & 1 = 8 & 1 = 0 (correct:
+            // dark). Under `|`: (9 | 1) & 1 = 9 & 1 = 1 (incorrect: classified light).
+            // The mutant would see parity(b2)=1 != parity(a1)=0 → returns false (wrong).
+            //
+            // FEN: white Bw=b2, Wk=c1, black Bb=a1, Bk=e6.
+            let pos = Position::from_fen("8/8/4k3/8/8/8/1B6/b1K5 w - - 0 1").unwrap();
+            assert!(
+                is_insufficient_material(&pos),
+                "KBKB same-colour (b2 dark, a1 dark) must be insufficient; \
+                 XOR parity formula bug would misclassify b2 as light"
+            );
+        }
+
         // ---------------------------------------------------------------
         // Precedence tests
         // ---------------------------------------------------------------
@@ -4881,6 +4999,34 @@ mod sprt {
             assert!(
                 lo.is_nan() && est.is_nan() && hi.is_nan(),
                 "pentanomial_ci at zero variance must return NaN tuple"
+            );
+        }
+
+        #[test]
+        fn pentanomial_ci_two_pairs_non_zero_variance_returns_valid_ci() {
+            // n=2 pairs: one LL (bin-0, score 0.0) and one WW (bin-4, score 2.0).
+            // n=2 satisfies `n >= 2`, so the function must NOT return NaN.
+            // Pins the `< → <=` mutation on `if n < 2`: the mutant would
+            // early-return NaN for n=2 (since 2 <= 2 is true), but the correct
+            // code proceeds past the guard and computes a valid CI.
+            //
+            // mu = (0.0 + 2.0) / 2 = 1.0.
+            // sum_ns2 = (0.0 + 4.0) / 2 = 2.0. var = 2.0 - 1.0 = 1.0.
+            // SE = sqrt(1.0/2) ≈ 0.707. CI pair ≈ [1.0 - 1.96*0.707, 1.0 + 1.96*0.707].
+            let mut s = SprtState::default();
+            s.pair_counts[0] = 1; // LL: score 0.0
+            s.pair_counts[4] = 1; // WW: score 2.0
+            let (lo, est, hi) = pentanomial_ci(&s);
+            assert!(
+                !lo.is_nan() && !est.is_nan() && !hi.is_nan(),
+                "pentanomial_ci at n=2 with non-zero variance must return a valid (non-NaN) CI; \
+                 got ({lo}, {est}, {hi})"
+            );
+            // est ≈ 0.0 (uniform draw rate at this exact mu=1.0 → Elo_est = 0 because
+            // pair_score(mu=1.0) maps to p=0.5 → Elo=0).
+            assert!(
+                est.is_finite(),
+                "Elo estimate must be finite for balanced LL+WW sample; got {est}"
             );
         }
 
@@ -9430,6 +9576,83 @@ mod controller {
             assert!(
                 content.is_empty(),
                 "zero-game run must produce empty match.pgn"
+            );
+        }
+
+        #[test]
+        fn match_pgn_separator_newline_between_games() {
+            // write_match_pgn must insert exactly one blank-line separator
+            // (\n) between adjacent games. Pins three `>` boundary mutations:
+            //   - `> → ==`: inserts \n before game-0 only (wrong side).
+            //   - `> → <`: `i < 0` always false — no separator ever added.
+            //   - `> → >=`: `i >= 0` always true — adds \n before EVERY game
+            //     including the first, which creates a leading blank line.
+            // The test asserts the combined output starts with game-1 content
+            // (no leading newline) AND that games are separated by exactly
+            // one blank line (\n\n) between the trailing newline of game N and
+            // the opening tag of game N+1.
+            let dir = std::env::temp_dir().join("eloh_e_match_pgn_separator");
+            let games_dir = dir.join("games");
+            let _ = std::fs::create_dir_all(&games_dir);
+            for n in 1..=2 {
+                let _ = std::fs::remove_file(games_dir.join(format!("{n}.pgn")));
+            }
+            let match_pgn = dir.join("match_sep.pgn");
+            let _ = std::fs::remove_file(&match_pgn);
+            // Each game ends with \n so they already have a trailing newline.
+            std::fs::write(games_dir.join("1.pgn"), "[Round \"1\"]\n*\n").unwrap();
+            std::fs::write(games_dir.join("2.pgn"), "[Round \"2\"]\n*\n").unwrap();
+            super::write_match_pgn(&games_dir, &match_pgn).unwrap();
+            let content = std::fs::read_to_string(&match_pgn).unwrap();
+            // Must not start with a newline (no prefix separator before game 1).
+            assert!(
+                !content.starts_with('\n'),
+                "match.pgn must not start with a newline; got {content:?}"
+            );
+            // Must contain exactly one blank-line separator between games.
+            assert!(
+                content.contains("\n\n"),
+                "match.pgn must contain a blank-line separator between games; got {content:?}"
+            );
+            // Expected exact output: game1 content + separator \n + game2 content.
+            let expected = "[Round \"1\"]\n*\n\n[Round \"2\"]\n*\n";
+            assert_eq!(
+                content, expected,
+                "match.pgn exact content mismatch; expected {expected:?}"
+            );
+        }
+
+        #[test]
+        fn match_pgn_trailing_newline_added_when_missing() {
+            // When a game's content does NOT end with '\n', write_match_pgn
+            // must append one. Pins the `delete !` mutation on
+            // `if !content.ends_with('\n')` which would flip to appending an
+            // extra newline when content ALREADY ends with '\n'.
+            //
+            // Two sub-assertions:
+            //   a) Content without trailing \n gets one appended.
+            //   b) Content with trailing \n does NOT get an extra one.
+            let dir = std::env::temp_dir().join("eloh_e_match_pgn_trailing_nl");
+            let games_dir = dir.join("games");
+            let _ = std::fs::create_dir_all(&games_dir);
+            for n in 1..=2 {
+                let _ = std::fs::remove_file(games_dir.join(format!("{n}.pgn")));
+            }
+            let match_pgn = dir.join("match_trailing.pgn");
+            let _ = std::fs::remove_file(&match_pgn);
+            // Game 1: no trailing newline. Game 2: has trailing newline.
+            std::fs::write(games_dir.join("1.pgn"), "[Round \"1\"]\n*").unwrap();
+            std::fs::write(games_dir.join("2.pgn"), "[Round \"2\"]\n*\n").unwrap();
+            super::write_match_pgn(&games_dir, &match_pgn).unwrap();
+            let content = std::fs::read_to_string(&match_pgn).unwrap();
+            // Expected: game1 (no \n) + appended \n + separator \n + game2 (has \n).
+            // So combined: "[Round \"1\"]\n*\n\n[Round \"2\"]\n*\n".
+            let expected = "[Round \"1\"]\n*\n\n[Round \"2\"]\n*\n";
+            assert_eq!(
+                content, expected,
+                "write_match_pgn must append \\n to content without trailing newline \
+                 and must NOT append an extra \\n to content that already has one; \
+                 got {content:?}"
             );
         }
     }
