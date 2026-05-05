@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::history::{HistoryTable, MAX_HISTORY};
 use crate::tt::{TranspositionTable, TtBound, TtData, score_from_tt, score_to_tt};
-use crate::{Color, Move, PieceKind, Position};
+use crate::{Color, Move, MoveList, PieceKind, Position};
 
 // ---------------------------------------------------------------------------
 // ELOH.C — VirtualClock UCI option: SearchInstant + SearchClock + libc shim.
@@ -451,6 +451,27 @@ pub(crate) const RFP_MAX_DEPTH: u32 = 6;
 /// ADR-0024 §1.
 pub(crate) const RFP_MARGIN_PER_DEPTH: i32 = 100;
 
+/// Minimum depth at which LMR is considered. Below this, reduced searches are
+/// too shallow to justify the complexity and tend to degenerate into qsearch.
+/// M5.C plan / forthcoming ADR-0025.
+pub(crate) const LMR_MIN_DEPTH: u32 = 3;
+
+/// Quiets are indexed 1-based within the node's quiet-only ordering. The
+/// first quiet searched at a node (index 1) is never reduced; reductions may
+/// begin at the second quiet (index 2).
+pub(crate) const LMR_MIN_QUIET_INDEX: u32 = 2;
+
+/// Additive base term for the M5.C log-log LMR formula.
+pub(crate) const LMR_BASE_OFFSET: f64 = 0.99;
+
+/// Divisor in the M5.C log-log LMR formula.
+#[allow(clippy::approx_constant)] // SPRT-tunable, not π
+pub(crate) const LMR_LOG_DIVISOR: f64 = 3.14;
+
+/// Quiets with history scores at or above this threshold are trusted and are
+/// exempt from LMR in M5.C v1.
+pub(crate) const LMR_HIGH_HISTORY_THRESHOLD: i16 = 4_096;
+
 /// Construct the "iteration-1 aborted before any root improvement" fallback
 /// result for `Search::go` (M3.E).
 ///
@@ -584,6 +605,79 @@ pub(crate) fn reverse_futility_margin(depth: u32) -> i32 {
     RFP_MARGIN_PER_DEPTH * depth as i32
 }
 
+/// LMR base reduction. Inputs are `(depth, quiet_index)` where `quiet_index`
+/// is 1-based within the quiet-only ordering at the current node. Returns
+/// `0` for `depth < LMR_MIN_DEPTH` or `quiet_index < LMR_MIN_QUIET_INDEX`
+/// (in-domain guard pinned by tests; do not rely on caller-side gates
+/// alone). Otherwise computes `floor(LMR_BASE_OFFSET + ln(depth) *
+/// ln(quiet_index) / LMR_LOG_DIVISOR)` and clamps to `0..=(depth - 2)` so
+/// the reduced child is always at least depth 1. Extracted as a named
+/// helper so formula mutations are directly unit-testable (M3.D
+/// `negate_window` precedent). ADR-0025 §4.
+pub(crate) fn late_move_reduction(depth: u32, quiet_index: u32) -> u32 {
+    if depth < LMR_MIN_DEPTH || quiet_index < LMR_MIN_QUIET_INDEX {
+        return 0;
+    }
+
+    let raw = LMR_BASE_OFFSET + (depth as f64).ln() * (quiet_index as f64).ln() / LMR_LOG_DIVISOR;
+    let reduction = raw.floor() as u32;
+    reduction.clamp(0, depth.saturating_sub(2))
+}
+
+/// Per-quiet LMR eligibility, applied after the caller has already cleared
+/// the node-level gates (`ply > 0`, `!is_pv`, `depth >= LMR_MIN_DEPTH`,
+/// `!in_check`). Returns `false` for non-quiets, for quiets at index
+/// `< LMR_MIN_QUIET_INDEX`, for either killer slot, and for quiets whose
+/// history score has reached `LMR_HIGH_HISTORY_THRESHOLD`. The TT move is
+/// implicitly exempt: after the step-12 reorder it is the first searched
+/// move (ADR-0018 §12), so a quiet TT move receives `quiet_index = 1` and
+/// the floor at `LMR_MIN_QUIET_INDEX = 2` rules it out without an explicit
+/// TT-move parameter. ADR-0025 §3.
+fn is_lmr_eligible_quiet(
+    mv: Move,
+    pos: &Position,
+    quiet_index: u32,
+    killer0: Move,
+    killer1: Move,
+    history_table: &HistoryTable,
+) -> bool {
+    if !is_quiet(mv) || quiet_index < LMR_MIN_QUIET_INDEX {
+        return false;
+    }
+    if mv == killer0 || mv == killer1 {
+        return false;
+    }
+    history_table.score(pos.side_to_move(), mv.from_square(), mv.to_square())
+        < LMR_HIGH_HISTORY_THRESHOLD
+}
+
+/// Classical M5.C re-search policy: re-search at full depth iff the reduced
+/// first pass returns above alpha.
+fn lmr_needs_full_research(reduced_score: i32, alpha: i32) -> bool {
+    reduced_score > alpha
+}
+
+/// TT bound classification for a completed negamax node, including the M5.C
+/// soundness rule that a node whose best score is only reduced-depth-proven
+/// must not advertise a full-depth TT bound.
+fn tt_bound_for_completed_node(
+    best: i32,
+    beta: i32,
+    original_alpha: i32,
+    best_is_full_depth: bool,
+) -> Option<TtBound> {
+    if !best_is_full_depth {
+        return None;
+    }
+    Some(if best >= beta {
+        TtBound::Lower
+    } else if best > original_alpha {
+        TtBound::Exact
+    } else {
+        TtBound::Upper
+    })
+}
+
 /// True iff `side` has at least one non-pawn, non-king piece on the board.
 /// NMP zugzwang guard (ADR-0023 §4): zugzwang is dominantly a K+P-ending
 /// phenomenon, so the presence of any minor or major piece reduces
@@ -627,6 +721,21 @@ impl PvTable {
             self.moves[ply][i + 1] = self.moves[ply + 1][i];
         }
         self.lengths[ply] = 1 + child_len;
+    }
+}
+
+/// Update whether the current node's best score has at least one full-depth
+/// witness after considering a newly searched move.
+fn best_is_full_depth_after_score(
+    best: i32,
+    best_is_full_depth: bool,
+    score: i32,
+    move_is_full_depth: bool,
+) -> bool {
+    if score > best {
+        move_is_full_depth
+    } else {
+        best_is_full_depth || (score == best && move_is_full_depth)
     }
 }
 
@@ -677,6 +786,31 @@ pub(crate) struct AlphaBetaMover {
     /// so production builds don't carry the field.
     #[cfg(test)]
     rfp_firings: u32,
+    /// M5.C: test-only count of reduced-depth first-pass searches performed by
+    /// LMR at the outermost `negamax_for_test` frame only.
+    #[cfg(test)]
+    lmr_reduced_searches: u32,
+    /// M5.C: test-only count of full-depth re-searches triggered at the
+    /// outermost `negamax_for_test` frame only.
+    #[cfg(test)]
+    lmr_full_researches: u32,
+    /// M5.C: exact quiet moves that took the reduced-depth first pass at the
+    /// outermost `negamax_for_test` frame only.
+    #[cfg(test)]
+    lmr_reduced_moves: Vec<Move>,
+    /// M5.C: exact quiet moves that triggered a full-depth re-search at the
+    /// outermost `negamax_for_test` frame only.
+    #[cfg(test)]
+    lmr_researched_moves: Vec<Move>,
+    /// M5.C: quiet moves that entered `quiets_searched` at the outermost
+    /// `negamax_for_test` frame only. Used to pin that reduced-only quiets do
+    /// not get treated as fully searched priors for later history malus.
+    #[cfg(test)]
+    lmr_history_candidates: Vec<Move>,
+    /// M5.C: root-ply marker for test-only LMR instrumentation. `Some(ply)`
+    /// means "record only events that happen at this negamax frame".
+    #[cfg(test)]
+    lmr_trace_root_ply: Option<u32>,
 }
 
 impl AlphaBetaMover {
@@ -695,6 +829,18 @@ impl AlphaBetaMover {
             nmp_firings: 0,
             #[cfg(test)]
             rfp_firings: 0,
+            #[cfg(test)]
+            lmr_reduced_searches: 0,
+            #[cfg(test)]
+            lmr_full_researches: 0,
+            #[cfg(test)]
+            lmr_reduced_moves: Vec::new(),
+            #[cfg(test)]
+            lmr_researched_moves: Vec::new(),
+            #[cfg(test)]
+            lmr_history_candidates: Vec::new(),
+            #[cfg(test)]
+            lmr_trace_root_ply: None,
         }
     }
 }
@@ -721,6 +867,12 @@ impl Search for AlphaBetaMover {
         {
             self.nmp_firings = 0;
             self.rfp_firings = 0;
+            self.lmr_reduced_searches = 0;
+            self.lmr_full_researches = 0;
+            self.lmr_reduced_moves.clear();
+            self.lmr_researched_moves.clear();
+            self.lmr_history_candidates.clear();
+            self.lmr_trace_root_ply = None;
         }
         // M4.A: install the TT and advance its generation once per `go` (ADR-0018 §9).
         self.tt = ctx.tt.clone();
@@ -923,6 +1075,51 @@ impl AlphaBetaMover {
     /// top-level `Search::go` call and from the move-loop recursive call;
     /// `false` only in the NMP null-search recursive call (stacked-null
     /// prevention — ADR-0023 §5).
+    ///
+    /// Make `mv`, recurse `negamax` on the resulting child at `child_depth`,
+    /// undo, and return the negated child score. Centralises the
+    /// `make_move` / `history.push` / `negate_window` / `history.pop` /
+    /// `unmake_move` plumbing so the move loop has one call site per
+    /// recursion variant (M5.C reduced first pass, M5.C full re-search,
+    /// non-LMR child) instead of three near-identical inline blocks.
+    /// `allow_null = true` for every move-loop child (the
+    /// stacked-NMP guard is the NMP block's responsibility, not the
+    /// move-loop's). The returned score is `0` if the search aborted;
+    /// callers MUST inspect `self.aborted` immediately after the call and
+    /// propagate the abort up to their own caller (`if self.aborted {
+    /// return 0; }`) before reading the returned score.
+    #[allow(clippy::too_many_arguments)]
+    fn search_child(
+        &mut self,
+        pos: &mut Position,
+        mv: Move,
+        child_depth: u32,
+        ply: u32,
+        alpha: i32,
+        beta: i32,
+        child_is_pv: bool,
+        ctx: &SearchContext,
+        clock: &SearchClock,
+    ) -> i32 {
+        let undo = pos.make_move(mv);
+        self.history.push(pos.zobrist());
+        let (child_alpha, child_beta) = negate_window(alpha, beta);
+        let score = -self.negamax(
+            pos,
+            child_depth,
+            ply + 1,
+            child_alpha,
+            child_beta,
+            child_is_pv,
+            true, // move-loop children always permit NMP at their own gate
+            ctx,
+            clock,
+        );
+        self.history.pop();
+        pos.unmake_move(mv, undo);
+        score
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn negamax(
         &mut self,
@@ -1181,32 +1378,121 @@ impl AlphaBetaMover {
         // 13. Recurse fail-soft. `child_is_pv = is_pv && i == 0` per ADR-0018 §11
         //     where `i` is the recursion-order index (post-step-12 reorder).
         let mut best = -INF;
+        let mut best_is_full_depth = false;
         let mut cutoff_move: Option<Move> = None;
         // M4.C: quiets that complete recursion without cutting; used for malus on cutoff.
         let mut quiets_searched: MoveList = MoveList::new();
+        let lmr_node_eligible = ply > 0 && !is_pv && depth >= LMR_MIN_DEPTH && !in_check(pos);
+        let mut quiet_index: u32 = 0;
         for (i, &mv) in moves_vec.iter().enumerate() {
-            let undo = pos.make_move(mv);
-            self.history.push(pos.zobrist());
-            let (child_alpha, child_beta) = negate_window(alpha, beta);
             let child_is_pv = is_pv && i == 0;
-            let score = -self.negamax(
-                pos,
-                depth - 1,
-                ply + 1,
-                child_alpha,
-                child_beta,
-                child_is_pv,
-                true, // allow_null: move-loop children may attempt NMP
-                ctx,
-                clock,
-            );
-            self.history.pop();
-            pos.unmake_move(mv, undo);
+            let quiet_move = is_quiet(mv);
+            let mut move_is_full_depth = true;
+
+            // Decide whether this move takes the LMR path (reduced first
+            // pass + conditional full re-search) or the plain full-depth
+            // path. Only quiets at LMR-eligible nodes that pass the per-quiet
+            // skip policy reduce; everything else searches at `depth - 1`.
+            let lmr_reduction = if quiet_move {
+                quiet_index += 1;
+                if lmr_node_eligible
+                    && is_lmr_eligible_quiet(
+                        mv,
+                        pos,
+                        quiet_index,
+                        killer0,
+                        killer1,
+                        &self.history_table,
+                    )
+                {
+                    let r = late_move_reduction(depth, quiet_index);
+                    debug_assert!(
+                        r <= depth.saturating_sub(2),
+                        "LMR reduction must clamp to depth-2; depth={depth} reduction={r}"
+                    );
+                    // Guard against future tunings of LMR_BASE_OFFSET / LMR_LOG_DIVISOR
+                    // (plan §8 row 1) that could push the formula's floor down to 0.
+                    // A `Some(0)` reduction would search the child at full `depth - 1`
+                    // first, then re-search at the same `depth - 1` on `> alpha` —
+                    // doubled work for any alpha-improving move, no correctness gain.
+                    // Skip the LMR path entirely when the formula yields 0.
+                    if r == 0 { None } else { Some(r) }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let score = if let Some(reduction) = lmr_reduction {
+                #[cfg(test)]
+                if self.lmr_trace_root_ply == Some(ply) {
+                    self.lmr_reduced_searches += 1;
+                    self.lmr_reduced_moves.push(mv);
+                }
+
+                let reduced_score = self.search_child(
+                    pos,
+                    mv,
+                    depth - 1 - reduction,
+                    ply,
+                    alpha,
+                    beta,
+                    child_is_pv,
+                    ctx,
+                    clock,
+                );
+                if self.aborted {
+                    return 0;
+                }
+
+                if lmr_needs_full_research(reduced_score, alpha) {
+                    #[cfg(test)]
+                    if self.lmr_trace_root_ply == Some(ply) {
+                        self.lmr_full_researches += 1;
+                        self.lmr_researched_moves.push(mv);
+                    }
+
+                    let full_score = self.search_child(
+                        pos,
+                        mv,
+                        depth - 1,
+                        ply,
+                        alpha,
+                        beta,
+                        child_is_pv,
+                        ctx,
+                        clock,
+                    );
+                    if self.aborted {
+                        return 0;
+                    }
+                    full_score
+                } else {
+                    move_is_full_depth = false;
+                    reduced_score
+                }
+            } else {
+                self.search_child(
+                    pos,
+                    mv,
+                    depth - 1,
+                    ply,
+                    alpha,
+                    beta,
+                    child_is_pv,
+                    ctx,
+                    clock,
+                )
+            };
 
             // Abort check: score from an aborted search is invalid.
             if self.aborted {
                 return 0;
             }
+
+            best_is_full_depth =
+                best_is_full_depth_after_score(best, best_is_full_depth, score, move_is_full_depth);
 
             if score > best {
                 best = score;
@@ -1227,7 +1513,6 @@ impl AlphaBetaMover {
                     // history bonus to cutter and malus to all priors.
                     if is_quiet(mv) {
                         update_killers(&mut self.killers, ply as usize, mv);
-                        let bonus = (depth as i32) * (depth as i32);
                         // SIDE-TO-MOVE INVARIANT: pos has been restored to the
                         // pre-move-loop state by `pos.unmake_move(mv, undo)` above,
                         // so `pos.side_to_move()` here is the **mover's color**.
@@ -1235,27 +1520,30 @@ impl AlphaBetaMover {
                         // inside the malus loop. Pinned by HS8 (root White) + HS8b
                         // (non-root Black).
                         let side = pos.side_to_move();
-                        self.history_table
-                            .update(side, mv.from_square(), mv.to_square(), bonus);
-                        for prior in quiets_searched.iter() {
-                            self.history_table.update(
-                                side,
-                                prior.from_square(),
-                                prior.to_square(),
-                                -bonus,
-                            );
-                        }
+                        update_history_on_quiet_cutoff(
+                            &mut self.history_table,
+                            side,
+                            mv,
+                            &quiets_searched,
+                            depth,
+                        );
                     }
                     break; // beta cutoff — fail-soft: return `best`, not `beta`
                 }
             }
 
             // Did not cut. If quiet, record for potential malus by a later cutter.
-            if is_quiet(mv) {
+            if is_quiet(mv) && move_is_full_depth {
                 debug_assert!(
                     mv.from_square() != mv.to_square(),
                     "Move::default() sentinel must never enter quiets_searched"
                 );
+                #[cfg(test)]
+                {
+                    if self.lmr_trace_root_ply == Some(ply) {
+                        self.lmr_history_candidates.push(mv);
+                    }
+                }
                 quiets_searched.push(mv);
             }
         }
@@ -1267,14 +1555,9 @@ impl AlphaBetaMover {
         //     `original_alpha` — the caller's pre-MDP alpha (step 4).
         if let Some(tt) = &self.tt
             && !self.aborted
+            && let Some(bound) =
+                tt_bound_for_completed_node(best, beta, original_alpha, best_is_full_depth)
         {
-            let bound = if best >= beta {
-                TtBound::Lower
-            } else if best > original_alpha {
-                TtBound::Exact
-            } else {
-                TtBound::Upper
-            };
             let best_move_packed: u16 = match bound {
                 TtBound::Lower => cutoff_move.map(|m| m.bits()).unwrap_or(0),
                 TtBound::Exact if self.pv.lengths[ply as usize] > 0 => {
@@ -1322,7 +1605,15 @@ impl AlphaBetaMover {
         ctx: &SearchContext,
     ) -> i32 {
         let clock = SearchClock::start_for(ctx.virtual_clock, ctx.caps);
-        self.negamax(pos, depth, ply, alpha, beta, is_pv, allow_null, ctx, &clock)
+        self.lmr_reduced_searches = 0;
+        self.lmr_full_researches = 0;
+        self.lmr_reduced_moves.clear();
+        self.lmr_researched_moves.clear();
+        self.lmr_history_candidates.clear();
+        self.lmr_trace_root_ply = Some(ply);
+        let score = self.negamax(pos, depth, ply, alpha, beta, is_pv, allow_null, ctx, &clock);
+        self.lmr_trace_root_ply = None;
+        score
     }
 
     /// Test-only accessor for the per-`go` NMP firings counter (M5.A).
@@ -1339,6 +1630,39 @@ impl AlphaBetaMover {
     #[cfg(test)]
     pub(super) fn rfp_firings_for_test(&self) -> u32 {
         self.rfp_firings
+    }
+
+    /// Test-only accessor for the M5.C reduced-first-pass counter.
+    #[cfg(test)]
+    pub(super) fn lmr_reduced_searches_for_test(&self) -> u32 {
+        self.lmr_reduced_searches
+    }
+
+    /// Test-only accessor for the M5.C full-depth re-search counter.
+    #[cfg(test)]
+    pub(super) fn lmr_full_researches_for_test(&self) -> u32 {
+        self.lmr_full_researches
+    }
+
+    /// Test-only accessor for the exact quiets that took the reduced-depth
+    /// first pass in M5.C.
+    #[cfg(test)]
+    pub(super) fn lmr_reduced_moves_for_test(&self) -> &[Move] {
+        &self.lmr_reduced_moves
+    }
+
+    /// Test-only accessor for the exact quiets that were re-searched at full
+    /// depth in M5.C.
+    #[cfg(test)]
+    pub(super) fn lmr_researched_moves_for_test(&self) -> &[Move] {
+        &self.lmr_researched_moves
+    }
+
+    /// Test-only accessor for quiets that entered `quiets_searched` at the
+    /// traced negamax frame.
+    #[cfg(test)]
+    pub(super) fn lmr_history_candidates_for_test(&self) -> &[Move] {
+        &self.lmr_history_candidates
     }
 
     /// Test-only setter to install a TT directly without going through
@@ -1631,6 +1955,28 @@ fn update_killers(killers: &mut [[Move; 2]; MAX_PLY], ply: usize, mv: Move) {
     if killers[ply][0] != mv {
         killers[ply][1] = killers[ply][0];
         killers[ply][0] = mv;
+    }
+}
+
+/// Apply the M4.C butterfly-history updates for a quiet beta-cutoff:
+/// `+depth^2` to the cutter and `-depth^2` to each prior quiet searched at
+/// the same node.
+fn update_history_on_quiet_cutoff(
+    history_table: &mut HistoryTable,
+    side: Color,
+    cutoff_move: Move,
+    quiets_searched: &MoveList,
+    depth: u32,
+) {
+    let bonus = (depth as i32) * (depth as i32);
+    history_table.update(
+        side,
+        cutoff_move.from_square(),
+        cutoff_move.to_square(),
+        bonus,
+    );
+    for prior in quiets_searched.iter() {
+        history_table.update(side, prior.from_square(), prior.to_square(), -bonus);
     }
 }
 
@@ -1990,7 +2336,7 @@ pub fn is_fifty_move_draw(halfmove_clock: u8) -> bool {
 /// at impl time. M5.C's LMR may reshape the descendant set; if K drifts on
 /// a future phase's run, re-pin to the new observed value.
 #[cfg(test)]
-const NMP_FIRINGS_PINNED: u32 = 34;
+const NMP_FIRINGS_PINNED: u32 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -5647,6 +5993,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn update_history_on_quiet_cutoff_applies_bonus_once_and_malus_once_per_prior() {
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+
+        let mut history_table = HistoryTable::new();
+        let side = Color::White;
+        let cutoff_move = Move::new(Square::G6, Square::G7, MoveFlag::Quiet);
+        let prior_a = Move::new(Square::F6, Square::E6, MoveFlag::Quiet);
+        let prior_b = Move::new(Square::F6, Square::F5, MoveFlag::Quiet);
+        let mut quiets_searched = MoveList::new();
+        quiets_searched.push(prior_a);
+        quiets_searched.push(prior_b);
+
+        update_history_on_quiet_cutoff(&mut history_table, side, cutoff_move, &quiets_searched, 4);
+
+        assert_eq!(
+            history_table.score(side, cutoff_move.from_square(), cutoff_move.to_square()) as i32,
+            16,
+            "cutting quiet must receive exactly one +depth^2 bonus"
+        );
+        assert_eq!(
+            history_table.score(side, prior_a.from_square(), prior_a.to_square()) as i32,
+            -16,
+            "first prior quiet must receive exactly one -depth^2 malus"
+        );
+        assert_eq!(
+            history_table.score(side, prior_b.from_square(), prior_b.to_square()) as i32,
+            -16,
+            "second prior quiet must receive exactly one -depth^2 malus"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // S20 — `negamax_move_order_score` returns KILLER0_SCORE for quiet == killer0.
     // -----------------------------------------------------------------------
@@ -7996,34 +8375,35 @@ mod tests {
         let mut ab = AlphaBetaMover::new();
         let (result, infos) = drive_go(&mut ab, &pos, &ctx);
 
-        // iter-5 finds mate; iter-6 + iter-7 carry mate-prior under
-        // aspiration. Final result must report mate, not crash, not produce
-        // a stray re-search line at the mate-prior iterations (window-
-        // contained because the same mate persists).
+        // Under M5.C the mate is first found one ply later on this fixture,
+        // so the durable property is narrower: once a mate score is the
+        // prior iteration's result, the next mate-prior aspiration search
+        // must be window-contained.
         let mate_line = infos
             .iter()
             .find(|s| s.contains("score mate "))
-            .expect("a mate score must be reported once iter-5 finds the mate");
+            .expect("a mate score must be reported once the search reaches the mating depth");
         assert!(
             mate_line.contains("info depth"),
             "mate must appear on a real info-depth line; got: {mate_line:?}"
         );
-        // iter-6 and iter-7 are mate-prior aspiration iterations. Centered
-        // window on a mate score is window-contained when the same mate
-        // persists, so NO aspiration_re_search lines should fire at depth
-        // ≥ 6 on this fixture. (Anti-stub against accidental re-search:
-        // a buggy widen that fires on equal-score returns would emit one.)
-        let asp_at_6plus = infos
+        // After the first mate-scored iteration, the next mate-prior
+        // iteration is depth 7 on this fixture. Centered window on the same
+        // mate score must be window-contained there, so NO
+        // aspiration_re_search lines should fire at depth ≥ 7. (Anti-stub
+        // against accidental re-search: a buggy widen that fires on
+        // equal-score returns would emit one.)
+        let asp_at_7plus = infos
             .iter()
             .filter(|s| s.contains("info string aspiration_re_search"))
             .filter(|s| {
                 let (d, _, _) = parse_aspiration_line(s);
-                d >= 6
+                d >= 7
             })
             .count();
         assert_eq!(
-            asp_at_6plus, 0,
-            "mate-prior iterations at depth ≥ 6 should be window-contained; got: {infos:?}"
+            asp_at_7plus, 0,
+            "mate-prior iterations at depth ≥ 7 should be window-contained; got: {infos:?}"
         );
         assert!(
             result.bestmove.is_some(),
@@ -9908,5 +10288,738 @@ mod tests {
              got {} rfp_firings",
             ab_skip.rfp_firings_for_test()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M5.C — LMR helper and move-loop behavior tests.
+    // -----------------------------------------------------------------------
+
+    fn mate_in_one_lmr_fixture() -> (Position, Move, Move) {
+        let pos =
+            Position::from_fen("7k/8/5KQ1/8/8/8/8/8 w - - 0 1").expect("mate-in-1 FEN must parse");
+        let weak_quiet = Move::from_uci("f6e6", &pos).expect("f6e6 must be a legal quiet move");
+        let mate_quiet = Move::from_uci("g6g7", &pos).expect("g6g7 must be a legal quiet mate");
+        (pos, weak_quiet, mate_quiet)
+    }
+
+    fn capture_then_quiets_lmr_fixture() -> (Position, Move) {
+        let pos =
+            Position::from_fen("4k3/8/2p5/2qQ4/1P6/8/8/4K3 w - - 0 1").expect("FEN must parse");
+        let first_quiet = Move::from_uci("e1e2", &pos).expect("e1e2 must be a legal quiet move");
+        (pos, first_quiet)
+    }
+
+    #[test]
+    fn late_move_reduction_at_depth_3_quiet_2_is_1() {
+        assert_eq!(
+            late_move_reduction(3, 2),
+            1,
+            "second quiet at depth 3 must reduce by 1 under the pinned v1 constants"
+        );
+    }
+
+    #[test]
+    fn late_move_reduction_grows_with_depth_for_fixed_quiet_index() {
+        let shallow = late_move_reduction(3, 4);
+        let deep = late_move_reduction(8, 4);
+        assert!(
+            deep >= shallow,
+            "LMR reduction must not shrink as depth grows for the same quiet index; \
+             shallow={shallow}, deep={deep}"
+        );
+    }
+
+    #[test]
+    fn late_move_reduction_grows_with_quiet_index_for_fixed_depth() {
+        let early = late_move_reduction(6, 2);
+        let late = late_move_reduction(6, 6);
+        assert!(
+            late >= early,
+            "LMR reduction must not shrink for later quiets at fixed depth; \
+             early={early}, late={late}"
+        );
+    }
+
+    #[test]
+    fn late_move_reduction_clamps_to_depth_minus_two() {
+        let reduction = late_move_reduction(3, 1_000);
+        assert_eq!(
+            reduction, 1,
+            "LMR reduction at depth 3 must clamp to depth-2 = 1 even for huge quiet indices; \
+             got {reduction}"
+        );
+    }
+
+    #[test]
+    fn is_lmr_eligible_quiet_rejects_first_quiet() {
+        let pos = Position::starting_position();
+        let mv = Move::from_uci("e2e3", &pos).expect("e2e3 must be legal");
+        let history_table = HistoryTable::new();
+        assert!(
+            !is_lmr_eligible_quiet(
+                mv,
+                &pos,
+                1,
+                Move::default(),
+                Move::default(),
+                &history_table
+            ),
+            "first quiet must not be LMR-eligible"
+        );
+    }
+
+    #[test]
+    fn is_lmr_eligible_quiet_rejects_killer_moves() {
+        let pos = Position::starting_position();
+        let mv = Move::from_uci("e2e3", &pos).expect("e2e3 must be legal");
+        let history_table = HistoryTable::new();
+        assert!(
+            !is_lmr_eligible_quiet(mv, &pos, 2, mv, Move::default(), &history_table),
+            "killer0 quiet must not be LMR-eligible"
+        );
+        assert!(
+            !is_lmr_eligible_quiet(mv, &pos, 2, Move::default(), mv, &history_table),
+            "killer1 quiet must not be LMR-eligible"
+        );
+    }
+
+    #[test]
+    fn is_lmr_eligible_quiet_rejects_high_history_quiet() {
+        let pos = Position::starting_position();
+        let mv = Move::from_uci("e2e3", &pos).expect("e2e3 must be legal");
+        let mut history_table = HistoryTable::new();
+        history_table.update(
+            Color::White,
+            mv.from_square(),
+            mv.to_square(),
+            LMR_HIGH_HISTORY_THRESHOLD as i32,
+        );
+        assert!(
+            !is_lmr_eligible_quiet(
+                mv,
+                &pos,
+                2,
+                Move::default(),
+                Move::default(),
+                &history_table
+            ),
+            "quiet with history score at threshold must not be LMR-eligible"
+        );
+    }
+
+    #[test]
+    fn is_lmr_eligible_quiet_accepts_just_below_history_threshold() {
+        let pos = Position::starting_position();
+        let mv = Move::from_uci("e2e3", &pos).expect("e2e3 must be legal");
+        let mut history_table = HistoryTable::new();
+        history_table.update(
+            Color::White,
+            mv.from_square(),
+            mv.to_square(),
+            (LMR_HIGH_HISTORY_THRESHOLD - 1) as i32,
+        );
+        assert!(
+            is_lmr_eligible_quiet(
+                mv,
+                &pos,
+                2,
+                Move::default(),
+                Move::default(),
+                &history_table
+            ),
+            "quiet with history score one below threshold must remain LMR-eligible"
+        );
+    }
+
+    #[test]
+    fn is_lmr_eligible_quiet_accepts_plain_late_quiet() {
+        let pos = Position::starting_position();
+        let mv = Move::from_uci("e2e3", &pos).expect("e2e3 must be legal");
+        let history_table = HistoryTable::new();
+        assert!(
+            is_lmr_eligible_quiet(
+                mv,
+                &pos,
+                2,
+                Move::default(),
+                Move::default(),
+                &history_table
+            ),
+            "ordinary second quiet with empty history and no killer match must be LMR-eligible"
+        );
+    }
+
+    #[test]
+    fn negamax_skips_lmr_for_first_quiet_even_after_captures() {
+        let (pos, first_quiet) = capture_then_quiets_lmr_fixture();
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let mut ab = AlphaBetaMover::new();
+        // Promote this quiet to the top of the quiet pool while keeping it
+        // below the high-history exemption threshold.
+        ab.history_table_for_test_mut().update(
+            Color::White,
+            first_quiet.from_square(),
+            first_quiet.to_square(),
+            (LMR_HIGH_HISTORY_THRESHOLD - 1) as i32,
+        );
+
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+
+        assert!(
+            !ab.lmr_reduced_moves_for_test().contains(&first_quiet),
+            "the first quiet in the node's quiet-only ordering must not be reduced, \
+             even when captures appear before it in the full move list"
+        );
+        assert!(
+            ab.lmr_reduced_searches_for_test() > 0,
+            "fixture must still reduce some later quiet so this is not a vacuous pass"
+        );
+    }
+
+    #[test]
+    fn negamax_skips_lmr_for_killer_quiet_at_move_loop_boundary() {
+        // Loading both killer slots is load-bearing: KILLER0_SCORE > KILLER1_SCORE >
+        // any history score, so the comparator sorts killer0 to the top of the quiet
+        // pool, then killer1 second. With only one killer seeded, the seeded quiet
+        // would land at quiet_index = 1 and be rejected by the `quiet_index <
+        // LMR_MIN_QUIET_INDEX` arm BEFORE reaching the killer-equality arm — making
+        // the test pass for the wrong reason. By seeding the decoy at slot 0 and the
+        // mate at slot 1, the mate quiet lands at quiet_index = 2 and the
+        // killer-equality arm of `is_lmr_eligible_quiet` becomes the load-bearing
+        // gate the test name claims to pin.
+        let (pos, weak_quiet, mate_quiet) = mate_in_one_lmr_fixture();
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+
+        // Sister run: no preseeded killers → verify LMR fires at all (anti-vacuous).
+        let mut ab_no_killer = AlphaBetaMover::new();
+        let _ = ab_no_killer.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+        assert!(
+            ab_no_killer.lmr_reduced_searches_for_test() > 0,
+            "sister run without killer must confirm LMR fires; got {}",
+            ab_no_killer.lmr_reduced_searches_for_test()
+        );
+
+        // Primary run: decoy in slot 0, mate quiet in slot 1.
+        let mut ab = AlphaBetaMover::new();
+        let mut killers = [[Move::default(); 2]; MAX_PLY];
+        killers[1][0] = weak_quiet;
+        killers[1][1] = mate_quiet;
+        ab.set_killers_for_test(killers);
+
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+
+        assert!(
+            ab.lmr_reduced_searches_for_test() > 0,
+            "primary run must still confirm LMR fires on some other quiet under the same search state \
+             (defends against a tree-shape shift after killer seeding silently zeroing all firings); got {}",
+            ab.lmr_reduced_searches_for_test()
+        );
+        assert!(
+            !ab.lmr_reduced_moves_for_test().contains(&mate_quiet),
+            "killer-1 quiet at quiet_index = 2 must not take the reduced-first-pass path \
+             (the killer-equality arm of `is_lmr_eligible_quiet` is the load-bearing gate here, \
+             not the first-quiet arm — see test header comment)"
+        );
+    }
+
+    #[test]
+    fn negamax_skips_lmr_for_high_history_quiet_at_move_loop_boundary() {
+        // Same load-bearing structure as the killer test above: pre-seed a *decoy*
+        // quiet with a higher history score than the test target so the comparator
+        // sorts the decoy to the top of the quiet pool (quiet_index = 1, where the
+        // first-quiet arm rejects it for an unrelated reason) and the test target
+        // lands at quiet_index = 2, where the high-history arm of
+        // `is_lmr_eligible_quiet` is the load-bearing gate.
+        let (pos, weak_quiet, mate_quiet) = mate_in_one_lmr_fixture();
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+
+        // Sister run: no preseeded history → verify LMR fires at all (anti-vacuous).
+        let mut ab_no_history = AlphaBetaMover::new();
+        let _ =
+            ab_no_history.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+        assert!(
+            ab_no_history.lmr_reduced_searches_for_test() > 0,
+            "sister run without high history must confirm LMR fires; got {}",
+            ab_no_history.lmr_reduced_searches_for_test()
+        );
+
+        // Primary run: decoy gets a higher score than mate_quiet so it sorts first.
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table_for_test_mut().update(
+            Color::White,
+            weak_quiet.from_square(),
+            weak_quiet.to_square(),
+            MAX_HISTORY as i32,
+        );
+        ab.history_table_for_test_mut().update(
+            Color::White,
+            mate_quiet.from_square(),
+            mate_quiet.to_square(),
+            LMR_HIGH_HISTORY_THRESHOLD as i32,
+        );
+
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+
+        assert!(
+            ab.lmr_reduced_searches_for_test() > 0,
+            "primary run must still confirm LMR fires on some other quiet under the same search state \
+             (defends against a tree-shape shift after high-history seeding silently zeroing all firings); got {}",
+            ab.lmr_reduced_searches_for_test()
+        );
+        assert!(
+            !ab.lmr_reduced_moves_for_test().contains(&mate_quiet),
+            "high-history quiet at quiet_index = 2 must not take the reduced-first-pass path \
+             (the high-history arm of `is_lmr_eligible_quiet` is the load-bearing gate here, \
+             not the first-quiet arm — see test header comment)"
+        );
+    }
+
+    #[test]
+    fn negamax_skips_lmr_at_pv_node() {
+        let (pos, _weak_quiet, _mate_quiet) = mate_in_one_lmr_fixture();
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+
+        let mut ab_pv = AlphaBetaMover::new();
+        let _ = ab_pv.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, true, true, &ctx);
+
+        let mut ab_nonpv = AlphaBetaMover::new();
+        let _ = ab_nonpv.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+
+        assert_eq!(
+            ab_pv.lmr_reduced_searches_for_test(),
+            0,
+            "PV node must skip LMR reduced first passes"
+        );
+        assert!(
+            ab_nonpv.lmr_reduced_searches_for_test() > 0,
+            "non-PV sister must perform at least one LMR reduced first pass; got {}",
+            ab_nonpv.lmr_reduced_searches_for_test()
+        );
+    }
+
+    #[test]
+    fn negamax_skips_lmr_at_ply_zero_even_when_is_pv_false() {
+        let (pos, _weak_quiet, _mate_quiet) = mate_in_one_lmr_fixture();
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+
+        let mut ab_root = AlphaBetaMover::new();
+        let _ = ab_root.negamax_for_test(&mut pos.clone(), 4, 0, -INF, INF, false, true, &ctx);
+
+        let mut ab_interior = AlphaBetaMover::new();
+        let _ = ab_interior.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+
+        assert_eq!(
+            ab_root.lmr_reduced_searches_for_test(),
+            0,
+            "ply=0 must skip LMR even when is_pv=false"
+        );
+        assert!(
+            ab_interior.lmr_reduced_searches_for_test() > 0,
+            "ply=1 sister must perform at least one LMR reduced first pass; got {}",
+            ab_interior.lmr_reduced_searches_for_test()
+        );
+    }
+
+    #[test]
+    fn negamax_skips_lmr_when_in_check() {
+        use crate::movegen::in_check;
+
+        let pos_check = Position::from_fen("7k/8/8/8/8/3Q4/4nPPP/6K1 w - - 0 1")
+            .expect("in-check FEN must parse");
+        let pos_no_check = Position::from_fen("7k/7n/8/8/8/3Q4/5PPP/6K1 w - - 0 1")
+            .expect("no-check FEN must parse");
+        assert!(in_check(&pos_check), "fixture must be in check");
+        assert!(
+            !in_check(&pos_no_check),
+            "sister fixture must not be in check"
+        );
+
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+
+        let mut ab_check = AlphaBetaMover::new();
+        let _ =
+            ab_check.negamax_for_test(&mut pos_check.clone(), 4, 1, -INF, INF, false, true, &ctx);
+
+        let mut ab_no = AlphaBetaMover::new();
+        let _ = ab_no.negamax_for_test(
+            &mut pos_no_check.clone(),
+            4,
+            1,
+            -INF,
+            INF,
+            false,
+            true,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab_check.lmr_reduced_searches_for_test(),
+            0,
+            "in-check node must skip LMR reduced first passes"
+        );
+        assert!(
+            ab_no.lmr_reduced_searches_for_test() > 0,
+            "not-in-check sister must perform at least one LMR reduced first pass; got {}",
+            ab_no.lmr_reduced_searches_for_test()
+        );
+    }
+
+    #[test]
+    fn negamax_skips_lmr_below_min_depth() {
+        let (pos, _weak_quiet, _mate_quiet) = mate_in_one_lmr_fixture();
+        let (ctx2, _stop2) = non_aborting_ctx_at_depth(2);
+        let (ctx3, _stop3) = non_aborting_ctx_at_depth(3);
+
+        let mut ab_d2 = AlphaBetaMover::new();
+        let _ = ab_d2.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, false, true, &ctx2);
+
+        let mut ab_d3 = AlphaBetaMover::new();
+        let _ = ab_d3.negamax_for_test(&mut pos.clone(), 3, 1, -INF, INF, false, true, &ctx3);
+
+        assert_eq!(
+            ab_d2.lmr_reduced_searches_for_test(),
+            0,
+            "depth below LMR_MIN_DEPTH must skip LMR"
+        );
+        assert!(
+            ab_d3.lmr_reduced_searches_for_test() > 0,
+            "depth at LMR_MIN_DEPTH must perform at least one reduced first pass; got {}",
+            ab_d3.lmr_reduced_searches_for_test()
+        );
+    }
+
+    #[test]
+    fn negamax_reduces_late_quiet_when_all_gates_pass() {
+        let (pos, weak_quiet, mate_quiet) = mate_in_one_lmr_fixture();
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table_for_test_mut().update(
+            Color::White,
+            weak_quiet.from_square(),
+            weak_quiet.to_square(),
+            LMR_HIGH_HISTORY_THRESHOLD as i32,
+        );
+
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+
+        assert!(
+            ab.lmr_reduced_searches_for_test() > 0,
+            "LMR-eligible node must perform at least one reduced first pass; got {}",
+            ab.lmr_reduced_searches_for_test()
+        );
+        assert!(
+            ab.lmr_reduced_moves_for_test().contains(&mate_quiet),
+            "the intended late quiet must be observed on the reduced-first-pass path"
+        );
+    }
+
+    #[test]
+    fn negamax_researches_full_depth_when_reduced_score_beats_alpha() {
+        let (pos, weak_quiet, mate_quiet) = mate_in_one_lmr_fixture();
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let mut ab = AlphaBetaMover::new();
+        ab.history_table_for_test_mut().update(
+            Color::White,
+            weak_quiet.from_square(),
+            weak_quiet.to_square(),
+            LMR_HIGH_HISTORY_THRESHOLD as i32,
+        );
+
+        let alpha = -INF;
+        let beta = INF;
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+
+        assert!(
+            ab.lmr_reduced_searches_for_test() > 0,
+            "fixture must take the reduced-first-pass path before testing re-search"
+        );
+        assert!(
+            ab.lmr_full_researches_for_test() > 0,
+            "reduced score above alpha must trigger full-depth re-search; got {}",
+            ab.lmr_full_researches_for_test()
+        );
+        assert!(
+            ab.lmr_researched_moves_for_test().contains(&mate_quiet),
+            "the intended late quiet must appear in the re-search path when it beats alpha"
+        );
+    }
+
+    #[test]
+    fn negamax_reduced_only_quiet_does_not_enter_quiets_searched() {
+        // Starting position at depth=4, ply=1, alpha=900 cp. Many quiets
+        // → quiet_index >= 2 cases are LMR-eligible. Reduced child depth ~2
+        // cannot score near 900 cp from startpos, so reduced-only quiets exist.
+        let pos = Position::starting_position();
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, 900, INF, false, true, &ctx);
+
+        let reduced_only: Vec<Move> = ab
+            .lmr_reduced_moves_for_test()
+            .iter()
+            .copied()
+            .filter(|mv| !ab.lmr_researched_moves_for_test().contains(mv))
+            .collect();
+
+        assert!(
+            !reduced_only.is_empty(),
+            "fixture must produce at least one reduced-only quiet (anti-vacuous); \
+             lmr_reduced={}, lmr_researched={}",
+            ab.lmr_reduced_searches_for_test(),
+            ab.lmr_full_researches_for_test()
+        );
+
+        let history_candidates = ab.lmr_history_candidates_for_test();
+        for mv in &reduced_only {
+            assert!(
+                !history_candidates.contains(mv),
+                "reduced-only quiets must not enter quiets_searched"
+            );
+        }
+    }
+
+    #[test]
+    fn best_is_full_depth_after_score_upgrades_equal_score_to_full_depth() {
+        assert!(
+            best_is_full_depth_after_score(42, false, 42, true),
+            "a later full-depth tie on the node's best score must restore TT-store eligibility"
+        );
+        assert!(
+            !best_is_full_depth_after_score(42, false, 42, false),
+            "a reduced-only tie must not claim full-depth provenance"
+        );
+        assert!(
+            best_is_full_depth_after_score(42, true, 10, false),
+            "once a best score has a full-depth witness, lower scores must not clear that provenance"
+        );
+        assert!(
+            !best_is_full_depth_after_score(42, false, 10, true),
+            "a lower-score full-depth witness must not upgrade a reduced-only best's provenance"
+        );
+        // Equal-score, prior full-depth, current reduced-only: the prior
+        // provenance must persist (the OR semantics in the equal-score arm
+        // preserve a `true` flag against an incoming `false`). Pinned to kill
+        // a `> → >=` mutation on `score > best` that would treat equal-score
+        // as a strict improvement and replace `true` with the incoming
+        // reduced-only `false`.
+        assert!(
+            best_is_full_depth_after_score(42, true, 42, false),
+            "an equal-score reduced-only tie must not clear an existing full-depth provenance flag"
+        );
+    }
+
+    #[test]
+    fn lmr_needs_full_research_strict_greater_than_alpha() {
+        assert!(
+            !lmr_needs_full_research(100, 100),
+            "reduced score equal to alpha must not trigger a full-depth re-search"
+        );
+        assert!(
+            !lmr_needs_full_research(99, 100),
+            "reduced score below alpha must not trigger a full-depth re-search"
+        );
+        assert!(
+            lmr_needs_full_research(101, 100),
+            "reduced score strictly above alpha must trigger a full-depth re-search"
+        );
+    }
+
+    #[test]
+    fn negamax_does_not_research_when_reduced_score_stays_at_or_below_alpha() {
+        // Starting position at depth=4, ply=1, alpha=900 cp.
+        // 16+ quiets → quiet_index >= 2 cases exist → LMR fires.
+        // Reduced child depth ~2: from startpos no forced mate is reachable
+        // at depth 2, and ordinary middlegame eval at depth 2 stays well
+        // below 900 cp, so every reduced search lands at or below alpha and
+        // the `lmr_needs_full_research` gate must keep `lmr_full_researches`
+        // at 0 throughout the search.
+        let pos = Position::starting_position();
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, 900, INF, false, true, &ctx);
+
+        assert!(
+            ab.lmr_reduced_searches_for_test() > 0,
+            "fixture must trigger at least one LMR reduced first pass; got {}",
+            ab.lmr_reduced_searches_for_test()
+        );
+        assert_eq!(
+            ab.lmr_full_researches_for_test(),
+            0,
+            "no reduced search may exceed alpha=900 in this fixture; got {} full re-searches",
+            ab.lmr_full_researches_for_test()
+        );
+    }
+
+    #[test]
+    fn tt_bound_for_completed_node_suppresses_when_reduced_only() {
+        // All three bound shapes are suppressed when best_is_full_depth=false.
+        // §4.6: only the Upper shape is unsound to store, but the helper
+        // suppresses unconditionally; the Lower/Exact arms are kept for
+        // symmetry and to ensure a mutation on the `best_is_full_depth` guard
+        // is killed by all three arms simultaneously.
+        assert!(
+            tt_bound_for_completed_node(200, 100, 0, false).is_none(),
+            "would-be Lower (best >= beta) must be suppressed when reduced-only"
+        );
+        assert!(
+            tt_bound_for_completed_node(42, 100, -100, false).is_none(),
+            "would-be Exact (original_alpha < best < beta) must be suppressed when reduced-only"
+        );
+        assert!(
+            tt_bound_for_completed_node(-200, 100, -100, false).is_none(),
+            "would-be Upper (best <= original_alpha) must be suppressed when reduced-only"
+        );
+    }
+
+    #[test]
+    fn tt_bound_for_completed_node_classifies_full_depth() {
+        assert_eq!(
+            tt_bound_for_completed_node(150, 100, -100, true),
+            Some(TtBound::Lower),
+            "full-depth-proven fail-high node must still classify as Lower"
+        );
+        assert_eq!(
+            tt_bound_for_completed_node(20, 100, -100, true),
+            Some(TtBound::Exact),
+            "full-depth-proven node that improved original alpha without failing high must classify as Exact"
+        );
+        assert_eq!(
+            tt_bound_for_completed_node(-200, 100, -100, true),
+            Some(TtBound::Upper),
+            "full-depth-proven fail-low node must still classify as Upper"
+        );
+        // Boundary: best == original_alpha must classify as Upper, not Exact.
+        // ADR-0018 §13: an Exact bound requires the score to *strictly* improve
+        // the parent's α; a score that ties original_alpha is at the upper bound
+        // of the fail-low band and stays Upper. Pinned to kill a `> → >=`
+        // mutation on the `best > original_alpha` arm.
+        assert_eq!(
+            tt_bound_for_completed_node(0, 100, 0, true),
+            Some(TtBound::Upper),
+            "best == original_alpha must classify as Upper (Exact requires strict improvement)"
+        );
+    }
+
+    #[test]
+    fn late_move_reduction_returns_zero_below_min_depth() {
+        assert_eq!(
+            late_move_reduction(2, 5),
+            0,
+            "depth=2 < LMR_MIN_DEPTH must return 0"
+        );
+        assert_eq!(
+            late_move_reduction(0, 5),
+            0,
+            "depth=0 < LMR_MIN_DEPTH must return 0"
+        );
+        assert_eq!(
+            late_move_reduction(LMR_MIN_DEPTH - 1, 5),
+            0,
+            "depth = LMR_MIN_DEPTH-1 must return 0"
+        );
+        assert_ne!(
+            late_move_reduction(LMR_MIN_DEPTH, LMR_MIN_QUIET_INDEX),
+            0,
+            "at-min boundary must reduce by at least 1 (anti-vacuous: helper does not always return 0)"
+        );
+    }
+
+    #[test]
+    fn late_move_reduction_returns_zero_below_min_quiet_index() {
+        assert_eq!(
+            late_move_reduction(8, 1),
+            0,
+            "quiet_index=1 < LMR_MIN_QUIET_INDEX must return 0"
+        );
+        assert_eq!(
+            late_move_reduction(8, 0),
+            0,
+            "quiet_index=0 < LMR_MIN_QUIET_INDEX must return 0"
+        );
+        assert_eq!(
+            late_move_reduction(8, LMR_MIN_QUIET_INDEX - 1),
+            0,
+            "quiet_index = LMR_MIN_QUIET_INDEX-1 must return 0"
+        );
+        assert_ne!(
+            late_move_reduction(LMR_MIN_DEPTH, LMR_MIN_QUIET_INDEX),
+            0,
+            "at-min boundary must reduce by at least 1 (anti-vacuous: helper does not always return 0)"
+        );
+    }
+
+    // §4.6 worked-case anchor. best=200, beta=100, original_alpha=0:
+    //   - reduced-only provenance (best_is_full_depth=false) must suppress the store.
+    //   - full-depth provenance (best_is_full_depth=true) must classify as Lower.
+    // Together these two assertions kill both a stub that always returns None
+    // and a mutation that bypasses suppression on the Lower arm.
+    #[test]
+    fn tt_bound_for_completed_node_lower_requires_full_depth_witness() {
+        assert!(
+            tt_bound_for_completed_node(200, 100, 0, false).is_none(),
+            "best=200 >= beta=100 would classify as Lower, but reduced-only provenance must suppress the store"
+        );
+        assert_eq!(
+            tt_bound_for_completed_node(200, 100, 0, true),
+            Some(TtBound::Lower),
+            "same numerics with full-depth provenance must classify as Lower, not suppressed"
+        );
+    }
+
+    #[test]
+    fn best_is_full_depth_after_score_strict_improvement_takes_new_provenance() {
+        // A strict improvement installs the new move's provenance regardless of prior.
+        assert!(
+            best_is_full_depth_after_score(10, false, 20, true),
+            "strict improvement with full-depth provenance must set flag to true"
+        );
+        assert!(
+            !best_is_full_depth_after_score(10, true, 20, false),
+            "strict improvement with reduced-only provenance must set flag to false"
+        );
+        assert!(
+            best_is_full_depth_after_score(10, true, 20, true),
+            "strict improvement with full-depth on both sides must stay true"
+        );
+    }
+
+    // Anti-vacuous sister to `negamax_reduced_only_quiet_does_not_enter_quiets_searched`.
+    // A quiet that takes the non-LMR path (either ineligible due to quiet_index=1,
+    // or re-searched after reduced score > alpha) MUST appear in lmr_history_candidates.
+    // The KR-vs-K position at depth=4, ply=1, alpha=-INF/INF ensures the first quiet
+    // (quiet_index=1, ineligible for LMR, full-depth by definition) is searched and,
+    // if it fails low without causing a cutoff, enters quiets_searched.
+    #[test]
+    fn negamax_full_depth_quiet_still_enters_quiets_searched() {
+        // KR vs K: all moves are quiets; first quiet (quiet_index=1) takes the
+        // full-depth path and must appear in lmr_history_candidates when it fails low.
+        let pos =
+            Position::from_fen("4k3/8/8/8/8/8/8/2R1K3 w - - 0 1").expect("KR vs K FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let mut ab = AlphaBetaMover::new();
+        // Full window so the search completes without beta cutoffs, ensuring
+        // the first quiet (quiet_index=1) is searched at full depth and recorded.
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+
+        let candidates = ab.lmr_history_candidates_for_test();
+        assert!(
+            !candidates.is_empty(),
+            "at least one full-depth quiet must appear in the history-candidate trace; got none"
+        );
+        // Trace must be scoped to the traced frame only. Generate the legal
+        // White moves at the test fixture's root position; every recorded
+        // candidate must come from that set. A `lmr_trace_root_ply` filter
+        // mutation that records descendants instead would push Black moves
+        // (post-1...K?) which are not legal as White moves from this FEN.
+        let mut legal_at_root = MoveList::new();
+        crate::movegen::generate_moves(&pos, &mut legal_at_root);
+        for &mv in candidates {
+            assert!(
+                legal_at_root.iter().any(|legal| legal == mv),
+                "history-candidate trace must record only moves at the traced ply; \
+                 got {mv:?} which is not a legal White move at root (descendants leaked into the trace)"
+            );
+        }
     }
 }

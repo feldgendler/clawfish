@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Phase: M5.B complete — reverse futility pruning landed 2026-05-02 with mixed-TC SPRT (W-L-D 94/32/74 in 200 games / 100 pairs; score 65.5%; logistic Elo +111; H1 not formally crossed at `elo1=5` due to too-narrow bound, but signal unambiguous — adopted on score-based decisioning) and Stockfish UCI_LimitStrength rating estimate (2652.43 ± 14.55 mixed-TC, fast-TC-weighted, **+51 Elo over M5.A**); M5.A NMP landed 2026-05-01; M4 fully closed (aspiration at M4.D); ELOH tooling milestone closed at ELOH.E; M5.C (LMR / late-move reductions) is next.** Architectural commitments settled (see `docs/decisions/`). M5.B bench: `bench: 3355270 nodes <NPS> nps` (-37.2% vs M5.A's 5345534). The `baseline/m5b-rfp` tag (at `7d99ccc`, M5.B landing) is the M5.C SPRT reference. The `baseline/m5<letter>-<feature>` shorter convention is the M5 milestone's adopted form.
+**Phase: M5.C implemented locally on 2026-05-04 — late move reductions (LMR) added to the negamax move loop; focused M5.C tests passing; bench `bench: 1651610 nodes <NPS> nps` (**-50.8%** vs M5.B's 3355270); mixed-TC SPRT vs `baseline/m5b-rfp` still pending before the phase is marked landed. M5.B reverse futility pruning landed 2026-05-02 with mixed-TC SPRT (W-L-D 94/32/74 in 200 games / 100 pairs; score 65.5%; logistic Elo +111; H1 not formally crossed at `elo1=5` due to too-narrow bound, but signal unambiguous — adopted on score-based decisioning) and Stockfish UCI_LimitStrength rating estimate (2652.43 ± 14.55 mixed-TC, fast-TC-weighted, **+51 Elo over M5.A**); M5.A NMP landed 2026-05-01; M4 fully closed (aspiration at M4.D); ELOH tooling milestone closed at ELOH.E.** Architectural commitments settled (see `docs/decisions/`). The `baseline/m5b-rfp` tag (at `7d99ccc`, M5.B landing) is the M5.C SPRT reference. The `baseline/m5<letter>-<feature>` shorter convention is the M5 milestone's adopted form.
 
 | Phase | Status | One-line summary |
 |---|---|---|
@@ -35,7 +35,7 @@ For per-phase detail (what landed, verification numbers, lessons), see [`docs/mi
 
 ### What's next
 
-**M5.C — LMR / late-move reductions** is next. Reduces the search depth for moves ordered late in the move loop (quiets beyond the first few, after captures and killers) at high enough depths. Composes additively with M5.A's NMP and M5.B's RFP. Reference baseline: `baseline/m5b-rfp` at commit `7d99ccc`. Detail in [`docs/roadmap.md`](docs/roadmap.md).
+**Next validated roadmap item: M5.D — frontier futility pruning.** M5.C (LMR / late-move reductions) is implemented locally and benchmarked, but still awaiting its mixed-TC SPRT run against `baseline/m5b-rfp` before the phase is marked landed. Detail in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## How to pick up a new session
 

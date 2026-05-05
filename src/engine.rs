@@ -1863,10 +1863,21 @@ mod tests {
             }
         };
 
-        // (2) Reset seed 42 (back to the start of the seed-42 sequence) so the
-        // next go produces the 1st pick. Then go once to advance PRNG one step,
-        // send the four bad-value inputs, and go again to capture M_AFTER_BAD.
-        // If bad inputs leave the seed unchanged, M_AFTER_BAD == M_REF2.
+        // (2) Send `ucinewgame` to clear TT / killers / history so the M_AFTER_BAD
+        // half starts from byte-identical engine state to the M_REF2 half. Without
+        // this, AlphaBetaMover's accumulated search state from phase (1) would feed
+        // into phase (2)'s searches, and any TT-state-sensitive search behavior
+        // could legitimately produce a different bestmove without the seed having
+        // changed at all. ADR-0025's `tt_bound_for_completed_node` suppression rule
+        // is one such TT-state-sensitive behavior; without `ucinewgame` here the
+        // test would conflate two unrelated invariants ("bad seed inputs don't
+        // change PRNG state" with "search bestmove is invariant under TT carry-over").
+        tx.send(Command::UciNewGame).unwrap();
+
+        // Reset seed 42 (back to the start of the seed-42 sequence) so the next
+        // go produces the 1st pick. Then go once to advance PRNG one step, send
+        // the four bad-value inputs, and go again to capture M_AFTER_BAD. If bad
+        // inputs leave the seed unchanged, M_AFTER_BAD == M_REF2.
         tx.send(parse_uci_line("setoption name Random_Seed value 42"))
             .unwrap();
         tx.send(parse_uci_line("position startpos")).unwrap();
@@ -2161,10 +2172,17 @@ mod tests {
 
     #[test]
     fn greedy_mover_determinism_across_repeated_runs_with_fixed_seed() {
-        // Run the same UCI transcript twice with a fresh Engine each time.
-        // Assert identical bestmove lines from both runs. (The info line
-        // includes a `time <ms>` token that legitimately varies, so we compare
-        // only the bestmove output rather than the full stdout.)
+        // Run the same UCI transcript twice with a fresh Engine each time and
+        // assert identical bestmove lines from both runs. The driver uses
+        // synchronous polling between each `go` and the subsequent command so
+        // that each search completes naturally before the engine processes
+        // the next instruction. Without polling, sending all commands +
+        // `Quit` up front allows `handle_quit`'s `stop` signal to abort the
+        // last `go` mid-search; the resulting bestmove then depends on which
+        // ID iteration the worker happened to finish before the abort, which
+        // varies with OS scheduling and test-suite parallel load. (The info
+        // line carries a `time <ms>` token that legitimately varies, so we
+        // compare only the bestmove output rather than the full stdout.)
         let transcript: &[&str] = &[
             "uci",
             "setoption name Random_Seed value 99",
@@ -2173,17 +2191,48 @@ mod tests {
             "position startpos moves e2e4",
             "go",
         ];
-        let (stdout_a, _) = drive(transcript);
-        let (stdout_b, _) = drive(transcript);
 
-        let bestmoves_a: Vec<&str> = stdout_a
-            .lines()
-            .filter(|l| l.starts_with("bestmove"))
-            .collect();
-        let bestmoves_b: Vec<&str> = stdout_b
-            .lines()
-            .filter(|l| l.starts_with("bestmove"))
-            .collect();
+        let drive_with_polling = || -> Vec<String> {
+            let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let writer = CapturedWriter(Arc::clone(&buf));
+            let buf_clone = Arc::clone(&buf);
+            let mut engine = Engine::new(writer, AlphaBetaMover::new());
+            let (tx, rx) = mpsc::channel::<Command>();
+            let handle = thread::spawn(move || engine.run(rx));
+
+            let mut bestmoves_seen = 0usize;
+            for line in transcript {
+                let cmd = parse_uci_line(line);
+                let is_go = matches!(cmd, Command::Go(_));
+                tx.send(cmd).unwrap();
+                if is_go {
+                    bestmoves_seen += 1;
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let snap = snapshot_output(&buf_clone);
+                        let count = snap.lines().filter(|l| l.starts_with("bestmove")).count();
+                        if count >= bestmoves_seen {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "bestmove #{bestmoves_seen} did not appear within 5 s"
+                        );
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                }
+            }
+            tx.send(Command::Quit).unwrap();
+            handle.join().expect("engine thread should not panic");
+            let snap = snapshot_output(&buf_clone);
+            snap.lines()
+                .filter(|l| l.starts_with("bestmove"))
+                .map(str::to_owned)
+                .collect()
+        };
+
+        let bestmoves_a = drive_with_polling();
+        let bestmoves_b = drive_with_polling();
         assert_eq!(
             bestmoves_a, bestmoves_b,
             "identical seed + transcript must produce identical bestmove lines;\n\

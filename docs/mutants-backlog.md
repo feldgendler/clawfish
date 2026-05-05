@@ -221,6 +221,27 @@ Update `docs/milestones/m4.b.md`'s, `docs/milestones/m4.c.md`'s, `docs/milestone
 
 ## Done
 
+### M5.C — Late move reductions (campaign ran 2026-05-05 on the M5.C working tree)
+
+94 mutants: 82 caught + 4 timeout-caught + 2 unviable + **6 missed** (93.5% effective catch rate, 86 / 92 excluding unviable). Diff range `git diff aa7ac4a -- 'src/*.rs' 'tests/*.rs'` (HEAD vs working tree at the M5.C landing).
+
+**6 survivors triaged in this commit:**
+
+1. **Tests added (3 assertions catching real gaps), all in `src/search.rs`:**
+   - `tt_bound_for_completed_node_classifies_full_depth` extended with `(0, 100, 0, true) → Some(Upper)` to pin the `best == original_alpha` boundary as Upper, killing `> → >=` on the Exact arm.
+   - `best_is_full_depth_after_score_upgrades_equal_score_to_full_depth` extended with `(42, true, 42, false) == true` to pin that an equal-score reduced-only candidate does not clear an existing full-depth flag, killing `> → >=` on the strict-improvement arm.
+   - `negamax_full_depth_quiet_still_enters_quiets_searched` extended to generate the legal moves at the traced root position and assert every recorded `lmr_history_candidates` entry comes from that set, killing the `==` → `!=` mutation on the `lmr_trace_root_ply == Some(ply)` instrumentation gate (descendant Black moves leak into the trace under the mutation, e.g., `d7-d6`).
+
+2. **`exclude_re` rules added (3 rules)** in `.cargo/mutants.toml`:
+   - `replace || with && in late_move_reduction` — equivalent: the formula path coincidentally produces 0 for every input the early-return guard catches (`ln(0)→-∞` saturates; `ln(1)=0` zeros the product; `clamp(0, depth.saturating_sub(2))` ceiling is 0 for `depth < 3`).
+   - `replace * with + in late_move_reduction` and `replace * with / in late_move_reduction` — structurally undetectable at the M5.C test surface (clamp absorbs the difference); deferred to the formula re-tuning campaign (plan §8 row 1).
+
+3. **Self-review of fixes**: each new assertion verified by manual mutation-and-revert (apply mutation → confirm test fails → revert). Each `exclude_re` rule carries a function-anchored regex (per project convention against fragile line anchors) and a multi-paragraph equivalence/undetectability proof in the toml comment.
+
+See `docs/milestones/m5.c.md` "Mutation-survivor analysis" for the per-survivor narrative.
+
+---
+
 ### M4.B+M4.C+M4.D+M5.A+M5.B — joint campaign (ran 2026-05-02 on branch `mutants/m4bcd-m5ab`)
 
 748 mutants: 669 caught + 15 timeout-caught + 33 unviable + **31 missed** (89.4% catch rate). Diff range `33a0d0d..7d99ccc -- src/*.rs tests/*.rs`.

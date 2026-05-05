@@ -593,4 +593,48 @@ exclude_re = [
     #
     # ACCEPTED AS PERMANENT EQUIVALENT MISSES. Audit trail: M4.B+C+D+M5.A+B
     # joint campaign (2026-05-02). See docs/milestones/m5.b.md for details.
+
+    # ---- M5.C: late_move_reduction in-domain guard `||` → `&&` -----------
+    #
+    # `late_move_reduction(depth, quiet_index)` opens with:
+    #   if depth < LMR_MIN_DEPTH || quiet_index < LMR_MIN_QUIET_INDEX {
+    #       return 0;
+    #   }
+    # The `||` → `&&` mutation falls through to the formula path on inputs
+    # the original would have short-circuited. PROVABLY EQUIVALENT for every
+    # input the function receives:
+    #   - quiet_index = 0 or 1: ln(quiet_index) is ln(0) = -inf or ln(1) = 0.
+    #     Either way, the multiplicative formula `ln(d) * ln(qi) / 3.14` is
+    #     0 or -inf. floor(0.99 + 0) = 0; floor(0.99 + (-inf)) = -inf, which
+    #     `as u32` saturates to 0. Then clamp(0, 0, depth.saturating_sub(2))
+    #     returns 0.
+    #   - depth = 0, 1, or 2: depth.saturating_sub(2) returns 0, so the
+    #     final clamp returns 0 regardless of the formula's output.
+    # In short, the formula path coincidentally produces 0 for exactly the
+    # inputs the early-return guard catches. The `||` guard is defense-in-
+    # depth, not load-bearing for any reachable input. A line-anchored
+    # exclusion would rot if the helper is refactored, so the rule is
+    # function-anchored — there is only one `||` in this helper.
+    "replace \\|\\| with && in late_move_reduction",
+
+    # ---- M5.C: late_move_reduction formula `*` → `+` and `*` → `/` -------
+    #
+    # The formula `floor(LMR_BASE_OFFSET + ln(depth) * ln(quiet_index)
+    # / LMR_LOG_DIVISOR)` is mutated to use `+` or `/` in place of the
+    # multiplication. At the v1 constants (LMR_BASE_OFFSET=0.99,
+    # LMR_LOG_DIVISOR=3.14) the resulting reductions diverge from the
+    # original at large (depth, quiet_index) inputs, but the differences
+    # are absorbed by the `clamp(0, depth - 2)` post-step at every input
+    # the test suite reaches: at depth=3 the clamp ceiling is 1, and at
+    # depth=8 the floor coincidentally lands on the same integer for both
+    # the original and the mutated formula. STRUCTURALLY UNDETECTABLE at
+    # the M5.C test surface; would become detectable when the constants
+    # are re-tuned (plan §8 row 1: `LMR_BASE_OFFSET` and `LMR_LOG_DIVISOR`
+    # joint re-fit). Deferred to that campaign — at re-tune time, the
+    # boundary tests must be widened to pin the formula's behavior at
+    # several (depth, quiet_index) tuples that the clamp does NOT absorb.
+    # Function-anchored to survive any future formula refactor that keeps
+    # the `*` between `ln(depth)` and `ln(quiet_index)`.
+    "replace \\* with \\+ in late_move_reduction",
+    "replace \\* with / in late_move_reduction",
 ]

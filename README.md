@@ -12,28 +12,39 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > null-move pruning (`R = 2 + depth/6`; seven-condition gate; mate-cap),
 > reverse futility pruning (`margin = 100*depth`; depth ≤ 6; non-PV,
 > non-check; no TT store),
+> late move reductions (log-log formula `R = floor(0.99 + ln(d)·ln(qi)/3.14)`
+> clamped to `0..=(d−2)`; quiet-only, non-PV, non-check, depth ≥ 3,
+> quiet_index ≥ 2; killers and high-history quiets exempt; full-depth re-search
+> on `reduced_score > alpha`; reduced-only TT-store suppression),
 > mate-distance pruning, PeSTO middlegame piece-square tables, and
 > `compute_caps`-driven time management. `bench` UCI command for
 > deterministic node-count regression baselines. The rest of the strength
-> path (LMR, futility, singular extensions; eval improvements; NNUE)
-> is tracked in [`docs/roadmap.md`](docs/roadmap.md).
+> path (frontier futility, qsearch correctness + TT, singular extensions;
+> eval improvements; NNUE) is tracked in [`docs/roadmap.md`](docs/roadmap.md).
 >
-> **Current strength: ~2652 Elo on Stockfish 18 UCI_LimitStrength scale
-> at fast-TC-weighted mixed TC** (M5.B end, 2026-05-02). Mixed-TC rating
+> **Current strength: ~2657 Elo on Stockfish 18 UCI_LimitStrength scale
+> at fast-TC-weighted mixed TC** (M5.C end, 2026-05-05). Mixed-TC rating
 > estimate via the in-process ELOH harness with Robbins-Monro iteration:
 >
 > | Metric | Value |
 > |---|---|
-> | Converged Elo | **2652.43 ± 14.55** |
-> | Games | 40 (20 pairs) |
-> | W-L-D | 15 / 18 / 7 (46.25% score) |
+> | Converged Elo | **2657.44 ± 16.49** |
+> | Games | 38 (19 pairs) |
+> | W-L-D | 12 / 16 / 10 (44.7% score) |
 > | TC mix | `--tc-sample 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1` (uniform 4-bucket) |
-> | TC sampled | 18 / 4 / 14 / 4 games (early σ-stop fired before TC balance — fast-TC-weighted) |
+> | TC sampled | 14 / 12 / 4 / 8 games (early σ-stop fired before TC balance — fast-TC-weighted) |
 > | Stop reason | σ-stop |
 >
 > Apple M4 P-cores (utility QoS), single thread, no pondering, virtual
 > clock on clawfish. Methodology + per-TC distribution caveat:
-> [`bench/sprt/2026-05-02-m5.b-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-02-m5.b-mixed-tc-rating-estimate.md).
+> [`bench/sprt/2026-05-05-m5.c-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-05-m5.c-mixed-tc-rating-estimate.md).
+>
+> M5.C's mixed-TC SPRT vs `baseline/m5b-rfp` (M5.B end) — **H1 accepted in
+> 144 games / 72 pairs**, Δ Elo **+145.47 [+100.12, +196.09]** (pentanomial
+> 95% CI). All four TC buckets positive with strong slow-TC amplification
+> (40+0.4: 81.9%; 60+0.6: 78.9%; 20+0.2: 58.75%; 10+0.1: 58.3%) — typical
+> of LMR's depth-bounded selectivity. Full log:
+> [`bench/sprt/2026-05-05-m5.c-vs-m5b-mixed-tc.md`](bench/sprt/2026-05-05-m5.c-vs-m5b-mixed-tc.md).
 >
 > M5.B's mixed-TC SPRT vs `baseline/m5a-nmp` (M5.A end) — W-L-D
 > **94/32/74** in 200 games / 100 pairs, score 65.5%, **logistic Elo +111**.
@@ -51,16 +62,16 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 >
 > Pure-logistic SPRT gains do NOT translate 1:1 to UCI_Elo space.
 > Stockfish UCI_LimitStrength has a non-linear strength curve at
-> 2200–2700 (per the M4.D + M5.A + M5.B rating-estimate docs); chained
+> 2200–2700 (per the M4.D + M5.A + M5.B + M5.C rating-estimate docs); chained
 > clawfish-vs-clawfish SPRT logistic Elo measures relative strength
 > tightly but doesn't transfer additively to UCI_Elo space.
 >
-> **Current bench:** `bench: 3355270 nodes <NPS> nps` at default depth 7
-> (M5.B end; node count is deterministic, NPS is wallclock-dependent).
-> Down from M5.A's 5,345,534 nodes — −37.2% additional reduction from
-> reverse futility pruning composing with NMP + M4's TT/killer/history/
-> aspiration ordering; down from M3.F's 172,312,700 — ~98% cumulative
-> reduction from TT + killer + history + aspiration + NMP + RFP. Run
+> **Current bench:** `bench: 1651610 nodes <NPS> nps` at default depth 7
+> (M5.C end; node count is deterministic, NPS is wallclock-dependent).
+> Down from M5.B's 3,355,270 nodes — −50.8% additional reduction from
+> late move reductions composing with RFP + NMP + M4's TT/killer/history/
+> aspiration ordering; down from M3.F's 172,312,700 — ~99% cumulative
+> reduction from TT + killer + history + aspiration + NMP + RFP + LMR. Run
 > `printf 'bench\nquit\n' | ./target/release/clawfish` to reproduce
 > the node count.
 

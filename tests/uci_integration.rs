@@ -884,8 +884,10 @@ fn bench_signature_deterministic_across_two_runs_with_nmp() {
 /// `bench / bench` from a single engine subprocess must produce the same
 /// total node count both times, even with RFP cutting branches inside
 /// negamax. RFP is purely static (no sub-search, no TT store) so it
-/// introduces no non-determinism across identical positions. Node count is
-/// pinned to 3355270 (M5.B signature; −37.2% vs M5.A's 5345534).
+/// introduces no non-determinism across identical positions. The value pin
+/// originally lived in this test for the M5.B signature (137174 nodes at
+/// depth=4); E50 carries the M5.C value pin going forward, and this test
+/// retains the determinism-only contract per the E46/E47/E48 pattern.
 #[test]
 fn bench_signature_deterministic_across_two_runs_with_rfp() {
     let mut child = spawn_engine();
@@ -956,11 +958,87 @@ fn bench_signature_deterministic_across_two_runs_with_rfp() {
          static-only check, no sub-search, no TT store → deterministic); \
          got {nodes1} vs {nodes2}"
     );
-    // Pin to M5.B bench 4 signature (137174 nodes at depth=4).
-    // For the full default-depth signature (3355270 nodes at depth=8), see bench/m5.md.
+}
+
+// E50 — bench is deterministic across two consecutive runs in the same
+// engine session with M5.C late-move reductions active, AND pins the
+// depth-4 signature to the M5.C value.
+// ---------------------------------------------------------------------------
+
+/// `bench / bench` from a single engine subprocess must produce the same
+/// total node count both times with LMR active (LMR's reduction formula and
+/// eligibility predicate are pure functions of `(depth, quiet_index)` plus
+/// `Position` / killers / history; nothing introduces non-determinism). Plus
+/// the depth-4 signature is pinned to `130884` (M5.C signature; the M5.B
+/// pin was 137174). For the default-depth signature, see `bench/m5.md`.
+#[test]
+fn bench_signature_deterministic_across_two_runs_with_lmr() {
+    let mut child = spawn_engine();
+    let stdout = child.stdout.take().expect("stdout handle");
+    let line_rx = drain_stdout(stdout);
+
+    let mut stdin = child.stdin.take().expect("stdin handle");
+    stdin.write_all(b"bench 4\nbench 4\n").unwrap();
+
+    let mut lines: Vec<String> = Vec::new();
+    let bench_deadline_1 = Instant::now() + Duration::from_secs(60);
+    wait_for_line_starting_with(
+        &line_rx,
+        "info string bench: ",
+        bench_deadline_1,
+        &mut lines,
+    );
+    let bench_deadline_2 = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < bench_deadline_2 {
+        match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                let matched = line.starts_with("info string bench: ");
+                lines.push(line);
+                if matched {
+                    break;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    stdin.write_all(b"quit\n").unwrap();
+    drop(stdin);
+
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    let exited = wait_for_exit(&mut child, exit_deadline);
+    lines.extend(collect_lines(&line_rx));
+    let output = lines.join("\n");
+
+    assert!(exited, "E50: engine did not exit within 5 s after quit");
+
+    let signatures: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("info string bench: "))
+        .collect();
     assert_eq!(
-        nodes1, 137_174,
-        "E49: bench node count changed from M5.B pin (137174 at depth=4); \
+        signatures.len(),
+        2,
+        "E50: expected exactly two bench signature lines; got {}.\nfull output:\n{output}",
+        signatures.len()
+    );
+
+    let parse_nodes = |sig: &str| -> u64 {
+        let rest = sig.strip_prefix("info string bench: ").unwrap();
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        assert_eq!(parts.len(), 4, "E50: signature shape wrong; {sig:?}");
+        parts[0].parse::<u64>().expect("E50: nodes must parse")
+    };
+    let nodes1 = parse_nodes(signatures[0]);
+    let nodes2 = parse_nodes(signatures[1]);
+    assert_eq!(
+        nodes1, nodes2,
+        "E50: bench node counts must match across two runs in the same session \
+         with LMR active; got {nodes1} vs {nodes2}"
+    );
+    assert_eq!(
+        nodes1, 130_884,
+        "E50: bench node count changed from M5.C pin (130884 at depth=4); \
          re-pin if intentional; got {nodes1}"
     );
 }
