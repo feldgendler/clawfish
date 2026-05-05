@@ -64,9 +64,11 @@ Pinned v1 constants:
 
 ```rust
 pub(crate) const LMR_BASE_OFFSET: f64 = 0.99;
-#[allow(clippy::approx_constant)] // SPRT-tunable, not π
+#[allow(clippy::approx_constant)] // conservative-band placeholder; SPRT-tunable
 pub(crate) const LMR_LOG_DIVISOR: f64 = 3.14;
 ```
+
+`LMR_LOG_DIVISOR = 3.14` is a memorable placeholder in the conservative band `[~2.9, ~3.5]` — the probe table at v1 constants in plan §3.1 is invariant across that range. π provides only the mnemonic; the value carries no theoretical weight and is the first target of the §"Open SPRT-tunable parameters" row 1 joint re-fit.
 
 Reduction:
 

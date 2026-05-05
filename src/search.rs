@@ -465,7 +465,7 @@ pub(crate) const LMR_MIN_QUIET_INDEX: u32 = 2;
 pub(crate) const LMR_BASE_OFFSET: f64 = 0.99;
 
 /// Divisor in the M5.C log-log LMR formula.
-#[allow(clippy::approx_constant)] // SPRT-tunable, not π
+#[allow(clippy::approx_constant)] // conservative-band placeholder; SPRT-tunable
 pub(crate) const LMR_LOG_DIVISOR: f64 = 3.14;
 
 /// Quiets with history scores at or above this threshold are trusted and are
