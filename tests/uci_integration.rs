@@ -1119,7 +1119,9 @@ fn bench_signature_deterministic_across_two_runs_with_ffp() {
     );
     // M5.D depth-4 bench-signature pin. Recorded from the production binary
     // immediately after the move-loop integration landed (plan §11).
-    const M5D_DEPTH4_BENCH_NODES: u64 = 117_768;
+    // v1 (FFP_MAX_DEPTH = 2): 117_768 — adjusted at the v2 retune to drop
+    // the depth-2 firings (per the v1 SPRT's per-TC slow-TC regression).
+    const M5D_DEPTH4_BENCH_NODES: u64 = 120_856;
     assert_eq!(
         nodes1, M5D_DEPTH4_BENCH_NODES,
         "E51: bench node count changed from M5.D pin ({M5D_DEPTH4_BENCH_NODES} at depth=4); \

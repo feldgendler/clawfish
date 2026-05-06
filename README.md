@@ -22,28 +22,36 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > path (frontier futility, qsearch correctness + TT, singular extensions;
 > eval improvements; NNUE) is tracked in [`docs/roadmap.md`](docs/roadmap.md).
 >
-> **Current strength: ~2664 Elo on Stockfish 18 UCI_LimitStrength scale
-> at uniform mixed TC** (M5.D, 2026-05-06; estimated 2663.95 ± 47.75,
-> statistically indistinguishable from M5.C's 2657 ± 16.49 anchor).
-> M5.D's mixed-TC SPRT vs `baseline/m5c-lmr` was **inconclusive** at v1
-> parameters (Δ Elo −6.95 [−32.50, +18.53] at 400 games; per-TC
-> bimodal: positive at fast TC, negative at slow TC); `baseline/m5d-ffp`
-> NOT tagged. Mixed-TC rating estimate via the in-process ELOH harness
-> with Robbins-Monro iteration:
+> **Current strength: ~2641 Elo on Stockfish 18 UCI_LimitStrength scale
+> at uniform mixed TC** (M5.D-v2, 2026-05-06; rating estimate Δ Elo
+> −15.65 [−59.02, +27.25] vs Stockfish-2657 anchor; CI overlaps the
+> M5.C anchor — statistically indistinguishable). M5.D shipped in two
+> passes: v1 (FFP_MAX_DEPTH=2) shipped with an inconclusive SPRT
+> (per-TC bimodal: positive fast, negative slow); v2 retune
+> (FFP_MAX_DEPTH=1, frontier-only per Heinz 1998) cleanly recovered the
+> slow-TC regression with **H1-accepted SPRT** vs `baseline/m5c-lmr`:
+> Δ Elo +53.24 [+28.49, +78.54] at 342 games. The rating estimate
+> against Stockfish moves slowly across phases because the cross-engine
+> signal is dominated by the gap between clawfish's classical PSQT eval
+> and Stockfish's NNUE strategic understanding; the +53 SPRT signal
+> over `baseline/m5c-lmr` is the load-bearing strength gate.
+> `baseline/m5d-ffp` tagged at the v2 landing. Mixed-TC rating estimate
+> via the in-process ELOH harness with Robbins-Monro iteration:
 >
 > | Metric | Value |
 > |---|---|
-> | Estimated Elo (M5.D) | **~2664 ± 48** (anchor 2657 + Δ +6.95 [−40.64, +54.80]) |
+> | Estimated Elo (M5.D-v2) | **~2641 ± 43** (anchor 2657 + Δ −15.65 [−59.02, +27.25]) |
 > | Anchor (M5.C) | 2657.44 ± 16.49 |
 > | Games | 200 (100 pairs) |
-> | W-L-D | 80 / 76 / 44 (51.0% score) |
+> | W-L-D | 76 / 85 / 39 (47.75% score) |
 > | TC mix | `--tc-sample 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1` (uniform 4-bucket) |
-> | TC sampled | 44 / 50 / 52 / 54 games (frozen K + disabled σ-stop; full 200 games complete) |
+> | TC sampled | 56 / 36 / 42 / 66 games (frozen K + disabled σ-stop; full 200 games complete) |
 > | Stop reason | max-games |
 >
 > Apple M4 P-cores (utility QoS), single thread, no pondering, virtual
-> clock on clawfish. M5.D rating-estimate methodology + per-TC pattern:
-> [`bench/sprt/2026-05-06-m5.d-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-06-m5.d-mixed-tc-rating-estimate.md).
+> clock on clawfish. M5.D-v2 rating-estimate methodology + the SPRT-vs-
+> rating-estimate divergence analysis:
+> [`bench/sprt/2026-05-06-m5.d-v2-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-06-m5.d-v2-mixed-tc-rating-estimate.md).
 > M5.C anchor methodology: [`bench/sprt/2026-05-05-m5.c-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-05-m5.c-mixed-tc-rating-estimate.md).
 >
 > M5.C's mixed-TC SPRT vs `baseline/m5b-rfp` (M5.B end) — **H1 accepted in
@@ -73,14 +81,13 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > clawfish-vs-clawfish SPRT logistic Elo measures relative strength
 > tightly but doesn't transfer additively to UCI_Elo space.
 >
-> **Current bench:** `bench: 1414405 nodes <NPS> nps` at default depth 7
-> (M5.D end; node count is deterministic, NPS is wallclock-dependent).
-> Down from M5.C's 1,651,610 nodes — −14.4% additional reduction from
-> frontier futility pruning composing with LMR + RFP + NMP + M4's
+> **Current bench:** `bench: 1466436 nodes <NPS> nps` at default depth 7
+> (M5.D-v2 end; node count is deterministic, NPS is wallclock-dependent).
+> Down from M5.C's 1,651,610 nodes — −11.2% additional reduction from
+> frontier-only FFP composing with LMR + RFP + NMP + M4's
 > TT/killer/history/aspiration ordering; down from M3.F's 172,312,700 —
-> ~99% cumulative reduction from TT + killer + history + aspiration + NMP
-> + RFP + LMR + FFP. Run `printf 'bench\nquit\n' | ./target/release/clawfish`
-> to reproduce the node count.
+> ~99% cumulative reduction. Run `printf 'bench\nquit\n' |
+> ./target/release/clawfish` to reproduce the node count.
 
 ## Build
 

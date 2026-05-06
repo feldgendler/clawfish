@@ -473,21 +473,35 @@ pub(crate) const LMR_LOG_DIVISOR: f64 = 3.14;
 pub(crate) const LMR_HIGH_HISTORY_THRESHOLD: i16 = 4_096;
 
 /// FFP node-level depth ceiling (M5.D — ADR-0026 §4). At depth > FFP_MAX_DEPTH,
-/// FFP does not fire. v1: 2 (frontier + pre-frontier per Heinz 1998). Depth 3 /
-/// pre-pre-frontier is a post-landing SPRT-tune candidate.
-pub(crate) const FFP_MAX_DEPTH: u32 = 2;
+/// FFP does not fire.
+///
+/// **v2: 1** (frontier-only, Heinz 1998 original formulation). The v1 setting
+/// (`FFP_MAX_DEPTH = 2`) layered "extended futility" at depth 2 on top, but
+/// the v1 mixed-TC SPRT (M5.D landing) showed strong slow-TC regression
+/// implicating depth-2 FFP as the cause: per-TC bimodal pattern with positive
+/// fast TC (10+0.1: 56.5%, 20+0.2: 68.3%) and negative slow TC (40+0.4:
+/// 30.2%, 60+0.6: 40.6%). Restricting to depth 1 (Heinz's classical scope)
+/// keeps the cheap frontier prune but drops the deeper-search tactical-
+/// blindness risk. See [`bench/sprt/2026-05-06-m5.d-vs-m5c-mixed-tc.md`] and
+/// the M5.D retrospective for the v1 → v2 reasoning.
+///
+/// `FFP_MARGIN_D2 = 150` and `FFP_MARGIN_D3 = 250` are kept as named
+/// constants (forward compat) but inactive at v2.
+pub(crate) const FFP_MAX_DEPTH: u32 = 1;
 
 /// FFP margin at depth 1 (frontier nodes). 100 cp ≈ one pawn. Conservative v1
 /// per ADR-0026 §4. TalkChess t=74403 successful at 100 cp / d=1 in `{100, 150}`.
 pub(crate) const FFP_MARGIN_D1: i32 = 100;
 
 /// FFP margin at depth 2 (pre-frontier / Heinz "extended futility"). 150 cp.
-/// Roadmap M5.D row's CPW reference. ADR-0026 §4.
+/// **Inactive at v2** (FFP_MAX_DEPTH = 1 keeps depth 2 from firing). Defined
+/// here so a post-tune `FFP_MAX_DEPTH = 2` revival can re-activate it without
+/// churn. ADR-0026 §4.
 pub(crate) const FFP_MARGIN_D2: i32 = 150;
 
 /// FFP margin at depth 3 (pre-pre-frontier / "limited razoring"). **Inactive
-/// at v1** (FFP_MAX_DEPTH = 2 keeps depth 3 from firing). Defined here so a
-/// post-landing `FFP_MAX_DEPTH = 3` SPRT can activate it without churn.
+/// at v2** (FFP_MAX_DEPTH = 1 keeps depth 3 from firing). Defined here so a
+/// post-tune `FFP_MAX_DEPTH = 3` SPRT can activate it without churn.
 /// ADR-0026 §4.
 pub(crate) const FFP_MARGIN_D3: i32 = 250;
 
@@ -11317,17 +11331,21 @@ mod tests {
         );
     }
 
-    /// Same boundary at d=2 (different margin).
+    /// At v2 (FFP_MAX_DEPTH = 1), depth=2 returns None even with arithmetically
+    /// passing margin/alpha — the helper-level domain guard rules it out.
+    /// The constant `FFP_MARGIN_D2 = 150` is still defined for forward compat
+    /// (a post-tune `FFP_MAX_DEPTH = 2` revival can re-activate it), and
+    /// `frontier_futility_margin_at_depth_2_is_150` still pins the constant's
+    /// value; this test pins the gate's domain-guard behavior.
     #[test]
-    fn ffp_pruned_bound_at_depth_2_boundary_inequality_inclusive() {
-        assert_eq!(
-            ffp_pruned_bound(0, 2, 150),
-            Some(150),
-            "boundary equality must fire FFP at d=2 with margin 150"
+    fn ffp_pruned_bound_at_depth_2_returns_none_under_v2_max_depth() {
+        assert!(
+            ffp_pruned_bound(0, 2, 150).is_none(),
+            "depth=2 must return None at v2 (FFP_MAX_DEPTH = 1) — even with arithmetically passing condition"
         );
         assert!(
-            ffp_pruned_bound(0, 2, 149).is_none(),
-            "boundary - 1 must NOT fire FFP at d=2"
+            ffp_pruned_bound(0, 2, 1_000_000).is_none(),
+            "depth=2 must return None at v2 even with very high alpha"
         );
     }
 
@@ -11352,13 +11370,20 @@ mod tests {
         );
     }
 
-    /// Payload arithmetic pin at d=2 (different margin).
+    /// At v2 (FFP_MAX_DEPTH = 1), the d=2 payload is unreachable: the gate
+    /// returns None before the payload is computed. This test fortifies the
+    /// `_returns_none_under_v2_max_depth` pin against a refactor that would
+    /// drop the call-site `depth ≤ FFP_MAX_DEPTH` check while keeping the
+    /// arithmetic intact (helper-level defense-in-depth, M5.C
+    /// `late_move_reduction` precedent).
     #[test]
-    fn ffp_pruned_bound_payload_equals_static_eval_plus_margin_at_d2() {
-        assert_eq!(
-            ffp_pruned_bound(-200, 2, 0),
-            Some(-50),
-            "FFP-proved bound payload at d=2 must equal static_eval + FFP_MARGIN_D2"
+    fn ffp_pruned_bound_at_depth_2_is_unreachable_under_v2_max_depth() {
+        // Arithmetic that WOULD pass the inequality if the gate didn't block:
+        // static_eval = -200, margin(2) = 150 → bound would be -50, alpha 0,
+        // -50 ≤ 0. Under v1 this was Some(-50); under v2 it must be None.
+        assert!(
+            ffp_pruned_bound(-200, 2, 0).is_none(),
+            "depth=2 with passing arithmetic must still return None at v2 (FFP_MAX_DEPTH = 1)"
         );
     }
 
