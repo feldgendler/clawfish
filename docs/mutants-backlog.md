@@ -27,18 +27,7 @@ Per-unit `cargo mutants --in-diff` runs that are deferred from the unit's commit
 
 ## Pending
 
-### M5.D — Frontier futility pruning (`--in-diff` campaign deferred to overnight backlog)
-
-Per the M5.A/B/C precedent. Anticipated catchable surface (~25 mutants, mostly on `frontier_futility_margin` / `ffp_pruned_bound` / the move-loop FFP block):
-
-- `frontier_futility_margin`: per-depth match arms (`1 => FFP_MARGIN_D1`, etc.). Direct value mutations killed by the per-depth pin tests.
-- `ffp_pruned_bound`: `depth == 0`, `depth > FFP_MAX_DEPTH`, `<= alpha`, `Some(bound)` payload, `saturating_add` substitution. Domain guard mutations killed by `ffp_pruned_bound_returns_none_at_depth_zero` / `_above_max`. Inequality-direction mutations killed by `_at_depth_1_boundary_inequality_inclusive` / `_at_depth_2_boundary_inequality_inclusive`. Payload mutations killed by `_payload_equals_static_eval_plus_margin_at_d1` / `_d2`. Saturation mutations killed by `_does_not_overflow_on_max_static_eval`.
-- Move-loop FFP block: `quiet_move &&`, `if let Some(static_eval) = ...`, `if let Some(pruned_bound) = ...`, `move_is_full_depth = false`, `pruned_bound > best`, `continue`. Gate-skip mutations killed by `negamax_skips_ffp_at_*` tests; firing mutations killed by `negamax_fires_ffp_when_quiet_cannot_reach_alpha` and `ffp_firings_counter_increments_on_skip`; `quiet_move &&` mutations killed by `negamax_skips_ffp_for_capture_moves`. Sign-convention mutations killed by `negamax_ffp_with_black_to_move_uses_stm_relative_not_white_relative_static_eval`. Provenance-downgrade `move_is_full_depth = false` → `true` mutation killed by `negamax_ffp_contribution_downgrades_best_is_full_depth`. Pruned-bound contribution mutations killed by `negamax_ffp_pruned_bound_contributed_to_best_when_only_pruned_quiets` (equality-strength).
-
-**Anticipated survivors:**
-
-- The `match` arm `_ => 0` in `frontier_futility_margin` may have a `delete _ => 0` survivor that's structurally undetectable (no test exercises a depth that's both > 3 and inside the match's domain). Deferred to a future campaign or accepted as equivalent.
-- The compile-time `assert!(FFP_MAX_DEPTH < LMR_MIN_DEPTH)` is not a runtime mutant target; cargo-mutants doesn't mutate `const _: () = assert!(...)` blocks.
+_(no pending campaigns)_
 
 ---
 
@@ -231,6 +220,20 @@ Update `docs/milestones/m4.b.md`'s, `docs/milestones/m4.c.md`'s, `docs/milestone
 - **If a survivor maps outside the M4.B/M4.C/M4.D/M5.A/M5.B surface** (i.e., a mutation on a line outside `src/search.rs` killer / history / aspiration / NMP / RFP logic, `src/history.rs`, `src/mov.rs::from_bits` / null-move primitives, `src/movegen.rs::test_strategies` lift, `src/position.rs` delegators, the M4.C/M4.D/M5.A/M5.B-specific test surface): something's off with the diff scope. Re-check that `33a0d0d..<m5.b-merge-sha>` is the correct hash range and that no drift commits have landed.
 
 ## Done
+
+### M5.D — Frontier futility pruning (campaign ran 2026-05-06 on the M5.D landing diff)
+
+38 mutants in the `git diff 0f9bd88..HEAD` range (M5.D landing). Initial pass: 36 caught / 2 unviable / **1 missed**.
+
+**The single missed mutant (closed by code change):**
+
+- `replace > with >= in AlphaBetaMover::negamax` at the FFP pruned-bound contribution site, originally `if pruned_bound > best { best = pruned_bound; }` — **equivalent under semantics**: when `pruned_bound == best`, the `>` form skips the assignment, the `>=` form runs the assignment with an equal value; both leave `best` unchanged. **Closure**: replaced the conditional with `best = best.max(pruned_bound);` — removes the `>` operator entirely, kills the mutant by structural elimination. Re-run after the fix: 36 caught + 2 unviable + 0 missed = **100% effective catch rate**.
+
+**The 2 unviable mutants:**
+
+- `replace && with || in AlphaBetaMover::negamax` at lines `1544` (`if quiet_move && let Some(static_eval) = ...`) and `1545` (`&& let Some(pruned_bound) = ...`). Rust let-chains require `&&` syntactically; `||` is a compile error. cargo-mutants correctly classifies these as unviable (won't compile), not missed.
+
+**Catchable surface confirmed**: per-depth match arms in `frontier_futility_margin` (killed by per-depth pin tests); domain guard / inequality / payload / saturation in `ffp_pruned_bound` (killed by helper tests); FFP gate predicates / sign convention / provenance downgrade / firings counter in the move loop (killed by behavior tests). The provenance downgrade `move_is_full_depth = false → true` mutation is killed by `negamax_ffp_contribution_downgrades_best_is_full_depth` (the load-bearing TT-store correctness pin).
 
 ### M5.C — Late move reductions (campaign ran 2026-05-05 on the M5.C working tree)
 

@@ -1556,9 +1556,13 @@ impl AlphaBetaMover {
                     pruned_bound,
                     /* move_is_full_depth = */ false,
                 );
-                if pruned_bound > best {
-                    best = pruned_bound;
-                }
+                // `pruned_bound` is `<= alpha` by FFP's gate; floors `best`
+                // without ever improving alpha or causing a beta cutoff.
+                // Use `i32::max` (not a `>` conditional) so the only
+                // operator at this site is mutation-undetectable as
+                // equivalent (the conditional form's `> → >=` mutant is
+                // observationally identical when `pruned_bound == best`).
+                best = best.max(pruned_bound);
                 continue;
             }
 
