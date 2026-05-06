@@ -29,6 +29,11 @@
 #        scripts/sprt.sh rating-estimate
 #        SPRT_GAMES=400 scripts/sprt.sh sprt baseline/random-mover  (override)
 #        SPRT_TC=10+0.1 scripts/sprt.sh sprt baseline/random-mover  (override)
+#        SPRT_TC_SAMPLE='10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1' scripts/sprt.sh sprt <tag>
+#                                                                    (mixed-TC per ELOH.D;
+#                                                                    mutually exclusive with SPRT_TC)
+#        SPRT_SEED=0xC1ABF15AE10DD005 scripts/sprt.sh sprt <tag>     (deterministic per-pair
+#                                                                    TC stream)
 #        SPRT_CONCURRENCY=6 scripts/sprt.sh sprt baseline/random-mover
 #        SPRT_REBUILD=1 scripts/sprt.sh sprt baseline/random-mover  (force rebuild
 #                                                                    of cached baseline)
@@ -150,7 +155,25 @@ OUT_DIR="$SPRT_DIR/${TS}-${BASELINE_SLUG}-${SUBCMD}"
 # Match parameters.
 # -----------------------------------------------------------------------------
 TC="${SPRT_TC:-10+0.1}"
+TC_SAMPLE="${SPRT_TC_SAMPLE:-}"
 CONCURRENCY="${SPRT_CONCURRENCY:-6}"
+SEED_ARG="${SPRT_SEED:-}"
+
+# `--tc-sample` (mixed-TC per-pair sampling, ELOH.D) is mutually exclusive
+# with `--tc`. Pick one based on whether SPRT_TC_SAMPLE is set.
+if [[ -n "$TC_SAMPLE" ]]; then
+    TC_HARNESS_ARGS=(--tc-sample "$TC_SAMPLE")
+else
+    TC_HARNESS_ARGS=(--tc "$TC")
+fi
+
+# Optional SPRT_SEED: pass through to the harness so per-pair TC sampling
+# is bit-deterministic across runs (load-bearing for replays).
+if [[ -n "$SEED_ARG" ]]; then
+    SEED_HARNESS_ARGS=(--seed "$SEED_ARG")
+else
+    SEED_HARNESS_ARGS=()
+fi
 
 # Common harness invocation. Adjudication thresholds match the historical
 # fastchess settings the SPRT runs were calibrated against.
@@ -159,7 +182,8 @@ COMMON_HARNESS_ARGS=(
     --opponent "$BASELINE_BINARY"
     --engine-launch-prefix "taskpolicy -c utility"
     --opponent-launch-prefix "taskpolicy -c utility"
-    --tc "$TC"
+    "${TC_HARNESS_ARGS[@]}"
+    "${SEED_HARNESS_ARGS[@]}"
     --concurrency "$CONCURRENCY"
     --resign-movecount 3 --resign-score 600
     --draw-movenumber 34 --draw-movecount 8 --draw-score 20
@@ -170,10 +194,16 @@ COMMON_HARNESS_ARGS=(
 # -----------------------------------------------------------------------------
 # Subcommand dispatch.
 # -----------------------------------------------------------------------------
+if [[ -n "$TC_SAMPLE" ]]; then
+    TC_LABEL="tc-sample=$TC_SAMPLE"
+else
+    TC_LABEL="tc=$TC"
+fi
+
 case "$SUBCMD" in
     sprt)
         GAMES="${SPRT_GAMES:-400}"
-        echo "Running SPRT (in-process harness): tc=$TC, up to $GAMES games, elo0=0 elo1=10 alpha=0.05 beta=0.05"
+        echo "Running SPRT (in-process harness): $TC_LABEL, up to $GAMES games, elo0=0 elo1=10 alpha=0.05 beta=0.05"
         echo "  HEAD vs $BASELINE_LABEL"
         cargo run --release --bin elo-iterate --manifest-path "$REPO_ROOT/Cargo.toml" --quiet -- \
             "${COMMON_HARNESS_ARGS[@]}" \
@@ -183,7 +213,7 @@ case "$SUBCMD" in
         ;;
     match)
         GAMES="${SPRT_GAMES:-200}"
-        echo "Running fixed-game match (in-process harness): tc=$TC, $GAMES games"
+        echo "Running fixed-game match (in-process harness): $TC_LABEL, $GAMES games"
         echo "  HEAD vs $BASELINE_LABEL"
         cargo run --release --bin elo-iterate --manifest-path "$REPO_ROOT/Cargo.toml" --quiet -- \
             "${COMMON_HARNESS_ARGS[@]}" \
@@ -193,7 +223,7 @@ case "$SUBCMD" in
         ;;
     rating-estimate)
         GAMES="${SPRT_GAMES:-200}"
-        echo "Running rating-estimate match: tc=$TC, $GAMES games (in-process harness)"
+        echo "Running rating-estimate match: $TC_LABEL, $GAMES games (in-process harness)"
         echo "  HEAD vs $BASELINE_LABEL (Stockfish UCI_Elo=$STOCKFISH_ELO_VALUE)"
         # ELOH.B harness with --k0 0 --target-sigma 0 freezes both K and σ-stopping,
         # producing a fixed-anchor measurement equivalent to the prior fastchess

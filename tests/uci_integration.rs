@@ -961,16 +961,19 @@ fn bench_signature_deterministic_across_two_runs_with_rfp() {
 }
 
 // E50 — bench is deterministic across two consecutive runs in the same
-// engine session with M5.C late-move reductions active, AND pins the
-// depth-4 signature to the M5.C value.
+// engine session with M5.C late-move reductions active. The depth-4 value
+// pin (`130884` at M5.C) was dropped at the M5.D landing; E50 now tests
+// determinism only. The M5.D depth-4 value pin lives in E51 below.
 // ---------------------------------------------------------------------------
 
 /// `bench / bench` from a single engine subprocess must produce the same
 /// total node count both times with LMR active (LMR's reduction formula and
 /// eligibility predicate are pure functions of `(depth, quiet_index)` plus
-/// `Position` / killers / history; nothing introduces non-determinism). Plus
-/// the depth-4 signature is pinned to `130884` (M5.C signature; the M5.B
-/// pin was 137174). For the default-depth signature, see `bench/m5.md`.
+/// `Position` / killers / history; nothing introduces non-determinism). The
+/// depth-4 value pin was dropped at the M5.D landing per the M5.B → M5.C
+/// precedent (E49 dropped its M5.B value pin at the M5.C landing); E50 now
+/// tests determinism only. For the default-depth signature, see `bench/m5.md`;
+/// for the M5.D depth-4 value pin, see E51.
 #[test]
 fn bench_signature_deterministic_across_two_runs_with_lmr() {
     let mut child = spawn_engine();
@@ -1036,9 +1039,90 @@ fn bench_signature_deterministic_across_two_runs_with_lmr() {
         "E50: bench node counts must match across two runs in the same session \
          with LMR active; got {nodes1} vs {nodes2}"
     );
+    // M5.C value pin (`130884`) was dropped at M5.D landing per the M5.B → M5.C
+    // precedent (E49 dropped its M5.B value pin at the M5.C landing). E50 now
+    // tests determinism only; the M5.D depth-4 value pin lives in E51 below.
+}
+
+/// E51 — bench signature determinism with M5.D frontier futility pruning.
+///
+/// Same shape as E50 (M5.C). Two consecutive `bench 4` invocations must
+/// produce identical node counts. The depth-4 value pin will be set after
+/// M5.D's first production-binary `bench` run (TODO at impl time); on initial
+/// landing the `assert_eq!` on a placeholder is replaced with the actual
+/// number observed from the production binary. E50 is downgraded to
+/// determinism-only at the same time per the M5.B → M5.C precedent.
+#[test]
+fn bench_signature_deterministic_across_two_runs_with_ffp() {
+    let mut child = spawn_engine();
+    let stdout = child.stdout.take().expect("stdout handle");
+    let line_rx = drain_stdout(stdout);
+
+    let mut stdin = child.stdin.take().expect("stdin handle");
+    stdin.write_all(b"bench 4\nbench 4\n").unwrap();
+
+    let mut lines: Vec<String> = Vec::new();
+    let bench_deadline_1 = Instant::now() + Duration::from_secs(60);
+    wait_for_line_starting_with(
+        &line_rx,
+        "info string bench: ",
+        bench_deadline_1,
+        &mut lines,
+    );
+    let bench_deadline_2 = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < bench_deadline_2 {
+        match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                let matched = line.starts_with("info string bench: ");
+                lines.push(line);
+                if matched {
+                    break;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    stdin.write_all(b"quit\n").unwrap();
+    drop(stdin);
+
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    let exited = wait_for_exit(&mut child, exit_deadline);
+    lines.extend(collect_lines(&line_rx));
+    let output = lines.join("\n");
+
+    assert!(exited, "E51: engine did not exit within 5 s after quit");
+
+    let signatures: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("info string bench: "))
+        .collect();
     assert_eq!(
-        nodes1, 130_884,
-        "E50: bench node count changed from M5.C pin (130884 at depth=4); \
+        signatures.len(),
+        2,
+        "E51: expected exactly two bench signature lines; got {}.\nfull output:\n{output}",
+        signatures.len()
+    );
+
+    let parse_nodes = |sig: &str| -> u64 {
+        let rest = sig.strip_prefix("info string bench: ").unwrap();
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        assert_eq!(parts.len(), 4, "E51: signature shape wrong; {sig:?}");
+        parts[0].parse::<u64>().expect("E51: nodes must parse")
+    };
+    let nodes1 = parse_nodes(signatures[0]);
+    let nodes2 = parse_nodes(signatures[1]);
+    assert_eq!(
+        nodes1, nodes2,
+        "E51: bench node counts must match across two runs in the same session \
+         with FFP active; got {nodes1} vs {nodes2}"
+    );
+    // M5.D depth-4 bench-signature pin. Recorded from the production binary
+    // immediately after the move-loop integration landed (plan §11).
+    const M5D_DEPTH4_BENCH_NODES: u64 = 117_768;
+    assert_eq!(
+        nodes1, M5D_DEPTH4_BENCH_NODES,
+        "E51: bench node count changed from M5.D pin ({M5D_DEPTH4_BENCH_NODES} at depth=4); \
          re-pin if intentional; got {nodes1}"
     );
 }

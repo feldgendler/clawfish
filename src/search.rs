@@ -472,6 +472,34 @@ pub(crate) const LMR_LOG_DIVISOR: f64 = 3.14;
 /// exempt from LMR in M5.C v1.
 pub(crate) const LMR_HIGH_HISTORY_THRESHOLD: i16 = 4_096;
 
+/// FFP node-level depth ceiling (M5.D — ADR-0026 §4). At depth > FFP_MAX_DEPTH,
+/// FFP does not fire. v1: 2 (frontier + pre-frontier per Heinz 1998). Depth 3 /
+/// pre-pre-frontier is a post-landing SPRT-tune candidate.
+pub(crate) const FFP_MAX_DEPTH: u32 = 2;
+
+/// FFP margin at depth 1 (frontier nodes). 100 cp ≈ one pawn. Conservative v1
+/// per ADR-0026 §4. TalkChess t=74403 successful at 100 cp / d=1 in `{100, 150}`.
+pub(crate) const FFP_MARGIN_D1: i32 = 100;
+
+/// FFP margin at depth 2 (pre-frontier / Heinz "extended futility"). 150 cp.
+/// Roadmap M5.D row's CPW reference. ADR-0026 §4.
+pub(crate) const FFP_MARGIN_D2: i32 = 150;
+
+/// FFP margin at depth 3 (pre-pre-frontier / "limited razoring"). **Inactive
+/// at v1** (FFP_MAX_DEPTH = 2 keeps depth 3 from firing). Defined here so a
+/// post-landing `FFP_MAX_DEPTH = 3` SPRT can activate it without churn.
+/// ADR-0026 §4.
+pub(crate) const FFP_MARGIN_D3: i32 = 250;
+
+/// Compile-time invariant: at v1, FFP fires at `depth ≤ 2` and LMR fires at
+/// `depth ≥ 3`, so the two pruning paths cannot co-fire at any node. This
+/// assertion is load-bearing as a tripwire — a future tuning that raises
+/// `FFP_MAX_DEPTH` to overlap with `LMR_MIN_DEPTH` MUST update ADR-0026 §6
+/// (the per-quiet ordinal semantics question) and remove this assertion in
+/// the same patch. Mirrors ADR-0025 §3's `LMR_HIGH_HISTORY_THRESHOLD <=
+/// MAX_HISTORY` invariant pattern.
+const _: () = assert!(FFP_MAX_DEPTH < LMR_MIN_DEPTH);
+
 /// Construct the "iteration-1 aborted before any root improvement" fallback
 /// result for `Search::go` (M3.E).
 ///
@@ -622,6 +650,63 @@ pub(crate) fn late_move_reduction(depth: u32, quiet_index: u32) -> u32 {
     let raw = LMR_BASE_OFFSET + (depth as f64).ln() * (quiet_index as f64).ln() / LMR_LOG_DIVISOR;
     let reduction = raw.floor() as u32;
     reduction.clamp(0, depth.saturating_sub(2))
+}
+
+/// Per-depth FFP margin (M5.D — ADR-0026 §4 + §5). Returns 0 outside
+/// `[1, FFP_MAX_DEPTH]`.
+///
+/// Defining the depth-3 entry here (even though `FFP_MAX_DEPTH = 2` disables
+/// it at v1) keeps the constant inventory consistent with the roadmap's CPW
+/// reference and lets a future SPRT raise `FFP_MAX_DEPTH` without revisiting
+/// the table.
+pub(crate) fn frontier_futility_margin(depth: u32) -> i32 {
+    match depth {
+        1 => FFP_MARGIN_D1,
+        2 => FFP_MARGIN_D2,
+        3 => FFP_MARGIN_D3, // inactive until FFP_MAX_DEPTH raised
+        _ => 0,
+    }
+}
+
+/// FFP gate test combined with proved fail-soft upper bound (M5.D — ADR-0026
+/// §5). `static_eval` and `alpha` are STM-relative centipawn scores at the
+/// **parent** node (pre-move).
+///
+/// Returns `Some(static_eval + margin)` iff `depth ∈ [1, FFP_MAX_DEPTH]` AND
+/// `static_eval + margin <= alpha` (saturating addition); `None` otherwise.
+/// The `Some` payload is the FFP-proved fail-soft upper bound on the move's
+/// true score, guaranteed `<= alpha` by the gate. The call site uses it to
+/// floor `best` (ADR-0026 §7) without a separate recompute.
+///
+/// **One helper, two responsibilities by design.** Splitting into a bool
+/// gate + a separate i32 bound calc would create a saturation-overflow
+/// asymmetry: the gate must use `saturating_add` (else `+`-overflow could
+/// let the bound test pass when arithmetic says no), and the call-site
+/// contribution must reuse the same saturated value (else the `+`-overflow
+/// could re-emerge at the call site). The single helper closes the
+/// asymmetry by computing the bound once.
+///
+/// **Domain guard.** The depth-range check is helper-level defense-in-depth
+/// (M5.C `late_move_reduction` precedent): the helper returns `None` at
+/// `d == 0` or `d > FFP_MAX_DEPTH` even with mathematically passing
+/// `margin`/`alpha` — guards against a refactor that drops the call-site
+/// `depth <= FFP_MAX_DEPTH` gate.
+///
+/// **Overflow defense.** `saturating_add` defends against `i32` overflow
+/// when `static_eval` is near `MATE`. The node-level gate's
+/// `alpha.abs() < MATE_IN_MAX_PLY` makes that case unreachable in
+/// production, but the helper is `pub(crate)` and unit-tested independently
+/// — overflow on a unit-test edge would be a confusing failure.
+///
+/// **Inequality.** `<=` not `<`: a move whose true score could exactly
+/// equal alpha does not improve alpha (fail-soft requires strict
+/// improvement); pruning at equality is the standard CPW form.
+pub(crate) fn ffp_pruned_bound(static_eval: i32, depth: u32, alpha: i32) -> Option<i32> {
+    if depth == 0 || depth > FFP_MAX_DEPTH {
+        return None;
+    }
+    let bound = static_eval.saturating_add(frontier_futility_margin(depth));
+    if bound <= alpha { Some(bound) } else { None }
 }
 
 /// Per-quiet LMR eligibility, applied after the caller has already cleared
@@ -809,8 +894,22 @@ pub(crate) struct AlphaBetaMover {
     lmr_history_candidates: Vec<Move>,
     /// M5.C: root-ply marker for test-only LMR instrumentation. `Some(ply)`
     /// means "record only events that happen at this negamax frame".
+    /// **Reused by M5.D**: gates `ffp_firings` / `ffp_skipped_moves` recording
+    /// to the same `Some(ply)` frame so FFP and LMR instrumentation share
+    /// one trace root.
     #[cfg(test)]
     lmr_trace_root_ply: Option<u32>,
+    /// M5.D: per-`go` count of FFP per-move skips (number of times the
+    /// FFP gate fired and a quiet was skipped without recursion). Test-only
+    /// instrumentation; gated by `#[cfg(test)]` so production builds don't
+    /// carry the field. Naming follows the M5.A `nmp_firings` /
+    /// M5.B `rfp_firings` convention.
+    #[cfg(test)]
+    ffp_firings: u32,
+    /// M5.D: exact quiet moves that took the FFP-skip path at the
+    /// `lmr_trace_root_ply` frame.
+    #[cfg(test)]
+    ffp_skipped_moves: Vec<Move>,
 }
 
 impl AlphaBetaMover {
@@ -841,6 +940,10 @@ impl AlphaBetaMover {
             lmr_history_candidates: Vec::new(),
             #[cfg(test)]
             lmr_trace_root_ply: None,
+            #[cfg(test)]
+            ffp_firings: 0,
+            #[cfg(test)]
+            ffp_skipped_moves: Vec::new(),
         }
     }
 }
@@ -873,6 +976,8 @@ impl Search for AlphaBetaMover {
             self.lmr_researched_moves.clear();
             self.lmr_history_candidates.clear();
             self.lmr_trace_root_ply = None;
+            self.ffp_firings = 0;
+            self.ffp_skipped_moves.clear();
         }
         // M4.A: install the TT and advance its generation once per `go` (ADR-0018 §9).
         self.tt = ctx.tt.clone();
@@ -1383,11 +1488,79 @@ impl AlphaBetaMover {
         // M4.C: quiets that complete recursion without cutting; used for malus on cutoff.
         let mut quiets_searched: MoveList = MoveList::new();
         let lmr_node_eligible = ply > 0 && !is_pv && depth >= LMR_MIN_DEPTH && !in_check(pos);
+
+        // M5.D — FFP node-level gate. `ffp_static_eval == Some(_)` IS the
+        // eligibility predicate; the per-quiet branch matches on
+        // `Some(static_eval)` and skips otherwise. No separate
+        // `ffp_node_eligible: bool` to keep in sync.
+        //
+        // Lazy-dup `static_eval` (and lazy-dup `in_check(pos)`) per ADR-0024
+        // §6 / ADR-0026 §3: this block reads its own `static_eval`
+        // independently of NMP (step 9) and RFP (step 8), so the M5.A/B
+        // reads remain byte-identical and the M5.D SPRT signal is
+        // attributable to FFP alone. At v1 constants, FFP (depth ≤ 2) and
+        // LMR (depth ≥ 3) cannot fire at the same node (compile-time
+        // invariant `FFP_MAX_DEPTH < LMR_MIN_DEPTH`), so any duplicated
+        // `in_check` evaluation is structural only — never per-frame.
+        let ffp_static_eval: Option<i32> = if ply > 0
+            && !is_pv
+            && (1..=FFP_MAX_DEPTH).contains(&depth)
+            && alpha.abs() < MATE_IN_MAX_PLY
+            && !in_check(pos)
+        {
+            let stm = pos.side_to_move();
+            Some(if stm == Color::White {
+                pos.static_eval_white()
+            } else {
+                -pos.static_eval_white()
+            })
+        } else {
+            None
+        };
+
         let mut quiet_index: u32 = 0;
         for (i, &mv) in moves_vec.iter().enumerate() {
             let child_is_pv = is_pv && i == 0;
             let quiet_move = is_quiet(mv);
             let mut move_is_full_depth = true;
+
+            // M5.D — FFP per-move skip (lands BEFORE LMR; ADR-0026 §6).
+            //   - per-quiet, non-capture, non-promo (is_quiet excludes those)
+            //   - alpha is the node's caller-tightened alpha at this point
+            //   - the pruned bound is the move's fail-soft proved upper
+            //     bound, guaranteed `<= alpha` by the gate; never improves
+            //     alpha; never causes a beta cutoff — only floors `best`
+            //   - the contribution is routed through
+            //     `best_is_full_depth_after_score` with `move_is_full_depth
+            //     = false` so the flag is downgraded if the FFP bound
+            //     overwrites a previously full-depth-witnessed `best`
+            //     (load-bearing for TT-store correctness — ADR-0026 §7)
+            //   - FFP-skipped quiets do NOT advance `quiet_index` (semantic:
+            //     `quiet_index` is the considered-for-reduction ordinal,
+            //     not seen-in-ordering — ADR-0025 §3 / ADR-0026 §6) and do
+            //     NOT enter `quiets_searched` (no recursive evidence —
+            //     ADR-0026 §8)
+            if quiet_move
+                && let Some(static_eval) = ffp_static_eval
+                && let Some(pruned_bound) = ffp_pruned_bound(static_eval, depth, alpha)
+            {
+                #[cfg(test)]
+                if self.lmr_trace_root_ply == Some(ply) {
+                    self.ffp_firings += 1;
+                    self.ffp_skipped_moves.push(mv);
+                }
+
+                best_is_full_depth = best_is_full_depth_after_score(
+                    best,
+                    best_is_full_depth,
+                    pruned_bound,
+                    /* move_is_full_depth = */ false,
+                );
+                if pruned_bound > best {
+                    best = pruned_bound;
+                }
+                continue;
+            }
 
             // Decide whether this move takes the LMR path (reduced first
             // pass + conditional full re-search) or the plain full-depth
@@ -1610,6 +1783,8 @@ impl AlphaBetaMover {
         self.lmr_reduced_moves.clear();
         self.lmr_researched_moves.clear();
         self.lmr_history_candidates.clear();
+        self.ffp_firings = 0;
+        self.ffp_skipped_moves.clear();
         self.lmr_trace_root_ply = Some(ply);
         let score = self.negamax(pos, depth, ply, alpha, beta, is_pv, allow_null, ctx, &clock);
         self.lmr_trace_root_ply = None;
@@ -1663,6 +1838,20 @@ impl AlphaBetaMover {
     #[cfg(test)]
     pub(super) fn lmr_history_candidates_for_test(&self) -> &[Move] {
         &self.lmr_history_candidates
+    }
+
+    /// Test-only accessor for the per-`go` FFP firings counter (M5.D).
+    /// Mirrors `nmp_firings_for_test` / `rfp_firings_for_test`.
+    #[cfg(test)]
+    pub(super) fn ffp_firings_for_test(&self) -> u32 {
+        self.ffp_firings
+    }
+
+    /// Test-only accessor for the exact quiets that took the FFP-skip path
+    /// at the traced negamax frame (M5.D).
+    #[cfg(test)]
+    pub(super) fn ffp_skipped_moves_for_test(&self) -> &[Move] {
+        &self.ffp_skipped_moves
     }
 
     /// Test-only setter to install a TT directly without going through
@@ -11021,5 +11210,865 @@ mod tests {
                  got {mv:?} which is not a legal White move at root (descendants leaked into the trace)"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // M5.D — FFP helper and move-loop behavior tests.
+    // -----------------------------------------------------------------------
+
+    // ---- Helper tests for `frontier_futility_margin` ----
+
+    #[test]
+    fn frontier_futility_margin_at_depth_1_is_100() {
+        assert_eq!(
+            frontier_futility_margin(1),
+            100,
+            "depth=1 margin must equal FFP_MARGIN_D1 = 100 cp"
+        );
+    }
+
+    #[test]
+    fn frontier_futility_margin_at_depth_2_is_150() {
+        assert_eq!(
+            frontier_futility_margin(2),
+            150,
+            "depth=2 margin must equal FFP_MARGIN_D2 = 150 cp"
+        );
+    }
+
+    /// Pinned even though FFP_MARGIN_D3 is inactive at v1 (FFP_MAX_DEPTH = 2).
+    /// The constant is defined for forward-compat (post-landing SPRT-tune).
+    #[test]
+    fn frontier_futility_margin_at_depth_3_is_250() {
+        assert_eq!(
+            frontier_futility_margin(3),
+            250,
+            "depth=3 margin must equal FFP_MARGIN_D3 = 250 cp (defined but inactive at v1)"
+        );
+    }
+
+    #[test]
+    fn frontier_futility_margin_at_depth_0_is_0() {
+        assert_eq!(
+            frontier_futility_margin(0),
+            0,
+            "depth=0 must return 0 (out of FFP's active range)"
+        );
+    }
+
+    #[test]
+    fn frontier_futility_margin_at_depth_4_is_0() {
+        assert_eq!(
+            frontier_futility_margin(4),
+            0,
+            "depth=4 must return 0 (above the table)"
+        );
+    }
+
+    /// Anti-vacuous: helper does not always return 0.
+    #[test]
+    fn frontier_futility_margin_anti_vacuous_not_always_zero() {
+        assert_ne!(
+            frontier_futility_margin(1),
+            0,
+            "anti-vacuous: at least one in-domain depth must return non-zero"
+        );
+    }
+
+    // ---- Helper tests for `ffp_pruned_bound` ----
+
+    /// Helper-level domain guard pin: d=0 returns None even if arithmetic
+    /// would otherwise yield a passing condition. Defense-in-depth against a
+    /// future call-site refactor that drops the node-level `depth >= 1` gate.
+    #[test]
+    fn ffp_pruned_bound_returns_none_at_depth_zero() {
+        assert!(
+            ffp_pruned_bound(0, 0, 1_000_000).is_none(),
+            "depth=0 must return None even with arithmetically-passing margin/alpha"
+        );
+    }
+
+    /// Helper-level domain guard pin: d > FFP_MAX_DEPTH returns None.
+    #[test]
+    fn ffp_pruned_bound_returns_none_at_depth_above_max() {
+        assert!(
+            ffp_pruned_bound(0, FFP_MAX_DEPTH + 1, 1_000_000).is_none(),
+            "depth = FFP_MAX_DEPTH + 1 must return None even with arithmetically-passing condition"
+        );
+    }
+
+    /// Boundary inequality `<=` (inclusive at equality), pinned at d=1.
+    /// `0 + 100 == 100 ≤ 100` → fires; `0 + 100 == 100 > 99` → does not fire.
+    /// Pins `<=` → `<` mutation.
+    #[test]
+    fn ffp_pruned_bound_at_depth_1_boundary_inequality_inclusive() {
+        assert_eq!(
+            ffp_pruned_bound(0, 1, 100),
+            Some(100),
+            "boundary equality (static_eval + margin == alpha) must fire FFP at d=1"
+        );
+        assert!(
+            ffp_pruned_bound(0, 1, 99).is_none(),
+            "boundary - 1 (static_eval + margin > alpha) must NOT fire FFP at d=1"
+        );
+    }
+
+    /// Same boundary at d=2 (different margin).
+    #[test]
+    fn ffp_pruned_bound_at_depth_2_boundary_inequality_inclusive() {
+        assert_eq!(
+            ffp_pruned_bound(0, 2, 150),
+            Some(150),
+            "boundary equality must fire FFP at d=2 with margin 150"
+        );
+        assert!(
+            ffp_pruned_bound(0, 2, 149).is_none(),
+            "boundary - 1 must NOT fire FFP at d=2"
+        );
+    }
+
+    /// When `static_eval` is high enough that `alpha - margin < static_eval`,
+    /// the move can already reach alpha without help; FFP must not fire.
+    #[test]
+    fn ffp_pruned_bound_returns_none_when_static_eval_above_alpha_minus_margin() {
+        assert!(
+            ffp_pruned_bound(0, 1, -50).is_none(),
+            "static_eval already at or above alpha - margin must not trigger pruning"
+        );
+    }
+
+    /// Payload arithmetic pin at d=1: bound equals static_eval + 100.
+    /// `static_eval = -200, alpha = 0`: `-200 + 100 = -100 ≤ 0` → Some(-100).
+    #[test]
+    fn ffp_pruned_bound_payload_equals_static_eval_plus_margin_at_d1() {
+        assert_eq!(
+            ffp_pruned_bound(-200, 1, 0),
+            Some(-100),
+            "FFP-proved bound payload at d=1 must equal static_eval + FFP_MARGIN_D1"
+        );
+    }
+
+    /// Payload arithmetic pin at d=2 (different margin).
+    #[test]
+    fn ffp_pruned_bound_payload_equals_static_eval_plus_margin_at_d2() {
+        assert_eq!(
+            ffp_pruned_bound(-200, 2, 0),
+            Some(-50),
+            "FFP-proved bound payload at d=2 must equal static_eval + FFP_MARGIN_D2"
+        );
+    }
+
+    /// Overflow defense: `i32::MAX + 100` saturates to `i32::MAX`. The gate
+    /// `bound <= alpha` with alpha = i32::MAX yields true → Some(i32::MAX).
+    /// No panic.
+    #[test]
+    fn ffp_pruned_bound_does_not_overflow_on_max_static_eval() {
+        let result = ffp_pruned_bound(i32::MAX, 1, i32::MAX);
+        assert_eq!(
+            result,
+            Some(i32::MAX),
+            "saturating_add must keep payload at i32::MAX without overflowing"
+        );
+    }
+
+    // ---- Move-loop behavior tests ----
+
+    /// FFP gate-skip at PV node. Sister fixture: same call with `is_pv = false`.
+    /// Discriminator: `ffp_firings` counter.
+    ///
+    /// At depth=1, root is the FFP-eligible frame; FFP fires per quiet move.
+    /// PV must skip; non-PV must fire at least once.
+    #[test]
+    fn negamax_skips_ffp_at_pv_node() {
+        // Quiet middlegame position with many quiet moves available.
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        // Pick an alpha well above static_eval + margin so FFP fires for every
+        // quiet at depth 1 (margin=100). Add an upper guard against MATE.
+        let alpha = static_eval + frontier_futility_margin(1) + 200;
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab_pv = AlphaBetaMover::new();
+        let _ = ab_pv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, true, true, &ctx);
+
+        let mut ab_nonpv = AlphaBetaMover::new();
+        let _ = ab_nonpv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+
+        assert_eq!(
+            ab_pv.ffp_firings_for_test(),
+            0,
+            "PV node must skip FFP; got {} ffp_firings",
+            ab_pv.ffp_firings_for_test()
+        );
+        assert!(
+            ab_nonpv.ffp_firings_for_test() > 0,
+            "non-PV sister must fire FFP at least once; got 0"
+        );
+    }
+
+    /// FFP gate-skip at ply 0 even with `is_pv = false`. Defense-in-depth
+    /// structural-root guard. Sister: same call with ply = 1.
+    #[test]
+    fn negamax_skips_ffp_at_ply_zero_even_when_is_pv_false() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let alpha = static_eval + frontier_futility_margin(1) + 200;
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab_ply0 = AlphaBetaMover::new();
+        let _ = ab_ply0.negamax_for_test(&mut pos.clone(), 1, 0, alpha, beta, false, true, &ctx);
+
+        let mut ab_ply1 = AlphaBetaMover::new();
+        let _ = ab_ply1.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+
+        assert_eq!(
+            ab_ply0.ffp_firings_for_test(),
+            0,
+            "ply=0 must skip FFP regardless of is_pv; got {}",
+            ab_ply0.ffp_firings_for_test()
+        );
+        assert!(
+            ab_ply1.ffp_firings_for_test() > 0,
+            "ply=1 sister must fire FFP at least once; got 0"
+        );
+    }
+
+    /// FFP gate-skip when in check.
+    /// Sister: not-in-check fixture.
+    ///
+    /// **Legal-position invariant.** Both fixtures must be LEGAL chess
+    /// positions (only the side-to-move can be in check; the opposite side
+    /// must not be). FFP's move loop runs on the gate-skipped arm too (it
+    /// just doesn't fire FFP); a movegen capture of the opponent's king
+    /// would only be emitted from an illegal position. RFP's analogous
+    /// test escapes this constraint because RFP returns early without
+    /// running the move loop, but FFP does iterate.
+    #[test]
+    fn negamax_skips_ffp_when_in_check() {
+        use crate::movegen::in_check;
+
+        // In-check fixture (legal): White Kh1 in check from Black Bd5
+        // along the d5-h1 diagonal. Black king on e8; not attacked by
+        // White's lone king.
+        let pos_check =
+            Position::from_fen("4k3/8/8/3b4/8/8/8/7K w - - 0 1").expect("in-check FEN must parse");
+        // Sister (legal, not-in-check): standard middlegame, White to
+        // move, neither side in check, plenty of quiet moves available.
+        let pos_no_check =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("no-check FEN must parse");
+
+        assert!(in_check(&pos_check), "fixture must be in check");
+        assert!(
+            !in_check(&pos_no_check),
+            "sister fixture must NOT be in check"
+        );
+
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+
+        // Each arm gets its own alpha derived from its own static_eval, so
+        // both arms have an FFP-passing alpha (we don't need both to fire,
+        // but we need the no-check sister to fire and the in-check arm to
+        // be blocked by the gate alone).
+        let alpha_check = stm_static_eval(&pos_check) + frontier_futility_margin(1) + 200;
+        let alpha_no_check = stm_static_eval(&pos_no_check) + frontier_futility_margin(1) + 200;
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab_check = AlphaBetaMover::new();
+        let _ = ab_check.negamax_for_test(
+            &mut pos_check.clone(),
+            1,
+            1,
+            alpha_check,
+            beta,
+            false,
+            true,
+            &ctx,
+        );
+
+        let mut ab_no = AlphaBetaMover::new();
+        let _ = ab_no.negamax_for_test(
+            &mut pos_no_check.clone(),
+            1,
+            1,
+            alpha_no_check,
+            beta,
+            false,
+            true,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab_check.ffp_firings_for_test(),
+            0,
+            "in-check node must skip FFP; got {}",
+            ab_check.ffp_firings_for_test()
+        );
+        assert!(
+            ab_no.ffp_firings_for_test() > 0,
+            "not-in-check sister must fire FFP at least once; got 0"
+        );
+    }
+
+    /// FFP gate-skip at depth above FFP_MAX_DEPTH. Sister: depth = FFP_MAX_DEPTH.
+    /// Pins `<=` boundary at FFP_MAX_DEPTH (catches `<= → <` mutation).
+    #[test]
+    fn negamax_skips_ffp_at_depth_above_max() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(8);
+        let static_eval = stm_static_eval(&pos);
+        let alpha = static_eval + frontier_futility_margin(2) + 200;
+        let beta = MATE_IN_MAX_PLY;
+
+        // depth = FFP_MAX_DEPTH + 1 = 3 → root gate fails. The counter is
+        // gated to `lmr_trace_root_ply == Some(1)`, so only firings at the
+        // root frame (ply == 1) are recorded. The root frame's depth-3 fails
+        // the `depth <= FFP_MAX_DEPTH` gate, so the counter stays 0. FFP
+        // firings at descendant frames (ply > 1, depth ≤ 2) are NOT counted
+        // — those plies don't match the trace root. The test discriminates
+        // the boundary at the root frame only; descendant FFP behavior is
+        // covered separately by `negamax_skips_ffp_at_pv_node` and friends.
+        let mut ab_above = AlphaBetaMover::new();
+        let _ = ab_above.negamax_for_test(
+            &mut pos.clone(),
+            FFP_MAX_DEPTH + 1,
+            1,
+            alpha,
+            beta,
+            false,
+            true,
+            &ctx,
+        );
+
+        // Sister: depth = FFP_MAX_DEPTH = 2 → root gate passes; FFP fires.
+        let mut ab_at = AlphaBetaMover::new();
+        let _ = ab_at.negamax_for_test(
+            &mut pos.clone(),
+            FFP_MAX_DEPTH,
+            1,
+            alpha,
+            beta,
+            false,
+            true,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab_above.ffp_firings_for_test(),
+            0,
+            "depth = FFP_MAX_DEPTH + 1 must skip FFP at this frame; got {}",
+            ab_above.ffp_firings_for_test()
+        );
+        assert!(
+            ab_at.ffp_firings_for_test() > 0,
+            "depth = FFP_MAX_DEPTH sister must fire FFP at least once; got 0"
+        );
+    }
+
+    /// FFP gate-skip when `alpha.abs() >= MATE_IN_MAX_PLY`. The mate-window
+    /// guard is load-bearing because centipawn margins are meaningless at
+    /// near-mate alpha. Sister: alpha well below MATE_IN_MAX_PLY.
+    #[test]
+    fn negamax_skips_ffp_when_alpha_near_mate() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let beta = MATE;
+
+        // Mate-magnitude alpha: gate `alpha.abs() < MATE_IN_MAX_PLY` fails →
+        // FFP never fires.
+        let alpha_mate = MATE_IN_MAX_PLY;
+        let mut ab_mate = AlphaBetaMover::new();
+        let _ =
+            ab_mate.negamax_for_test(&mut pos.clone(), 1, 1, alpha_mate, beta, false, true, &ctx);
+
+        // Sister: ordinary high alpha (FFP fires).
+        let static_eval = stm_static_eval(&pos);
+        let alpha_normal = static_eval + frontier_futility_margin(1) + 200;
+        // Defensive: ensure sister alpha is well below MATE_IN_MAX_PLY.
+        assert!(
+            alpha_normal.abs() < MATE_IN_MAX_PLY,
+            "test fixture invariant: sister alpha must satisfy mate-window gate; \
+             got alpha={alpha_normal}, MATE_IN_MAX_PLY={MATE_IN_MAX_PLY}"
+        );
+        let mut ab_normal = AlphaBetaMover::new();
+        let _ = ab_normal.negamax_for_test(
+            &mut pos.clone(),
+            1,
+            1,
+            alpha_normal,
+            MATE_IN_MAX_PLY,
+            false,
+            true,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab_mate.ffp_firings_for_test(),
+            0,
+            "alpha = MATE_IN_MAX_PLY must skip FFP via mate-window gate; got {}",
+            ab_mate.ffp_firings_for_test()
+        );
+        assert!(
+            ab_normal.ffp_firings_for_test() > 0,
+            "ordinary-alpha sister must fire FFP at least once; got 0"
+        );
+    }
+
+    /// FFP must not fire on capture moves (only on quiets). Fixture: a position
+    /// where every legal move is a capture — FFP firings count must be 0.
+    /// Sister: a position with quiets — FFP fires at least once.
+    #[test]
+    fn negamax_skips_ffp_for_capture_moves() {
+        // Captures-only fixture: White K, Black K, single White piece that can
+        // only capture. Construct: White Kg1 + queen on a1 attacking only Black
+        // K at b2 — but the king cannot be captured; movegen would find the K-K
+        // adjacency illegal. Use a position where the only legal move is a
+        // capture.
+        //
+        // Simpler: White K e1 + Q d4. Black K e6, B d5. White to move; only
+        // legal moves include the queen capture Qxd5 alongside several quiets.
+        // We can't truly construct "captures only" without contrivances. Use a
+        // pawn-up endgame with at least one capture and assert FFP doesn't fire
+        // on the capture by checking the captured square doesn't appear in
+        // ffp_skipped_moves.
+        let pos = Position::from_fen("4k3/8/4p3/3P4/8/8/8/4K3 w - - 0 1").expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let alpha = static_eval + frontier_futility_margin(1) + 200;
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+
+        // The capture move d5xe6: assert it is NOT in the FFP-skipped move list.
+        let capture = Move::from_uci("d5e6", &pos).expect("d5e6 must be a legal capture");
+        let skipped: Vec<Move> = ab.ffp_skipped_moves_for_test().to_vec();
+        assert!(
+            !skipped.contains(&capture),
+            "the d5xe6 capture must NOT appear in the FFP-skipped move list; \
+             skipped = {skipped:?}"
+        );
+
+        // Anti-vacuous: at least one quiet is in the skipped list (king moves).
+        assert!(
+            !skipped.is_empty(),
+            "anti-vacuous: at least one quiet (king move) must be FFP-skipped; \
+             skipped = {skipped:?}"
+        );
+
+        // Counter / list invariant: ffp_firings must equal the length of the
+        // ffp_skipped_moves list. Catches a bug where one tracking field is
+        // updated but not the other (e.g., increment counter on captures
+        // without pushing to the move list, or vice versa).
+        assert_eq!(
+            ab.ffp_firings_for_test() as usize,
+            skipped.len(),
+            "ffp_firings counter must match the length of ffp_skipped_moves; \
+             got firings={}, skipped.len()={}",
+            ab.ffp_firings_for_test(),
+            skipped.len()
+        );
+    }
+
+    /// FFP fires at least once when all gates pass and the per-quiet condition
+    /// holds (`static_eval + margin <= alpha`). Pins the positive case.
+    #[test]
+    fn negamax_fires_ffp_when_quiet_cannot_reach_alpha() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        // alpha well above static_eval + margin so FFP fires for every quiet
+        // at depth 1.
+        let alpha = static_eval + frontier_futility_margin(1) + 200;
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+
+        assert!(
+            ab.ffp_firings_for_test() > 0,
+            "FFP must fire at least once when gates pass and condition holds; got 0"
+        );
+    }
+
+    /// Exact firings-counter pin (mirrors M5.B `rfp_firings_counter_increments_on_cutoff`).
+    /// At depth=1, a quiet position with N legal quiet moves and 0 captures →
+    /// FFP fires exactly N times. Captures-only mixed positions are handled in
+    /// `negamax_skips_ffp_for_capture_moves`.
+    #[test]
+    fn ffp_firings_counter_increments_on_skip() {
+        // King-only fixture: only legal moves are king moves (all quiet);
+        // count them and assert ffp_firings == count.
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").expect("KvK FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let alpha = static_eval + frontier_futility_margin(1) + 200;
+        let beta = MATE_IN_MAX_PLY;
+
+        // Count expected legal quiet moves up front.
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let expected_quiets: u32 = ml.iter().filter(|m| is_quiet(*m)).count() as u32;
+        assert!(
+            expected_quiets > 0,
+            "test fixture invariant: position must have at least one legal quiet move"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+
+        assert_eq!(
+            ab.ffp_firings_for_test(),
+            expected_quiets,
+            "FFP must fire exactly once per legal quiet move at this fixture; \
+             expected {expected_quiets}, got {}",
+            ab.ffp_firings_for_test()
+        );
+    }
+
+    /// FFP-skipped quiets must NOT enter `quiets_searched` (would otherwise
+    /// receive history malus on a later beta cutoff at the same node, training
+    /// history on coarse static-comparison-rejected moves). ADR-0026 §8.
+    /// Anti-vacuous sister: at this node a non-skipped quiet exists (e.g. a
+    /// capture or non-FFP-eligible move) and IS recorded in lmr_history_candidates.
+    #[test]
+    fn ffp_skipped_quiet_does_not_enter_quiets_searched() {
+        // KvK-only fixture: only quiet moves; all FFP-skipped at the configured
+        // alpha. Every move enters ffp_skipped_moves; none enters
+        // lmr_history_candidates (which represents quiets_searched recordings).
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").expect("KvK FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let alpha = static_eval + frontier_futility_margin(1) + 200;
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+
+        let skipped: Vec<Move> = ab.ffp_skipped_moves_for_test().to_vec();
+        let history_candidates: Vec<Move> = ab.lmr_history_candidates_for_test().to_vec();
+
+        // Anti-vacuous (skipped side): at least one quiet was FFP-skipped.
+        assert!(
+            !skipped.is_empty(),
+            "fixture must FFP-skip at least one quiet; got 0"
+        );
+
+        // Main assertion: no FFP-skipped move appears in quiets_searched.
+        for mv in &skipped {
+            assert!(
+                !history_candidates.contains(mv),
+                "FFP-skipped quiet {mv:?} must NOT enter quiets_searched; \
+                 history_candidates = {history_candidates:?}"
+            );
+        }
+    }
+
+    /// Anti-vacuous sister to `ffp_skipped_quiet_does_not_enter_quiets_searched`:
+    /// when alpha is set so FFP does NOT fire (alpha well below static_eval),
+    /// quiets are searched normally and at least one enters quiets_searched.
+    /// This proves the previous test's assertion is non-vacuous (lmr_history_candidates
+    /// is populated by the trace at this ply when FFP doesn't intercept).
+    #[test]
+    fn negamax_full_depth_quiet_enters_quiets_searched_when_ffp_does_not_fire() {
+        // KR-vs-K fixture (reused from M5.C): all moves are quiets; with alpha
+        // = -INF, FFP cannot fire (no positive margin can make
+        // static_eval + margin <= -INF), so quiets are searched normally.
+        let pos =
+            Position::from_fen("4k3/8/8/8/8/8/8/2R1K3 w - - 0 1").expect("KR vs K FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+
+        // FFP did not fire at all (alpha = -INF blocks every positive margin).
+        assert_eq!(
+            ab.ffp_firings_for_test(),
+            0,
+            "FFP must not fire when alpha = -INF; got {}",
+            ab.ffp_firings_for_test()
+        );
+
+        // Anti-vacuous: at least one quiet entered quiets_searched (proves the
+        // previous test's "no FFP-skipped move appears in quiets_searched"
+        // assertion is non-vacuous).
+        assert!(
+            !ab.lmr_history_candidates_for_test().is_empty(),
+            "at least one full-depth quiet must enter quiets_searched when FFP does not fire"
+        );
+    }
+
+    /// Sign-convention pin: with Black to move, FFP must use the STM-relative
+    /// static eval (`-static_eval_white`), NOT the raw white-relative value.
+    /// Failure mode under a sign-flip bug: FFP would fire when the white-side
+    /// score `+W + margin <= alpha` instead of the black-side score
+    /// `-W + margin <= alpha`. For a position where +W is large and -W is
+    /// small, the sign-bug fires when it shouldn't, and vice versa.
+    ///
+    /// Fixture: a Black-to-move position whose `static_eval_white` is positive
+    /// (White-favored); from STM=Black's perspective the eval is negative.
+    /// Set `alpha` so that `-W + margin <= alpha` (FFP fires for the correct
+    /// STM-relative test) but `+W + margin > alpha` (would NOT fire under a
+    /// sign-flip bug — FFP firings would be 0).
+    #[test]
+    fn negamax_ffp_with_black_to_move_uses_stm_relative_not_white_relative_static_eval() {
+        // White-favored quiet middlegame, Black to move. PeSTO MG eval is
+        // dominated by the f1 bishop pair / better king safety. We confirm
+        // sign by reading `static_eval_white()` directly (must be positive).
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 b - - 0 9")
+                .expect("FEN must parse");
+        let static_eval_white = pos.static_eval_white();
+        let stm_eval = stm_static_eval(&pos);
+        assert!(
+            static_eval_white > 0,
+            "fixture invariant: static_eval_white must be positive (White-favored); got {static_eval_white}"
+        );
+        assert!(
+            stm_eval < 0,
+            "fixture invariant: STM-relative eval (Black) must be negative; got {stm_eval}"
+        );
+
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        // Pick alpha such that:
+        //   stm_eval + 100 ≤ alpha  (correct: FFP fires at d=1)
+        //   −stm_eval + 100 > alpha (sign-flip bug: would NOT fire)
+        // Concretely, set alpha = stm_eval + 100 (boundary inclusive), and
+        // confirm |stm_eval| + 100 > alpha.
+        let alpha = stm_eval + frontier_futility_margin(1);
+        assert!(
+            -stm_eval + frontier_futility_margin(1) > alpha,
+            "sign-discriminator: under a sign-flip bug, FFP must NOT fire for this alpha"
+        );
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+
+        assert!(
+            ab.ffp_firings_for_test() > 0,
+            "FFP must fire when STM-relative eval + margin <= alpha; \
+             got 0 firings (likely a sign-flip bug — code is using +static_eval_white \
+             instead of negating for Black STM)"
+        );
+    }
+
+    /// Pruned-bound contribution to `best` is visible in the returned score
+    /// when no other move improved alpha. Pinned to **exact equality**, not
+    /// `>=`, in a single-move fixture so the result is determined entirely by
+    /// the FFP contribution. A stub returning the constant directly would be
+    /// killed by the firings-counter pin (firings would be 0).
+    ///
+    /// ADR-0026 §7 / research §13 Pitfall 6: without the contribution, the
+    /// node's `best = -INF` would propagate to the parent as +INF, registering
+    /// a phantom fail-high.
+    #[test]
+    fn negamax_ffp_pruned_bound_contributed_to_best_when_only_pruned_quiets() {
+        // KvK with one legal quiet (a king move). At alpha well above
+        // static_eval + 100, FFP fires for that king move; no other move runs.
+        // Returned score must equal exactly `static_eval + 100` (the pruned
+        // bound), NOT -INF.
+        //
+        // Use a position with EXACTLY one legal move where possible. KvK has 5
+        // king moves typically; we don't need exactly one. We need: every move
+        // is FFP-skipped, AND nothing improves `best` past the pruned bound.
+        // Because all king moves at this position have the same parent
+        // static_eval, all pruned bounds are equal to static_eval + 100. So
+        // `best` = static_eval + 100 regardless of how many quiets fire.
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").expect("KvK FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let alpha = static_eval + frontier_futility_margin(1) + 200;
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab = AlphaBetaMover::new();
+        let score = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+
+        // Anti-stub: if the implementation always returned static_eval+margin
+        // without firing FFP, this assertion would still pass — but the
+        // firings counter would be 0. Pin both.
+        assert!(
+            ab.ffp_firings_for_test() > 0,
+            "FFP must fire (else the bound contribution is vacuous); got 0"
+        );
+
+        let expected = static_eval + frontier_futility_margin(1);
+        assert_eq!(
+            score, expected,
+            "returned score must equal exactly static_eval + FFP_MARGIN_D1 \
+             when every legal move is FFP-skipped; expected {expected}, got {score}"
+        );
+    }
+
+    /// Provenance-downgrade pin (ADR-0026 §7, load-bearing TT-store
+    /// correctness). The mixed case to discriminate:
+    ///
+    ///   1. A non-quiet move (capture) is searched at full depth, returns
+    ///      `capture_score`, and updates `best = capture_score, flag = true`.
+    ///   2. An FFP-pruned quiet contributes `pruned_bound > capture_score`
+    ///      and **also `pruned_bound ≤ alpha`** (so it does not improve
+    ///      alpha, but DOES update `best` past the capture's score).
+    ///   3. End of loop: under WITHOUT-downgrade, `best = pruned_bound,
+    ///      flag = true (stale)`, `best ≤ original_alpha` → would store
+    ///      Upper at depth 1 with score = pruned_bound (inflated coarse-
+    ///      static bound). Under WITH-downgrade, `flag = false`, store is
+    ///      suppressed.
+    ///
+    /// To reach this regime, two fixture invariants must hold simultaneously:
+    /// (a) `pruned_bound ≤ alpha` (FFP fires); (b) `pruned_bound >
+    /// capture_score` (so the FFP contribution improves `best`, exercising
+    /// the strict-improvement-with-reduced-only-provenance arm of
+    /// `best_is_full_depth_after_score`). The fixture below uses a position
+    /// where White is up a queen and the only available captures are
+    /// Q-for-P trades that LOSE the queen on the recapture. The capture's
+    /// qsearch return is therefore a large negative number (~-900 cp from
+    /// White's perspective), while `pruned_bound = static_eval + 100` is
+    /// roughly +900 cp (White's pre-move material advantage). So
+    /// `pruned_bound > capture_score` by ~1800 cp, structurally guaranteed.
+    /// We additionally assert this invariant at runtime via the post-search
+    /// state.
+    ///
+    /// `alpha` is set just below the mate-window ceiling so it is trivially
+    /// above `pruned_bound` (FFP fires for quiets) and trivially above any
+    /// realistic capture score (so the capture cannot improve alpha).
+    ///
+    /// Anti-vacuous sister: same fixture with `alpha = -INF`. FFP cannot
+    /// fire; capture improves best from -INF; `best > original_alpha` →
+    /// Exact bound stored. TT entry IS present (proves the suppression
+    /// assertion is non-vacuous — the TT path is reachable when FFP is
+    /// not blocking it).
+    #[test]
+    fn negamax_ffp_contribution_downgrades_best_is_full_depth() {
+        // Fixture: White Kg1 + Qd4 vs Black Ke8 + pd7. The only legal
+        // capture is Qxd7 — pd7 is defended by Ke8, so the queen is
+        // recaptured (Kxd7), losing Q for P. The capture's qsearch score
+        // from White's perspective lands well below `pruned_bound`.
+        // Quiets are king moves and queen non-capture moves. The runtime
+        // invariants below pin the regime structurally.
+        let pos = Position::from_fen("4k3/3p4/8/8/3Q4/8/8/6K1 w - - 0 1").expect("FEN must parse");
+
+        // Verify the position has at least one capture and one quiet so the
+        // mixed case is possible.
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let n_quiets: usize = ml.iter().filter(|m| is_quiet(*m)).count();
+        let n_captures: usize = ml.iter().filter(|m| !is_quiet(*m)).count();
+        assert!(
+            n_captures >= 1 && n_quiets >= 1,
+            "fixture invariant: at least one capture and one quiet; got {n_captures} captures, {n_quiets} quiets"
+        );
+        // Confirm the only capture is Qxd7 (a losing capture defended by king).
+        let captures: Vec<Move> = ml.iter().filter(|m| !is_quiet(*m)).collect();
+        assert_eq!(
+            captures.len(),
+            1,
+            "fixture invariant: exactly one capture in this fixture (Qxd7); got {} captures",
+            captures.len()
+        );
+
+        // Fixture-pre-move static_eval (used to compute expected pruned_bound).
+        let static_eval = stm_static_eval(&pos);
+        let pruned_bound_d1 = static_eval + frontier_futility_margin(1);
+
+        // alpha is set just below the mate-window gate's ceiling. No realistic
+        // depth-1 capture can score this high, so the capture cannot improve
+        // alpha — it only improves `best` from -INF and sets the flag, leaving
+        // the FFP contribution to overwrite `best` and discriminate the
+        // downgrade behavior.
+        let alpha = MATE_IN_MAX_PLY - 100; // 29836; |alpha| < MATE_IN_MAX_PLY = 29936.
+        assert!(
+            alpha.abs() < MATE_IN_MAX_PLY,
+            "fixture invariant: alpha must satisfy mate-window FFP gate; \
+             got alpha={alpha}, MATE_IN_MAX_PLY={MATE_IN_MAX_PLY}"
+        );
+        assert!(
+            pruned_bound_d1 < alpha,
+            "fixture invariant: pruned_bound (={pruned_bound_d1}) must be below alpha (={alpha}) so FFP fires"
+        );
+        let beta = MATE_IN_MAX_PLY;
+
+        // Test arm: with FFP active. Provide a TT and check post-search whether
+        // an entry exists at the test node's Zobrist key.
+        let tt_test = Arc::new(TranspositionTable::new(1));
+        let (ctx_test, _stop_test) = non_aborting_ctx_at_depth_with_tt(4, tt_test.clone());
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(tt_test.clone()));
+        // Advance the generation once (mirroring `Search::go`'s behavior — the
+        // store path requires the per-search generation counter to be set).
+        tt_test.new_search();
+        let returned_score =
+            ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx_test);
+        let firings = ab.ffp_firings_for_test();
+        assert!(
+            firings > 0,
+            "fixture invariant: FFP must fire (anti-vacuous for the suppression assertion); got 0"
+        );
+        // Runtime invariant for the regime under test: the returned score
+        // must equal `pruned_bound`. This proves both:
+        //   (a) the FFP contribution actually overwrote `best` past the
+        //       capture's score (i.e., `pruned_bound > capture_score` —
+        //       the strict-improvement-with-reduced-only-provenance arm
+        //       was reached);
+        //   (b) the FFP contribution was the LAST thing to update `best`
+        //       (no quiet recursion produced a higher score that would
+        //       have overwritten it again).
+        // If either fails, the regime is not exercised and the suppression
+        // assertion below is vacuous.
+        assert_eq!(
+            returned_score, pruned_bound_d1,
+            "regime-exercised invariant: returned score ({returned_score}) must equal pruned_bound \
+             ({pruned_bound_d1}); the FFP contribution must be the highest-scoring move at this node \
+             for the downgrade arm to fire"
+        );
+        let entry_after_ffp = tt_test.probe(pos.zobrist());
+        // The load-bearing assertion: NO Upper-bounded entry exists at
+        // depth=1 for this key from the FFP-influenced root frame. Without
+        // the downgrade, the captured-flag-true path would store Upper at
+        // score = pruned_bound (inflated coarse-static-witness bound). With
+        // the downgrade, the store is suppressed.
+        if let Some(e) = entry_after_ffp {
+            assert!(
+                !(e.depth as u32 == 1 && matches!(e.bound(), TtBound::Upper)),
+                "FFP suppression failed: stored Upper entry at depth=1 with score={} \
+                 (would be inflated coarse-static-witness bound)",
+                e.score
+            );
+        }
+
+        // Anti-vacuous sister: alpha = -INF → FFP cannot fire (no positive
+        // margin satisfies static_eval + margin ≤ -INF). The capture is
+        // searched at full depth; its score updates `best` past
+        // original_alpha = -INF → Exact bound stored. TT entry IS present
+        // (proves the suppression assertion is non-vacuous — the TT path is
+        // reachable when FFP is not blocking it).
+        let tt_sister = Arc::new(TranspositionTable::new(1));
+        let (ctx_sister, _stop_sister) = non_aborting_ctx_at_depth_with_tt(4, tt_sister.clone());
+        let mut ab_sister = AlphaBetaMover::new();
+        ab_sister.set_tt_for_test(Some(tt_sister.clone()));
+        tt_sister.new_search();
+        let _ =
+            ab_sister.negamax_for_test(&mut pos.clone(), 1, 1, -INF, INF, false, true, &ctx_sister);
+        assert_eq!(
+            ab_sister.ffp_firings_for_test(),
+            0,
+            "sister fixture invariant: FFP must NOT fire under alpha = -INF; got {}",
+            ab_sister.ffp_firings_for_test()
+        );
+        assert!(
+            tt_sister.probe(pos.zobrist()).is_some(),
+            "sister: with FFP not firing, the TT path must be reachable and an entry stored \
+             (proves the FFP-test assertion is non-vacuous)"
+        );
     }
 }

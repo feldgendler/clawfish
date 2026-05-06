@@ -22,22 +22,29 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > path (frontier futility, qsearch correctness + TT, singular extensions;
 > eval improvements; NNUE) is tracked in [`docs/roadmap.md`](docs/roadmap.md).
 >
-> **Current strength: ~2657 Elo on Stockfish 18 UCI_LimitStrength scale
-> at fast-TC-weighted mixed TC** (M5.C end, 2026-05-05). Mixed-TC rating
-> estimate via the in-process ELOH harness with Robbins-Monro iteration:
+> **Current strength: ~2664 Elo on Stockfish 18 UCI_LimitStrength scale
+> at uniform mixed TC** (M5.D, 2026-05-06; estimated 2663.95 ± 47.75,
+> statistically indistinguishable from M5.C's 2657 ± 16.49 anchor).
+> M5.D's mixed-TC SPRT vs `baseline/m5c-lmr` was **inconclusive** at v1
+> parameters (Δ Elo −6.95 [−32.50, +18.53] at 400 games; per-TC
+> bimodal: positive at fast TC, negative at slow TC); `baseline/m5d-ffp`
+> NOT tagged. Mixed-TC rating estimate via the in-process ELOH harness
+> with Robbins-Monro iteration:
 >
 > | Metric | Value |
 > |---|---|
-> | Converged Elo | **2657.44 ± 16.49** |
-> | Games | 38 (19 pairs) |
-> | W-L-D | 12 / 16 / 10 (44.7% score) |
+> | Estimated Elo (M5.D) | **~2664 ± 48** (anchor 2657 + Δ +6.95 [−40.64, +54.80]) |
+> | Anchor (M5.C) | 2657.44 ± 16.49 |
+> | Games | 200 (100 pairs) |
+> | W-L-D | 80 / 76 / 44 (51.0% score) |
 > | TC mix | `--tc-sample 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1` (uniform 4-bucket) |
-> | TC sampled | 14 / 12 / 4 / 8 games (early σ-stop fired before TC balance — fast-TC-weighted) |
-> | Stop reason | σ-stop |
+> | TC sampled | 44 / 50 / 52 / 54 games (frozen K + disabled σ-stop; full 200 games complete) |
+> | Stop reason | max-games |
 >
 > Apple M4 P-cores (utility QoS), single thread, no pondering, virtual
-> clock on clawfish. Methodology + per-TC distribution caveat:
-> [`bench/sprt/2026-05-05-m5.c-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-05-m5.c-mixed-tc-rating-estimate.md).
+> clock on clawfish. M5.D rating-estimate methodology + per-TC pattern:
+> [`bench/sprt/2026-05-06-m5.d-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-06-m5.d-mixed-tc-rating-estimate.md).
+> M5.C anchor methodology: [`bench/sprt/2026-05-05-m5.c-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-05-m5.c-mixed-tc-rating-estimate.md).
 >
 > M5.C's mixed-TC SPRT vs `baseline/m5b-rfp` (M5.B end) — **H1 accepted in
 > 144 games / 72 pairs**, Δ Elo **+145.47 [+100.12, +196.09]** (pentanomial
@@ -66,14 +73,14 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > clawfish-vs-clawfish SPRT logistic Elo measures relative strength
 > tightly but doesn't transfer additively to UCI_Elo space.
 >
-> **Current bench:** `bench: 1651610 nodes <NPS> nps` at default depth 7
-> (M5.C end; node count is deterministic, NPS is wallclock-dependent).
-> Down from M5.B's 3,355,270 nodes — −50.8% additional reduction from
-> late move reductions composing with RFP + NMP + M4's TT/killer/history/
-> aspiration ordering; down from M3.F's 172,312,700 — ~99% cumulative
-> reduction from TT + killer + history + aspiration + NMP + RFP + LMR. Run
-> `printf 'bench\nquit\n' | ./target/release/clawfish` to reproduce
-> the node count.
+> **Current bench:** `bench: 1414405 nodes <NPS> nps` at default depth 7
+> (M5.D end; node count is deterministic, NPS is wallclock-dependent).
+> Down from M5.C's 1,651,610 nodes — −14.4% additional reduction from
+> frontier futility pruning composing with LMR + RFP + NMP + M4's
+> TT/killer/history/aspiration ordering; down from M3.F's 172,312,700 —
+> ~99% cumulative reduction from TT + killer + history + aspiration + NMP
+> + RFP + LMR + FFP. Run `printf 'bench\nquit\n' | ./target/release/clawfish`
+> to reproduce the node count.
 
 ## Build
 

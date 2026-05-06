@@ -27,7 +27,18 @@ Per-unit `cargo mutants --in-diff` runs that are deferred from the unit's commit
 
 ## Pending
 
-_(no pending campaigns)_
+### M5.D — Frontier futility pruning (`--in-diff` campaign deferred to overnight backlog)
+
+Per the M5.A/B/C precedent. Anticipated catchable surface (~25 mutants, mostly on `frontier_futility_margin` / `ffp_pruned_bound` / the move-loop FFP block):
+
+- `frontier_futility_margin`: per-depth match arms (`1 => FFP_MARGIN_D1`, etc.). Direct value mutations killed by the per-depth pin tests.
+- `ffp_pruned_bound`: `depth == 0`, `depth > FFP_MAX_DEPTH`, `<= alpha`, `Some(bound)` payload, `saturating_add` substitution. Domain guard mutations killed by `ffp_pruned_bound_returns_none_at_depth_zero` / `_above_max`. Inequality-direction mutations killed by `_at_depth_1_boundary_inequality_inclusive` / `_at_depth_2_boundary_inequality_inclusive`. Payload mutations killed by `_payload_equals_static_eval_plus_margin_at_d1` / `_d2`. Saturation mutations killed by `_does_not_overflow_on_max_static_eval`.
+- Move-loop FFP block: `quiet_move &&`, `if let Some(static_eval) = ...`, `if let Some(pruned_bound) = ...`, `move_is_full_depth = false`, `pruned_bound > best`, `continue`. Gate-skip mutations killed by `negamax_skips_ffp_at_*` tests; firing mutations killed by `negamax_fires_ffp_when_quiet_cannot_reach_alpha` and `ffp_firings_counter_increments_on_skip`; `quiet_move &&` mutations killed by `negamax_skips_ffp_for_capture_moves`. Sign-convention mutations killed by `negamax_ffp_with_black_to_move_uses_stm_relative_not_white_relative_static_eval`. Provenance-downgrade `move_is_full_depth = false` → `true` mutation killed by `negamax_ffp_contribution_downgrades_best_is_full_depth`. Pruned-bound contribution mutations killed by `negamax_ffp_pruned_bound_contributed_to_best_when_only_pruned_quiets` (equality-strength).
+
+**Anticipated survivors:**
+
+- The `match` arm `_ => 0` in `frontier_futility_margin` may have a `delete _ => 0` survivor that's structurally undetectable (no test exercises a depth that's both > 3 and inside the match's domain). Deferred to a future campaign or accepted as equivalent.
+- The compile-time `assert!(FFP_MAX_DEPTH < LMR_MIN_DEPTH)` is not a runtime mutant target; cargo-mutants doesn't mutate `const _: () = assert!(...)` blocks.
 
 ---
 
