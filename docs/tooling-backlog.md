@@ -29,6 +29,26 @@ Usage: `cargo run --release --bin elo-iterate -- --engine <path> --opponent <pat
 
 **Estimated cost vs. payoff.** The current deferral is acceptable because (a) the ELOH.B back-validation gate (Part 1: 120-game online run vs M3.F's ~2114 ± 2σ) catches dispatch-level structural bugs end-to-end; (b) a future controller refactor with real bugs is also catchable by ELOH.C's self-play stress under `--go-nodes`. The mock harness pays back when running mutation tests against the controller surface becomes cheap enough that catching boundary mutants surfaces small bugs early.
 
+### EPD diagnostic suites — WAC and STS regression harness
+
+**Purpose.** Deterministic per-position best-move scoring against canonical public diagnostic suites: **WAC** (Win at Chess; 300 tactical positions, single `bm` solution) and **STS** (Strategic Test Suite; 1500 themed positions across 15 strategy themes, weighted multi-move `c0` scoring). Complements SPRT — SPRT measures relative game-playing strength stochastically over a game distribution; WAC/STS measure absolute correctness on a fixed corpus deterministically. WAC for tactical health (catches pruning regressions that fast-TC SPRT might miss); STS for positional / eval health (per-theme breakdown attributes regressions to specific eval components).
+
+**Surfaced.** During the M5.D `/my-explain` walkthrough on 2026-05-06, when the user asked how frontier futility handles tactical quiet moves (direct checks, discovered checks, mate-in-1, fork setups). Futility pruning accepts statistical risk for speedup; WAC catches tactical mis-prunes that fast-TC SPRT might pass but slow-TC games would reveal. STS becomes load-bearing in M6 (eval improvements), where each new eval term should defend itself via per-theme score change on the relevant group.
+
+**Scope.** EPD parser handling `bm` + `c0` opcodes; per-position runner that issues `position fen <FEN>` → `go movetime <T>` → captures `bestmove` → scores against the annotation. Aggregate output: total score + per-theme breakdown for STS. Both suites are public-domain EPD; vendor under `bench/data/`. Separate `src/bin/epd-suite.rs` binary; not in CI by default (multi-hour wallclock at meaningful per-position time).
+
+**When to land.**
+- **M5.D-class plan-review trigger.** If a futility / pruning phase's plan-reviewer pushes on tactical-soundness, land alongside or before the phase as the empirical answer beyond "SPRT was positive."
+- **Mandatory before M6.A.** M6 per-phase plans should reference per-theme STS deltas, not just aggregate Elo.
+
+**Implementation notes.**
+- WAC: 300 × 5–30s/position ≈ 25min–2.5h wallclock; trivially parallelisable across positions.
+- STS: 1500 × 5–30s/position ≈ 2h–12h; STS-Elo regression `Elo ≈ 44.523 · (points/100) − 242.85` maps raw points to an estimated CCRL Elo (calibrated for the ~2000–2800 band; extrapolation outside degrades).
+- Time-per-position is the main lever; both suites' scores plateau around ~5s/pos at current engine strength.
+- Bratko-Kopec (24 positions) deferred — too small for statistical significance; covered functionally by WAC + STS overlap.
+
+**Estimated size.** ~150–250 LOC harness code + vendored EPD data files.
+
 ### Split `src/bin/elo-iterate.rs` into a library + thin binary
 
 **Surfaced.** ELOH.E plan §11 file-size growth observation. After ELOH.E lands, `src/bin/elo-iterate.rs` is past 9000 lines (`mod cli` + `mod prng` + `mod tc_sample` + `mod driver` + `mod adjudicate` + `mod estimator` + `mod sigma` + `mod sprt` + `mod pgn` + `mod summary` + `mod progress` + `mod match_loop` + `mod controller` + `mod root_tests` + `mod e2e_smoke` all in one file). This is approaching the upper bound of comfortable single-file editing.
