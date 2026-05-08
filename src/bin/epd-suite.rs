@@ -308,7 +308,11 @@ mod epd {
     // EPD line parser
     // -----------------------------------------------------------------------
 
-    /// Parse a single EPD line. Returns `Ok(None)` for blank/comment lines.
+    /// Parse a single EPD line.
+    ///
+    /// Returns `Err(EpdParseError::EmptyLine)` for blank lines and lines starting with `#`.
+    /// (The `Result<Option<EpdEntry>, _>` shape is preserved historically; the `Some` case is
+    /// always taken for valid entries.)
     pub(crate) fn parse_epd_line(line: &str) -> Result<Option<EpdEntry>, EpdParseError> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -886,10 +890,10 @@ mod driver {
 
     /// A live UCI engine subprocess with a background reader thread.
     pub(crate) struct EngineDriver {
-        child: Child,
-        stdin: Option<ChildStdin>,
-        rx: Receiver<String>,
-        reader: Option<JoinHandle<()>>,
+        pub(crate) child: Child,
+        pub(crate) stdin: Option<ChildStdin>,
+        pub(crate) rx: Receiver<String>,
+        pub(crate) reader: Option<JoinHandle<()>>,
     }
 
     impl EngineDriver {
@@ -1137,6 +1141,36 @@ mod runner {
     }
 
     /// Run the suite and return results ordered by index.
+    /// Build a sentinel `PositionResult` that scores 0 for the position at `idx`.
+    /// Used when the worker can't obtain a real engine answer (driver failure).
+    fn fallback_result(
+        suite: Suite,
+        entries: &[EpdEntry],
+        idx: usize,
+        elapsed_ms: u128,
+    ) -> PositionResult {
+        let entry = &entries[idx];
+        let max_credit = match suite {
+            Suite::Wac => 1,
+            Suite::Sts => entry
+                .c0
+                .as_ref()
+                .map(|c| c.iter().map(|(_, w)| *w).max().unwrap_or(0))
+                .unwrap_or(0),
+        };
+        let theme = entry.id.as_deref().and_then(parse_sts_id);
+        PositionResult {
+            index: idx,
+            id: entry.id.clone(),
+            theme,
+            credit: 0,
+            max_credit,
+            engine_uci: "0000".to_string(),
+            engine_san: "0000".to_string(),
+            elapsed_ms,
+        }
+    }
+
     pub(crate) fn run(cfg: &RunConfig, entries: &[EpdEntry]) -> io::Result<Vec<PositionResult>> {
         let total = entries.len().min(cfg.limit.unwrap_or(usize::MAX));
         let entries = &entries[..total];
@@ -1144,12 +1178,16 @@ mod runner {
         let queue: Arc<Mutex<VecDeque<usize>>> = Arc::new(Mutex::new((0..total).collect()));
 
         let (result_tx, result_rx) = std::sync::mpsc::channel::<PositionResult>();
+        // Tracks how many workers came up successfully — used by the collector
+        // to error out cleanly if every worker failed to spawn.
+        let workers_alive = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let n_workers = cfg.concurrency.min(total.max(1));
 
-        std::thread::scope(|scope| {
+        std::thread::scope(|scope| -> io::Result<Vec<PositionResult>> {
             for _ in 0..n_workers {
                 let queue = Arc::clone(&queue);
                 let result_tx = result_tx.clone();
+                let workers_alive = Arc::clone(&workers_alive);
                 let engine_path = cfg.engine_path.clone();
                 let hash_mib = cfg.hash_mib;
                 let movetime_ms = cfg.movetime_ms;
@@ -1169,6 +1207,7 @@ mod runner {
                                 return;
                             }
                         };
+                    workers_alive.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                     loop {
                         let idx = {
@@ -1182,6 +1221,9 @@ mod runner {
                         // Per ADR-0018: clear TT before each position for determinism.
                         if let Err(e) = driver.new_game() {
                             eprintln!("error: new_game failed for position {idx}: {e}");
+                            // Emit a sentinel 0-credit result so the position is
+                            // counted (silent dropping would understate `total`).
+                            let _ = result_tx.send(fallback_result(suite, entries, idx, 0));
                             continue;
                         }
 
@@ -1275,6 +1317,16 @@ mod runner {
             }
 
             all_results.sort_by_key(|r| r.index);
+
+            // Surface "no worker came up" as an error rather than silently
+            // returning a zero-length result vector that main would print as
+            // a 0/0 summary with success exit.
+            if total > 0 && workers_alive.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                return Err(io::Error::other(
+                    "no engine worker could be spawned — see stderr for the spawn error",
+                ));
+            }
+
             Ok(all_results)
         })
     }
@@ -1760,18 +1812,25 @@ mod tests {
 
     #[test]
     fn s6_queen_full_square_disambiguation() {
-        // Ensure queen move rendering doesn't panic with multiple queens.
-        let pos = Position::from_fen("Q6k/8/8/8/8/8/8/Q5QK w - - 0 1").unwrap();
-        let moves = {
-            use clawfish::{MoveList, generate_moves};
-            let mut ml = MoveList::new();
-            generate_moves(&pos, &mut ml);
-            ml.as_slice().to_vec()
-        };
-        // Render all — should not panic.
-        for mv in moves {
-            let _ = crate::san::san_of_legal_move(&pos, mv);
-        }
+        // Three white queens at a1, a4, h1 can all reach d1:
+        //   a1 → d1 along rank 1
+        //   a4 → d1 along diagonal a4-d1
+        //   h1 → d1 along rank 1
+        // The a1 mover shares file with a4 AND shares rank with h1, so neither
+        // file alone nor rank alone disambiguates — full square required.
+        // Kings at e8/e2 keep the position legal and out of the way.
+        let pos = Position::from_fen("4k3/8/8/8/Q7/8/4K3/Q6Q w - - 0 1").unwrap();
+
+        let mv_a1d1 = clawfish::Move::new(Square::A1, Square::D1, MoveFlag::Quiet);
+        let mv_a4d1 = clawfish::Move::new(Square::A4, Square::D1, MoveFlag::Quiet);
+        let mv_h1d1 = clawfish::Move::new(Square::H1, Square::D1, MoveFlag::Quiet);
+
+        // a1 mover: file 'a' shared with a4, rank '1' shared with h1 → full square.
+        assert_eq!(crate::san::san_of_legal_move(&pos, mv_a1d1), "Qa1d1");
+        // a4 mover: file 'a' shared with a1, but rank '4' unique → rank disambiguation.
+        assert_eq!(crate::san::san_of_legal_move(&pos, mv_a4d1), "Q4d1");
+        // h1 mover: file 'h' unique → file disambiguation.
+        assert_eq!(crate::san::san_of_legal_move(&pos, mv_h1d1), "Qhd1");
     }
 
     #[test]
@@ -1980,34 +2039,49 @@ mod tests {
 
     #[test]
     fn d3_driver_timeout_on_no_bestmove() {
-        // Simulate a timeout by directly exercising the channel-drain logic
-        // without a real engine process.
-        use std::sync::mpsc;
-        use std::time::{Duration, Instant};
+        // Real-driver timeout test: spawn `/bin/cat`, which reads stdin forever
+        // and never writes anything UCI-shaped. `EngineDriver::spawn_with_env`
+        // would normally block waiting for `uciok` during the handshake — bypass
+        // that by constructing the driver state by hand and calling `search`.
+        // The 10× movetime ceiling fires; assert TimedOut.
+        //
+        // Mirrors the `/bin/cat` fixture pattern from `elo-iterate.rs`'s driver
+        // tests (search elo-iterate.rs for "/bin/cat").
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
 
-        let (tx, rx) = mpsc::sync_channel::<String>(4);
-        tx.send("info depth 1".to_string()).unwrap();
-        // Do NOT send bestmove — hang the reader.
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn /bin/cat");
+        let stdin = child.stdin.take().expect("stdin piped");
+        let stdout = child.stdout.take().expect("stdout piped");
 
-        let ceiling = Duration::from_millis(50);
-        let deadline = Instant::now() + ceiling;
-
-        let mut got_bestmove = false;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match rx.recv_timeout(remaining) {
-                Ok(line) if line.starts_with("bestmove ") => {
-                    got_bestmove = true;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1024);
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
                     break;
                 }
-                Ok(_) => {}
-                Err(_) => break,
             }
-        }
-        assert!(!got_bestmove, "expected timeout without bestmove");
+        });
+
+        let mut driver = crate::driver::EngineDriver {
+            child,
+            stdin: Some(stdin),
+            rx,
+            reader: Some(reader),
+        };
+
+        let result = driver.search(clawfish::Position::STARTING_FEN, 50);
+        assert!(
+            matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut),
+            "expected TimedOut, got {result:?}"
+        );
+
+        driver.quit();
     }
 
     // -----------------------------------------------------------------------
