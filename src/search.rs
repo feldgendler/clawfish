@@ -924,6 +924,19 @@ pub(crate) struct AlphaBetaMover {
     /// `lmr_trace_root_ply` frame.
     #[cfg(test)]
     ffp_skipped_moves: Vec<Move>,
+    /// M5.E: per-`go` count of qsearch single-reply extensions (M5.E #1) —
+    /// number of times qsearch recursed on the unique legal quiet move
+    /// instead of returning stand-pat. Test-only instrumentation; gated by
+    /// `#[cfg(test)]` so production builds don't carry the field. Naming
+    /// follows the M5.A `nmp_firings` / M5.B `rfp_firings` / M5.D
+    /// `ffp_firings` convention.
+    #[cfg(test)]
+    qsearch_single_reply_firings: u32,
+    /// M5.E: per-`go` count of qsearch under-promo extensions (M5.E #3) —
+    /// number of synthesized rook/bishop promo recursions fired when a
+    /// queen-promo's post-make child position is stalemate.
+    #[cfg(test)]
+    qsearch_under_promo_firings: u32,
 }
 
 impl AlphaBetaMover {
@@ -958,6 +971,10 @@ impl AlphaBetaMover {
             ffp_firings: 0,
             #[cfg(test)]
             ffp_skipped_moves: Vec::new(),
+            #[cfg(test)]
+            qsearch_single_reply_firings: 0,
+            #[cfg(test)]
+            qsearch_under_promo_firings: 0,
         }
     }
 }
@@ -1803,6 +1820,13 @@ impl AlphaBetaMover {
         self.lmr_history_candidates.clear();
         self.ffp_firings = 0;
         self.ffp_skipped_moves.clear();
+        // M5.E: clear qsearch counters here too — negamax delegates to
+        // qsearch at depth 0, so a negamax-driven test that touches qsearch
+        // transitively must start with cleared counters. Symmetric reset
+        // across both test entry points keeps back-to-back invocations
+        // independent regardless of which entry triggered the prior call.
+        self.qsearch_single_reply_firings = 0;
+        self.qsearch_under_promo_firings = 0;
         self.lmr_trace_root_ply = Some(ply);
         let score = self.negamax(pos, depth, ply, alpha, beta, is_pv, allow_null, ctx, &clock);
         self.lmr_trace_root_ply = None;
@@ -1972,6 +1996,22 @@ impl AlphaBetaMover {
             return 0;
         }
 
+        // M5.E — defense-in-depth against pathological forced-quiet chains
+        // under the single-reply extension (M5.E #1). Pre-M5.E qsearch
+        // terminated naturally as captures ran out; #1 introduces all-quiet
+        // recursion. Only the !in_check arm is guarded (see helper docs).
+        // Helper extraction (vs inline `ply >= MAX_PLY - 1 && !in_check`)
+        // is per the M3.D `negate_window` precedent: structurally trivial
+        // checks inside `qsearch` are difficult for cargo-mutants to
+        // discriminate from the fall-through behavior on existing test
+        // fixtures (the fall-through path also returns stand-pat at the
+        // !in_check ply ceiling), so extracting the predicate into a named
+        // helper gives `cargo mutants --in-diff` a unique name to mutate
+        // and a unit test surface to discriminate.
+        if qsearch_short_circuit_at_ply_ceiling(ply, pos) {
+            return evaluate(pos);
+        }
+
         // 2. Mate-distance pruning — may return mate-bound before stand-pat is
         //    computed. Safe because mate-distance pruning narrows toward provable
         //    mate scores only; if the window is already collapsed by a known mate,
@@ -2030,15 +2070,65 @@ impl AlphaBetaMover {
 
         // 6. Terminal:
         //    - In check + empty: mate (-(MATE - ply)).
-        //    - Not in check + empty: return stand-pat. The empty-after-filter
-        //      case does NOT mean stalemate — the position has many quiet moves.
-        //      Returning stand-pat avoids the false-stalemate bug (CPW §10.7).
+        //    - Not in check + empty: distinguish three sub-cases via the full
+        //      legal-move list `ml` (true stalemate, single-reply extension,
+        //      or M3.D false-stalemate guard).
         if moves_vec.is_empty() {
             if in_chk {
+                // Mate at horizon — empty filtered means empty legal in the
+                // in-check arm (full legal moves are evasions, no separate
+                // filter). Unchanged from M3.D.
                 return -(MATE - ply as i32);
-            } else {
-                return best_init; // = stand_pat
             }
+
+            // M5.E #1 + #2: distinguish the three not-in-check empty-filter
+            // cases. `ml` is already populated in step 5; use the O(1)
+            // `is_empty()` / `len()` accessors rather than `iter().count()`.
+
+            if ml.is_empty() {
+                // True stalemate (M5.E #2): zero legal moves and not in check
+                // is a FIDE-9.2 draw. Pre-M5.E this branch returned stand-pat
+                // (M3.D approximation). M5.E corrects the score; the change
+                // is structurally tied to ml.is_empty().
+                return 0;
+            }
+
+            if ml.len() == 1 {
+                // Single-reply extension (M5.E #1): recurse on the unique
+                // legal move. The unique move is necessarily a non-promo
+                // quiet by movegen invariant: legal-direct movegen always
+                // emits all four promotion variants whenever a promotion is
+                // legal, so an under-promo can never appear alone. With the
+                // qsearch filter rejecting both quiets and under-promos, an
+                // empty filter + ml.len() == 1 leaves only Quiet | DoublePush
+                // | KingCastle | QueenCastle as reachable flags. Pinned by
+                // `qsearch_single_reply_under_promo_uniqueness_is_structurally_unreachable`.
+                let only_mv = ml
+                    .iter()
+                    .next()
+                    .expect("ml.len() == 1 → at least one move in iter");
+
+                #[cfg(test)]
+                {
+                    self.qsearch_single_reply_firings += 1;
+                }
+
+                let undo = pos.make_move(only_mv);
+                self.history.push(pos.zobrist());
+                let (child_alpha, child_beta) = negate_window(alpha, beta);
+                let score = -self.qsearch(pos, child_alpha, child_beta, ply + 1, ctx, clock);
+                self.history.pop();
+                pos.unmake_move(only_mv, undo);
+
+                if self.aborted {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            // 2+ legal moves: M3.D false-stalemate guard preserved verbatim.
+            return best_init; // = stand_pat
         }
 
         // 7. Order: MVV-LVA descending. Reuses negamax's helper.
@@ -2049,6 +2139,24 @@ impl AlphaBetaMover {
         for mv in moves_vec {
             let undo = pos.make_move(mv);
             self.history.push(pos.zobrist());
+
+            // M5.E #3: detect queen-promo stalemate BEFORE the recursion. The
+            // detection scans the post-make position (child's POV) — at this
+            // point `pos` is in the post-make state. Cheap: the `matches!`
+            // gate skips the movegen for non-queen-promo moves. Captured
+            // into a local so the predicate's lifetime crosses the recursion
+            // / unmake window cleanly without splitting `history.pop()` from
+            // `unmake_move`.
+            let queen_promo_stalemates = matches!(
+                mv.flag(),
+                crate::mov::MoveFlag::QueenPromo | crate::mov::MoveFlag::QueenPromoCapture
+            ) && {
+                let mut child_ml = MoveList::new();
+                generate_moves(pos, &mut child_ml);
+                // True stalemate at the child: zero legal moves AND not in check.
+                child_ml.is_empty() && !in_check(pos)
+            };
+
             let (child_alpha, child_beta) = negate_window(alpha, beta);
             let score = -self.qsearch(pos, child_alpha, child_beta, ply + 1, ctx, clock);
             self.history.pop();
@@ -2061,14 +2169,60 @@ impl AlphaBetaMover {
                 return 0;
             }
 
+            // 10a. Update best/alpha from the queen-promo (or other) score.
             if score > best {
                 best = score;
                 if score > alpha {
                     alpha = score;
                 }
-                if alpha >= beta {
-                    break; // beta cutoff, fail-soft
+            }
+
+            // 10b. M5.E #3: under-promo extension — runs BEFORE the cutoff
+            //      check (10c) so a queen-promo's stalemate score (0) cannot
+            //      suppress the under-promo recursions via `alpha >= beta`.
+            //      Knight-promo deliberately not searched (out of M5.E scope).
+            if queen_promo_stalemates {
+                for under_mv_opt in stalemate_avoiding_under_promos(mv) {
+                    let Some(under_mv) = under_mv_opt else {
+                        continue;
+                    };
+
+                    #[cfg(test)]
+                    {
+                        self.qsearch_under_promo_firings += 1;
+                    }
+
+                    let undo2 = pos.make_move(under_mv);
+                    self.history.push(pos.zobrist());
+                    let (ca, cb) = negate_window(alpha, beta);
+                    let under_score = -self.qsearch(pos, ca, cb, ply + 1, ctx, clock);
+                    self.history.pop();
+                    pos.unmake_move(under_mv, undo2);
+
+                    if self.aborted {
+                        return 0;
+                    }
+
+                    if under_score > best {
+                        best = under_score;
+                        if under_score > alpha {
+                            alpha = under_score;
+                        }
+                    }
+
+                    // Mid-under-promo cutoff: skip remaining under-promo
+                    // variants if a rook/bishop promo's score already cut
+                    // the node. The outer cutoff (10c) is then redundant
+                    // but harmless.
+                    if alpha >= beta {
+                        break;
+                    }
                 }
+            }
+
+            // 10c. Per-move beta cutoff (post-under-promo).
+            if alpha >= beta {
+                break; // beta cutoff, fail-soft
             }
         }
 
@@ -2086,8 +2240,29 @@ impl AlphaBetaMover {
         ply: u32,
         ctx: &SearchContext,
     ) -> i32 {
+        // M5.E: reset qsearch counters at each entry so back-to-back
+        // qsearch_for_test invocations get independent counter values.
+        // Symmetric with negamax_for_test (which also resets these because
+        // negamax delegates to qsearch at depth 0).
+        self.qsearch_single_reply_firings = 0;
+        self.qsearch_under_promo_firings = 0;
         let clock = SearchClock::start_for(ctx.virtual_clock, ctx.caps);
         self.qsearch(pos, alpha, beta, ply, ctx, &clock)
+    }
+
+    /// Test-only accessor for the per-`go` qsearch single-reply firings
+    /// counter (M5.E #1). Mirrors `nmp_firings_for_test` /
+    /// `rfp_firings_for_test` / `ffp_firings_for_test`.
+    #[cfg(test)]
+    pub(super) fn qsearch_single_reply_firings_for_test(&self) -> u32 {
+        self.qsearch_single_reply_firings
+    }
+
+    /// Test-only accessor for the per-`go` qsearch under-promo firings
+    /// counter (M5.E #3).
+    #[cfg(test)]
+    pub(super) fn qsearch_under_promo_firings_for_test(&self) -> u32 {
+        self.qsearch_under_promo_firings
     }
 }
 
@@ -2272,6 +2447,30 @@ fn clear_killers(killers: &mut [[Move; 2]; MAX_PLY]) {
     *killers = [[Move::default(); 2]; MAX_PLY];
 }
 
+/// M5.E #4 — qsearch ply-ceiling short-circuit predicate. Returns `true`
+/// when qsearch should return `evaluate(pos)` immediately instead of
+/// recursing further, as a defense-in-depth against pathological forced-
+/// quiet chains under the M5.E #1 single-reply extension.
+///
+/// Only the `!in_check` arm is guarded. At in-check + ply ceiling the
+/// existing evasion arm runs as before. Returning a fabricated mate-in-ply
+/// score (`-(MATE - ply)`) would propagate a false mate through
+/// `score_to_uci`, `score_to_tt`, and mate-distance pruning, and the
+/// in-check ceiling case is structurally near-impossible (a chain of
+/// forced check evasions tall enough to hit MAX_PLY does not occur in
+/// real positions). ADR-0027 §4.
+///
+/// Extracted from the inline qsearch guard for mutation-coverage
+/// discrimination per the M3.D `negate_window` precedent: at the only
+/// callable ply value (`MAX_PLY - 1`) the qsearch fall-through path also
+/// returns stand-pat on typical fixtures, so cargo-mutants cannot
+/// distinguish the inline arithmetic. The helper's named function and
+/// unit tests give mutation testing a discriminating surface.
+#[inline]
+pub(crate) fn qsearch_short_circuit_at_ply_ceiling(ply: u32, pos: &Position) -> bool {
+    ply >= MAX_PLY as u32 - 1 && !crate::movegen::in_check(pos)
+}
+
 /// Returns true iff the move should be searched in qsearch (when not in check).
 /// Captures, EnPassant, and queen-promo variants (with or without capture).
 /// Excludes under-promotions and under-promo-captures (M3.D scope) and
@@ -2282,6 +2481,41 @@ fn qsearch_move_filter(mv: Move) -> bool {
         mv.flag(),
         Capture | EnPassant | QueenPromo | QueenPromoCapture
     )
+}
+
+/// M5.E #3 — given a queen-promo move `mv`, returns the rook-promo and
+/// bishop-promo variants at the same `(from, to)`. Capture-aware: if `mv`
+/// is `QueenPromoCapture`, returns the `*PromoCapture` variants; otherwise
+/// the non-capture `*Promo` variants. Knight-promo deliberately omitted —
+/// fork-tactic motivation is independent of stalemate avoidance and out
+/// of scope per ADR-0027 §1 (M5.E open-questions row 1).
+///
+/// Caller contract: `mv.flag()` SHOULD be `QueenPromo | QueenPromoCapture`.
+/// On any other input, the helper returns `[None, None]` — defense-in-depth
+/// against a future call-site refactor that loses the queen-promo gate.
+/// The empty-array fallback mirrors the M5.D `ffp_pruned_bound -> Option<i32>`
+/// helper-level domain guard precedent: misuse returns the empty value of
+/// the contribution type rather than panicking.
+///
+/// The returned moves are legal-by-construction at the same `(from, to)`
+/// as the input queen-promo: legal-direct movegen would have emitted all
+/// four promo variants from the same square pair, and the legality of the
+/// move (geometric path, check resolution, pin) is identical across the
+/// four promotion choices. The caller may pass the synthesized moves to
+/// `make_move` without re-validation.
+pub(crate) fn stalemate_avoiding_under_promos(mv: Move) -> [Option<Move>; 2] {
+    use crate::mov::MoveFlag::*;
+    let (rook_flag, bishop_flag) = match mv.flag() {
+        QueenPromo => (RookPromo, BishopPromo),
+        QueenPromoCapture => (RookPromoCapture, BishopPromoCapture),
+        _ => return [None, None],
+    };
+    let from = mv.from_square();
+    let to = mv.to_square();
+    [
+        Some(Move::new(from, to, rook_flag)),
+        Some(Move::new(from, to, bishop_flag)),
+    ]
 }
 
 /// MVV-LVA move ordering score. Captures and promotions score > 0; quiets score 0.
@@ -3657,6 +3891,51 @@ mod tests {
                 "qsearch_move_filter must reject {flag:?}"
             );
         }
+    }
+
+    // ----- M5.E #4: qsearch_short_circuit_at_ply_ceiling helper unit tests. -----
+
+    /// At the ply ceiling (`ply == MAX_PLY - 1`) with a not-in-check
+    /// position, the helper returns `true`. Mutation-killing for the
+    /// MAX_PLY arithmetic (`MAX_PLY - 1` → `MAX_PLY + 1` would push the
+    /// threshold to 65 and the helper would return `false`).
+    #[test]
+    fn qsearch_short_circuit_at_ply_ceiling_not_in_check_returns_true() {
+        let pos = Position::starting_position();
+        assert!(qsearch_short_circuit_at_ply_ceiling(
+            MAX_PLY as u32 - 1,
+            &pos
+        ));
+    }
+
+    /// Below the ceiling (any `ply < MAX_PLY - 1`), the helper returns
+    /// `false` regardless of in-check state. Discriminates a mutation that
+    /// drops the `>=` comparison (e.g. `>=` → `<=` would fire at low ply).
+    #[test]
+    fn qsearch_short_circuit_below_ceiling_returns_false() {
+        let pos = Position::starting_position();
+        assert!(!qsearch_short_circuit_at_ply_ceiling(0, &pos));
+        assert!(!qsearch_short_circuit_at_ply_ceiling(
+            MAX_PLY as u32 - 2,
+            &pos
+        ));
+    }
+
+    /// At the ply ceiling but in check, the helper returns `false` —
+    /// the `!in_check` arm is the discriminator. Mutation-killing for the
+    /// `delete !` mutation (without the `!`, the helper would fire on
+    /// in-check positions and propagate fabricated mate scores via the
+    /// caller's `evaluate(pos)` return). Fixture: white in check from
+    /// black rook on e2.
+    #[test]
+    fn qsearch_short_circuit_in_check_at_ceiling_returns_false() {
+        let pos =
+            Position::from_fen("4k3/8/8/8/8/8/4r3/4K3 w - - 0 1").expect("in-check FEN must parse");
+        assert!(crate::movegen::in_check(&pos));
+        assert!(!qsearch_short_circuit_at_ply_ceiling(
+            MAX_PLY as u32 - 1,
+            &pos
+        ));
     }
 
     // ----- §6.1 row 3: stand-pat returns evaluate(pos) when quiet + no captures. -----
@@ -12098,6 +12377,1126 @@ mod tests {
             tt_sister.probe(pos.zobrist()).is_some(),
             "sister: with FFP not firing, the TT path must be reachable and an entry stored \
              (proves the FFP-test assertion is non-vacuous)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M5.E — qsearch correctness.
+    //
+    // Tests for:
+    //   #1 single-reply extension (one legal quiet, no captures, not in check),
+    //   #2 true-stalemate detection at the qsearch horizon,
+    //   #3 stalemate-conditional rook/bishop under-promotion in the move loop,
+    //   #4 MAX_PLY ceiling guard in the !in_check arm.
+    //
+    // Counter resets are wired in `qsearch_for_test` and `negamax_for_test`
+    // (both reset both M5.E counters), so direct-qsearch tests below can
+    // read counters cleanly. Per plan §5.
+    // -----------------------------------------------------------------------
+
+    // ===== §5.1 — Helper tests for `stalemate_avoiding_under_promos`. =====
+
+    /// Input `QueenPromo` from a7→a8 → returns
+    /// `[Some(Move::new(A7, A8, RookPromo)), Some(Move::new(A7, A8, BishopPromo))]`.
+    /// Pins the helper's flag-mapping table for the non-capture queen-promo arm.
+    #[test]
+    fn stalemate_avoiding_under_promos_for_queen_promo_returns_rook_and_bishop() {
+        use crate::Square;
+        use crate::mov::MoveFlag;
+        let qp = Move::new(Square::A7, Square::A8, MoveFlag::QueenPromo);
+        let result = stalemate_avoiding_under_promos(qp);
+        assert_eq!(
+            result[0],
+            Some(Move::new(Square::A7, Square::A8, MoveFlag::RookPromo)),
+            "first slot must be RookPromo at the same (from, to)"
+        );
+        assert_eq!(
+            result[1],
+            Some(Move::new(Square::A7, Square::A8, MoveFlag::BishopPromo)),
+            "second slot must be BishopPromo at the same (from, to)"
+        );
+    }
+
+    /// Input `QueenPromoCapture` → returns the `*PromoCapture` variants at
+    /// the same (from, to). Pins the capture-aware branch of the helper.
+    #[test]
+    fn stalemate_avoiding_under_promos_for_queen_promo_capture_returns_capture_variants() {
+        use crate::Square;
+        use crate::mov::MoveFlag;
+        let qpc = Move::new(Square::B7, Square::A8, MoveFlag::QueenPromoCapture);
+        let result = stalemate_avoiding_under_promos(qpc);
+        assert_eq!(
+            result[0],
+            Some(Move::new(
+                Square::B7,
+                Square::A8,
+                MoveFlag::RookPromoCapture
+            )),
+            "first slot must be RookPromoCapture at the same (from, to)"
+        );
+        assert_eq!(
+            result[1],
+            Some(Move::new(
+                Square::B7,
+                Square::A8,
+                MoveFlag::BishopPromoCapture
+            )),
+            "second slot must be BishopPromoCapture at the same (from, to)"
+        );
+    }
+
+    /// Input is any non-queen-promo flag → returns `[None, None]`. Pins the
+    /// helper-level domain guard against future call-site refactors that
+    /// drop the queen-promo gate. Exhaustive across all 12 non-queen-promo
+    /// flags so a flag-list mutation in the helper would be caught.
+    #[test]
+    fn stalemate_avoiding_under_promos_for_non_queen_promo_returns_empty() {
+        use crate::Square;
+        use crate::mov::MoveFlag::*;
+        // Every flag except QueenPromo and QueenPromoCapture must produce
+        // `[None, None]`. Includes RookPromo / BishopPromo / KnightPromo and
+        // their capture variants — under-promos passed in directly should
+        // not synthesize further variants.
+        for flag in [
+            Quiet,
+            DoublePush,
+            KingCastle,
+            QueenCastle,
+            Capture,
+            EnPassant,
+            KnightPromo,
+            BishopPromo,
+            RookPromo,
+            KnightPromoCapture,
+            BishopPromoCapture,
+            RookPromoCapture,
+        ] {
+            let mv = Move::new(Square::A1, Square::B1, flag);
+            let result = stalemate_avoiding_under_promos(mv);
+            assert_eq!(
+                result,
+                [None, None],
+                "stalemate_avoiding_under_promos({flag:?}) must return [None, None]"
+            );
+        }
+    }
+
+    /// (from, to) of returned moves equals the input's (from, to). Pins the
+    /// helper does not accidentally swap squares or rebase the move geometry.
+    #[test]
+    fn stalemate_avoiding_under_promos_preserves_from_and_to() {
+        use crate::Square;
+        use crate::mov::MoveFlag;
+        // Sample a few (from, to) pairs at the rank-7→rank-8 promotion
+        // geometry (white) and rank-2→rank-1 (black).
+        for (from, to, flag) in [
+            (Square::A7, Square::A8, MoveFlag::QueenPromo),
+            (Square::B7, Square::C8, MoveFlag::QueenPromoCapture),
+            (Square::H2, Square::H1, MoveFlag::QueenPromo),
+            (Square::E2, Square::F1, MoveFlag::QueenPromoCapture),
+        ] {
+            let mv = Move::new(from, to, flag);
+            let [r, b] = stalemate_avoiding_under_promos(mv);
+            let r = r.expect("rook variant must be Some for queen-promo input");
+            let b = b.expect("bishop variant must be Some for queen-promo input");
+            assert_eq!(r.from_square(), from, "rook variant from-square preserved");
+            assert_eq!(r.to_square(), to, "rook variant to-square preserved");
+            assert_eq!(
+                b.from_square(),
+                from,
+                "bishop variant from-square preserved"
+            );
+            assert_eq!(b.to_square(), to, "bishop variant to-square preserved");
+        }
+    }
+
+    /// The two synthesized moves are NEVER `KnightPromo*` or `QueenPromo*`.
+    /// Pins the M5.E scope commitment (knight-promo's fork-tactics motivation
+    /// is separate; out of scope per ADR-0027 §1) and protects against a
+    /// future flag-table mutation that would silently re-enable knight
+    /// synthesis.
+    #[test]
+    fn stalemate_avoiding_under_promos_does_not_include_knight_or_queen() {
+        use crate::Square;
+        use crate::mov::MoveFlag;
+        for input_flag in [MoveFlag::QueenPromo, MoveFlag::QueenPromoCapture] {
+            let mv = Move::new(Square::A7, Square::A8, input_flag);
+            let [r, b] = stalemate_avoiding_under_promos(mv);
+            for opt in [r, b] {
+                let m = opt.expect("queen-promo input must produce Some variants");
+                let f = m.flag();
+                assert!(
+                    !matches!(
+                        f,
+                        MoveFlag::KnightPromo
+                            | MoveFlag::KnightPromoCapture
+                            | MoveFlag::QueenPromo
+                            | MoveFlag::QueenPromoCapture
+                    ),
+                    "synthesized variant must not be Knight* or Queen*; got {f:?}"
+                );
+            }
+        }
+    }
+
+    // ===== §5.2 — Single-reply extension behavior tests. =====
+
+    /// M5.E #1 fires when filter is empty AND exactly one legal quiet exists,
+    /// not in check. Anti-vacuous sister: a fixture with 2+ legal quiets
+    /// returns stand-pat (counter stays 0).
+    ///
+    /// Fixture (1) — single legal quiet: Black to move; Black King a8 is
+    /// trapped (a7/b7/b8 all attacked by Qb6); Black pawn a5 has the unique
+    /// legal move a5→a4 (a quiet single-push). The qsearch filter rejects
+    /// quiets, so `moves_vec` is empty, but `ml.len() == 1` and the single
+    /// move is `is_quiet`. Single-reply extension must fire.
+    ///
+    /// Anti-vacuous sister: KvK with white to move has multiple legal king
+    /// moves; the M5.E #1 path's `ml.len() == 1` condition is not met and
+    /// the path falls through to stand-pat. Counter stays 0.
+    #[test]
+    fn qsearch_single_reply_fires_when_filter_empty_and_one_legal_quiet() {
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        // Single-reply fixture: black to move, exactly one legal quiet
+        // (pa5→a4). White pawn placed on h2 (not h1) so the position is
+        // legal (white pawns on rank 1 are not legal in real chess).
+        let pos = Position::from_fen("k7/8/1Q6/p7/8/8/7P/K7 b - - 0 1")
+            .expect("single-reply fixture FEN must parse");
+
+        // Fixture validation: not in check, no captures available, exactly
+        // one legal move, and that move is quiet.
+        assert!(!in_check(&pos), "fixture invariant: not in check");
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        assert_eq!(
+            ml.len(),
+            1,
+            "fixture invariant: exactly one legal move; got {}",
+            ml.len()
+        );
+        let only_mv = ml.iter().next().expect("ml.len() == 1");
+        assert!(
+            is_quiet(only_mv),
+            "fixture invariant: the unique legal move must be quiet; got flag {:?}",
+            only_mv.flag()
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let _score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 1, &ctx);
+        assert!(
+            ab.qsearch_single_reply_firings_for_test() >= 1,
+            "M5.E #1 must fire at the root frame on the single-legal-quiet fixture; \
+             got firings = {}",
+            ab.qsearch_single_reply_firings_for_test()
+        );
+
+        // Anti-vacuous sister: KvK with multiple legal king moves. ml.len() != 1
+        // → M5.E #1 path not entered. Counter stays 0.
+        let pos_sister =
+            Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").expect("KvK FEN must parse");
+        let mut ml_sister = MoveList::new();
+        generate_moves(&pos_sister, &mut ml_sister);
+        assert!(
+            ml_sister.len() >= 2,
+            "sister fixture invariant: 2+ legal moves; got {}",
+            ml_sister.len()
+        );
+        let mut ab_sister = AlphaBetaMover::new();
+        ab_sister.history = vec![pos_sister.zobrist()];
+        let (ctx_sister, _stop_sister) = non_aborting_ctx();
+        let _score_sister =
+            ab_sister.qsearch_for_test(&mut pos_sister.clone(), -INF, INF, 1, &ctx_sister);
+        assert_eq!(
+            ab_sister.qsearch_single_reply_firings_for_test(),
+            0,
+            "sister: M5.E #1 must NOT fire when ml.len() != 1; got {}",
+            ab_sister.qsearch_single_reply_firings_for_test()
+        );
+    }
+
+    /// In-check arm runs first; M5.E #1 path is unreachable when in_chk is
+    /// true. Pins the §4.2 ordering (in-check arm precedes the not-in-check
+    /// branches).
+    ///
+    /// Fixture: White Ke1 in check from Black Re2. Multiple legal evasions
+    /// (Kxe2, Kd1, Kf1) — the in-check arm runs the evasion search and
+    /// returns its score; the M5.E #1 single-reply branch is structurally
+    /// unreachable.
+    #[test]
+    fn qsearch_single_reply_does_not_fire_when_in_check() {
+        use crate::movegen::in_check;
+        let pos = Position::from_fen("4k3/8/8/8/8/8/4r3/4K3 w - - 0 1")
+            .expect("in-check fixture FEN must parse");
+        assert!(in_check(&pos), "fixture invariant: white must be in check");
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let _score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 1, &ctx);
+        assert_eq!(
+            ab.qsearch_single_reply_firings_for_test(),
+            0,
+            "M5.E #1 must NOT fire when in check; got {}",
+            ab.qsearch_single_reply_firings_for_test()
+        );
+    }
+
+    /// Filter is non-empty (capture available) → the move loop runs and the
+    /// M5.E #1 path is unreachable. Pins the §4.2 condition that M5.E #1 is
+    /// gated on `moves_vec.is_empty()`.
+    ///
+    /// Fixture: White Pe4 can capture pd5. The qsearch filter accepts the
+    /// capture, populating `moves_vec`. The empty-filter terminal branch
+    /// (where M5.E #1 lives) is never reached.
+    #[test]
+    fn qsearch_single_reply_does_not_fire_when_filter_nonempty() {
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        let pos = Position::from_fen("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1")
+            .expect("capture-available fixture FEN must parse");
+        assert!(!in_check(&pos), "fixture invariant: not in check");
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let captures: Vec<_> = ml.iter().filter(|m| m.is_capture()).collect();
+        assert!(
+            !captures.is_empty(),
+            "fixture invariant: at least one capture present; got 0"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let _score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 1, &ctx);
+        assert_eq!(
+            ab.qsearch_single_reply_firings_for_test(),
+            0,
+            "M5.E #1 must NOT fire when the filter is non-empty; got {}",
+            ab.qsearch_single_reply_firings_for_test()
+        );
+    }
+
+    /// M5.E #1's recursion propagates the child's score (negated), NOT the
+    /// parent's stand-pat. Construct the parent's qsearch result via
+    /// `qsearch_for_test`, then manually make the unique move and compute
+    /// `-qsearch(child, -beta, -alpha, ply+1)`; the two must match.
+    ///
+    /// Pins the recursion's window-negation, ply-increment, and result
+    /// negation against any of the three possible mutation classes.
+    #[test]
+    fn qsearch_single_reply_recursion_propagates_score_correctly() {
+        use crate::movegen::{MoveList, generate_moves};
+        let pos = Position::from_fen("k7/8/1Q6/p7/8/8/7P/K7 b - - 0 1")
+            .expect("single-reply fixture FEN must parse");
+
+        // Confirm fixture exhibits the regime (ml.len() == 1, quiet move).
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        assert_eq!(ml.len(), 1, "fixture invariant: ml.len() == 1");
+        let only_mv = ml.iter().next().expect("one move");
+        assert!(
+            is_quiet(only_mv),
+            "fixture invariant: unique legal move must be quiet"
+        );
+
+        // Drive parent qsearch — fires M5.E #1 → recurses → returns negated child.
+        let mut ab_parent = AlphaBetaMover::new();
+        ab_parent.history = vec![pos.zobrist()];
+        let (ctx_parent, _stop_parent) = non_aborting_ctx();
+        let parent_score = ab_parent.qsearch_for_test(&mut pos.clone(), -INF, INF, 1, &ctx_parent);
+
+        // Manual reconstruction: make the unique move, qsearch the child at
+        // ply+1 with negated window, negate the result.
+        let mut child_pos = pos;
+        let _undo = child_pos.make_move(only_mv);
+        let mut ab_child = AlphaBetaMover::new();
+        ab_child.history = vec![pos.zobrist(), child_pos.zobrist()];
+        let (ctx_child, _stop_child) = non_aborting_ctx();
+        let (ca, cb) = negate_window(-INF, INF);
+        let child_score = ab_child.qsearch_for_test(&mut child_pos, ca, cb, 2, &ctx_child);
+        let expected = -child_score;
+
+        assert_eq!(
+            parent_score, expected,
+            "M5.E #1 must propagate the negated child score; got parent={parent_score}, expected={expected}"
+        );
+    }
+
+    /// True stalemate at the qsearch horizon (M5.E #2): zero legal moves,
+    /// not in check → return 0. Pre-M5.E this conflated with the false-
+    /// stalemate guard and returned stand-pat.
+    ///
+    /// Fixture: Black Kh8, White Qf7, White Kg6, Black to move. Black is
+    /// stalemated — g7 attacked by Qf7 (rank 7), h7 attacked by Kg6 + Qf7,
+    /// g8 attacked by Qf7 (f7-g8 diagonal). h8 itself is unattacked (Qf7→h8
+    /// is 2 files / 1 rank — not a queen line; Kg6→h8 is 1 file / 2 ranks
+    /// — not adjacent), so Black is NOT in check. Black's stand-pat is
+    /// large-negative (down a queen), which defeats an always-return-0
+    /// stub: a correct M5.E #2 implementation must return 0 *despite* the
+    /// non-zero stand-pat.
+    #[test]
+    fn qsearch_returns_zero_on_true_stalemate_when_not_in_check() {
+        use crate::eval::evaluate;
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        let pos = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1")
+            .expect("true-stalemate fixture FEN must parse");
+
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        assert!(
+            ml.is_empty(),
+            "fixture invariant: stalemate position must have zero legal moves; got {}",
+            ml.len()
+        );
+        assert!(
+            !in_check(&pos),
+            "fixture invariant: stalemate is not-in-check"
+        );
+        // Anti-vacuous: stand-pat must be != 0 to defeat an always-return-0 stub.
+        let sp = evaluate(&pos);
+        assert!(
+            sp != 0,
+            "fixture invariant: evaluate must be non-zero so the test discriminates an always-return-0 stub; got {sp}"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 1, &ctx);
+        assert_eq!(
+            score, 0,
+            "true stalemate must return 0 (FIDE 9.2 draw); got {score}"
+        );
+        assert_eq!(
+            ab.qsearch_single_reply_firings_for_test(),
+            0,
+            "M5.E #1 must NOT fire on the empty-ml stalemate path; got {}",
+            ab.qsearch_single_reply_firings_for_test()
+        );
+    }
+
+    /// M3.D anchor: in-check + zero legal moves → `-(MATE - ply)`. Unchanged
+    /// across the M5.E refinement; the test pins it as a regression anchor.
+    ///
+    /// Fixture: Standard K+Q mating-net. Black Ka8 in check from Qb7
+    /// (diagonal). Kings on a8 and c6 (not adjacent — legal position).
+    /// Black escapes: Ka7 (Qb7 attacks rank 7 → illegal), Kb8 (Qb7 attacks
+    /// file b → illegal), Kxb7 (Qb7 defended by Kc6 → illegal). 0 evasions
+    /// in check → checkmate.
+    #[test]
+    fn qsearch_returns_mate_in_ply_on_true_mate() {
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        let pos = Position::from_fen("k7/1Q6/2K5/8/8/8/8/8 b - - 0 1")
+            .expect("true-mate fixture FEN must parse");
+        assert!(in_check(&pos), "fixture invariant: black in check");
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        assert_eq!(
+            ml.len(),
+            0,
+            "fixture invariant: zero legal moves (checkmate); got {}",
+            ml.len()
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let ply: u32 = 1;
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, ply, &ctx);
+        assert_eq!(
+            score,
+            -(MATE - ply as i32),
+            "in-check + no legal moves must return -(MATE - ply); got {score}"
+        );
+    }
+
+    /// MAX_PLY ceiling guard (M5.E #4): not in check at `ply == MAX_PLY - 1`
+    /// → return `evaluate(pos)` (the side-to-move-relative stand-pat) without
+    /// recursing. Counter stays 0 (no recursion firings possible).
+    ///
+    /// Fixture: KvKR (`4k3/8/8/8/8/8/8/4K2R w - - 0 1`). White materially up
+    /// a rook → `evaluate(pos) > 0`, which defeats an always-return-0 stub
+    /// (the prior KvK fixture had `evaluate == 0`, making the test vacuous).
+    /// Drive at `ply = MAX_PLY as u32 - 1`.
+    #[test]
+    fn qsearch_max_ply_guard_returns_stand_pat_at_ceiling_when_not_in_check() {
+        use crate::eval::evaluate;
+        use crate::movegen::in_check;
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/4K2R w - - 0 1")
+            .expect("KvKR fixture FEN must parse");
+        assert!(!in_check(&pos), "fixture invariant: not in check");
+        let expected = evaluate(&pos);
+        assert!(
+            expected != 0,
+            "anti-vacuous: stand-pat must be non-zero on this fixture; got {expected}"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let ply = MAX_PLY as u32 - 1;
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, ply, &ctx);
+        assert_eq!(
+            score, expected,
+            "MAX_PLY ceiling guard must return evaluate(pos) = stand-pat; got {score}, expected {expected}"
+        );
+        assert_eq!(
+            ab.qsearch_single_reply_firings_for_test(),
+            0,
+            "no recursion at the ceiling means no M5.E #1 firings possible; got {}",
+            ab.qsearch_single_reply_firings_for_test()
+        );
+    }
+
+    /// MAX_PLY ceiling guard does NOT fire on the in-check arm. The plan's
+    /// design choice (§4.1) is to leave in-check at ceiling unguarded —
+    /// returning a fabricated mate-in-ply score would propagate a false
+    /// mate; the in-check evasion arm runs naturally even at ply=MAX_PLY-1.
+    /// The structural rarity of an in-check chain reaching MAX_PLY makes
+    /// this acceptable.
+    ///
+    /// Fixture: White Ke1 + Qa1 in check from Re2 (Black Ke8). Kxe2
+    /// captures the attacking rook; with white still owning a queen
+    /// post-capture, qsearch returns a materially-winning score from
+    /// white's POV. Other legal evasions (Kd1, Kf1) leave the rook on
+    /// the board; MVV-LVA orders Kxe2 first and the capture's score
+    /// dominates. Queen on a1 deliberately positioned so it neither
+    /// attacks e2 (cannot capture rook itself) nor blocks the check
+    /// (cannot interpose on e-file). Drive at `ply = MAX_PLY as u32 - 1`.
+    ///
+    /// Assertions:
+    ///   - `score.abs() < MATE_IN_MAX_PLY` (no fabricated mate-in-ply).
+    ///   - `score > 0` (Kxe2 wins material — defeats a stub returning 0).
+    ///   - `qsearch_single_reply_firings == 0` (in-check arm runs the
+    ///     evasion path; M5.E #1 single-reply extension lives on the
+    ///     not-in-check arm and must NOT fire here).
+    #[test]
+    fn qsearch_max_ply_guard_does_not_fire_in_check() {
+        use crate::movegen::in_check;
+        let pos = Position::from_fen("4k3/8/8/8/8/8/4r3/Q3K3 w - - 0 1")
+            .expect("in-check fixture FEN must parse");
+        assert!(in_check(&pos), "fixture invariant: white in check");
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let ply = MAX_PLY as u32 - 1;
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, ply, &ctx);
+        assert!(
+            score.abs() < MATE_IN_MAX_PLY,
+            "in-check arm at MAX_PLY-1 must return a centipawn score (no fabricated mate); \
+             got score = {score}, MATE_IN_MAX_PLY = {MATE_IN_MAX_PLY}"
+        );
+        assert!(
+            score > 0,
+            "Kxe2 evasion wins the rook → score must be positive (defeats an always-zero \
+             stub); got {score}"
+        );
+        assert_eq!(
+            ab.qsearch_single_reply_firings_for_test(),
+            0,
+            "in-check arm must not invoke the M5.E #1 single-reply extension \
+             (lives on the not-in-check arm); got {}",
+            ab.qsearch_single_reply_firings_for_test()
+        );
+    }
+
+    // NOTE: The plan listed `qsearch_single_reply_chain_fires_recursively`
+    // (recursive M5.E #1 chains across both sides). A natural fixture
+    // requires both sides simultaneously zugzwanged into a single quiet
+    // reply, which is hard to construct from scratch. The recursion's
+    // correctness is structurally invariant — qsearch's single-reply
+    // branch is one recursive call site with no special chain handling,
+    // so `qsearch_single_reply_recursion_propagates_score_correctly`
+    // (which exercises one recursion level) is sufficient to pin the
+    // recursive structure; the chain test would add no independent
+    // coverage.
+
+    /// Documents the structural invariant that under-promo single-reply
+    /// uniqueness (`ml.len() == 1` AND the unique move is an under-promo)
+    /// is unreachable: legal-direct movegen (`src/movegen/pawn.rs`) emits
+    /// all four promotion variants whenever a promotion is geometrically
+    /// legal, so an under-promo can never appear alone. This invariant is
+    /// what allows M5.E #1's single-reply branch to recurse on the unique
+    /// move without an `is_quiet` gate (plan §0 #1; ADR-0027): when the
+    /// qsearch filter rejects the unique move and `ml.len() == 1`, the
+    /// move is provably a non-promo quiet (Quiet | DoublePush | KingCastle
+    /// | QueenCastle).
+    ///
+    /// Pinned by enumerating several promotion-bearing positions (quiet
+    /// promo, capture promo, near-stalemate-with-promo) and asserting the
+    /// movelist contains all four promo variants in each case.
+    #[test]
+    fn qsearch_single_reply_under_promo_uniqueness_is_structurally_unreachable() {
+        use crate::mov::MoveFlag;
+        use crate::movegen::{MoveList, generate_moves};
+        for fen in [
+            // Quiet promotion (white pawn a7 → a8, no capture available).
+            "4k3/P7/8/8/8/8/8/4K3 w - - 0 1",
+            // Capture promotion (white pawn b7 can capture ra8 OR push to b8).
+            "r3k3/1P6/8/8/8/8/8/4K3 w - - 0 1",
+            // Near-stalemate-with-promo: shared M5.E #3 fixture; f7 → f8
+            // promotion exists in a position where most other moves are
+            // sharply constrained.
+            "6Bk/5P2/4K3/8/8/3B4/8/8 w - - 0 1",
+        ] {
+            let pos = Position::from_fen(fen).expect("promo fixture FEN must parse");
+            let mut ml = MoveList::new();
+            generate_moves(&pos, &mut ml);
+            // Find the (from, to) of any promotion in the list — there must
+            // be at least one for the fixture to exercise the invariant.
+            let promo_to = ml
+                .iter()
+                .find(|m| {
+                    matches!(
+                        m.flag(),
+                        MoveFlag::KnightPromo
+                            | MoveFlag::BishopPromo
+                            | MoveFlag::RookPromo
+                            | MoveFlag::QueenPromo
+                            | MoveFlag::KnightPromoCapture
+                            | MoveFlag::BishopPromoCapture
+                            | MoveFlag::RookPromoCapture
+                            | MoveFlag::QueenPromoCapture
+                    )
+                })
+                .map(|m| (m.from_square(), m.to_square()))
+                .expect("fixture invariant: at least one promotion must be present");
+
+            // Capture vs quiet path: collect the promo variants at this (from, to).
+            let mut have_knight = false;
+            let mut have_bishop = false;
+            let mut have_rook = false;
+            let mut have_queen = false;
+            let mut is_capture_path = false;
+            for m in ml.iter() {
+                if (m.from_square(), m.to_square()) != promo_to {
+                    continue;
+                }
+                match m.flag() {
+                    MoveFlag::KnightPromo => have_knight = true,
+                    MoveFlag::BishopPromo => have_bishop = true,
+                    MoveFlag::RookPromo => have_rook = true,
+                    MoveFlag::QueenPromo => have_queen = true,
+                    MoveFlag::KnightPromoCapture => {
+                        have_knight = true;
+                        is_capture_path = true;
+                    }
+                    MoveFlag::BishopPromoCapture => {
+                        have_bishop = true;
+                        is_capture_path = true;
+                    }
+                    MoveFlag::RookPromoCapture => {
+                        have_rook = true;
+                        is_capture_path = true;
+                    }
+                    MoveFlag::QueenPromoCapture => {
+                        have_queen = true;
+                        is_capture_path = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                have_knight && have_bishop && have_rook && have_queen,
+                "fixture {fen}: movegen must emit all four promo variants at {promo_to:?} \
+                 (capture_path = {is_capture_path}); got knight = {have_knight}, \
+                 bishop = {have_bishop}, rook = {have_rook}, queen = {have_queen}"
+            );
+        }
+    }
+
+    /// Two legal quiet moves and no captures → the qsearch capture filter
+    /// is empty, `ml.len() != 1`, so the M5.E #1 single-reply path does
+    /// NOT fire. qsearch returns stand-pat (= `evaluate(pos)`).
+    ///
+    /// Fixture: `8/8/8/8/8/4k3/4P3/4K3 w - - 0 1` — white Ke1 + Pe2,
+    /// black Ke3 (kings not adjacent: e1 ↔ e3 are 2 ranks apart). Pe2
+    /// cannot push to e3 (blocked by black king); pe2 has no capture. White
+    /// king's only legal moves are Kd1, Kf1 (d2/e2/f2 blocked or attacked).
+    /// ml.len() == 2, both quiet — confirms the regime.
+    #[test]
+    fn qsearch_two_legal_quiets_and_no_captures_returns_stand_pat() {
+        use crate::eval::evaluate;
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        let pos = Position::from_fen("8/8/8/8/8/4k3/4P3/4K3 w - - 0 1")
+            .expect("two-legal-quiets fixture FEN must parse");
+        assert!(!in_check(&pos), "fixture invariant: not in check");
+
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        assert!(
+            ml.len() >= 2,
+            "fixture invariant: at least two legal moves; got {}",
+            ml.len()
+        );
+        assert!(
+            ml.iter().all(|m| !m.is_capture()),
+            "fixture invariant: no captures present"
+        );
+
+        let expected = evaluate(&pos);
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 1, &ctx);
+        assert_eq!(
+            score, expected,
+            "ml.len() != 1 with no captures must return stand-pat; got {score}, expected {expected}"
+        );
+        assert_eq!(
+            ab.qsearch_single_reply_firings_for_test(),
+            0,
+            "M5.E #1 must NOT fire when ml.len() != 1; got {}",
+            ab.qsearch_single_reply_firings_for_test()
+        );
+    }
+
+    // ===== §5.3 — Stalemate-conditional under-promo behavior tests. =====
+    //
+    // Shared fixture for the under-promo tests:
+    //
+    //   White Ke6, Bg8, Pf7, Bd3. Black Kh8.
+    //   FEN: `6Bk/5P2/4K3/8/8/3B4/8/8 w - - 0 1`.
+    //
+    // After 1.f8=Q (the only filtered move qsearch considers):
+    //   - Qf8 attacks rank 8 (blocked at Bg8) — does NOT see h8.
+    //   - Qf8 attacks the f8-g7-h6 diagonal (covers g7).
+    //   - Bd3 covers h7. Bg8 (own piece) occupies g8 and is defended by Qf8
+    //     via rank 8.
+    //   - Black Kh8 has no escape: g7 attacked by Qf8 (diagonal), g8 capture
+    //     blocked (Bg8 defended), h7 attacked by Bd3.
+    //   - Black not in check (Qf8 blocked by own Bg8 from seeing h8).
+    //   ⇒ STALEMATE. Queen-promo's child qsearch returns 0 under M5.E #2.
+    //
+    // After 1.f8=R (rook-promo at the same (from, to)):
+    //   - Rf8 has the same rank-8 + file-f attacks as Qf8 (rank 8 blocked at
+    //     Bg8) but NO diagonal — g7 is no longer attacked by the promoted
+    //     piece. Ke6 also doesn't attack g7. Bd3 doesn't attack g7.
+    //   ⇒ Black plays Kg7 (the unique legal quiet); the M5.E #1 single-reply
+    //     extension fires at the child frame, recursing on Kg7. White's
+    //     qsearch sees no further captures → returns the materially winning
+    //     stand-pat (white has K + B + B + R; black has K only). Negated
+    //     back, the rook-promo's contribution is large and positive.
+    //
+    // After 1.f8=B (bishop-promo at the same (from, to)):
+    //   - Bf8 has only diagonal attacks (no rank-8 → does NOT defend Bg8).
+    //   - Black Kh8 plays Kxg8 (capture of the now-undefended Wbishop on g8).
+    //   - Resulting position: White K + B + B vs Black K → eval positive
+    //     (sufficient material). Negated back, bishop-promo also contributes
+    //     a positive (smaller) score.
+    //
+    // The under-promo loop runs both rook + bishop unconditionally on the
+    // queen_promo_stalemates flag, so `qsearch_under_promo_firings == 2` on
+    // the default (-INF, INF) window. The returned `best` is the max of
+    // {queen-promo (0), rook-promo (large +), bishop-promo (smaller +)} ⇒
+    // strictly > 0, exposing the M5.E #3 strength gain.
+
+    /// M5.E #3 fires when queen-promo's post-make child is stalemate. Both
+    /// the rook-promo and bishop-promo synthesized variants are recursed →
+    /// `qsearch_under_promo_firings >= 2`.
+    #[test]
+    fn qsearch_under_promo_fires_when_queen_promo_stalemates() {
+        use crate::mov::MoveFlag;
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        let pos = Position::from_fen("6Bk/5P2/4K3/8/8/3B4/8/8 w - - 0 1")
+            .expect("queen-promo-stalemate fixture FEN must parse");
+        assert!(
+            !in_check(&pos),
+            "fixture invariant: white not in check at root"
+        );
+
+        // Fixture invariant: 1.f8=Q must stalemate Black (zero legal replies
+        // AND not in check) — this is what gates the M5.E #3 firing.
+        let qp_move = Move::new(crate::Square::F7, crate::Square::F8, MoveFlag::QueenPromo);
+        let mut after_qp = pos;
+        let _undo_qp = after_qp.make_move(qp_move);
+        let mut child_ml = MoveList::new();
+        generate_moves(&after_qp, &mut child_ml);
+        assert!(
+            child_ml.is_empty() && !in_check(&after_qp),
+            "fixture invariant: 1.f8=Q must stalemate (zero legal moves AND not in check); \
+             got moves = {}, in_check = {}",
+            child_ml.len(),
+            in_check(&after_qp)
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let _score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 0, &ctx);
+        // Assert exact firing count (== 2, not >= 2) — harmonizes with the
+        // other two under-promo tests on this fixture and pins double-counting
+        // regressions (e.g., a bug that re-runs the helper).
+        assert_eq!(
+            ab.qsearch_under_promo_firings_for_test(),
+            2,
+            "M5.E #3 must fire rook + bishop under-promo recursions exactly once each; got firings = {}",
+            ab.qsearch_under_promo_firings_for_test()
+        );
+    }
+
+    /// M5.E #3 does NOT fire when queen-promo gives checkmate (post-make
+    /// child has 0 legal moves AND in_check). The predicate's `!in_check`
+    /// half rejects this case.
+    ///
+    /// Fixture: White Kf6, Bd5, Pf7. Black Kh8, Ng8. White is in check from
+    /// Ng8 (knight on g8 attacks f6). White's evasion 1.fxg8=Q+ promotes
+    /// the f7-pawn while capturing the checking knight. After 1.fxg8=Q+,
+    /// Qg8 checks BK h8 (rank 8 adjacent), and the only nominal escapes
+    /// are: Kg7 (attacked by Qg8 + Kf6), Kh7 (attacked by Qg8 diagonal),
+    /// Kxg8 (Qg8 defended by Bd5 along the now-cleared d5-g8 diagonal once
+    /// the f7 pawn has promoted away). All escapes illegal → checkmate.
+    /// The queen-promo's child is in_check → predicate false → counter 0.
+    ///
+    /// Note: white is in check at the root, so qsearch's in-check arm runs
+    /// with no capture filter (full evasion list). Several other evasions
+    /// also exist (Ke5, Kg5, Kg7, the under-promo variants of fxg8); none
+    /// of them is a queen-promo with stalemate child → counter stays 0
+    /// across the whole move loop.
+    #[test]
+    fn qsearch_under_promo_does_not_fire_when_queen_promo_checkmates() {
+        use crate::mov::MoveFlag;
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        let pos = Position::from_fen("6nk/5P2/5K2/3B4/8/8/8/8 w - - 0 1")
+            .expect("queen-promo-checkmate fixture FEN must parse");
+        // White is in check from Ng8 — the in-check arm of qsearch runs the
+        // full evasion list, including the f7×g8=Q capture-promotion that
+        // delivers checkmate. The fixture invariant for THIS test is that
+        // the queen-promo evasion's child is mate (in_check), not stalemate.
+        assert!(in_check(&pos), "fixture invariant: white in check at root");
+
+        // Fixture invariant: 1.fxg8=Q+ must checkmate Black (zero legal
+        // replies AND in check) — this is what blocks the M5.E #3 firing.
+        let qpc = Move::new(
+            crate::Square::F7,
+            crate::Square::G8,
+            MoveFlag::QueenPromoCapture,
+        );
+        let mut after = pos;
+        let _undo = after.make_move(qpc);
+        let mut child_ml = MoveList::new();
+        generate_moves(&after, &mut child_ml);
+        assert!(
+            child_ml.is_empty() && in_check(&after),
+            "fixture invariant: 1.fxg8=Q+ must checkmate (zero legal moves AND in check); \
+             got moves = {}, in_check = {}",
+            child_ml.len(),
+            in_check(&after)
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let _score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 0, &ctx);
+        assert_eq!(
+            ab.qsearch_under_promo_firings_for_test(),
+            0,
+            "M5.E #3 must NOT fire when queen-promo checkmates (child in check); got {}",
+            ab.qsearch_under_promo_firings_for_test()
+        );
+    }
+
+    /// M5.E #3 does NOT fire when queen-promo leaves the opponent at least
+    /// one legal reply (no stalemate). The predicate's `child_ml.is_empty()`
+    /// half rejects this case.
+    ///
+    /// Fixture: White Kc1, Pe7. Black Ka1. After 1.e8=Q: Black Ka1 has Ka2
+    /// legal (a2 not attacked by Qe8 nor by Kc1). Counter == 0.
+    #[test]
+    fn qsearch_under_promo_does_not_fire_when_queen_promo_leaves_opponent_with_legal_replies() {
+        use crate::mov::MoveFlag;
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        let pos = Position::from_fen("8/4P3/8/8/8/8/8/k1K5 w - - 0 1")
+            .expect("queen-promo-with-replies fixture FEN must parse");
+        assert!(
+            !in_check(&pos),
+            "fixture invariant: white not in check at root"
+        );
+
+        // Fixture invariant: 1.e8=Q must leave Black with at least one
+        // legal reply — this is what blocks the M5.E #3 firing.
+        let qp = Move::new(crate::Square::E7, crate::Square::E8, MoveFlag::QueenPromo);
+        let mut after = pos;
+        let _undo = after.make_move(qp);
+        let mut child_ml = MoveList::new();
+        generate_moves(&after, &mut child_ml);
+        assert!(
+            !child_ml.is_empty(),
+            "fixture invariant: 1.e8=Q must leave Black with at least one legal reply; got 0 legal moves"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let _score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 0, &ctx);
+        assert_eq!(
+            ab.qsearch_under_promo_firings_for_test(),
+            0,
+            "M5.E #3 must NOT fire when queen-promo leaves opponent with replies; got {}",
+            ab.qsearch_under_promo_firings_for_test()
+        );
+    }
+
+    /// M5.E #3 does NOT fire on non-queen-promo moves. The predicate's
+    /// flag-match (`QueenPromo | QueenPromoCapture`) gates the entire
+    /// stalemate detection; on a Capture / Quiet move the helper would also
+    /// return `[None, None]`, but the gate fires first and skips the
+    /// movegen-and-stalemate-check work.
+    ///
+    /// Fixture: White Pe4 captures Black pd5. Filter accepts the capture;
+    /// no queen-promo present in the move list. Counter == 0.
+    #[test]
+    fn qsearch_under_promo_does_not_fire_for_non_queen_promo_moves() {
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        let pos = Position::from_fen("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1")
+            .expect("capture-fixture FEN must parse");
+        assert!(!in_check(&pos), "fixture invariant: white not in check");
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let captures: Vec<_> = ml.iter().filter(|m| m.is_capture()).collect();
+        assert!(
+            !captures.is_empty(),
+            "fixture invariant: at least one capture present"
+        );
+        // Sanity: no queen-promos in the move list.
+        let qpromos: Vec<_> = ml
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.flag(),
+                    crate::mov::MoveFlag::QueenPromo | crate::mov::MoveFlag::QueenPromoCapture
+                )
+            })
+            .collect();
+        assert!(
+            qpromos.is_empty(),
+            "fixture invariant: no queen-promos present (so the M5.E #3 flag-gate is the discriminator)"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let _score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 0, &ctx);
+        assert_eq!(
+            ab.qsearch_under_promo_firings_for_test(),
+            0,
+            "M5.E #3 must NOT fire for non-queen-promo moves; got {}",
+            ab.qsearch_under_promo_firings_for_test()
+        );
+    }
+
+    /// M5.E #3's strength gain: queen-promo stalemates (returns 0) while a
+    /// rook-promo at the same (from, to) DOES NOT stalemate, exposing a
+    /// winning continuation. The returned `best` reflects the under-promo's
+    /// material gain.
+    ///
+    /// **Fixture construction notes** (per plan §5.3):
+    ///
+    /// FEN: `6Bk/5P2/4K3/8/8/3B4/8/8 w - - 0 1` (White Ke6, Bg8, Pf7, Bd3.
+    /// Black Kh8.)
+    ///
+    /// Regime invariants (verified via runtime fixture-validation
+    /// assertions below):
+    ///
+    ///   (a) After 1.f8=Q, Black has zero legal replies AND is not in check
+    ///       — true stalemate. The queen-promo's recursed-and-negated score
+    ///       is therefore 0 under M5.E #2.
+    ///   (b) After 1.f8=R, Black has at least one legal reply (Kg7) —
+    ///       rook-promo does NOT stalemate. The diagonal attack on g7 from
+    ///       the queen-promo is the load-bearing difference: Rf8 has no
+    ///       diagonal coverage of g7, while Bd3 does NOT cover g7 either,
+    ///       so Black escapes to g7.
+    ///   (c) After 1...Kg7 in the rook-promo line, white has K + R + B + B
+    ///       vs lone black K → stand-pat is materially winning. Negated
+    ///       back to the under-promo recursion's parent, this surfaces a
+    ///       large positive score.
+    ///   (d) After 1.f8=B, Black plays Kxg8 (capturing the now-undefended
+    ///       white bishop). Resulting position: K + B + B vs K → still a
+    ///       sufficient-material position (eval > 0); contributes a
+    ///       positive (smaller) score.
+    ///
+    /// The fixture is hand-constructed; the under-promo loop is documented
+    /// to fire both rook AND bishop unconditionally per §4.3, so
+    /// `qsearch_under_promo_firings == 2` (the expected steady-state count).
+    /// Returned `best` is `max(queen=0, rook=+large, bishop=+positive) >= rook >> 0`.
+    #[test]
+    fn qsearch_under_promo_finds_winning_rook_promo_when_queen_stalemates() {
+        use crate::mov::MoveFlag;
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        let pos = Position::from_fen("6Bk/5P2/4K3/8/8/3B4/8/8 w - - 0 1")
+            .expect("under-promo-winning fixture FEN must parse");
+        assert!(!in_check(&pos), "fixture invariant: white not in check");
+
+        // Regime invariant (a): queen-promo at f8 stalemates.
+        let qp_move = Move::new(crate::Square::F7, crate::Square::F8, MoveFlag::QueenPromo);
+        let mut after_qp = pos;
+        let _undo_qp = after_qp.make_move(qp_move);
+        let mut child_ml_qp = MoveList::new();
+        generate_moves(&after_qp, &mut child_ml_qp);
+        assert!(
+            child_ml_qp.is_empty() && !in_check(&after_qp),
+            "fixture invariant (a): 1.f8=Q must stalemate (zero legal moves AND not in check); \
+             got moves = {}, in_check = {}",
+            child_ml_qp.len(),
+            in_check(&after_qp)
+        );
+
+        // Regime invariant (b): rook-promo at f8 does NOT stalemate.
+        let rp_move = Move::new(crate::Square::F7, crate::Square::F8, MoveFlag::RookPromo);
+        let mut after_rp = pos;
+        let _undo_rp = after_rp.make_move(rp_move);
+        let mut child_ml_rp = MoveList::new();
+        generate_moves(&after_rp, &mut child_ml_rp);
+        assert!(
+            !child_ml_rp.is_empty(),
+            "fixture invariant (b): 1.f8=R must NOT stalemate (rook-promo leaves an escape); got 0 legal moves"
+        );
+
+        // Capture stand-pat at the root before driving qsearch — the
+        // tightened assertion below requires that the under-promo's
+        // contribution surface ABOVE stand-pat (otherwise stand-pat alone
+        // would mask sign-flip / wrong-direction-best-update mutations
+        // on the under-promo branch).
+        let stand_pat = crate::eval::evaluate(&pos);
+        assert!(
+            stand_pat > 0,
+            "fixture invariant: stand-pat must be positive (white materially up at root); got {stand_pat}"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 0, &ctx);
+
+        assert_eq!(
+            ab.qsearch_under_promo_firings_for_test(),
+            2,
+            "M5.E #3 must fire BOTH rook + bishop under-promo recursions \
+             (the under-promo loop runs unconditionally on the stalemate flag); got {}",
+            ab.qsearch_under_promo_firings_for_test()
+        );
+        // Tightened assertion (mutation-killing): the under-promo's
+        // contribution must surface ABOVE stand-pat. The rook-promo's
+        // continuation reaches K+R+B+B vs K (~+1200 cp), well above the
+        // root stand-pat (~+800 cp). A sign-flip mutation on the
+        // under-promo recursion (line 2194:39) would leave best at
+        // stand-pat; a wrong-direction `best`-update (line 2202:36) would
+        // also leave best at stand-pat. Only the production sign + update
+        // direction surfaces a score > stand-pat. Margin of 100 cp covers
+        // PSQT variation across the path.
+        assert!(
+            score > stand_pat + 100,
+            "fixture's M5.E #3 strength gain: returned best must reflect the winning under-promo \
+             continuation ABOVE stand-pat ({stand_pat}); got {score}. The under-promo's score \
+             (~+1200 cp from K+R+B+B vs K) must surface — wrong-sign / wrong-direction-update \
+             mutations would leave best at stand-pat."
+        );
+    }
+
+    // M5.E #3 ordering note (§4.3): the production code runs the under-promo
+    // loop BEFORE the per-move beta cutoff. Constructing a discriminating
+    // fixture is hard: the discrimination requires `stand_pat < beta <= 0` so
+    // the move loop runs (no step-4 stand-pat cutoff) AND the queen-promo's
+    // stalemate score (0) raises alpha to >= beta. Both conditions together
+    // demand the side-to-move be materially behind (stand_pat < 0), but the
+    // M5.E #3 trigger fires only on a queen-promo whose post-make child is
+    // stalemated, which typically requires the promoting side to be materially
+    // ahead (so the queen + remaining material covers the opponent's escape
+    // squares). The two requirements push in opposite directions; no compact
+    // natural fixture satisfies both.
+    //
+    // The ordering invariant is documented in plan §4.3 and ADR-0027 §6, and
+    // pinned structurally by the production code's block layout (10a → 10b →
+    // 10c). Final review's code reading is the load-bearing check; the test
+    // is omitted rather than shipping a non-discriminating placeholder.
+
+    /// Cross-check of helper integration: the synthesized rook + bishop
+    /// moves preserve (from, to) of the underlying queen-promo. Pinned via
+    /// the helper directly (no qsearch driving needed — the helper's
+    /// from/to-preservation is the load-bearing invariant for the under-
+    /// promo loop's make/unmake correctness).
+    #[test]
+    fn qsearch_under_promo_synthetic_moves_have_same_from_to_as_queen_promo() {
+        use crate::Square;
+        use crate::mov::MoveFlag;
+        // Sample several (from, to) pairs spanning rank-7→8 (white) and
+        // rank-2→1 (black) promotions, including capture variants.
+        for (from, to, flag) in [
+            (Square::A7, Square::A8, MoveFlag::QueenPromo),
+            (Square::H7, Square::H8, MoveFlag::QueenPromo),
+            (Square::B7, Square::A8, MoveFlag::QueenPromoCapture),
+            (Square::A2, Square::A1, MoveFlag::QueenPromo),
+            (Square::H2, Square::H1, MoveFlag::QueenPromo),
+            (Square::E2, Square::F1, MoveFlag::QueenPromoCapture),
+        ] {
+            let qp = Move::new(from, to, flag);
+            let [r, b] = stalemate_avoiding_under_promos(qp);
+            let r = r.expect("rook variant must be Some for queen-promo input");
+            let b = b.expect("bishop variant must be Some for queen-promo input");
+            assert_eq!(
+                (r.from_square(), r.to_square()),
+                (from, to),
+                "rook variant must preserve (from, to) of the queen-promo input"
+            );
+            assert_eq!(
+                (b.from_square(), b.to_square()),
+                (from, to),
+                "bishop variant must preserve (from, to) of the queen-promo input"
+            );
+        }
+    }
+
+    /// Under-promo recursions fire AND demonstrate the alpha-respecting
+    /// fail-soft contract: the under-promo scores update `best` but do NOT
+    /// push it above the high alpha. Pins that the cutoff *within* the
+    /// under-promo loop is keyed on `alpha >= beta` and that fail-soft
+    /// returns from the under-promo recursions cannot exceed beta.
+    ///
+    /// Window: `alpha = 2000, beta = 2001`. The under-promo continuations
+    /// score ~+1200 cp at the shared fixture (white up R+B+B vs lone K
+    /// after rook-promo + Black's escape), so neither under-promo can beat
+    /// alpha = 2000. The under-promo loop must still fire (gated on the
+    /// stalemate flag, not on alpha/beta); `best` reflects the under-promos'
+    /// fail-soft contributions but stays below alpha = 2000.
+    #[test]
+    fn qsearch_under_promo_respects_existing_alpha_beta_cutoff() {
+        let pos = Position::from_fen("6Bk/5P2/4K3/8/8/3B4/8/8 w - - 0 1")
+            .expect("under-promo-alpha-beta fixture FEN must parse");
+
+        // alpha = 2000 is high enough that the under-promos' material gain
+        // (~+1200 cp) cannot reach it; beta = 2001 keeps the window narrow
+        // but ensures `alpha < beta` throughout. The under-promo loop must
+        // execute both rook + bishop regardless of alpha-improvement.
+        let alpha = 2000;
+        let beta = 2001;
+
+        // Fixture-invariant: stand-pat must be strictly below beta so the
+        // step-4 stand-pat cutoff does NOT fire, otherwise the move loop
+        // never runs and the test passes vacuously regardless of M5.E #3.
+        let sp = crate::eval::evaluate(&pos);
+        assert!(
+            sp < beta,
+            "fixture invariant: stand-pat must be < beta={beta} so the move loop runs; got {sp}"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), alpha, beta, 0, &ctx);
+        assert_eq!(
+            ab.qsearch_under_promo_firings_for_test(),
+            2,
+            "under-promo loop must run BOTH rook + bishop regardless of alpha-improvement; got {}",
+            ab.qsearch_under_promo_firings_for_test()
+        );
+        assert!(
+            score > 0,
+            "under-promo's contribution must surface in `best` (fail-soft return); got {score}"
+        );
+        assert!(
+            score < alpha,
+            "under-promo scores cannot exceed alpha = {alpha}; got {score}"
         );
     }
 }
