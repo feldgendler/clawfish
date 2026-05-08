@@ -338,34 +338,33 @@ exclude_re = [
     "in controller::production_worker_fn",
     "replace controller::production_worker_fn with",
 
-    # `run_iteration` drain-loop boundary mutants are integration-only:
+    # `run_iteration` drain-loop boundary mutants — function-anchored
+    # exclusion LIFTED 2026-05-08 by tooling-eloh-controller-boundary-tests.
     #
-    # The synthetic-worker controller tests cover happy-path dispatch, W/L/D
-    # aggregation, and termination, but precise boundary distinctions in the
-    # drain-loop dispatch gating require an integration harness with a mock
-    # `EngineHandle`. **WHAT'S DEFERRED, SPECIFICALLY:**
-    # - PGN write call site inside the `WorkerReport::GameComplete` arm
-    #   (file-IO, exercised only by smoke).
-    # - `summary::append_summary_line` call site (same — file-IO).
-    # - The dispatch-loop's `pairs_dispatched < total_pairs` boundary: the
-    #   synthetic tests pin happy-path counts but a `<` → `<=` mutant would
-    #   over-dispatch by one. Catchable in principle by a synthetic test that
-    #   asserts `pairs_dispatched == total_pairs` exactly at exit, but each
-    #   such test requires bespoke channel-recording infrastructure.
-    # - The `t < args.max_games` early-break guard at the top of the drain
-    #   loop: ditto.
-    # - In-flight-pair tracking math (`pairs_in_flight[wid] += 1`,
-    #   `saturating_sub(1)`). Catchable but requires synthetic tests that
-    #   record the per-worker dispatch sequence under interleaved completion.
+    # The audit had deferred ~6 boundary mutants citing "mock EngineHandle"
+    # infrastructure. That framing was wrong: the dispatch/drain-loop boundary
+    # distinctions live in pure Rust above `production_worker_fn` and are
+    # closeable with synthetic-worker channel-recording fixtures + a thread
+    # watchdog wrapper. See `docs/plans/tooling-eloh-controller-boundary-
+    # tests.md` and the new tests under `mod controller::tests`:
+    #   - bootstrap_break (mutant A, hang-class)
+    #   - bootstrap_in_flight_increment (mutant D, immediate-exit)
+    #   - in_flight_decrement (mutant J, hang-class — defensive; cargo-mutants
+    #     27 does not generate the saturating_sub mutation)
+    #   - redispatch_pd_eq_tp_boundary (mutants L+M, hang-class)
+    #   - terminating_gate (mutant N1, hang-class)
+    #   - redispatch_pair_indices_form_strictly_ascending_sequence (mutant F)
+    #   - redispatch_dispatches_exactly_total_pairs_no_overshoot (mutant K)
     #
-    # The cumulative effect: ~6 boundary mutants in this function survive
-    # the cargo test suite. The deferral commitment is documented in
-    # `docs/tooling-backlog.md` ("ELOH controller boundary testing — mock
-    # EngineHandle harness for unit-testing dispatch-loop boundaries").
-    # ELOH.C lands `--go-nodes` mode without touching this surface; the
-    # deferral persists until a dedicated mock-engine test infrastructure
-    # lands (estimated ~150 LOC of test scaffolding; out of scope here).
-    "in controller::run_iteration",
+    # Mock-engine fixture for `production_worker_fn` setoption ordering is
+    # the truly integration-only follow-up — see `docs/tooling-backlog.md`
+    # "Mock-engine fixture for production_worker_fn setoption ordering".
+    # File-IO call sites inside the `GameComplete` arm (`std::fs::write` for
+    # the per-game PGN at line ~7321 and `summary::append_summary_line` at
+    # line ~7332) remain exercised only by the e2e smoke; if cargo-mutants
+    # surfaces those after this lift, re-add narrower exclusions targeting
+    # those specific call sites.
+    # "in controller::run_iteration",
 
     # `current_hostname` and `current_date_str` are system-call-bound
     # (gethostname; std::time::SystemTime).  They are exercised only via the
@@ -403,7 +402,8 @@ exclude_re = [
     # Ok(())`) is caught by the smoke (which reads back the file), not by
     # `cargo test --lib`. Same exclusion rationale as ELOH.A's
     # `in summary::append_summary_line` line.
-    "in pgn::format_pgn",
+    # LIFTED 2026-05-08 by tooling-eloh-controller-boundary-tests:
+    # "in pgn::format_pgn",
     "replace summary::append_summary_line ->",
 
     # `main` is the binary entry point — only exercised by the binary's
@@ -466,6 +466,24 @@ exclude_re = [
     # step is changed.
     "replace < with <= in controller::clamp_uci_elo",
     "replace > with >= in controller::clamp_uci_elo",
+
+    # ---- classify_score: `< → <=` on integer-valued inputs — equivalent ----
+    #
+    # `classify_score(s)` checks `(s - 1.0).abs() < 1e-9` and `s.abs() < 1e-9`
+    # to map a clawfish-POV score (1.0/0.5/0.0) to Win/Loss/Draw. The 1e-9
+    # epsilon defends against future float-arithmetic upstream of the
+    # callers, but every current caller passes scores produced by
+    # `compute_clawfish_score`, which only emits {0.0, 0.5, 1.0} —
+    # integer-valued doubles. For these inputs, `0.0 < 1e-9` and `0.0 <= 1e-9`
+    # both true; `0.5 < 1e-9` and `0.5 <= 1e-9` both false; `1.0 < 1e-9` and
+    # `1.0 <= 1e-9` both false. Same for the second branch with `s.abs()`.
+    # No test input distinguishes `<` from `<=`. Equivalent.
+    #
+    # **EQUIVALENCE DEPENDS ON: callers passing only {0.0, 0.5, 1.0}.**
+    # If a future code path ever calls `classify_score` with a score that
+    # could be 1e-9 (e.g., a smoothed/weighted score), this equivalence
+    # breaks and the exclusion must be re-evaluated.
+    "replace < with <= in classify_score",
 
     # ---- has_non_pawn_material: `|` ↔ `^` between provably-disjoint operands ----
     #

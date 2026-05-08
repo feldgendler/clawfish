@@ -5672,6 +5672,80 @@ mod pgn {
                 "must contain exactly one [TimeControl \"20+0.2\"] line; got:\n{pgn}"
             );
         }
+
+        /// Boundary sweep across move counts {0, 1, 2, 3, 4, 5}.
+        ///
+        /// Pins the move-pair separator at line `if i < moves.len()` after
+        /// `i += 2` (kills `< → <=` and `< → ==` mutants — both produce a
+        /// trailing space after the last pair) and the result-marker spacing
+        /// at `if !moves.is_empty()` (kills the `delete !` mutant — produces
+        /// a leading space at n=0 and skips the separator at n≥1).
+        ///
+        /// Existing pgn tests use `pgn.contains(...)` and
+        /// `pgn.trim_end().ends_with(...)` which silently absorb internal
+        /// whitespace mutations.  This sweep asserts the body shape exactly.
+        #[test]
+        fn format_pgn_pins_separator_and_result_spacing() {
+            let header = base_header("1-0");
+            for n in [0_usize, 1, 2, 3, 4, 5] {
+                let moves: Vec<PgnMove> = (0..n)
+                    .map(|i| PgnMove {
+                        uci: format!("a{}a{}", (i % 8) + 1, ((i + 1) % 8) + 1),
+                        last_info: None,
+                    })
+                    .collect();
+                let pgn = format_pgn(&header, &moves);
+
+                // Body is everything after the header's blank-line separator.
+                // `split_once("\n\n")` is correct because `base_header` produces
+                // header tags that contain no newlines, so the only `"\n\n"` is
+                // the mandatory header/body blank line.
+                let body = pgn
+                    .split_once("\n\n")
+                    .map(|(_, b)| b)
+                    .unwrap_or_else(|| panic!("n={n}: missing header/body separator in:\n{pgn}"));
+
+                if n == 0 {
+                    // Empty body: result marker on its own line, no leading space.
+                    // Catches `delete !` at line 5390 (would produce " 1-0\n").
+                    assert_eq!(body, "1-0\n", "n=0 body must be '1-0\\n', got {body:?}");
+                    continue;
+                }
+
+                // n ≥ 1: body must end with " 1-0\n" — exactly one space before
+                // the result marker.  Catches `delete !` at line 5390 in the
+                // non-empty case (would skip the separator → no space).
+                assert!(
+                    body.ends_with(" 1-0\n"),
+                    "n={n} body must end with ' 1-0\\n', got {body:?}"
+                );
+
+                // Body before the trailing " 1-0\n" must end with a
+                // non-space character (the last move's UCI).  Catches the
+                // L5376 mutants `< → <=` and `< → ==` (both push a spurious
+                // space after the last move pair, manifesting as `"  "`
+                // immediately before the " 1-0\n" result marker).
+                let body_moves = &body[..body.len() - " 1-0\n".len()];
+                assert!(
+                    !body_moves.is_empty()
+                        && body_moves.as_bytes().last().is_none_or(|b| *b != b' '),
+                    "n={n} body before result marker must end with a non-space character, got {body_moves:?}"
+                );
+
+                // Move-pair separator: each move number prefix `K. ` for K≥2
+                // must be preceded by a single space.  `n.div_ceil(2)`: for
+                // even n, equals n/2 (covers pairs 1..=n/2); for odd n,
+                // equals (n+1)/2 (includes the trailing white-only pair);
+                // for n=1, range `2..=1` is empty (no separators expected).
+                for k in 2..=n.div_ceil(2) {
+                    let sep = format!(" {k}. ");
+                    assert!(
+                        body_moves.contains(&sep),
+                        "n={n} expected move-pair separator {sep:?}, got {body_moves:?}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -6776,6 +6850,34 @@ mod controller {
         }
     }
 
+    /// Three-way classification of a clawfish-POV score into Win/Loss/Draw.
+    ///
+    /// Centralises the `(score - 1.0).abs() < 1e-9` and `score.abs() < 1e-9`
+    /// epsilon checks that appear in both the unconditional W/L/D counters
+    /// and the per-TC bucket aggregation. Extracting also moves the
+    /// `< 1e-9 → <= 1e-9` mutants out of `controller::run_iteration` and
+    /// onto this helper, which lets `.cargo/mutants.toml` exclude them with
+    /// a precise `in classify_score` regex (the mutation is structurally
+    /// equivalent: the only callers pass scores ∈ {0.0, 0.5, 1.0}, all of
+    /// which are integer-valued, so `0.0 < 1e-9` and `0.0 <= 1e-9` agree).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ScoreClass {
+        Win,
+        Loss,
+        Draw,
+    }
+
+    /// Classify a clawfish-POV score (1.0 = win, 0.0 = loss, 0.5 = draw).
+    pub(super) fn classify_score(clawfish_score: f64) -> ScoreClass {
+        if (clawfish_score - 1.0).abs() < 1e-9 {
+            ScoreClass::Win
+        } else if clawfish_score.abs() < 1e-9 {
+            ScoreClass::Loss
+        } else {
+            ScoreClass::Draw
+        }
+    }
+
     /// Map a `GameOutcome` and the side clawfish played to clawfish's POV score
     /// (1.0 = win, 0.5 = draw, 0.0 = loss).
     pub(super) fn compute_clawfish_score(
@@ -7257,12 +7359,10 @@ mod controller {
                     if args.tc_sample.is_some()
                         && let Some(idx) = buckets.iter().position(|b| b.tc == report_tc)
                     {
-                        if (clawfish_score - 1.0).abs() < 1e-9 {
-                            buckets[idx].wins += 1;
-                        } else if clawfish_score.abs() < 1e-9 {
-                            buckets[idx].losses += 1;
-                        } else {
-                            buckets[idx].draws += 1;
+                        match classify_score(clawfish_score) {
+                            ScoreClass::Win => buckets[idx].wins += 1,
+                            ScoreClass::Loss => buckets[idx].losses += 1,
+                            ScoreClass::Draw => buckets[idx].draws += 1,
                         }
                     }
 
@@ -7277,12 +7377,10 @@ mod controller {
                     estimates_trail.push(current_estimate);
                     t += 1;
 
-                    if (clawfish_score - 1.0).abs() < 1e-9 {
-                        wins += 1;
-                    } else if clawfish_score.abs() < 1e-9 {
-                        losses += 1;
-                    } else {
-                        draws += 1;
+                    match classify_score(clawfish_score) {
+                        ScoreClass::Win => wins += 1,
+                        ScoreClass::Loss => losses += 1,
+                        ScoreClass::Draw => draws += 1,
                     }
 
                     // σ-stopping check (per-game cadence). Skipped in SPRT mode
@@ -7313,9 +7411,9 @@ mod controller {
                 }
                 WorkerReport::PairComplete { worker_id } => {
                     let wid = worker_id as usize;
-                    if wid < pairs_in_flight.len() {
-                        pairs_in_flight[wid] = pairs_in_flight[wid].saturating_sub(1);
-                    }
+                    // Out-of-bounds worker_id is a worker bug; let indexing
+                    // panic rather than silently no-op'ing the bookkeeping.
+                    pairs_in_flight[wid] = pairs_in_flight[wid].saturating_sub(1);
 
                     // ELOH.E: drain this worker's pair-score buffer and feed
                     // it into the SPRT state. Always runs (the same state
@@ -7391,7 +7489,9 @@ mod controller {
                     }
 
                     // Dispatch next pair on this worker if we still have budget.
-                    if !terminating && pairs_dispatched < total_pairs && wid < pool.senders.len() {
+                    // `wid < senders.len()` is structurally guaranteed by
+                    // worker spawn/teardown semantics — no defensive gate.
+                    if !terminating && pairs_dispatched < total_pairs {
                         let opp_elo = clamp_uci_elo(current_estimate);
                         let (engine_tc, opponent_tc) = pair_tcs[pairs_dispatched as usize];
                         if pool.senders[wid]
@@ -9100,6 +9200,116 @@ mod controller {
             }
         }
 
+        /// Pure-helper classifier: 1.0 → Win, 0.0 → Loss, 0.5 → Draw.
+        /// Pins the integer-valued boundary cases for the `< 1e-9` epsilon.
+        #[test]
+        fn classify_score_three_way() {
+            assert_eq!(classify_score(1.0), ScoreClass::Win);
+            assert_eq!(classify_score(0.0), ScoreClass::Loss);
+            assert_eq!(classify_score(0.5), ScoreClass::Draw);
+        }
+
+        /// Per-TC bucket W/L/D classification. The existing
+        /// `per_tc_buckets_aggregate_in_input_order` test only asserts totals
+        /// (W+L+D = 2 per bucket), missing the per-class boundary mutations on
+        /// the win/loss epsilon checks (`(score - 1.0).abs() < 1e-9` →
+        /// `== 1e-9` / `> 1e-9` and the symmetric loss check on `score.abs()`).
+        /// This test feeds one win + one loss + one draw across three TC
+        /// buckets and asserts each bucket's W=, L=, D= values exactly.
+        #[test]
+        fn per_tc_buckets_classify_w_l_d_correctly() {
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc-sample".into(),
+                "10+0.1:1,20+0.2:1,40+0.4:1".into(),
+                "--max-games".into(),
+                "6".into(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+                "--seed".into(),
+                "42".into(),
+            ];
+            let args = super::super::cli::parse_args(argv).expect("parse ok");
+            let out_dir = std::env::temp_dir().join("eloh_per_tc_wld_classification");
+            // Three pairs, each pair pinned to one TC. Per pair, one game has
+            // a win-defining score and the other has the loss/draw mirror.
+            //   Pair 0 (TC 10+0.1): both wins → W=2.
+            //   Pair 1 (TC 20+0.2): both losses → L=2.
+            //   Pair 2 (TC 40+0.4): both draws → D=2.
+            let tcs = [
+                super::super::cli::TimeControl {
+                    initial_ms: 10_000,
+                    increment_ms: 100,
+                },
+                super::super::cli::TimeControl {
+                    initial_ms: 20_000,
+                    increment_ms: 200,
+                },
+                super::super::cli::TimeControl {
+                    initial_ms: 40_000,
+                    increment_ms: 400,
+                },
+            ];
+            let scores = [1.0_f64, 0.0_f64, 0.5_f64];
+            let pair_reports: Vec<WorkerReport> = (0..3u32)
+                .flat_map(|p| {
+                    let tc = tcs[p as usize];
+                    let s = scores[p as usize];
+                    vec![
+                        WorkerReport::GameComplete {
+                            worker_id: 0,
+                            game_index: p * 2 + 1,
+                            opponent_uci_elo: 2000,
+                            clawfish_score: s,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                            tc,
+                        },
+                        WorkerReport::GameComplete {
+                            worker_id: 0,
+                            game_index: p * 2 + 2,
+                            opponent_uci_elo: 2000,
+                            clawfish_score: s,
+                            outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                            pgn_moves: vec![],
+                            white_name: "w".into(),
+                            black_name: "b".into(),
+                            tc,
+                        },
+                        WorkerReport::PairComplete { worker_id: 0 },
+                    ]
+                })
+                .collect();
+            let mut pool = synthetic_pool(1, vec![pair_reports]);
+            let _ = run_iteration(&mut pool, &args, &out_dir);
+            let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap_or_default();
+            let by_tc_line = summary
+                .lines()
+                .find(|l| l.starts_with("summary-by-tc:"))
+                .expect("summary-by-tc: line missing");
+            // Pin per-bucket W/L/D shape exactly. Format: "TC: W=N L=N D=N (N)"
+            for (tc_str, expected_w, expected_l, expected_d) in [
+                ("10+0.1", 2u32, 0u32, 0u32),
+                ("20+0.2", 0, 2, 0),
+                ("40+0.4", 0, 0, 2),
+            ] {
+                let needle = format!("{tc_str}: W={expected_w} L={expected_l} D={expected_d}");
+                assert!(
+                    by_tc_line.contains(&needle),
+                    "expected substring {needle:?} in by_tc_line: {by_tc_line}"
+                );
+            }
+        }
+
         #[test]
         fn summary_by_tc_line_appended_under_tc_sample() {
             // args.tc_sample = Some(dist); summary.txt's last line matches ^summary-by-tc: regex.
@@ -9421,6 +9631,15 @@ mod controller {
                 super::super::StopReason::SprtAcceptH1,
                 "strong-H1 stream (mu=1.9) must accept H1"
             );
+            // Pin the summary's `sprt: verdict=H1` line — catches the
+            // `delete match arm Some(SprtAcceptH1)` mutant in the verdict
+            // dispatch (line 7604) that would silently downgrade the
+            // summary to verdict=continue while leaving stop_reason intact.
+            let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap();
+            assert!(
+                summary.contains("sprt: verdict=H1"),
+                "H1-accepting stream must emit `sprt: verdict=H1` in summary; got:\n{summary}"
+            );
         }
 
         #[test]
@@ -9437,6 +9656,14 @@ mod controller {
                 outcome.stop_reason,
                 super::super::StopReason::SprtAcceptH0,
                 "strong-H0 stream (mu=0.1) must accept H0"
+            );
+            // Pin `sprt: verdict=H0` — catches the `delete match arm
+            // Some(SprtAcceptH0)` mutant (line 7603) that would silently
+            // downgrade the summary verdict to `continue`.
+            let summary = std::fs::read_to_string(out_dir.join("summary.txt")).unwrap();
+            assert!(
+                summary.contains("sprt: verdict=H0"),
+                "H0-accepting stream must emit `sprt: verdict=H0` in summary; got:\n{summary}"
             );
         }
 
@@ -9654,6 +9881,351 @@ mod controller {
                  and must NOT append an extra \\n to content that already has one; \
                  got {content:?}"
             );
+        }
+
+        // -----------------------------------------------------------------------
+        // Boundary tests for `controller::run_iteration` — close the deferred
+        // mutation-coverage gap from `.cargo/mutants.toml` `in
+        // controller::run_iteration`. See `docs/plans/tooling-eloh-controller-
+        // boundary-tests.md` §4.2 for the per-mutant table.
+        // -----------------------------------------------------------------------
+
+        /// Watchdog wrapper for hang-class boundary mutants.
+        ///
+        /// Several drain-loop mutants make the loop's exit condition
+        /// unreachable under happy-path test fixtures (e.g., the `>= → <`
+        /// mutant on the bootstrap break, or `delete !` on the redispatch
+        /// gate's `!terminating`). `cargo test` has no per-test timeout, so a
+        /// hung mutant blocks the entire `cargo test` run indefinitely.
+        ///
+        /// Implementation: spawn `run_iteration` on a fresh thread with
+        /// ownership of the pool transferred in; recover the result via
+        /// `mpsc::Receiver::recv_timeout`; panic on timeout. The hung thread
+        /// is leaked when the watchdog fires; the test process exits soon
+        /// after, which reaps the OS thread.
+        ///
+        /// `std::thread::scope` was rejected because its closure waits for
+        /// spawned threads to join before returning, defeating the watchdog.
+        ///
+        /// Recommended timeout at call sites: `Duration::from_secs(2)`.
+        /// Synthetic-worker tests typically complete in ~50 ms, giving a
+        /// ~40× flake margin. Raise to 5 s on slow CI if false positives appear.
+        fn run_iteration_with_watchdog(
+            mut pool: WorkerPool,
+            args: super::super::cli::Args,
+            out_dir: std::path::PathBuf,
+            timeout: std::time::Duration,
+        ) -> Result<IterationOutcome, super::super::driver::HarnessError> {
+            let (tx, rx) = mpsc::channel();
+            let _hung_thread = std::thread::spawn(move || {
+                let r = run_iteration(&mut pool, &args, &out_dir);
+                let _ = tx.send(r);
+            });
+            rx.recv_timeout(timeout)
+                .unwrap_or_else(|_| panic!("run_iteration hung past {timeout:?}"))
+        }
+
+        /// Build `Args` with `--max-games N --concurrency C`, fixed-K and
+        /// disabled-σ so MaxGames is the only natural stop criterion.
+        fn args_with_concurrency(max_games: u32, concurrency: u32) -> super::super::cli::Args {
+            let argv: Vec<String> = vec![
+                "--engine".into(),
+                "/bin/clawfish".into(),
+                "--opponent".into(),
+                "/bin/stockfish".into(),
+                "--tc".into(),
+                "10+0.1".into(),
+                "--max-games".into(),
+                max_games.to_string(),
+                "--initial-elo".into(),
+                "2000".into(),
+                "--k0".into(),
+                "0".into(),
+                "--target-sigma".into(),
+                "0".into(),
+                "--concurrency".into(),
+                concurrency.to_string(),
+            ];
+            super::super::cli::parse_args(argv).expect("parse ok")
+        }
+
+        /// Build a `WorkerReport::GameComplete` skeleton for tests that don't
+        /// care about per-game fields beyond `worker_id` and `game_index`.
+        fn gc(worker_id: u32, game_index: u32) -> WorkerReport {
+            WorkerReport::GameComplete {
+                worker_id,
+                game_index,
+                opponent_uci_elo: 2000,
+                clawfish_score: 0.5,
+                outcome: super::super::match_loop::GameOutcome::MaxMovesReached,
+                pgn_moves: vec![],
+                white_name: "w".into(),
+                black_name: "b".into(),
+                tc: super::super::cli::TimeControl {
+                    initial_ms: 10_000,
+                    increment_ms: 100,
+                },
+            }
+        }
+
+        /// Mutant A (bootstrap-break `if pairs_dispatched >= total_pairs`,
+        /// `>= → <`) — hang-class.
+        /// Under the mutation, bootstrap breaks immediately at pd=0 → no
+        /// PlayPair sent → `pool.reports.recv()` blocks forever.
+        #[test]
+        fn run_iteration_does_not_hang_on_bootstrap_break() {
+            let args = args_with_concurrency(2, 1);
+            let pool = synthetic_pool(
+                1,
+                vec![vec![
+                    gc(0, 1),
+                    gc(0, 2),
+                    WorkerReport::PairComplete { worker_id: 0 },
+                ]],
+            );
+            let out_dir = std::env::temp_dir().join("eloh_boundary_bootstrap_break");
+            let outcome =
+                run_iteration_with_watchdog(pool, args, out_dir, std::time::Duration::from_secs(2))
+                    .expect("run_iteration must succeed under original");
+            assert_eq!(
+                outcome.games_played, 2,
+                "original code must process exactly max_games=2 games; got {}",
+                outcome.games_played
+            );
+        }
+
+        /// **Hypothetical** mutant J (`saturating_sub(1) → saturating_sub(0)`
+        /// on the redispatch-arm in-flight decrement) — hang-class. cargo-
+        /// mutants 27.0.0 does NOT generate this mutation (it doesn't mutate
+        /// method-call argument literals), so this test is defense-in-depth
+        /// coverage against a future cargo-mutants version that does generate
+        /// it, or a hand-applied regression that introduces equivalent broken
+        /// bookkeeping. Under the mutation, pif never decrements →
+        /// drain_done's `all_idle` never becomes true → after the last PC,
+        /// `recv()` blocks indefinitely.
+        ///
+        /// **Distinguishing fixture.** With the natural `max_games =
+        /// 2*total_pairs` constraint, t reaches max_games before drain_done
+        /// can fire (the t-gate preempts), making mutant J undetectable. To
+        /// force drain_done to be the sole stopping criterion, we use
+        /// max_games=100 (so total_pairs=50) with a script that emits only
+        /// 1 GC + 1 PC per PlayPair received — 50 PlayPairs produce 50 GCs
+        /// total, well under the t-gate of 100.
+        ///
+        /// Original: 50 PCs decrement pif to 0 each cycle, drain_done fires
+        /// on the loop top after PC50 (pd=50, all_idle=true); games_played=50.
+        ///
+        /// Mutant: pif stays at 1 across all 50 PCs; after PC50, the
+        /// redispatch arm gates out (50<50 false), pif=[1]; drain_done
+        /// `(false || pd>=tp=true) && all_idle=false` = false; recv blocks
+        /// (worker has nothing more to emit). Watchdog fires.
+        #[test]
+        fn run_iteration_does_not_hang_on_in_flight_decrement() {
+            let mut args = args_with_concurrency(4, 1);
+            args.max_games = 100; // total_pairs=50; 50 GCs total reach t=50 < max_games=100 → drain_done is the sole exit criterion.
+            let pool = synthetic_pool(
+                1,
+                vec![vec![gc(0, 1), WorkerReport::PairComplete { worker_id: 0 }]],
+            );
+            let out_dir = std::env::temp_dir().join("eloh_boundary_pif_decrement");
+            let outcome =
+                run_iteration_with_watchdog(pool, args, out_dir, std::time::Duration::from_secs(2))
+                    .expect("run_iteration must succeed under original");
+            // Original exits via drain_done after 50 pairs × 1 GC each.
+            assert_eq!(outcome.games_played, 50);
+        }
+
+        /// Mutant D (bootstrap `*in_flight_slot += 1 → *= 1`) — non-hang. Under mutation, `pif=[0,…,0]` at end of bootstrap;
+        /// when bootstrap fills all workers (`n_workers >= total_pairs`),
+        /// `pd>=tp` AND `all_idle` are both immediately true at the first
+        /// drain_done check → loop exits before any GC processed →
+        /// games_played=0.
+        ///
+        /// Setup: 4 workers, max_games=8 (total_pairs=4). Bootstrap dispatches
+        /// 4 PlayPairs (one per worker). Original: pif=[1,1,1,1], drain_done
+        /// false → games processed. Mutant: pif=[0,0,0,0], drain_done true
+        /// → games_played=0.
+        ///
+        /// Note: the synthetic_pool worker re-sends `worker_id` from each
+        /// canned report (lines 7728+). All four cloned scripts here use
+        /// `worker_id: 0`, so all PCs the controller receives carry
+        /// `worker_id=0` and only `pif[0]` is decremented at PC processing.
+        /// That's fine for this test — under the original, t increments via
+        /// GCs and reaches max_games=8 cleanly; under the mutant, the loop
+        /// exits at iter 1 before any GC.
+        #[test]
+        fn run_iteration_bootstrap_in_flight_increment_pins_drain_done() {
+            let args = args_with_concurrency(8, 4);
+            let make_script = || {
+                vec![
+                    gc(0, 1),
+                    gc(0, 2),
+                    WorkerReport::PairComplete { worker_id: 0 },
+                ]
+            };
+            let mut pool = synthetic_pool(
+                4,
+                vec![make_script(), make_script(), make_script(), make_script()],
+            );
+            let out_dir = std::env::temp_dir().join("eloh_boundary_bootstrap_pif");
+            let outcome = run_iteration(&mut pool, &args, &out_dir).unwrap();
+            assert!(
+                outcome.games_played > 0,
+                "original code must process at least one game; mutant exits immediately at bootstrap with games_played=0"
+            );
+        }
+
+        /// Mutants L, M (redispatch-gate `pairs_dispatched < total_pairs`,
+        /// `<` → `==`/`>` clause) — hang-class. Under either mutation, redispatch
+        /// fires for at most one pair before the gate falsifies; remaining
+        /// total_pairs go undispatched and drain_done can't reach `pd>=tp`.
+        ///
+        /// Setup: 1 worker, max_games=4 (total_pairs=2). Original: bootstrap
+        /// dispatches pair 0; PC1 redispatches pair 1; PC2 → drain_done true.
+        /// Mutant `<→==`: at PC1, `1==2` false → no redispatch; pif=0;
+        /// drain_done is `(false || pd=1>=tp=2 false) && all_idle=true` =
+        /// false → recv blocks forever.
+        #[test]
+        fn run_iteration_does_not_hang_on_redispatch_pd_eq_tp_boundary() {
+            let args = args_with_concurrency(4, 1);
+            let pool = synthetic_pool(
+                1,
+                vec![vec![
+                    gc(0, 1),
+                    gc(0, 2),
+                    WorkerReport::PairComplete { worker_id: 0 },
+                ]],
+            );
+            let out_dir = std::env::temp_dir().join("eloh_boundary_redispatch_pd_eq_tp");
+            let outcome =
+                run_iteration_with_watchdog(pool, args, out_dir, std::time::Duration::from_secs(2))
+                    .expect("run_iteration must succeed under original");
+            assert_eq!(outcome.games_played, 4);
+        }
+
+        /// Mutant N1 (redispatch-gate `delete !` on `!terminating`) —
+        /// hang-class.
+        /// Gate becomes `terminating && pd<tp && wid<senders.len()`.
+        /// Happy-path tests have terminating=false → gate always false → no
+        /// redispatch. Same hang signature as L/M.
+        ///
+        /// Test setup is intentionally identical to L/M — the watchdog
+        /// catches all four sibling drain-loop hangs under one assertion.
+        #[test]
+        fn run_iteration_does_not_hang_on_terminating_gate() {
+            let args = args_with_concurrency(4, 1);
+            let pool = synthetic_pool(
+                1,
+                vec![vec![
+                    gc(0, 1),
+                    gc(0, 2),
+                    WorkerReport::PairComplete { worker_id: 0 },
+                ]],
+            );
+            let out_dir = std::env::temp_dir().join("eloh_boundary_terminating_gate");
+            let outcome =
+                run_iteration_with_watchdog(pool, args, out_dir, std::time::Duration::from_secs(2))
+                    .expect("run_iteration must succeed under original");
+            assert_eq!(outcome.games_played, 4);
+        }
+
+        /// Mutant F (redispatch arm `pairs_dispatched += 1 → *= 1`)
+        /// — non-hang. Under the mutation, pd never advances past its
+        /// bootstrap value, but the redispatch arm keeps re-firing with the
+        /// same `pair_tcs[pd]`. Total games still reaches max_games (worker
+        /// emits 2 GCs per cmd), so `games_played == max_games` does NOT
+        /// distinguish — detection requires asserting on the per-cmd
+        /// `pair_index` SEQUENCE.
+        ///
+        /// Setup: 1 worker, max_games=8 (total_pairs=4). Recorder: worker's
+        /// received PlayPair `pair_index` sequence must be [0, 1, 2, 3]
+        /// strictly. Mutant: stays at 1 (or 0, depending on whether `*= 1`
+        /// fires before or after the bootstrap `pairs_dispatched += 1` —
+        /// a different site, mutated independently) → repeats forever.
+        #[test]
+        fn run_iteration_redispatch_pair_indices_form_strictly_ascending_sequence() {
+            use std::sync::{Arc, Mutex};
+
+            let recorded: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+            let (rpt_tx, rpt_rx) = mpsc::channel::<WorkerReport>();
+            let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+            let log = Arc::clone(&recorded);
+            let rpt_tx_clone = rpt_tx.clone();
+
+            let handle = std::thread::spawn(move || {
+                let mut pair_counter = 0u32;
+                for cmd in &cmd_rx {
+                    match cmd {
+                        WorkerCmd::Quit => break,
+                        WorkerCmd::PlayPair { pair_index, .. } => {
+                            log.lock().unwrap().push(pair_index);
+                            pair_counter += 1;
+                            let g = pair_counter * 2;
+                            let _ = rpt_tx_clone.send(gc(0, g - 1));
+                            let _ = rpt_tx_clone.send(gc(0, g));
+                            let _ = rpt_tx_clone.send(WorkerReport::PairComplete { worker_id: 0 });
+                        }
+                    }
+                }
+            });
+            drop(rpt_tx);
+            let mut pool = WorkerPool {
+                senders: vec![cmd_tx],
+                reports: rpt_rx,
+                join_handles: vec![handle],
+            };
+
+            let args = args_with_concurrency(8, 1);
+            let out_dir = std::env::temp_dir().join("eloh_boundary_pair_index_sequence");
+            let _ = run_iteration(&mut pool, &args, &out_dir);
+
+            let received = recorded.lock().unwrap().clone();
+            assert_eq!(
+                received,
+                vec![0u32, 1, 2, 3],
+                "redispatch must advance pair_index strictly: expected [0,1,2,3], got {received:?}"
+            );
+        }
+
+        /// Mutant K (redispatch-gate `pd<tp` clause, `<` → `<=`) — non-hang,
+        /// panic-class. At pd=tp, `tp <= tp` true → tries to dispatch one
+        /// more time → panics on `pair_tcs[tp]` (out of bounds).
+        ///
+        /// **Subtle fixture requirement.** With `max_games = 2*total_pairs`
+        /// (the natural case enforced by `parse_args`), `t` reaches
+        /// `max_games` exactly after the last GC of the final pair, and the
+        /// `t >= max_games` early-break preempts the final PC's processing.
+        /// To force the final PC to be processed (so the mutant's panic
+        /// fires), the test bypasses `parse_args` and sets `max_games =
+        /// 2*total_pairs + 1`.  The +1 leaves room for the final PC to be
+        /// recv'd before the t-gate fires.
+        ///
+        /// Setup: 1 worker, total_pairs=2, max_games=5.  Worker emits 2
+        /// pairs' worth (6 reports) per PlayPair. Bootstrap dispatches pair
+        /// 0; controller processes GC,GC,PC (t=2, redispatch pair 1, pd=2);
+        /// GC,GC,PC (t=4, PC1 reached because 4<5).  At PC1: redispatch
+        /// arm under original `pd<tp` is `2<2` false → no dispatch.  Under
+        /// mutant `pd<=tp` is `2<=2` true → tries `pair_tcs[2]` → panic.
+        #[test]
+        fn run_iteration_redispatch_dispatches_exactly_total_pairs_no_overshoot() {
+            let mut args = args_with_concurrency(4, 1);
+            args.max_games = 5; // total_pairs = 5/2 = 2; +1 headroom past the final pair's last GC.
+            let pair_reports: Vec<WorkerReport> = (0..2u32)
+                .flat_map(|p| {
+                    vec![
+                        gc(0, p * 2 + 1),
+                        gc(0, p * 2 + 2),
+                        WorkerReport::PairComplete { worker_id: 0 },
+                    ]
+                })
+                .collect();
+            let mut pool = synthetic_pool(1, vec![pair_reports]);
+            let out_dir = std::env::temp_dir().join("eloh_boundary_redispatch_no_overshoot");
+            let outcome = run_iteration(&mut pool, &args, &out_dir).unwrap();
+            assert_eq!(outcome.games_played, 4);
+            // Loop must terminate on its own — drain_done (pd>=tp, all_idle)
+            // fires after the final PC under the original.
+            assert_eq!(outcome.stop_reason, super::super::StopReason::MaxGames);
         }
     }
 }
