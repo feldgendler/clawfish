@@ -6918,6 +6918,37 @@ mod controller {
         }
     }
 
+    /// True iff either UCI `wait_for_uciok` returned `None` — i.e. one or
+    /// both engines failed to settle their handshake. Extracted into a pure
+    /// helper so the `||` operator is unit-testable without spawning real
+    /// subprocesses (the inline form was only reachable via integration
+    /// tests, leaving the operator's mutation-coverage gap open). Truth table
+    /// pinned by `controller::tests::handshake_caps_missing_truth_table`.
+    pub(super) fn handshake_caps_missing(
+        engine_caps: &Option<super::driver::EngineCapabilities>,
+        opponent_caps: &Option<super::driver::EngineCapabilities>,
+    ) -> bool {
+        engine_caps.is_none() || opponent_caps.is_none()
+    }
+
+    /// True iff both engines responded `readyok` to the post-setoption-block
+    /// `isready` sync. Pure-bool seam over the two `wait_for_readyok` calls,
+    /// extracted so the `&&` operator becomes directly unit-testable. Truth
+    /// table pinned by
+    /// `controller::tests::post_setoption_readyok_succeeded_truth_table`.
+    pub(super) fn post_setoption_readyok_succeeded(engine_ok: bool, opponent_ok: bool) -> bool {
+        engine_ok && opponent_ok
+    }
+
+    /// True iff either engine failed to respond `readyok` after the per-game
+    /// `ucinewgame` send — the per-game readyok-failure gate. Pure-bool seam
+    /// over the in-loop boolean reads, extracted so the `delete !` and the
+    /// `&&`→`||` operators become unit-testable. Truth table pinned by
+    /// `controller::tests::either_per_game_readyok_failed_truth_table`.
+    pub(super) fn either_per_game_readyok_failed(engine_ready: bool, opponent_ready: bool) -> bool {
+        !(engine_ready && opponent_ready)
+    }
+
     /// Production worker-thread function: spawns engine pair, runs UCI handshake,
     /// applies static options, and drives the per-pair flow on each `WorkerCmd`.
     fn production_worker_fn(
@@ -6962,7 +6993,7 @@ mod controller {
             } else {
                 None
             };
-        if engine_caps.is_none() || opponent_caps.is_none() {
+        if handshake_caps_missing(&engine_caps, &opponent_caps) {
             let _ = rpt_tx.send(WorkerReport::Failure(format!(
                 "worker {worker_id}: uci handshake"
             )));
@@ -6995,8 +7026,9 @@ mod controller {
                 &format!("setoption name {name} value {value}"),
             );
         }
-        let setopt_ok = super::driver::wait_for_readyok(&mut engine, isready_to).is_ok()
-            && super::driver::wait_for_readyok(&mut opponent, isready_to).is_ok();
+        let engine_setopt_ok = super::driver::wait_for_readyok(&mut engine, isready_to).is_ok();
+        let opponent_setopt_ok = super::driver::wait_for_readyok(&mut opponent, isready_to).is_ok();
+        let setopt_ok = post_setoption_readyok_succeeded(engine_setopt_ok, opponent_setopt_ok);
         if !setopt_ok {
             let _ = rpt_tx.send(WorkerReport::Failure(format!(
                 "worker {worker_id}: readyok after setoption"
@@ -7061,7 +7093,7 @@ mod controller {
                         let _ = super::driver::send_line(&mut opponent, "ucinewgame");
                         let opponent_ready =
                             super::driver::wait_for_readyok(&mut opponent, isready_to).is_ok();
-                        if !(engine_ready && opponent_ready) {
+                        if either_per_game_readyok_failed(engine_ready, opponent_ready) {
                             let _ = rpt_tx.send(WorkerReport::Failure(format!(
                                 "worker {worker_id}: readyok after ucinewgame"
                             )));
@@ -7690,6 +7722,37 @@ mod controller {
         use std::sync::mpsc;
 
         use super::*;
+
+        // -----------------------------------------------------------------------
+        // Pure-helper truth tables (close mutation-coverage gaps that the
+        // integration-driven `production_worker_tests` block cannot reach
+        // because the mock engine never produces a subprocess-failure path).
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn handshake_caps_missing_truth_table() {
+            let some = Some(super::super::driver::EngineCapabilities::default());
+            assert!(handshake_caps_missing(&None, &None));
+            assert!(handshake_caps_missing(&some, &None));
+            assert!(handshake_caps_missing(&None, &some));
+            assert!(!handshake_caps_missing(&some, &some));
+        }
+
+        #[test]
+        fn post_setoption_readyok_succeeded_truth_table() {
+            assert!(post_setoption_readyok_succeeded(true, true));
+            assert!(!post_setoption_readyok_succeeded(true, false));
+            assert!(!post_setoption_readyok_succeeded(false, true));
+            assert!(!post_setoption_readyok_succeeded(false, false));
+        }
+
+        #[test]
+        fn either_per_game_readyok_failed_truth_table() {
+            assert!(!either_per_game_readyok_failed(true, true));
+            assert!(either_per_game_readyok_failed(true, false));
+            assert!(either_per_game_readyok_failed(false, true));
+            assert!(either_per_game_readyok_failed(false, false));
+        }
 
         // -----------------------------------------------------------------------
         // Test infrastructure
@@ -10226,6 +10289,767 @@ mod controller {
             // Loop must terminate on its own — drain_done (pd>=tp, all_idle)
             // fires after the final PC under the original.
             assert_eq!(outcome.stop_reason, super::super::StopReason::MaxGames);
+        }
+
+        // -----------------------------------------------------------------------
+        // Subprocess-driven tests: production_worker_fn against mock-engine
+        //
+        // These tests pin the per-pair UCI command sequence emitted by
+        // `production_worker_fn` against the recording produced by the
+        // `mock-engine` test fixture binary (`src/bin/mock_engine.rs`). They
+        // close the structural gap noted in `.cargo/mutants.toml`'s
+        // `in controller::production_worker_fn` exclusion: the function is
+        // structurally untestable via synthetic-pool fixtures because its
+        // contract is the exact UCI byte sequence sent to engine subprocesses.
+        //
+        // Plan: docs/plans/tooling-mock-engine-fixture.md
+        // -----------------------------------------------------------------------
+
+        mod production_worker_tests {
+            use super::*;
+
+            /// Resolve the path to the `mock-engine` binary. Walks from
+            /// `current_exe()` up two parents to the profile directory
+            /// (`target/debug` or `target/release`) and looks for the binary
+            /// there — same pattern as `e2e_smoke::resolve_bin`. `cargo test`
+            /// builds all `[[bin]]` targets before running tests, so the
+            /// binary always exists at this path during a test run.
+            fn resolve_mock_engine_bin() -> String {
+                let exe = std::env::current_exe().expect("current_exe");
+                let deps_dir = exe.parent().expect("deps dir");
+                let profile_dir = deps_dir.parent().expect("profile dir");
+                let candidate = profile_dir.join("mock-engine");
+                if candidate.exists() {
+                    return candidate.to_str().expect("valid utf8 path").to_owned();
+                }
+                panic!(
+                    "could not find mock-engine binary at {candidate:?} — \
+                     run `cargo build --bin mock-engine` first or invoke \
+                     this test via `cargo test`"
+                );
+            }
+
+            /// Build an [`EngineSpec`] that launches the mock-engine binary
+            /// with per-instance environment variables conveyed via
+            /// `/usr/bin/env` in the launch_prefix. Uses `/usr/bin/env`
+            /// explicitly (not bare `env`) for PATH-independence on macOS and
+            /// Linux CI runners.
+            fn build_engine_spec_for_mock(
+                name: &str,
+                mock_path: &str,
+                record_path: &std::path::Path,
+                advertise_vc: bool,
+            ) -> super::super::super::driver::EngineSpec {
+                let mut prefix = vec![
+                    "/usr/bin/env".to_string(),
+                    format!("MOCK_ENGINE_RECORD_PATH={}", record_path.display()),
+                ];
+                if advertise_vc {
+                    prefix.push("MOCK_ENGINE_VIRTUAL_CLOCK_ADVERTISED=1".to_string());
+                }
+                super::super::super::driver::EngineSpec {
+                    name: name.to_string(),
+                    path: mock_path.to_string(),
+                    launch_prefix: Some(prefix),
+                }
+            }
+
+            /// Per-game `GameComplete` payload captured by the helper.
+            #[derive(Debug, Clone)]
+            struct GameInfo {
+                game_index: u32,
+                white_name: String,
+                black_name: String,
+            }
+
+            /// Outcome of one PlayPair run against two mock-engine instances.
+            #[derive(Debug)]
+            struct PairOutcome {
+                /// Lines recorded by the engine-side mock instance.
+                engine_log: Vec<String>,
+                /// Lines recorded by the opponent-side mock instance.
+                opponent_log: Vec<String>,
+                /// One per `GameComplete` report received, in arrival order.
+                /// Always length 2 for a successful pair.
+                games: Vec<GameInfo>,
+            }
+
+            /// Drive `production_worker_fn` through one full PlayPair against
+            /// two mock-engine instances and return their recordings.
+            ///
+            /// Mechanism:
+            /// 1. Spawn one worker via `controller::spawn_workers(1, cfg)`,
+            ///    which uses the production `production_worker_fn`.
+            /// 2. Send one `WorkerCmd::PlayPair` and drain reports until
+            ///    `PairComplete` (or watchdog).
+            /// 3. **Drop senders, then explicitly join the worker thread**
+            ///    with a 10 s watchdog so `driver::shutdown` reaps both child
+            ///    processes and the mocks have flushed their `quit` lines
+            ///    before the recording files are read. (Without the join,
+            ///    the read races with mid-shutdown writes — see plan §5.3.)
+            /// 4. Read both recording files and return the lines.
+            #[allow(clippy::too_many_arguments)]
+            fn run_one_pair_against_mocks(
+                engine_options: Vec<(String, String)>,
+                opponent_options: Vec<(String, String)>,
+                virtual_clock: bool,
+                advertise_vc_engine: bool,
+                advertise_vc_opponent: bool,
+                opponent_uci_elo: u32,
+                pair_index: u32,
+            ) -> PairOutcome {
+                let mock = resolve_mock_engine_bin();
+
+                // Unique temp-dir per call to avoid collisions across
+                // parallel-running tests under `cargo test`'s default
+                // -j N test runner. PID alone collides (all parallel tests
+                // share the cargo-test process); SystemTime::now() at
+                // nanosecond resolution still collides across cores when
+                // multiple tests start near-simultaneously. The atomic
+                // counter is the load-bearing tiebreaker.
+                static UNIQUE_COUNTER: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let unique = format!(
+                    "eloh_mock_pworker_{}_{}_{}",
+                    std::process::id(),
+                    UNIQUE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                );
+                let temp_dir = std::env::temp_dir().join(unique);
+                let _ = std::fs::remove_dir_all(&temp_dir);
+                std::fs::create_dir_all(&temp_dir).expect("create temp_dir");
+                let engine_record = temp_dir.join("engine.log");
+                let opponent_record = temp_dir.join("opponent.log");
+
+                let engine_spec = build_engine_spec_for_mock(
+                    "engine-mock",
+                    &mock,
+                    &engine_record,
+                    advertise_vc_engine,
+                );
+                let opponent_spec = build_engine_spec_for_mock(
+                    "opponent-mock",
+                    &mock,
+                    &opponent_record,
+                    advertise_vc_opponent,
+                );
+
+                let cfg = WorkerConfig {
+                    engine_spec,
+                    opponent_spec,
+                    engine_options,
+                    opponent_options,
+                    mode: clawfish::MatchTimeMode::Wallclock,
+                    harness_overhead_ms: 0,
+                    watchdog: std::time::Duration::from_secs(10),
+                    max_plies: 100,
+                    thresholds: super::super::super::cli::Thresholds::default(),
+                    virtual_clock,
+                };
+
+                let mut pool = spawn_workers(1, cfg).expect("spawn_workers");
+
+                // Send one PlayPair.
+                let tc = super::super::super::cli::TimeControl {
+                    initial_ms: 1000,
+                    increment_ms: 0,
+                };
+                pool.senders[0]
+                    .send(WorkerCmd::PlayPair {
+                        pair_index,
+                        opponent_uci_elo,
+                        engine_tc: tc,
+                        opponent_tc: tc,
+                    })
+                    .expect("send PlayPair");
+
+                // Drain reports until PairComplete (or Failure/timeout). The
+                // PairComplete arm is the only non-panic exit; reaching the
+                // post-loop assertions guarantees we saw exactly that report.
+                let report_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(20);
+                let mut games: Vec<GameInfo> = Vec::new();
+                loop {
+                    let remaining =
+                        report_deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        panic!(
+                            "report drain timed out after 20 s; got {} GameComplete reports, \
+                             no PairComplete",
+                            games.len()
+                        );
+                    }
+                    match pool.reports.recv_timeout(remaining) {
+                        Ok(WorkerReport::GameComplete {
+                            game_index,
+                            white_name,
+                            black_name,
+                            ..
+                        }) => {
+                            games.push(GameInfo {
+                                game_index,
+                                white_name,
+                                black_name,
+                            });
+                        }
+                        Ok(WorkerReport::PairComplete { .. }) => {
+                            break;
+                        }
+                        Ok(WorkerReport::Failure(msg)) => {
+                            panic!("worker reported failure before PairComplete: {msg}");
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            panic!(
+                                "report drain timed out (recv_timeout); got {} GameComplete \
+                                 reports, no PairComplete",
+                                games.len()
+                            );
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            panic!(
+                                "worker disconnected before PairComplete; got {} GameComplete \
+                                 reports",
+                                games.len()
+                            );
+                        }
+                    }
+                }
+                assert_eq!(
+                    games.len(),
+                    2,
+                    "PlayPair must produce exactly 2 GameComplete reports"
+                );
+
+                // Drop senders so the worker's recv loop exits → triggers
+                // `driver::shutdown` for both engine and opponent.
+                pool.senders.clear();
+
+                // Join the worker thread with a 10 s watchdog. Without this,
+                // we'd race with the mock's `quit`-record write.
+                let handles = std::mem::take(&mut pool.join_handles);
+                join_workers_with_watchdog(handles, std::time::Duration::from_secs(10));
+
+                // Drop the pool entirely (no-op on senders/handles, drops the
+                // reports receiver).
+                drop(pool);
+
+                // Read recording files. Both must exist; emptiness is a
+                // failure signal (mock crashed before any line, etc).
+                let engine_log = read_log(&engine_record);
+                let opponent_log = read_log(&opponent_record);
+
+                // Best-effort temp-dir cleanup. Stale dirs are harmless;
+                // the `remove_dir_all` at run start cleans them up next time.
+                let _ = std::fs::remove_dir_all(&temp_dir);
+
+                PairOutcome {
+                    engine_log,
+                    opponent_log,
+                    games,
+                }
+            }
+
+            /// Read a recording file into one `String` per line. Panics if
+            /// the file does not exist (mock failed to start) or is empty
+            /// (mock crashed before recording any line).
+            fn read_log(path: &std::path::Path) -> Vec<String> {
+                let raw = std::fs::read_to_string(path)
+                    .unwrap_or_else(|e| panic!("read recording {path:?}: {e}"));
+                let lines: Vec<String> = raw.lines().map(str::to_owned).collect();
+                assert!(
+                    !lines.is_empty(),
+                    "recording at {path:?} is empty — mock failed to record any UCI line"
+                );
+                lines
+            }
+
+            /// Join a vector of worker handles, bounded by `timeout`. The
+            /// hung-thread approach mirrors `run_iteration_with_watchdog`:
+            /// move ownership into a fresh thread, recover via
+            /// `mpsc::recv_timeout`, leak the thread on timeout (the test
+            /// process exits soon after, which reaps the OS thread).
+            fn join_workers_with_watchdog(
+                handles: Vec<std::thread::JoinHandle<()>>,
+                timeout: std::time::Duration,
+            ) {
+                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                let _hung = std::thread::spawn(move || {
+                    for h in handles {
+                        let _ = h.join();
+                    }
+                    let _ = tx.send(());
+                });
+                rx.recv_timeout(timeout)
+                    .unwrap_or_else(|_| panic!("worker join hung past {timeout:?}"));
+            }
+
+            // -------------------------------------------------------------------
+            // Tests
+            // -------------------------------------------------------------------
+
+            /// T1: per-pair `setoption name UCI_Elo …` precedes `ucinewgame`
+            /// in the opponent's log. Negative-symmetry: engine_log contains
+            /// no such per-pair setoption (the engine is the strength-cap
+            /// SUT, not the strength-limited opponent).
+            #[test]
+            fn production_worker_fn_emits_setoption_uci_elo_before_ucinewgame_per_pair() {
+                let outcome =
+                    run_one_pair_against_mocks(vec![], vec![], false, false, false, 2400, 0);
+
+                // (a) UCI_Elo precedes ucinewgame in opponent_log.
+                let elo_idx = outcome
+                    .opponent_log
+                    .iter()
+                    .position(|l| l.starts_with("setoption name UCI_Elo "))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "opponent_log missing `setoption name UCI_Elo …` line; got {:?}",
+                            outcome.opponent_log
+                        )
+                    });
+                let ucn_idx = outcome
+                    .opponent_log
+                    .iter()
+                    .position(|l| l == "ucinewgame")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "opponent_log missing `ucinewgame` line; got {:?}",
+                            outcome.opponent_log
+                        )
+                    });
+                assert!(
+                    elo_idx < ucn_idx,
+                    "UCI_Elo (idx {elo_idx}) must precede ucinewgame (idx {ucn_idx}) in opponent_log: {:?}",
+                    outcome.opponent_log
+                );
+
+                // (b) Negative-symmetry: engine_log has no UCI_Elo setoption.
+                assert!(
+                    !outcome
+                        .engine_log
+                        .iter()
+                        .any(|l| l.starts_with("setoption name UCI_Elo ")),
+                    "engine_log must NOT contain `setoption name UCI_Elo …` (engine is the SUT, \
+                     not the strength-limited opponent); got {:?}",
+                    outcome.engine_log
+                );
+            }
+
+            /// T2: per-pair UCI_Elo carries the exact value from the cmd
+            /// payload. Uses a non-round distinguishing integer (1789) to
+            /// reduce coincidental-match risk against hypothetical
+            /// constant-folding mutants.
+            #[test]
+            fn production_worker_fn_emits_uci_elo_with_correct_value() {
+                let outcome =
+                    run_one_pair_against_mocks(vec![], vec![], false, false, false, 1789, 0);
+                assert!(
+                    outcome
+                        .opponent_log
+                        .iter()
+                        .any(|l| l == "setoption name UCI_Elo value 1789"),
+                    "opponent_log must contain `setoption name UCI_Elo value 1789` exactly; \
+                     got {:?}",
+                    outcome.opponent_log
+                );
+            }
+
+            /// T3: per-pair `setoption UCI_LimitStrength` immediately follows
+            /// `setoption UCI_Elo` in opponent_log (no UCI command between).
+            /// Negative-symmetry: engine_log contains no LimitStrength line.
+            #[test]
+            fn production_worker_fn_emits_setoption_limitstrength_after_uci_elo_per_pair() {
+                let outcome =
+                    run_one_pair_against_mocks(vec![], vec![], false, false, false, 2400, 0);
+
+                // (a) LimitStrength comes immediately after UCI_Elo.
+                let elo_idx = outcome
+                    .opponent_log
+                    .iter()
+                    .position(|l| l.starts_with("setoption name UCI_Elo "))
+                    .expect("UCI_Elo");
+                let lim_line = outcome.opponent_log.get(elo_idx + 1).unwrap_or_else(|| {
+                    panic!(
+                        "nothing after UCI_Elo at idx {elo_idx}: {:?}",
+                        outcome.opponent_log
+                    )
+                });
+                assert_eq!(
+                    lim_line, "setoption name UCI_LimitStrength value true",
+                    "line immediately after UCI_Elo must be `setoption name UCI_LimitStrength \
+                     value true`; opponent_log = {:?}",
+                    outcome.opponent_log
+                );
+
+                // (b) Negative-symmetry: engine_log has no LimitStrength setoption.
+                assert!(
+                    !outcome
+                        .engine_log
+                        .iter()
+                        .any(|l| l.starts_with("setoption name UCI_LimitStrength ")),
+                    "engine_log must NOT contain `setoption name UCI_LimitStrength …`; got {:?}",
+                    outcome.engine_log
+                );
+            }
+
+            /// T4: per-pair `isready` (sent by `wait_for_readyok` after the
+            /// per-pair setoption block) precedes the next `ucinewgame` in
+            /// opponent_log.
+            #[test]
+            fn production_worker_fn_emits_isready_after_setoption_block_before_ucinewgame() {
+                let outcome =
+                    run_one_pair_against_mocks(vec![], vec![], false, false, false, 2400, 0);
+
+                let lim_idx = outcome
+                    .opponent_log
+                    .iter()
+                    .position(|l| l == "setoption name UCI_LimitStrength value true")
+                    .expect("UCI_LimitStrength");
+                let isready_idx = outcome
+                    .opponent_log
+                    .iter()
+                    .enumerate()
+                    .find(|(i, l)| *i > lim_idx && *l == "isready")
+                    .map(|(i, _)| i)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "no `isready` line after UCI_LimitStrength (idx {lim_idx}) in \
+                             opponent_log: {:?}",
+                            outcome.opponent_log
+                        )
+                    });
+                let ucn_idx = outcome
+                    .opponent_log
+                    .iter()
+                    .enumerate()
+                    .find(|(i, l)| *i > lim_idx && *l == "ucinewgame")
+                    .map(|(i, _)| i)
+                    .expect("ucinewgame after setoption block");
+                assert!(
+                    isready_idx < ucn_idx,
+                    "post-setoption isready (idx {isready_idx}) must precede ucinewgame \
+                     (idx {ucn_idx}) in opponent_log: {:?}",
+                    outcome.opponent_log
+                );
+            }
+
+            /// T5a: per game (2 per pair), BOTH engines receive `ucinewgame`
+            /// followed by `isready`. The pair has 2 games, so each log must
+            /// contain at least 2 `ucinewgame` lines and at least 2 `isready`
+            /// lines after the handshake-time isready.
+            #[test]
+            fn production_worker_fn_emits_ucinewgame_then_isready_per_game_for_both_engines() {
+                let outcome =
+                    run_one_pair_against_mocks(vec![], vec![], false, false, false, 2400, 0);
+
+                for (label, log) in [
+                    ("engine_log", &outcome.engine_log),
+                    ("opponent_log", &outcome.opponent_log),
+                ] {
+                    let ucn_count = log.iter().filter(|l| **l == "ucinewgame").count();
+                    assert_eq!(
+                        ucn_count, 2,
+                        "{label} must contain exactly 2 `ucinewgame` lines (one per game in \
+                         the pair); got {ucn_count}: {:?}",
+                        log
+                    );
+
+                    // Verify each ucinewgame is followed by isready (next-line).
+                    let mut ucn_indices: Vec<usize> = log
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, l)| if l == "ucinewgame" { Some(i) } else { None })
+                        .collect();
+                    ucn_indices.sort_unstable();
+                    for &idx in &ucn_indices {
+                        let next = log.get(idx + 1).unwrap_or_else(|| {
+                            panic!("{label}: no line after ucinewgame at idx {idx}: {:?}", log)
+                        });
+                        assert_eq!(
+                            next, "isready",
+                            "{label}: line after ucinewgame at idx {idx} must be `isready`; \
+                             got {next:?}; full log {:?}",
+                            log
+                        );
+                    }
+                }
+            }
+
+            /// T5b: `position startpos` and `go …` are routed to the
+            /// side-to-move's handle. With `bestmove 0000`, each game ends
+            /// after one ply via `IllegalMove(active_color)`, so the side
+            /// playing white in each game receives exactly one position+go
+            /// pair. Game 1: clawfish-white → engine_log has them. Game 2:
+            /// clawfish-black, opponent-white → opponent_log has them.
+            #[test]
+            fn production_worker_fn_routes_position_and_go_to_side_to_move_per_game() {
+                let outcome =
+                    run_one_pair_against_mocks(vec![], vec![], false, false, false, 2400, 0);
+
+                for (label, log) in [
+                    ("engine_log", &outcome.engine_log),
+                    ("opponent_log", &outcome.opponent_log),
+                ] {
+                    let pos_count = log.iter().filter(|l| l.starts_with("position ")).count();
+                    let go_count = log.iter().filter(|l| l.starts_with("go ")).count();
+                    assert_eq!(
+                        pos_count, 1,
+                        "{label}: expected exactly 1 `position …` line (one game per pair where \
+                         this side plays white); got {pos_count}: {:?}",
+                        log
+                    );
+                    assert_eq!(
+                        go_count, 1,
+                        "{label}: expected exactly 1 `go …` line; got {go_count}: {:?}",
+                        log
+                    );
+                }
+            }
+
+            /// T6: handshake-time engine_options and opponent_options are
+            /// applied via setoption BEFORE the first ucinewgame, on the
+            /// correct side (no cross-contamination).
+            #[test]
+            fn production_worker_fn_applies_engine_options_during_handshake_not_per_pair() {
+                let outcome = run_one_pair_against_mocks(
+                    vec![("EngineOnlyOption".to_string(), "engine_value".to_string())],
+                    vec![("OpponentOnlyOption".to_string(), "opp_value".to_string())],
+                    false,
+                    false,
+                    false,
+                    2400,
+                    0,
+                );
+
+                // Helper closure: index of an exact line, or panic with a clear message.
+                let find_exact = |label: &str, log: &Vec<String>, target: &str| -> usize {
+                    log.iter().position(|l| l == target).unwrap_or_else(|| {
+                        panic!("{label}: missing `{target}` line; got {:?}", log)
+                    })
+                };
+
+                // engine_log: contains EngineOnlyOption setoption, before first ucinewgame.
+                let engine_opt_idx = find_exact(
+                    "engine_log",
+                    &outcome.engine_log,
+                    "setoption name EngineOnlyOption value engine_value",
+                );
+                let engine_first_ucn = outcome
+                    .engine_log
+                    .iter()
+                    .position(|l| l == "ucinewgame")
+                    .expect("engine_log has at least one ucinewgame");
+                assert!(
+                    engine_opt_idx < engine_first_ucn,
+                    "engine_log: EngineOnlyOption setoption (idx {engine_opt_idx}) must precede \
+                     first ucinewgame (idx {engine_first_ucn})"
+                );
+
+                // opponent_log: contains OpponentOnlyOption setoption, before first ucinewgame.
+                let opp_opt_idx = find_exact(
+                    "opponent_log",
+                    &outcome.opponent_log,
+                    "setoption name OpponentOnlyOption value opp_value",
+                );
+                let opp_first_ucn = outcome
+                    .opponent_log
+                    .iter()
+                    .position(|l| l == "ucinewgame")
+                    .expect("opponent_log has at least one ucinewgame");
+                assert!(
+                    opp_opt_idx < opp_first_ucn,
+                    "opponent_log: OpponentOnlyOption setoption (idx {opp_opt_idx}) must \
+                     precede first ucinewgame (idx {opp_first_ucn})"
+                );
+
+                // Negative-symmetry: engine_log has NO OpponentOnlyOption; opponent_log has
+                // NO EngineOnlyOption.
+                assert!(
+                    !outcome
+                        .engine_log
+                        .iter()
+                        .any(|l| l.contains("OpponentOnlyOption")),
+                    "engine_log must NOT mention OpponentOnlyOption; got {:?}",
+                    outcome.engine_log
+                );
+                assert!(
+                    !outcome
+                        .opponent_log
+                        .iter()
+                        .any(|l| l.contains("EngineOnlyOption")),
+                    "opponent_log must NOT mention EngineOnlyOption; got {:?}",
+                    outcome.opponent_log
+                );
+            }
+
+            /// T7: VirtualClock setoption is sent only when **both** (a)
+            /// `cfg.virtual_clock` is true AND (b) the engine advertises the
+            /// option in its `uci` reply. The two AND-clauses correspond to
+            /// the two `&&` gates at lines 6979 (engine) and 6982 (opponent)
+            /// of `production_worker_fn`. To distinguish `&&` from `||` in
+            /// each gate, we run two scenarios:
+            ///
+            /// **Scenario A** — `virtual_clock=true, engine_advertises=true,
+            /// opponent_advertises=false`: the engine receives the setoption
+            /// (positive); the opponent does not (catches `&&`→`||` on line
+            /// 6982 because the opponent gate becomes `true || false = true`
+            /// under the mutant, sending the setoption incorrectly).
+            ///
+            /// **Scenario B** — `virtual_clock=false, engine_advertises=true`:
+            /// neither engine receives the setoption (catches `&&`→`||` on
+            /// line 6979 because the engine gate becomes `false || true =
+            /// true` under the mutant, sending the setoption incorrectly).
+            #[test]
+            fn production_worker_fn_negotiates_virtual_clock_with_advertising_engine_only() {
+                let target = "setoption name VirtualClock value true";
+
+                // Scenario A: the both-true / opponent-doesn't-advertise case.
+                let outcome_a = run_one_pair_against_mocks(
+                    vec![],
+                    vec![],
+                    /* virtual_clock = */ true,
+                    /* advertise_vc_engine = */ true,
+                    /* advertise_vc_opponent = */ false,
+                    2400,
+                    0,
+                );
+                assert!(
+                    outcome_a.engine_log.iter().any(|l| l == target),
+                    "scenario A: engine_log must contain `{target}` (engine advertises \
+                     VirtualClock and virtual_clock=true); got {:?}",
+                    outcome_a.engine_log
+                );
+                assert!(
+                    !outcome_a.opponent_log.iter().any(|l| l == target),
+                    "scenario A: opponent_log must NOT contain `{target}` (opponent does NOT \
+                     advertise VirtualClock); got {:?}",
+                    outcome_a.opponent_log
+                );
+
+                // Scenario B: virtual_clock=false even though engine advertises —
+                // distinguishes the line-6979 gate's `&&` from `||`.
+                let outcome_b = run_one_pair_against_mocks(
+                    vec![],
+                    vec![],
+                    /* virtual_clock = */ false,
+                    /* advertise_vc_engine = */ true,
+                    /* advertise_vc_opponent = */ false,
+                    2400,
+                    0,
+                );
+                assert!(
+                    !outcome_b.engine_log.iter().any(|l| l == target),
+                    "scenario B: engine_log must NOT contain `{target}` (virtual_clock=false \
+                     suppresses the setoption regardless of advertisement); got {:?}",
+                    outcome_b.engine_log
+                );
+                assert!(
+                    !outcome_b.opponent_log.iter().any(|l| l == target),
+                    "scenario B: opponent_log must NOT contain `{target}`; got {:?}",
+                    outcome_b.opponent_log
+                );
+            }
+
+            /// T8: on shutdown, both engines receive `quit`. The §5.3 helper
+            /// joins the worker thread, which in turn awaits
+            /// `driver::shutdown(engine)` and `driver::shutdown(opponent)`,
+            /// each of which sends `quit\n`. Catches the
+            /// `delete super::driver::shutdown(engine)` mutant on the two
+            /// shutdown calls inside `production_worker_fn`.
+            #[test]
+            fn production_worker_fn_emits_quit_to_both_engines_on_shutdown() {
+                let outcome =
+                    run_one_pair_against_mocks(vec![], vec![], false, false, false, 2400, 0);
+                assert!(
+                    outcome.engine_log.iter().any(|l| l == "quit"),
+                    "engine_log must contain `quit`; got {:?}",
+                    outcome.engine_log
+                );
+                assert!(
+                    outcome.opponent_log.iter().any(|l| l == "quit"),
+                    "opponent_log must contain `quit`; got {:?}",
+                    outcome.opponent_log
+                );
+            }
+
+            /// T9: per-pair `game_index` and `clawfish_white` color
+            /// assignment. Pins:
+            ///
+            /// - `let clawfish_white = game_in_pair == 0;` (in
+            ///   `production_worker_fn`) — game 0 must have clawfish
+            ///   (engine-mock) playing white; game 1 must have the
+            ///   opponent playing white. Catches the `==`→`!=` mutant on
+            ///   that line, which would flip both games' color routing.
+            ///   The discriminator is `white_name`/`black_name` recorded
+            ///   in `WorkerReport::GameComplete` (the white_engine_index
+            ///   selection block farther down in `production_worker_fn`).
+            /// - `let game_index = pair_index * 2 + game_in_pair + 1;` — the
+            ///   3 mutants that survive at `pair_index=0` (because `0*2 ≡
+            ///   0+2 ≡ 0/2 = 0` and `0+0 ≡ 0*0 = 0`) are distinguishable at
+            ///   `pair_index=3`. Original game_indices: [7, 8]. Mutants:
+            ///   - `*` → `+`: `3+2+0+1=6`, `3+2+1+1=7` → [6, 7].
+            ///   - `*` → `/`: `3/2+0+1=2`, `3/2+1+1=3` → [2, 3].
+            ///   - inner `+` → `*`: `3*2*0+1=1`, `3*2*1+1=7` → [1, 7].
+            ///
+            /// All three diverge from [7, 8].
+            #[test]
+            fn production_worker_fn_assigns_correct_game_index_and_color_per_pair() {
+                let outcome = run_one_pair_against_mocks(
+                    vec![],
+                    vec![],
+                    false,
+                    false,
+                    false,
+                    2400,
+                    /* pair_index = */ 3,
+                );
+
+                assert_eq!(
+                    outcome.games.len(),
+                    2,
+                    "PlayPair must produce 2 GameComplete reports; got {}",
+                    outcome.games.len()
+                );
+
+                // Game 0: pair_index*2 + 0 + 1 = 7; clawfish-white → engine plays white.
+                assert_eq!(
+                    outcome.games[0].game_index, 7,
+                    "first game_index must be pair_index*2+0+1=7 for pair_index=3; got {}",
+                    outcome.games[0].game_index
+                );
+                assert_eq!(
+                    outcome.games[0].white_name, "engine-mock",
+                    "first game's white_name must be `engine-mock` (clawfish_white=true at \
+                     game_in_pair=0); got {:?}",
+                    outcome.games[0].white_name
+                );
+                assert_eq!(
+                    outcome.games[0].black_name, "opponent-mock",
+                    "first game's black_name must be `opponent-mock`; got {:?}",
+                    outcome.games[0].black_name
+                );
+
+                // Game 1: pair_index*2 + 1 + 1 = 8; clawfish-black → opponent plays white.
+                assert_eq!(
+                    outcome.games[1].game_index, 8,
+                    "second game_index must be pair_index*2+1+1=8 for pair_index=3; got {}",
+                    outcome.games[1].game_index
+                );
+                assert_eq!(
+                    outcome.games[1].white_name, "opponent-mock",
+                    "second game's white_name must be `opponent-mock` (clawfish_white=false at \
+                     game_in_pair=1); got {:?}",
+                    outcome.games[1].white_name
+                );
+                assert_eq!(
+                    outcome.games[1].black_name, "engine-mock",
+                    "second game's black_name must be `engine-mock`; got {:?}",
+                    outcome.games[1].black_name
+                );
+            }
         }
     }
 }

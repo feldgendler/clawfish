@@ -82,6 +82,13 @@ exclude_globs = [
     # cargo test, so every mutation here would survive trivially.
     "src/bin/magicgen.rs",
 
+    # The mock-engine binary is a test fixture for `production_worker_fn`
+    # UCI-ordering tests (`mod controller::tests::production_worker_tests`).
+    # Not engine code; mutating it would not surface a real defect, only
+    # break the fixture's UCI replies and produce noise. Same precedent as
+    # `magicgen.rs`. See `docs/plans/tooling-mock-engine-fixture.md`.
+    "src/bin/mock_engine.rs",
+
     # Stub entry point — println! only, nothing meaningful to mutate.
     "src/main.rs",
 
@@ -323,20 +330,27 @@ exclude_re = [
     # ---- ELOH.B: integration-only paths — subprocess/system-call-bound ----
     #
     # `production_worker_fn` spawns real engine subprocesses and drives UCI
-    # handshake + per-pair flow over stdin/stdout pipes.  It is exercised
-    # end-to-end by the `#[ignore]`-gated
-    # `end_to_end_clawfish_self_play_concurrency_2` smoke (opt-in via
-    # `cargo test --release -- --ignored`).  Unit-testable mocking would
-    # require a fake EngineHandle infrastructure (deferred; out of scope for
-    # ELOH.B).  Excluding here documents the structural gap explicitly.
+    # handshake + per-pair flow over stdin/stdout pipes. Originally fully
+    # excluded as integration-only because no unit-test fixture could drive
+    # its UCI emissions.
     #
-    # Two pattern forms (mirrors current_hostname/current_date_str): the
-    # `in <fn>` form catches in-body operator/arithmetic mutations; the
-    # `replace <fn> with` form catches whole-function-replacement mutants.
-    # The function returns `()` so cargo-mutants generates `replace ... with ()`
-    # without the `-> ()` arrow form. Surfaced by ELOH.C's mutants run.
-    "in controller::production_worker_fn",
-    "replace controller::production_worker_fn with",
+    # **LIFTED 2026-05-08 by tooling-mock-engine-fixture.** The unit landed
+    # a `mock-engine` test fixture binary (`src/bin/mock_engine.rs`) plus
+    # 10 subprocess-driven tests under `mod controller::tests::production_worker_tests`
+    # that pin the per-pair UCI command sequence (setoption ordering,
+    # per-game ucinewgame/isready, position+go routing, VirtualClock
+    # negotiation, engine_options/opponent_options application, shutdown
+    # quit). All 16 in-body operator/arithmetic mutants in
+    # `production_worker_fn` are now caught.
+    #
+    # Three pure-bool helpers were extracted from the function to make the
+    # subprocess-failure-path operators directly unit-testable
+    # (`handshake_caps_missing`, `post_setoption_readyok_succeeded`,
+    # `either_per_game_readyok_failed`) — see truth-table tests in
+    # `mod controller::tests`.
+    #
+    # "in controller::production_worker_fn",
+    # "replace controller::production_worker_fn with",
 
     # `run_iteration` drain-loop boundary mutants — function-anchored
     # exclusion LIFTED 2026-05-08 by tooling-eloh-controller-boundary-tests.

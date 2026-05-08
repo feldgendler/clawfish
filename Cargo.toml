@@ -24,6 +24,14 @@ criterion = { version = "0.7", features = ["html_reports"] }
 name = "elo-iterate"
 path = "src/bin/elo-iterate.rs"
 
+# Test fixture: minimal UCI mock engine that records every received command to
+# a file for unit-testing `controller::production_worker_fn`'s UCI ordering.
+# Not a real engine — see `src/bin/mock_engine.rs` and
+# `docs/plans/tooling-mock-engine-fixture.md`.
+[[bin]]
+name = "mock-engine"
+path = "src/bin/mock_engine.rs"
+
 [[bench]]
 name = "perft"
 harness = false
