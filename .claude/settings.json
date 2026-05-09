@@ -5,7 +5,7 @@
   "sandbox": {
     "enabled": true,
     "autoAllowBashIfSandboxed": true,
-    "excludedCommands": ["rustup", "cargo"]
+    "excludedCommands": ["rustup", "cargo", "git"]
   },
   "hooks": {
     "PreToolUse": [
