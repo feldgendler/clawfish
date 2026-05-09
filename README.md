@@ -121,6 +121,39 @@ printf 'uci\nposition startpos\ngo movetime 100\nquit\n' \
   | ./target/release/clawfish
 ```
 
+## Diagnostic suites
+
+Per-position correctness scoring against the canonical public EPD test suites
+**WAC** (Win at Chess; 300 tactical positions) and **STS** (Strategic Test Suite;
+1500 positions across 15 strategy themes, weighted multi-move scoring).
+Complementary to SPRT — SPRT measures relative game-playing strength
+stochastically over a game distribution; WAC/STS measure absolute correctness
+on a fixed corpus deterministically. WAC catches tactical regressions; STS
+attributes positional regressions to specific eval components.
+
+Vendored corpora at `bench/data/wac.epd` and `bench/data/sts.epd`. The
+`epd-suite` binary drives the engine over UCI:
+
+```sh
+cargo build --release
+./target/release/epd-suite \
+    --engine target/release/clawfish \
+    --suite wac \
+    --epd bench/data/wac.epd \
+    --movetime 1000 \
+    --concurrency 6
+```
+
+Or via the wrapper for the typical recipes:
+
+```sh
+scripts/epd-suite.sh run wac           # HEAD on WAC
+scripts/epd-suite.sh run sts           # HEAD on STS
+scripts/epd-suite.sh backfill          # iterate baseline tags (worktree-isolated builds)
+```
+
+**HEAD (M5.E):** WAC **265/300 (88.3%)**, STS **8832/15000 (58.9% → STS-Elo ~2380)** at `--movetime 500`. Per-baseline backfill across 11 tags + per-theme STS breakdown at [`bench/epd-suites.md`](bench/epd-suites.md). Tactical (WAC) peak was at M5.A NMP (270/300 = 90%); subsequent pruning features (RFP, LMR, FFP) trade ~5 tactical positions for the SPRT-validated speed-and-depth gains. Strategic (STS) credit peaks at M5.C LMR (8803/15000 = 58.7%). STS-Elo systematically underestimates game-playing strength by ~200-300 Elo (no credit for tactical sharpness); the ~2380 STS-Elo is consistent with the actual ~2622 mixed-TC rating estimate. The relative ranking across tags is the load-bearing signal.
+
 ## Scope
 
 Standard chess only. Variant chess is explicitly out of scope.

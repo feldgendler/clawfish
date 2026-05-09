@@ -28,6 +28,7 @@ Current architectural state. Decisions and their rationale live in `docs/decisio
 | Search time source | Wallclock by default; thread CPU time (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`) when `VirtualClock=true` per ADR-0021; ownership in the worker thread (per-thread counter semantics), not the orchestrator | ADR-0021 |
 | Bench regression baseline | `bench` UCI command iterates a 16-position vendored corpus (`src/bench.rs::BENCH_POSITIONS`) at default depth 7; sums node counts; emits `info string bench: <N> nodes <NPS> nps` signature line. M3.F end signature: `bench: 172312700 nodes 11489045 nps`. | M3.F |
 | SPRT runner | `scripts/sprt.sh sprt\|match\|rating-estimate` builds baseline binary in `git worktree`-isolated checkout; runs the in-process harness (`elo-iterate`) for pentanomial-GSPRT, fixed-game match, or rating-estimate. Field-standard historical-commit-baseline methodology. | `docs/workflow.md` §SPRT, ADR-0022 |
+| EPD diagnostic suites | `src/bin/epd-suite.rs` + `scripts/epd-suite.sh` drive WAC (300 tactical) + STS (1500 strategic, 15 themes) per-position correctness scoring. Vendored corpora at `bench/data/{wac,sts}.epd`. Backfill table at `bench/epd-suites.md`. Complementary to SPRT: absolute correctness vs relative game-strength. Per-theme STS breakdown becomes load-bearing for M6 eval-term validation. | `bench/epd-suites.md`, `docs/plans/tooling-epd-suites.md` |
 
 ## Current design surface
 

@@ -288,7 +288,7 @@ Pruning and extension layer over M4's bookkeeping foundation (TT, killers, histo
 (M5.I's predecessor baseline is whichever phase precedes it in actual landing order — flexible because of its isolation. Its closing tag exists only if M5.I's SPRT accepts; an inconclusive M5.I lands as a no-change retrospective with no new tag.)
 
 ### M6 — Eval improvements
-Tapered eval, pawn structure, king safety, mobility, passed pawn evaluation. Texel-tuned where possible.
+Tapered eval, pawn structure, king safety, mobility, passed pawn evaluation. Texel-tuned where possible. **Per-theme STS validation now available** — `src/bin/epd-suite.rs` scores 1500 strategic positions across 15 themes. Each new eval term should defend itself via per-theme STS-credit change on the relevant theme group; M5.E baseline at HEAD is 8832/15000 (58.9%) total credit, with weakest themes "King Activity" (42.3%) and "AKPC" (46.2%) — natural empirical anchors. See `bench/epd-suites.md`.
 
 ### M7 — Skill dial (basic strength reduction)
 Configurable strength reduction: UCI's standard `UCI_LimitStrength` and `UCI_Elo` options, plus a granular "skill level" knob. Mechanisms: depth/node-count caps, eval noise injection, top-N randomized move selection. Each mechanism is a pure function (TDD-able); their composition's actual Elo at each setting is calibrated empirically via self-play matches.
