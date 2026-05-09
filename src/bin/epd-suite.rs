@@ -2045,8 +2045,8 @@ mod tests {
         // that by constructing the driver state by hand and calling `search`.
         // The 10× movetime ceiling fires; assert TimedOut.
         //
-        // Mirrors the `/bin/cat` fixture pattern from `elo-iterate.rs`'s driver
-        // tests (search elo-iterate.rs for "/bin/cat").
+        // Mirrors the `/bin/cat` fixture pattern from `clawfish::elo_iterate::driver`'s
+        // tests (search src/elo_iterate/driver.rs for "/bin/cat").
         use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
 

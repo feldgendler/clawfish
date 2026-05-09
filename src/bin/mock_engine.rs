@@ -8,7 +8,7 @@
 //! `bestmove 0000` (UCI null-move encoding); the harness adjudicates as
 //! `IllegalMove(active_color)` and proceeds to the next game.
 //!
-//! Used only by `src/bin/elo-iterate.rs::mod controller::tests::production_worker_tests`.
+//! Used only by `clawfish::elo_iterate::controller::tests::production_worker_tests`.
 //!
 //! See `docs/plans/tooling-mock-engine-fixture.md` for the full design.
 //!

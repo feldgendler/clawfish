@@ -7,6 +7,8 @@
 
 pub mod bench;
 pub mod bitboard;
+/// Tournament-harness binary glue (`elo-iterate`). See `docs/decisions/0020-eloh-harness.md`.
+pub mod elo_iterate;
 pub mod engine;
 pub mod eval;
 pub mod fen;
