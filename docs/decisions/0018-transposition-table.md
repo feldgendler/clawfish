@@ -46,6 +46,8 @@ struct TtEntry {
 
 16 bytes ÷ 64-byte cache line = 4 entries per cache line. `_pad` is logically zero; implementations must not encode meaning into it.
 
+**Empty-slot discriminator (M4.A → M5.F).** M4.A used a multi-field test `key == 0 && depth == 0 && age_and_bound == 0 && best_move == 0` and forbade `depth = 0` stores via `debug_assert!(data.depth >= 1)`. M5.F (ADR-0028) needed `depth = 0` for qsearch entries; the discriminator was changed to **`self.key == 0`** (sole field) and the store-side assertion to `debug_assert!(key != 0)`. The Polyglot Zobrist key of any reachable real position is non-zero with probability `1 − 2⁻⁶⁴`; release-build behavior on a hypothetical `key == 0` collision is benign-and-self-recovering (silent skip).
+
 ### 4. Hash UCI option: `spin default 16 min 1 max 4096`
 
 UCI line emitted at `uciok` time:
@@ -79,11 +81,13 @@ Worked example: mate-in-2 found at ply 0 → returned `MATE - 4`. `score_to_tt(M
 
 Round-trip: `score_from_tt(score_to_tt(s, p), p) == s` for all `s ∈ [-INF, INF]` and `p ∈ [0, MAX_PLY]`. Pinned by proptest T19.
 
-### 6. Qsearch participation in TT: deferred to M5
+### 6. Qsearch participation in TT: deferred to M5 — **closed at M5.F (ADR-0028)**
 
 M4.A's negamax probes/stores; qsearch does NOT. Rationale: empirical Elo benefit is uncertain (zero in Crafty, +25 Elo in one engine); structural fit is awkward (qsearch nodes have no negamax-equivalent depth field); composing intermediate "probe-but-don't-store at horizon" with full qsearch-in-TT later requires a redesign of the depth field semantic. Cleaner to defer entirely until full M5 redesign.
 
-Acknowledged miss: a position visited as a qsearch *interior* node on Branch A and reached as a horizon node on Branch B incurs a redundant qsearch on B. +5–15 Elo gap per CPW survey. M5 closes.
+Acknowledged miss: a position visited as a qsearch *interior* node on Branch A and reached as a horizon node on Branch B incurs a redundant qsearch on B. +5–15 Elo gap per CPW survey.
+
+**Closed at M5.F (2026-05-09; ADR-0028):** full probe-and-store at qsearch entry / exit. Qsearch entries store with `depth = 0`; the `is_empty()` discriminator changes to `self.key == 0` (the forward-planned alternative — see §3 below); the store-side `data.depth >= 1` debug-assert is replaced with `key != 0`. Per Stockfish 45e5e65, non-terminal qsearch results store as Lower or Upper only (never Exact); terminal Exact only at true stalemate (score=0) and mate at horizon (score=−(MATE−ply)). TT-move ordering inside qsearch is filter-gated implicitly via `moves_vec` membership (Andrew Grant's "long-chain protection"). Negamax's existing probe rule `entry.depth as u32 >= depth` (depth ≥ 1 at negamax sites) naturally rejects depth=0 qsearch entries from causing negamax cutoffs — exactly correct, since a qsearch score with restricted moves cannot soundly cut a full-width search. Mixed-TC SPRT vs `baseline/m5e-qsearch-correctness`: Δ Elo +13.03 [−10.92, +37.12], landed as "small-but-not-regression" per plan §11 spirit.
 
 ### 7. Best-move preservation on overwrite
 

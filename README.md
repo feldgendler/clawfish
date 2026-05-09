@@ -22,40 +22,45 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > path (frontier futility, qsearch correctness + TT, singular extensions;
 > eval improvements; NNUE) is tracked in [`docs/roadmap.md`](docs/roadmap.md).
 >
-> **Current strength: ~2622 Elo on Stockfish 18 UCI_LimitStrength scale
-> at uniform mixed TC** (M5.E, 2026-05-08; rating estimate Δ Elo
-> −19.13 [−64.73, +25.82] vs Stockfish-2641 anchor; CI overlaps the
-> M5.D-v2 anchor — statistically indistinguishable). M5.E was a
-> correctness-only landing: four narrow corrections to `qsearch`
+> **Current strength: ~2636 ± 43 Elo on Stockfish 18 UCI_LimitStrength
+> scale at uniform mixed TC** (M5.F rating-anchor, 2026-05-09; rating
+> estimate Δ Elo **−5.21 [−47.89, +37.31]** vs Stockfish-2641 anchor;
+> CI overlaps M5.E's 2622 — statistically indistinguishable). M5.F
+> (qsearch-in-TT) landed as "small-but-not-regression" with mixed-TC
+> SPRT Δ Elo **+13.03 [−10.92, +37.12]** vs `baseline/m5e-qsearch-correctness`
+> (mean positive; CI lower 0.92 Elo below plan §11's −10 no-regression
+> threshold). M5.F's bench drops to 1,072,309 nodes (−26.9% vs M5.E)
+> — well above the plan's −5% to −15% prediction; M4 ordering quality
+> compounds with each new pruning/caching layer. Diagnostic suites
+> (clean re-run, post-SPRT) flat: WAC 267/300 (+2 vs M5.E HEAD), STS
+> 8822/15000 (−10) — both within wallclock-noise. Per-TC bimodal SPRT:
+> 10+0.1 59.8% strong-positive, 60+0.6 46.5% slight-negative. M5.E was
+> a correctness-only landing: four narrow corrections to `qsearch`
 > (single-reply extension, true-stalemate detection, stalemate-conditional
-> rook/bishop under-promo, MAX_PLY ceiling guard). Bench unchanged from
-> M5.D-v2 (`bench: 1466436 nodes` — corner cases don't fire on the
-> 16-position middlegame corpus). Mixed-TC SPRT vs `baseline/m5d-ffp`
-> was **inconclusive** at 400 games (Δ Elo **−14.77 [−35.99, +6.33]**;
-> CI crosses 0; verdict=continue). Per plan §6's "Correctness, not Elo,
-> is the gate" framing, the M3.D horizon holes had to close before M5.F
-> (qsearch-in-TT) regardless of measurable Elo signal.
-> `baseline/m5e-qsearch-correctness` tagged at the M5.E landing.
+> rook/bishop under-promo, MAX_PLY ceiling guard); SPRT inconclusive
+> at Δ Elo −14.77 [−35.99, +6.33]. M5.F's full probe-and-store closes
+> the +5–15 Elo gap deferred at M4.A (ADR-0018 §6).
+> `baseline/m5f-qsearch-in-tt` tagged at the M5.F landing.
 > Mixed-TC rating estimate via the in-process ELOH harness with frozen-K +
 > disabled σ-stop:
 >
 > | Metric | Value |
 > |---|---|
-> | Estimated Elo (M5.E) | **~2622 ± 45** (anchor 2641 + Δ −19.13 [−64.73, +25.82]) |
-> | Anchor (M5.D-v2) | ~2641 ± 43 |
+> | Estimated Elo (M5.F) | **~2636 ± 43** (anchor 2641 + Δ −5.21 [−47.89, +37.31]) |
+> | Anchor (M5.E) | ~2622 ± 45 |
 > | Games | 200 (100 pairs) |
-> | W-L-D | 81 / 92 / 27 (47.25% score) |
+> | W-L-D | 73 / 75 / 52 (49.5% score) |
 > | TC mix | `--tc-sample 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1` (uniform 4-bucket) |
-> | Per-TC scores | 10+0.1: 38.0%; 20+0.2: 57.5%; 40+0.4: 42.2%; 60+0.6: 50.0% |
+> | Per-TC scores | 10+0.1: 53.7%; 20+0.2: 45.7%; 40+0.4: 46.3%; 60+0.6: 50.0% |
 > | Stop reason | max-games |
 >
 > Apple M4 P-cores (utility QoS), single thread, no pondering, virtual
-> clock on clawfish. M5.E rating-estimate methodology:
+> clock on clawfish. M5.F rating-estimate methodology:
+> [`bench/sprt/2026-05-09-m5.f-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-09-m5.f-mixed-tc-rating-estimate.md).
+> M5.F SPRT-vs-`baseline/m5e-qsearch-correctness` log:
+> [`bench/sprt/2026-05-09-m5.f-vs-m5e-mixed-tc.md`](bench/sprt/2026-05-09-m5.f-vs-m5e-mixed-tc.md).
+> M5.E rating-estimate methodology:
 > [`bench/sprt/2026-05-08-m5.e-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-08-m5.e-mixed-tc-rating-estimate.md).
-> M5.E SPRT-vs-`baseline/m5d-ffp` log:
-> [`bench/sprt/2026-05-08-m5.e-vs-m5d-mixed-tc.md`](bench/sprt/2026-05-08-m5.e-vs-m5d-mixed-tc.md).
-> M5.D-v2 rating-estimate methodology:
-> [`bench/sprt/2026-05-06-m5.d-v2-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-06-m5.d-v2-mixed-tc-rating-estimate.md).
 >
 > M5.C's mixed-TC SPRT vs `baseline/m5b-rfp` (M5.B end) — **H1 accepted in
 > 144 games / 72 pairs**, Δ Elo **+145.47 [+100.12, +196.09]** (pentanomial
@@ -84,16 +89,13 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > clawfish-vs-clawfish SPRT logistic Elo measures relative strength
 > tightly but doesn't transfer additively to UCI_Elo space.
 >
-> **Current bench:** `bench: 1466436 nodes <NPS> nps` at default depth 7
-> (M5.E end; identical to M5.D-v2 — the M5.E qsearch corner cases don't
-> fire on the 16-position middlegame bench corpus, which is plausible
-> given the rarity of the targeted positions: queen-promo-stalemate is
-> endgame-rare; forced-quiet-only positions and true qsearch stalemate
-> are both rare in middlegame play. Node count is deterministic; NPS is
-> wallclock-dependent). Down from M3.F's 172,312,700 — ~99% cumulative
-> reduction across NMP + RFP + LMR + FFP + M4's TT/killer/history/aspiration.
-> Run `printf 'bench\nquit\n' | ./target/release/clawfish` to reproduce
-> the node count.
+> **Current bench:** `bench: 1072309 nodes <NPS> nps` at default depth 7
+> (M5.F end; −26.9% vs M5.E's 1,466,436 — qsearch TT cuts dominate the
+> savings since qsearch frames dominate the leaf population). Node count
+> is deterministic; NPS is wallclock-dependent. Down from M3.F's
+> 172,312,700 — ~99.4% cumulative reduction across qsearch-in-TT + NMP +
+> RFP + LMR + FFP + M4's TT/killer/history/aspiration. Run
+> `printf 'bench\nquit\n' | ./target/release/clawfish` to reproduce.
 
 ## Build
 

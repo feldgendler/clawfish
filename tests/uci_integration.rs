@@ -1044,16 +1044,15 @@ fn bench_signature_deterministic_across_two_runs_with_lmr() {
     // tests determinism only; the M5.D depth-4 value pin lives in E51 below.
 }
 
-/// E51 — bench signature determinism with M5.D frontier futility pruning.
+/// E51 — bench signature determinism with M5.F qsearch-in-TT.
 ///
 /// Same shape as E50 (M5.C). Two consecutive `bench 4` invocations must
-/// produce identical node counts. The depth-4 value pin will be set after
-/// M5.D's first production-binary `bench` run (TODO at impl time); on initial
-/// landing the `assert_eq!` on a placeholder is replaced with the actual
-/// number observed from the production binary. E50 is downgraded to
-/// determinism-only at the same time per the M5.B → M5.C precedent.
+/// produce identical node counts. The depth-4 value pin moved from M5.D's
+/// `120_856` to M5.F's `89_080` (−26.3%) when qsearch TT probe+store landed.
+/// E50 stays determinism-only per the M5.B → M5.C → M5.D precedent of
+/// dropping the prior pin's value when the new pin lands.
 #[test]
-fn bench_signature_deterministic_across_two_runs_with_ffp() {
+fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
     let mut child = spawn_engine();
     let stdout = child.stdout.take().expect("stdout handle");
     let line_rx = drain_stdout(stdout);
@@ -1115,16 +1114,15 @@ fn bench_signature_deterministic_across_two_runs_with_ffp() {
     assert_eq!(
         nodes1, nodes2,
         "E51: bench node counts must match across two runs in the same session \
-         with FFP active; got {nodes1} vs {nodes2}"
+         with qsearch-in-TT active; got {nodes1} vs {nodes2}"
     );
-    // M5.D depth-4 bench-signature pin. Recorded from the production binary
-    // immediately after the move-loop integration landed (plan §11).
-    // v1 (FFP_MAX_DEPTH = 2): 117_768 — adjusted at the v2 retune to drop
-    // the depth-2 firings (per the v1 SPRT's per-TC slow-TC regression).
-    const M5D_DEPTH4_BENCH_NODES: u64 = 120_856;
+    // M5.F depth-4 bench-signature pin. Recorded from the production binary
+    // after M5.F qsearch TT probe+store landed. M5.D pin was 120_856;
+    // M5.F reduces depth-4 nodes by ~26% due to qsearch TT cutoffs.
+    const M5F_DEPTH4_BENCH_NODES: u64 = 89_080;
     assert_eq!(
-        nodes1, M5D_DEPTH4_BENCH_NODES,
-        "E51: bench node count changed from M5.D pin ({M5D_DEPTH4_BENCH_NODES} at depth=4); \
+        nodes1, M5F_DEPTH4_BENCH_NODES,
+        "E51: bench node count changed from M5.F pin ({M5F_DEPTH4_BENCH_NODES} at depth=4); \
          re-pin if intentional; got {nodes1}"
     );
 }

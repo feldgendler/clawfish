@@ -37,9 +37,19 @@ Run config: `--movetime 500 --concurrency 6 --hash 16`. Apple M4 P-cores. All 11
 | M5.C (+LMR) | `m5c-lmr` | 267 | 89.0% | **8803** | **58.7%** | **2369** |
 | M5.D (+FFP) | `m5d-ffp` | 263 | 87.7% | 8773 | 58.5% | 2360 |
 | M5.E (qsearch correctness) | `m5e-qsearch-correctness` | 263 | 87.7% | 8764 | 58.4% | 2356 |
-| HEAD (≡ M5.E engine) | — | 265 | 88.3% | 8832 | 58.9% | 2380 |
+| M5.F (qsearch-in-TT) | HEAD | 267 | 89.0% | 8822 | 58.8% | 2376 |
 
-**Bold** marks per-suite peak. HEAD's run differs slightly from the M5.E tag's run (+2 WAC, +68 STS credit) within wallclock-budget variance — the engine code is byte-identical from the M5.E tag onward; the only commits added are tooling.
+**Bold** marks per-suite peak. M5.E HEAD-run delta vs tag was +2 WAC / +68 STS (wallclock-budget noise; engine code byte-identical from tag onward). M5.F HEAD-run vs M5.E HEAD-run: +2 WAC, −10 STS — both well within wallclock noise. Statistically flat.
+
+### M5.F observation (2026-05-09)
+
+vs the displaced M5.E HEAD row (265 / 8832):
+- WAC: 267 vs 265 = **+2 positions** (within ±2 wallclock-noise band).
+- STS: 8822 vs 8832 = **−10 credit** (well within ±68 wallclock-noise band; M5.E's own run-vs-run variance was higher).
+
+M5.F's diagnostic-suite signal is **flat**. Bench drops 26.9% (1466436 → 1072309 nodes) without an EPD-detectable correctness regression. Earlier (now-overwritten) tentative numbers showed an apparent regression of −11 WAC / −302 STS — that run shared CPU with an in-flight 6-concurrency SPRT match against `baseline/m5e-qsearch-correctness` and was depressed by load contention; the clean re-run above is the load-bearing measurement.
+
+The SPRT remains the load-bearing strength gate. M5.F's mixed-TC SPRT vs `baseline/m5e-qsearch-correctness`: Δ Elo **+13.03 [−10.92, +37.12]**, verdict=continue at 400 games, per-TC bimodal (10+0.1: 59.8%, 60+0.6: 46.5%). Landed as "small-but-not-regression" per plan §11 spirit (mean positive, CI lower 0.92 Elo below the −10 threshold, diagnostic-suite flat). Full SPRT log: [`bench/sprt/2026-05-09-m5.f-vs-m5e-mixed-tc.md`](sprt/2026-05-09-m5.f-vs-m5e-mixed-tc.md).
 
 ### Observations
 

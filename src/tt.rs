@@ -76,9 +76,16 @@ pub(crate) struct TtEntry {
 }
 
 impl TtEntry {
-    /// True when the slot has never been written (all fields zero).
+    /// True when the slot has never been written.
+    ///
+    /// Discriminator: `key == 0`. The Polyglot Zobrist of any reachable
+    /// real position is non-zero with probability `1 − 2⁻⁶⁴`; storing
+    /// `key == 0` is forbidden by `store()`'s precondition assertion.
+    /// This single-field discriminator is the M5.F replacement for the
+    /// previous multi-field test (broken by qsearch entries with
+    /// `depth = 0`).
     pub fn is_empty(&self) -> bool {
-        self.key == 0 && self.depth == 0 && self.age_and_bound == 0 && self.best_move == 0
+        self.key == 0
     }
 
     /// Extract the bound from `age_and_bound` bits [1..0].
@@ -199,6 +206,10 @@ impl TranspositionTable {
         let idx = self.index_for(key);
         // SAFETY: single-mutator invariant; no concurrent write.
         let entry = unsafe { (&*self.entries.get())[idx] };
+        // Short-circuit on empty (key=0). Strictly redundant with the
+        // `entry.key != key` test below when the probe key is non-zero
+        // (which the store-side assertion enforces). Kept defensively
+        // against a future refactor that probes with key=0.
         if entry.is_empty() || entry.key != key {
             None
         } else {
@@ -213,18 +224,17 @@ impl TranspositionTable {
     /// current slot holds the same position (`old.key == key`) with a known
     /// move, the old move is preserved (ADR-0018 §7).
     pub fn store(&self, key: u64, data: TtData) {
-        // Invariant: stored entries always have `depth >= 1`. The
-        // `is_empty()` check distinguishes stored from default by leaving
-        // `score` and `_pad` out of the equality test; if a future caller
-        // ever stores `depth == 0`, an entry with `key == 0 && bound ==
-        // Exact && best_move == 0` would alias with a default entry on
-        // probe. Negamax never stores at `depth == 0` (qsearch handles
-        // the horizon), so the invariant holds today; pin it explicitly
-        // so a future qsearch-in-TT (M5) adopts a different empty-slot
-        // discriminator before going to depth=0.
+        // Empty-slot sentinel: an entry with `key == 0` is treated as
+        // empty. Forbidding `store(0, ...)` keeps the discriminator
+        // sound. The Polyglot Zobrist of any reachable position is
+        // non-zero with probability `1 − 2⁻⁶⁴`; the assertion is
+        // defense-in-depth. M5.F replaced the prior `data.depth >= 1`
+        // assertion: qsearch entries are stored at depth=0, so the old
+        // guard was incorrect. The new `is_empty()` discriminator
+        // (`key == 0`) is immune to depth-0 aliasing.
         debug_assert!(
-            data.depth >= 1,
-            "TT store with depth=0 breaks is_empty() distinguishability"
+            key != 0,
+            "TT store with key=0 collides with the empty-slot sentinel"
         );
         let idx = self.index_for(key);
         // SAFETY: single-mutator invariant; no concurrent write.
@@ -1000,5 +1010,339 @@ mod tests {
             idx_a, idx_b,
             "keys with identical low bits must map to the same index"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M5.F §6.1 — empty-slot discriminator tests (5 tests)
+    //
+    // The M5.F discriminator change: `is_empty()` now checks `self.key == 0`
+    // only (not the prior multi-field test). These tests pin both halves of
+    // the new discriminator. T1 (default-is-empty) is renamed for clarity;
+    // the original passes under both discriminators, but the new tests cover
+    // cases that would NOT pass under the old multi-field discriminator.
+    // -----------------------------------------------------------------------
+
+    /// Default `TtEntry` is empty via the new `key == 0` discriminator.
+    /// Mutation-kills `key == 0 → key != 0` (the entry would not be empty).
+    #[test]
+    fn tt_entry_default_is_empty_via_key_only() {
+        let e = TtEntry::default();
+        assert_eq!(e.key, 0, "default entry must have key=0");
+        assert!(e.is_empty(), "default entry must be empty");
+    }
+
+    /// An entry with `key == 0` but all other fields non-zero must still be
+    /// treated as empty. This pins that the discriminator is SOLELY `key == 0`
+    /// and does NOT depend on depth, age_and_bound, best_move, or score.
+    ///
+    /// Pre-M5.F, this entry would have been empty under the multi-field test
+    /// (all listed fields zero). Post-M5.F, the key is the only gate. The
+    /// other fields are now irrelevant — a depth-0 qsearch entry with
+    /// key=non-zero is NOT empty; a synthesized entry with key=0 is ALWAYS
+    /// empty regardless of other fields.
+    #[test]
+    fn tt_entry_with_key_zero_and_other_fields_set_is_still_empty() {
+        let e = TtEntry {
+            key: 0,
+            score: 500,
+            depth: 3,
+            age_and_bound: TtEntry::pack_age_bound(7, TtBound::Lower),
+            best_move: 0xABCD,
+            _pad: 0,
+        };
+        assert!(
+            e.is_empty(),
+            "entry with key=0 must be empty regardless of other fields"
+        );
+    }
+
+    /// An entry with a non-zero key but zero depth must NOT be treated as empty.
+    /// This is the critical new case enabled by M5.F: qsearch stores at depth=0,
+    /// so a depth=0 entry with key≠0 must be probe-visible (not skipped as empty).
+    ///
+    /// Pre-M5.F, the multi-field discriminator (`key==0 && depth==0 && …`) would
+    /// have returned `is_empty() = true` for this entry (since depth=0 satisfies
+    /// the depth predicate). Post-M5.F, only `key==0` matters, so a non-zero-key
+    /// depth-0 entry is NOT empty. This is load-bearing for M5.F's correctness.
+    #[test]
+    fn tt_entry_with_nonzero_key_is_not_empty_even_with_zero_depth() {
+        let e = TtEntry {
+            key: 0xDEAD_BEEF_CAFE_0001,
+            score: 0,
+            depth: 0, // qsearch depth — would have aliased with default under old discriminator
+            age_and_bound: 0, // age=0, bound=Exact
+            best_move: 0,
+            _pad: 0,
+        };
+        assert!(
+            !e.is_empty(),
+            "entry with non-zero key must NOT be empty even when depth=0; \
+             M5.F discriminator uses key-only"
+        );
+    }
+
+    /// `store()` panics in debug builds when `key == 0`. The panic fires from
+    /// the `debug_assert!(key != 0, …)` guard added at M5.F, replacing the
+    /// prior `data.depth >= 1` assertion. `debug_assert!` is stripped in
+    /// release; the project runs `cargo test --release` by default per
+    /// docs/workflow.md, so gate this test with `cfg(debug_assertions)`.
+    #[test]
+    #[should_panic]
+    #[cfg(debug_assertions)]
+    fn tt_store_panics_on_key_zero_in_debug() {
+        let tt = TranspositionTable::new(1);
+        // Storing key=0 collides with the empty-slot sentinel. Must panic.
+        tt.store(
+            0,
+            TtData {
+                score: 0,
+                depth: 1,
+                bound: TtBound::Exact,
+                best_move: 0,
+            },
+        );
+    }
+
+    /// Store + probe round-trip at `depth = 0` (qsearch tier). Verifies that
+    /// the M5.F `is_empty()` change correctly allows depth-0 entries to be
+    /// stored and retrieved. Under the old multi-field discriminator this test
+    /// would fail: a depth-0, bound=Exact, best_move=0 entry with key≠0 would
+    /// pass `old_is_empty()` (all fields zero except key and score), causing
+    /// `probe()` to skip it.
+    #[test]
+    fn tt_store_with_depth_zero_round_trips() {
+        let tt = TranspositionTable::new(1);
+        let key = 0xFACE_FEED_0000_0001_u64; // non-zero, non-colliding
+
+        tt.store(
+            key,
+            TtData {
+                score: 42,
+                depth: 0, // qsearch depth
+                bound: TtBound::Upper,
+                best_move: 0,
+            },
+        );
+
+        let entry = tt
+            .probe(key)
+            .expect("depth-0 entry must round-trip through probe");
+        assert_eq!(entry.key, key);
+        assert_eq!(
+            entry.depth, 0,
+            "depth-0 must be stored and retrieved exactly"
+        );
+        assert_eq!(entry.score, 42);
+        assert_eq!(entry.bound(), TtBound::Upper);
+        assert_eq!(entry.best_move, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // M5.F §6.2 — qsearch-tier replacement tests (4 tests)
+    //
+    // Verify that depth-preferred replacement works correctly when depth=0
+    // (qsearch) entries participate. The replacement rule is:
+    //   `old.is_empty() || old.age() != current_gen || old.depth <= data.depth`
+    // Cases at same generation:
+    //   - qsearch over qsearch (old=0, new=0): `0 <= 0` true → replace ✓
+    //   - negamax over qsearch (old=0, new=5): `0 <= 5` true → replace ✓
+    //   - qsearch over negamax (old=5, new=0): `5 <= 0` false → keep old ✓
+    // -----------------------------------------------------------------------
+
+    /// Two sequential depth-0 stores at the same key (same generation) — the
+    /// second must replace the first because `old.depth (0) <= data.depth (0)`.
+    #[test]
+    fn tt_store_qsearch_replaces_qsearch_at_same_index() {
+        let tt = TranspositionTable::new(1);
+        let key = 0xBEEF_CAFE_0000_0001_u64;
+
+        // First qsearch store.
+        tt.store(
+            key,
+            TtData {
+                score: 100,
+                depth: 0,
+                bound: TtBound::Upper,
+                best_move: 0,
+            },
+        );
+        assert_eq!(
+            tt.probe(key).unwrap().score,
+            100,
+            "pre-condition: first store visible"
+        );
+
+        // Second qsearch store — same gen, depth 0 → must replace.
+        tt.store(
+            key,
+            TtData {
+                score: 200,
+                depth: 0,
+                bound: TtBound::Lower,
+                best_move: 0,
+            },
+        );
+        let entry = tt.probe(key).expect("second depth-0 store must be visible");
+        assert_eq!(
+            entry.score, 200,
+            "same-gen same-depth (0) store must replace the prior entry"
+        );
+        assert_eq!(entry.bound(), TtBound::Lower);
+    }
+
+    /// A negamax entry (depth=5) must overwrite a prior qsearch entry (depth=0)
+    /// at the same key. `old.depth (0) <= data.depth (5)` → true → replace.
+    #[test]
+    fn tt_store_negamax_replaces_qsearch() {
+        let tt = TranspositionTable::new(1);
+        let key = 0xBEEF_CAFE_0000_0002_u64;
+
+        // Store qsearch entry (depth=0).
+        tt.store(
+            key,
+            TtData {
+                score: 50,
+                depth: 0,
+                bound: TtBound::Upper,
+                best_move: 0,
+            },
+        );
+        assert_eq!(
+            tt.probe(key).unwrap().depth,
+            0,
+            "pre-condition: qsearch entry stored"
+        );
+
+        // Store negamax entry (depth=5, same gen) — must replace.
+        tt.store(
+            key,
+            TtData {
+                score: 150,
+                depth: 5,
+                bound: TtBound::Exact,
+                best_move: 0x1234,
+            },
+        );
+        let entry = tt
+            .probe(key)
+            .expect("negamax store must be visible after replacing qsearch");
+        assert_eq!(
+            entry.depth, 5,
+            "depth=5 negamax entry must have replaced depth=0 qsearch entry"
+        );
+        assert_eq!(entry.score, 150);
+    }
+
+    /// A qsearch entry (depth=0) must NOT overwrite a same-gen deeper entry
+    /// (depth=5). `old.depth (5) <= data.depth (0)` → false → not replaced.
+    #[test]
+    fn tt_store_qsearch_does_not_replace_negamax() {
+        let tt = TranspositionTable::new(1);
+        let key = 0xBEEF_CAFE_0000_0003_u64;
+
+        // Store negamax entry (depth=5).
+        tt.store(
+            key,
+            TtData {
+                score: 300,
+                depth: 5,
+                bound: TtBound::Exact,
+                best_move: 0x5678,
+            },
+        );
+        assert_eq!(
+            tt.probe(key).unwrap().depth,
+            5,
+            "pre-condition: negamax entry stored at depth=5"
+        );
+
+        // Attempt qsearch store (depth=0, same gen) — must NOT replace.
+        tt.store(
+            key,
+            TtData {
+                score: 0,
+                depth: 0,
+                bound: TtBound::Upper,
+                best_move: 0,
+            },
+        );
+        let entry = tt
+            .probe(key)
+            .expect("negamax entry must still be probed after qsearch attempt");
+        assert_eq!(
+            entry.depth, 5,
+            "depth=5 negamax entry must not be replaced by depth=0 qsearch entry"
+        );
+        assert_eq!(
+            entry.score, 300,
+            "negamax score must survive the depth=0 replacement attempt"
+        );
+    }
+
+    /// A true-stalemate Exact qsearch entry (`depth=0, bound=Exact, score=0,
+    /// best_move=0`) at generation=0 must round-trip through store + probe.
+    /// This is the previously-impossible case: under the old discriminator
+    /// `key==0 && depth==0 && age_and_bound==0 && best_move==0` would have
+    /// returned `is_empty() = true`, causing probe to skip it. Under M5.F,
+    /// only `key==0` triggers empty — a non-zero-key entry with all-zero
+    /// fields is probe-visible.
+    ///
+    /// Additionally verify that a second depth=0 qsearch entry at the same
+    /// key (also gen=0) replaces it, confirming depth-preferred replacement
+    /// works at the qsearch tier.
+    #[test]
+    fn tt_store_qsearch_terminal_exact_at_gen_zero_round_trips() {
+        // Fresh TT has generation=0. A newly-allocated TT starts at gen=0 and
+        // the entries are zeroed. We do NOT call `new_search()` — remaining
+        // at gen=0 means age_and_bound for an Exact bound is pack_age_bound(0, Exact)
+        // = (0 << 2) | 0 = 0.
+        let tt = TranspositionTable::new(1);
+        assert_eq!(
+            tt.generation(),
+            0,
+            "pre-condition: fresh TT is at generation 0"
+        );
+
+        let key = 0xABCD_EF01_2345_6789_u64; // non-zero
+
+        // Store the stalemate-Exact qsearch entry.
+        tt.store(
+            key,
+            TtData {
+                score: 0, // stalemate score
+                depth: 0, // qsearch tier
+                bound: TtBound::Exact,
+                best_move: 0,
+            },
+        );
+
+        let entry = tt.probe(key).expect(
+            "stalemate-Exact depth=0 gen=0 entry must round-trip; \
+             M5.F discriminator (key-only) allows it — old discriminator would have missed it",
+        );
+        assert_eq!(entry.score, 0, "stalemate score must round-trip");
+        assert_eq!(entry.depth, 0);
+        assert_eq!(entry.bound(), TtBound::Exact);
+        assert_eq!(entry.best_move, 0);
+
+        // Now store another depth=0 entry at the same key (still gen=0).
+        // `old.depth (0) <= data.depth (0)` → true → replacement must occur.
+        tt.store(
+            key,
+            TtData {
+                score: 99,
+                depth: 0,
+                bound: TtBound::Lower,
+                best_move: 0xBEEF,
+            },
+        );
+        let entry2 = tt
+            .probe(key)
+            .expect("second depth-0 entry must be visible after replacement");
+        assert_eq!(
+            entry2.score, 99,
+            "second depth=0 store must replace the first at gen=0"
+        );
+        assert_eq!(entry2.bound(), TtBound::Lower);
     }
 }
