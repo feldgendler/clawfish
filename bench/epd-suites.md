@@ -38,9 +38,9 @@ Run config: `--movetime 500 --concurrency 6 --hash 16`. Apple M4 P-cores. All 11
 | M5.D (+FFP) | `m5d-ffp` | 263 | 87.7% | 8773 | 58.5% | 2360 |
 | M5.E (qsearch correctness) | `m5e-qsearch-correctness` | 263 | 87.7% | 8764 | 58.4% | 2356 |
 | M5.F (qsearch-in-TT) | `m5f-qsearch-in-tt` | 267 | 89.0% | 8822 | 58.8% | 2376 |
-| M5.G (singular extensions, v2) | HEAD | **268** | **89.3%** | **9036** | **60.2%** | **2439** |
+| M5.G (singular extensions, v2) | HEAD | **278** | **92.7%** | **9239** | **61.6%** | **2499** |
 
-**Bold** marks per-suite peak. M5.E HEAD-run delta vs tag was +2 WAC / +68 STS (wallclock-budget noise; engine code byte-identical from tag onward). M5.F HEAD-run vs M5.E HEAD-run: +2 WAC, −10 STS — both well within wallclock noise. Statistically flat. **M5.G HEAD-run vs M5.F: +1 WAC (within noise) and +214 STS credit (well above ±68 noise band) — strong positive tactical signal**, validating the SE extension's tactical contribution in fixed-`movetime` mode.
+**Bold** marks per-suite peak. M5.E HEAD-run delta vs tag was +2 WAC / +68 STS (wallclock-budget noise; engine code byte-identical from tag onward). M5.F HEAD-run vs M5.E HEAD-run: +2 WAC, −10 STS — both well within wallclock noise. Statistically flat. **M5.G HEAD-run vs M5.F: +11 WAC (well above ±2 noise band) and +417 STS credit (well above ±68 noise band) — decisive tactical+strategic positive**, validating the SE extension's contribution in fixed-`movetime` mode. Initial measurement (WAC 268 / STS 9036) was depressed by CPU contention from concurrent SPRT + parallel EPD suites; the clean re-run above is the load-bearing measurement (see "Methodology rule — RUN ALONE" below — a rule the M5.G campaign forced into the project conventions after a repeat M5.F-style mistake).
 
 ### M5.F observation (2026-05-09)
 
@@ -101,3 +101,19 @@ Output lands in `target/epd-suites/<TS>/`:
 - `<slug>-wac.{stdout,stderr,txt}` — full per-position trace + summary.
 - `<slug>-sts.{stdout,stderr,txt}` — same for STS.
 - `INDEX` — one-line digest per (tag, suite).
+
+## Methodology rule — RUN ALONE (load-bearing, do not relax)
+
+**EPD suites at fixed `--movetime` are CPU-contention-sensitive. Run them on an idle machine, never alongside any other CPU-heavy job (SPRT, rating-estimate, mutation testing, parallel EPD suites, parallel `cargo test`, ...).**
+
+The wallclock budget per position is fixed (default 1000ms or 500ms via `EPD_MOVETIME`). Under CPU contention, the engine reaches lower depths within that budget; tactical/strategic accuracy degrades; numbers come back depressed in ways that look like real regressions but are pure measurement noise. The depression magnitude is large — observed at M5.F (initial WAC 254, STS 8530 under in-flight SPRT contention; clean re-run 267 / 8822, a +13 / +292 swing) and at M5.G (concurrent WAC + STS + rating-estimate all started together; results invalid).
+
+**Operational rules:**
+- One EPD suite at a time (not WAC and STS in parallel — they together saturate the box even at `EPD_CONCURRENCY=4`).
+- No EPD suite while any SPRT/match/rating-estimate is running.
+- No EPD suite while `cargo mutants` is running (`cargo mutants` uses N parallel test workers).
+- No EPD suite while a parallel-coding-agent's `cargo test` is in flight.
+
+**Sequencing for milestone landings**: run WAC, then STS, then any `rating-estimate` SPRT, **strictly sequentially**. Total wallclock is ~5 + 15 + 30 ≈ 50 minutes; running them in parallel saves no clock time once you re-run the contaminated ones (which you will).
+
+This rule is appended to bench/m5.f.md's M5.F observation as a generalised methodology rule. Future milestones must check this section's history before claiming WAC/STS represent a clean signal.
