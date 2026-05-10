@@ -37,9 +37,10 @@ Run config: `--movetime 500 --concurrency 6 --hash 16`. Apple M4 P-cores. All 11
 | M5.C (+LMR) | `m5c-lmr` | 267 | 89.0% | **8803** | **58.7%** | **2369** |
 | M5.D (+FFP) | `m5d-ffp` | 263 | 87.7% | 8773 | 58.5% | 2360 |
 | M5.E (qsearch correctness) | `m5e-qsearch-correctness` | 263 | 87.7% | 8764 | 58.4% | 2356 |
-| M5.F (qsearch-in-TT) | HEAD | 267 | 89.0% | 8822 | 58.8% | 2376 |
+| M5.F (qsearch-in-TT) | `m5f-qsearch-in-tt` | 267 | 89.0% | 8822 | 58.8% | 2376 |
+| M5.G (singular extensions, v2) | HEAD | **268** | **89.3%** | **9036** | **60.2%** | **2439** |
 
-**Bold** marks per-suite peak. M5.E HEAD-run delta vs tag was +2 WAC / +68 STS (wallclock-budget noise; engine code byte-identical from tag onward). M5.F HEAD-run vs M5.E HEAD-run: +2 WAC, −10 STS — both well within wallclock noise. Statistically flat.
+**Bold** marks per-suite peak. M5.E HEAD-run delta vs tag was +2 WAC / +68 STS (wallclock-budget noise; engine code byte-identical from tag onward). M5.F HEAD-run vs M5.E HEAD-run: +2 WAC, −10 STS — both well within wallclock noise. Statistically flat. **M5.G HEAD-run vs M5.F: +1 WAC (within noise) and +214 STS credit (well above ±68 noise band) — strong positive tactical signal**, validating the SE extension's tactical contribution in fixed-`movetime` mode.
 
 ### M5.F observation (2026-05-09)
 

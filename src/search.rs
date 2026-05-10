@@ -514,6 +514,29 @@ pub(crate) const FFP_MARGIN_D3: i32 = 250;
 /// MAX_HISTORY` invariant pattern.
 const _: () = assert!(FFP_MAX_DEPTH < LMR_MIN_DEPTH);
 
+/// M5.G singular-extension minimum remaining depth. Below this, SE is too
+/// shallow to justify the verification-search cost, and the literature
+/// majority sets the threshold here. ADR-0029 §1.
+pub(crate) const SE_MIN_DEPTH: u32 = 6;
+
+/// M5.G singular-extension margin per ply. `singular_beta = tt_score - depth *
+/// SE_MARGIN_PER_DEPTH`. Xiphos / Ethereal defaults; conservative starting
+/// value. Post-landing SPRT-tune candidate (tuning backlog: try 2). ADR-0029 §2.
+pub(crate) const SE_MARGIN_PER_DEPTH: i32 = 1;
+
+/// M5.G singular-extension TT-entry depth tolerance. SE fires only when the
+/// TT entry's stored depth is at least `depth - SE_TT_DEPTH_DELTA`, i.e. the
+/// TT score is "fresh enough" to be evidence at the current depth. Xiphos
+/// default. ADR-0029 §3.
+pub(crate) const SE_TT_DEPTH_DELTA: u32 = 3;
+
+// Depth-disjointness invariants. These are load-bearing tripwires: a future
+// tuning that moves FFP_MAX_DEPTH or SE_MIN_DEPTH into overlap MUST update
+// the corresponding ADRs and remove the violated assertion.
+//
+// FFP ≤ LMR boundary (ADR-0026 §6 + ADR-0025 §3):
+const _: () = assert!(FFP_MAX_DEPTH < SE_MIN_DEPTH);
+
 /// Construct the "iteration-1 aborted before any root improvement" fallback
 /// result for `Search::go` (M3.E).
 ///
@@ -809,6 +832,83 @@ pub(crate) fn qsearch_tt_bound_for_completed_node(best: i32, beta: i32) -> TtBou
     }
 }
 
+/// Singular-extension β (M5.G — ADR-0029 §2). `tt_score - depth * SE_MARGIN_PER_DEPTH`,
+/// floored at `-(MATE - 1)` to avoid mate-score wrap when `tt_score` is near `-MATE`.
+/// Pure function. The caller-side `tt_score.abs() < MATE_IN_MAX_PLY` gate
+/// (§5 of `singular_extension_eligible`) makes the floor a defense-in-depth
+/// invariant rather than a hot-path concern, but the floor is unit-tested
+/// independently.
+pub(crate) fn singular_beta(tt_score: i32, depth: u32) -> i32 {
+    let raw = tt_score.saturating_sub(SE_MARGIN_PER_DEPTH * depth as i32);
+    raw.max(-(MATE - 1))
+}
+
+/// Singular-extension verification-search remaining depth (M5.G — ADR-0029 §3).
+/// `(depth - 1) / 2` (integer division), with a debug-assert that
+/// `depth >= SE_MIN_DEPTH`. At SE_MIN_DEPTH = 8 this yields verif_depth = 3.
+/// Pure function.
+///
+/// **Caller obligation.** `depth >= SE_MIN_DEPTH` is the contract.
+/// `(0 - 1)` underflows in `u32` (panicking in debug, wrapping in release —
+/// `(0_u32.wrapping_sub(1)) / 2 = u32::MAX / 2`, which would then propagate
+/// into a deep verification recursion). The eligibility predicate's clause 5
+/// (`depth >= SE_MIN_DEPTH`) is the only call-site protection; the helper's
+/// `debug_assert!` pins this in debug builds.
+pub(crate) fn verification_depth(depth: u32) -> u32 {
+    debug_assert!(
+        depth >= SE_MIN_DEPTH,
+        "verification_depth: caller must have passed the SE_MIN_DEPTH gate; depth={depth}"
+    );
+    (depth - 1) / 2
+}
+
+/// Singular-extension full eligibility predicate (M5.G — ADR-0029 §1).
+/// All nine conditions must hold. Pure function.
+///
+/// Conjunction (evaluation order; cheapest predicates first):
+/// 1. `excluded_move.is_none()` — re-entrancy guard: the verification call
+///    passes `excluded_move = Some(parent_tt_move)`; this clause prevents the
+///    verification frame's own SE block from firing (would yield one wasted
+///    nested verification at parent_depth ≥ 17).
+/// 2. `ply > 0` — root must search every move at full depth.
+/// 3. `!is_pv` — start conservative; PV-SE deferred per ADR-0029 §8.
+/// 4. `!in_check_flag` — check evasions already a hot spot; SE adds overhead.
+/// 5. `depth >= SE_MIN_DEPTH` — minimum-depth guard. Via the compile-time
+///    invariant `FFP_MAX_DEPTH < SE_MIN_DEPTH`, SE and FFP are depth-disjoint.
+/// 6. `tt_bound == Lower` — Lower bound is the only sound starting case
+///    (Exact deferred to a follow-up campaign per ADR-0029 §1).
+/// 7. `tt_depth >= depth - SE_TT_DEPTH_DELTA` — TT entry fresh enough;
+///    saturating subtraction avoids underflow at `depth = SE_MIN_DEPTH`.
+/// 8. `tt_score.abs() < MATE_IN_MAX_PLY` — mate-score guard; outside this
+///    band, `singular_beta` arithmetic is meaningless.
+/// 9. `tt_move != 0` — non-sentinel TT move; `Move::default().bits() == 0` is
+///    the no-move sentinel and is never produced by movegen.
+///
+/// Pure predicate — no `pos` access, no side effects. Each per-clause flip-mutant
+/// is independently testable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn singular_extension_eligible(
+    excluded_move: Option<Move>,
+    ply: u32,
+    is_pv: bool,
+    in_check_flag: bool,
+    depth: u32,
+    tt_bound: TtBound,
+    tt_depth: u8,
+    tt_score: i32,
+    tt_move: u16,
+) -> bool {
+    excluded_move.is_none()
+        && ply > 0
+        && !is_pv
+        && !in_check_flag
+        && depth >= SE_MIN_DEPTH
+        && tt_bound == TtBound::Lower
+        && (tt_depth as u32) >= depth.saturating_sub(SE_TT_DEPTH_DELTA)
+        && tt_score.abs() < MATE_IN_MAX_PLY
+        && tt_move != 0
+}
+
 /// True iff `side` has at least one non-pawn, non-king piece on the board.
 /// NMP zugzwang guard (ADR-0023 §4): zugzwang is dominantly a K+P-ending
 /// phenomenon, so the presence of any minor or major piece reduces
@@ -868,6 +968,19 @@ fn best_is_full_depth_after_score(
     } else {
         best_is_full_depth || (score == best && move_is_full_depth)
     }
+}
+
+/// Snapshot of a TT probe result captured at negamax step 7 (M5.G — ADR-0029).
+/// Used by the SE block at step 12.5 which needs the probe data post-step-12
+/// (after move ordering). The `score` field is already ply-adjusted via
+/// `score_from_tt` — `singular_beta(snapshot.score, depth)` is correct without
+/// further adjustment.
+struct TtProbeSnapshot {
+    tt_move: u16,
+    bound: TtBound,
+    depth: u8,
+    /// Ply-adjusted to the current frame via `score_from_tt(entry.score, ply)`.
+    score: i32,
 }
 
 /// Fail-soft negamax alpha-beta search with triangular PV recovery.
@@ -983,6 +1096,22 @@ pub(crate) struct AlphaBetaMover {
     /// ceiling guard returns, not on abort). Test-only instrumentation.
     #[cfg(test)]
     qsearch_tt_stores: u32,
+    /// M5.G: per-`go` count of confirmed singular extensions (verification
+    /// searches that returned fail-low below `singular_beta`). Test-only
+    /// instrumentation; gated by `#[cfg(test)]` so production builds don't
+    /// carry the field. Naming follows the M5.A `nmp_firings` /
+    /// M5.B `rfp_firings` / M5.D `ffp_firings` convention.
+    #[cfg(test)]
+    se_extensions: u32,
+    /// M5.G: the effective search depth used for the TT move (i == 0) at the
+    /// non-LMR `search_child` call site. Set to `Some(depth - 1 + move_extension)`
+    /// the first time the TT move is dispatched through the non-LMR path.
+    /// `None` if the TT move went through LMR or was never reached.
+    /// Used by `negamax_se_extension_increments_child_depth_by_one` to confirm
+    /// that `move_extension == 1` caused the child to receive `depth` instead of
+    /// `depth - 1`. Reset to `None` at each `negamax_for_test` invocation.
+    #[cfg(test)]
+    se_tt_move_search_depth: Option<u32>,
 }
 
 impl AlphaBetaMover {
@@ -1025,6 +1154,10 @@ impl AlphaBetaMover {
             qsearch_tt_probes: 0,
             #[cfg(test)]
             qsearch_tt_stores: 0,
+            #[cfg(test)]
+            se_extensions: 0,
+            #[cfg(test)]
+            se_tt_move_search_depth: None,
         }
     }
 }
@@ -1061,6 +1194,7 @@ impl Search for AlphaBetaMover {
             self.ffp_skipped_moves.clear();
             self.qsearch_tt_probes = 0;
             self.qsearch_tt_stores = 0;
+            self.se_extensions = 0;
         }
         // M4.A: install the TT and advance its generation once per `go` (ADR-0018 §9).
         self.tt = ctx.tt.clone();
@@ -1121,6 +1255,7 @@ impl Search for AlphaBetaMover {
                     beta,
                     true,
                     true,
+                    None,
                     ctx,
                     &clock,
                 );
@@ -1300,6 +1435,7 @@ impl AlphaBetaMover {
             child_beta,
             child_is_pv,
             true, // move-loop children always permit NMP at their own gate
+            None, // excluded_move: children never inherit a parent's excluded move
             ctx,
             clock,
         );
@@ -1318,6 +1454,7 @@ impl AlphaBetaMover {
         mut beta: i32,
         is_pv: bool,
         allow_null: bool,
+        excluded_move: Option<Move>,
         ctx: &SearchContext,
         clock: &SearchClock,
     ) -> i32 {
@@ -1380,13 +1517,32 @@ impl AlphaBetaMover {
 
         // 7. TT probe. Compares post-MDP `(alpha, beta)`; never returns
         //    early at PV nodes (ADR-0018 §11).
+        //
+        //    M5.G: the cutoff branch is gated on `excluded_move.is_none()`.
+        //    At the verification frame (`excluded_move = Some(tt_move)`), the same
+        //    TT entry that triggered SE at the parent has `bound=Lower` and
+        //    `tt_score >= singular_beta = tt_score - depth`. The cutoff guard
+        //    `tt_score >= beta_verif` reduces to `depth >= 0` (always true), so
+        //    the verification frame would self-cut and return `tt_score` — never
+        //    running the actual move loop, making SE a 0-Elo no-op. Suppressing
+        //    the cutoff (but NOT the probe — `tt_move` is captured unconditionally
+        //    so step-12 ordering works, though the excluded-move skip removes it
+        //    anyway) forces the verification frame to run the full move loop.
+        //    ADR-0029 §7.
         let mut tt_move: u16 = 0;
+        let mut tt_probe_snapshot: Option<TtProbeSnapshot> = None;
         if let Some(tt) = &self.tt
             && let Some(entry) = tt.probe(pos.zobrist())
         {
+            let tt_score = score_from_tt(entry.score as i32, ply as i32);
             tt_move = entry.best_move;
-            if !is_pv && entry.depth as u32 >= depth {
-                let tt_score = score_from_tt(entry.score as i32, ply as i32);
+            tt_probe_snapshot = Some(TtProbeSnapshot {
+                tt_move: entry.best_move,
+                bound: entry.bound(),
+                depth: entry.depth,
+                score: tt_score,
+            });
+            if excluded_move.is_none() && !is_pv && entry.depth as u32 >= depth {
                 match entry.bound() {
                     TtBound::Exact => return tt_score,
                     TtBound::Lower if tt_score >= beta => return tt_score,
@@ -1463,6 +1619,7 @@ impl AlphaBetaMover {
                         -beta + 1,
                         false, // is_pv
                         false, // allow_null (stacked-null prevention — ADR-0023 §5)
+                        None,  // excluded_move: NMP children never inherit excluded move
                         ctx,
                         clock,
                     );
@@ -1495,7 +1652,12 @@ impl AlphaBetaMover {
                         // Stored score is the mate-CAPPED value; best_move
                         // = 0 (NMP didn't pick a move) is preserved-against-
                         // overwrite by ADR-0018 §7's rule.
-                        if let Some(tt) = &self.tt {
+                        // M5.G: suppressed at the verification frame — the
+                        // NMP cutoff is for the verification's modified game
+                        // (TT-move excluded), not for pos.zobrist(). ADR-0029 §7.
+                        if excluded_move.is_none()
+                            && let Some(tt) = &self.tt
+                        {
                             let adjusted = score_to_tt(cutoff_score, ply as i32);
                             debug_assert!(
                                 adjusted == adjusted as i16 as i32,
@@ -1563,6 +1725,75 @@ impl AlphaBetaMover {
             tt_move,
         );
 
+        // 12.5  Singular-extension verification (M5.G — ADR-0029).
+        //
+        // Fire only when:
+        //   - step 7 captured a probe snapshot (tt_probe_snapshot.is_some());
+        //   - moves_vec[0].bits() == snapshot.tt_move (step-12 promoted a non-zero,
+        //     legal TT move to the front; without this match, snapshot.tt_move is
+        //     either 0 or a stale-but-illegal value and we don't fire);
+        //   - singular_extension_eligible passes all 9 clauses (clause 9 is
+        //     `tt_move != 0` for defense-in-depth against a future order_moves
+        //     refactor).
+        //
+        // On verification fail-low (verif_score < singular_beta), set tt_move_extension = 1.
+        // On verification fail-high or non-fire, tt_move_extension stays 0.
+        //
+        // `in_check(pos)` is read lazily — the cheap predicates (snapshot present,
+        // moves_vec non-empty post-step-11 — `debug_assert!`'d for defense-in-depth,
+        // `moves_vec[0]` matches the TT move) gate the read so that frames where SE
+        // could not possibly fire don't pay the in_check cost. Per ADR-0024 §6 /
+        // ADR-0026 §3 lazy-dup convention. The full eligibility predicate is then
+        // called once with the computed flag; SE fires only at depth ≥ SE_MIN_DEPTH = 8
+        // where the overhead of one extra in_check call is negligible.
+        debug_assert!(
+            !moves_vec.is_empty(),
+            "step 11 must have returned on empty move list"
+        );
+
+        let mut tt_move_extension: u32 = 0;
+        if let Some(snapshot) = &tt_probe_snapshot
+            && moves_vec[0].bits() == snapshot.tt_move
+            && singular_extension_eligible(
+                excluded_move,
+                ply,
+                is_pv,
+                in_check(pos),
+                depth,
+                snapshot.bound,
+                snapshot.depth,
+                snapshot.score,
+                snapshot.tt_move,
+            )
+        {
+            let s_beta = singular_beta(snapshot.score, depth);
+            let v_depth = verification_depth(depth);
+
+            let verif_score = self.negamax(
+                pos,
+                v_depth,
+                ply,
+                s_beta - 1,
+                s_beta,
+                false,              // is_pv (verification is non-PV by design)
+                true,               // allow_null (research §6.1: allowed inside verif)
+                Some(moves_vec[0]), // exclude the TT move from the verification's move loop
+                ctx,
+                clock,
+            );
+            if self.aborted {
+                return 0;
+            }
+
+            if verif_score < s_beta {
+                tt_move_extension = 1;
+                #[cfg(test)]
+                {
+                    self.se_extensions += 1;
+                }
+            }
+        }
+
         // 13. Recurse fail-soft. `child_is_pv = is_pv && i == 0` per ADR-0018 §11
         //     where `i` is the recursion-order index (post-step-12 reorder).
         let mut best = -INF;
@@ -1603,6 +1834,20 @@ impl AlphaBetaMover {
 
         let mut quiet_index: u32 = 0;
         for (i, &mv) in moves_vec.iter().enumerate() {
+            // M5.G: skip the excluded move at the verification frame. This skip
+            // fires BEFORE `child_is_pv`, `quiet_move`, and `quiet_index` so that
+            // `quiet_index` semantics (ADR-0025 §3) are preserved — skipped moves
+            // are not counted as "considered for reduction."
+            if Some(mv) == excluded_move {
+                continue;
+            }
+
+            // M5.G: per-iteration extension. Only the TT move (i == 0) is eligible
+            // for singular extension; all other moves are searched at depth - 1.
+            // The SE block above computes `tt_move_extension` (1 when singular, 0
+            // otherwise); it is zero for non-SE nodes and non-TT moves.
+            let move_extension: u32 = if i == 0 { tt_move_extension } else { 0 };
+
             let child_is_pv = is_pv && i == 0;
             let quiet_move = is_quiet(mv);
             let mut move_is_full_depth = true;
@@ -1733,10 +1978,24 @@ impl AlphaBetaMover {
                     reduced_score
                 }
             } else {
+                // M5.G: the TT move (i == 0) may be extended by 1 ply when
+                // singular_extension_eligible passed and verification returned
+                // fail-low. All other moves use `move_extension = 0` (plain
+                // `depth - 1`). The compile-time invariant `FFP_MAX_DEPTH <
+                // SE_MIN_DEPTH` guarantees SE and FFP never co-fire at the same
+                // node; the `i == 0` predicate guarantees SE and LMR (which
+                // requires `quiet_index >= 2`) never co-fire on the same move.
+                #[cfg(test)]
+                if i == 0 && move_extension > 0 && self.se_tt_move_search_depth.is_none() {
+                    // Record the effective depth only when SE extension actually applies
+                    // (move_extension > 0). This isolates the singular-extension depth
+                    // increment from normal i==0 dispatches in recursive sub-calls.
+                    self.se_tt_move_search_depth = Some(depth - 1 + move_extension);
+                }
                 self.search_child(
                     pos,
                     mv,
-                    depth - 1,
+                    depth - 1 + move_extension,
                     ply,
                     alpha,
                     beta,
@@ -1813,8 +2072,14 @@ impl AlphaBetaMover {
         //     Together this guarantees aborted iterations never overwrite a
         //     prior iteration's entry. Bound classification compares against
         //     `original_alpha` — the caller's pre-MDP alpha (step 4).
+        //
+        //     M5.G: suppressed at the verification frame (`excluded_move.is_some()`).
+        //     The verification ran with a candidate move excluded; the score it
+        //     computes is for a sub-game that is not the position keyed by
+        //     `pos.zobrist()`. ADR-0029 §7.
         if let Some(tt) = &self.tt
             && !self.aborted
+            && excluded_move.is_none()
             && let Some(bound) =
                 tt_bound_for_completed_node(best, beta, original_alpha, best_is_full_depth)
         {
@@ -1862,6 +2127,7 @@ impl AlphaBetaMover {
         beta: i32,
         is_pv: bool,
         allow_null: bool,
+        excluded_move: Option<Move>,
         ctx: &SearchContext,
     ) -> i32 {
         let clock = SearchClock::start_for(ctx.virtual_clock, ctx.caps);
@@ -1882,8 +2148,22 @@ impl AlphaBetaMover {
         // M5.F: reset TT probe/store counters symmetrically.
         self.qsearch_tt_probes = 0;
         self.qsearch_tt_stores = 0;
+        // M5.G: reset SE extensions counter and depth-recording field.
+        self.se_extensions = 0;
+        self.se_tt_move_search_depth = None;
         self.lmr_trace_root_ply = Some(ply);
-        let score = self.negamax(pos, depth, ply, alpha, beta, is_pv, allow_null, ctx, &clock);
+        let score = self.negamax(
+            pos,
+            depth,
+            ply,
+            alpha,
+            beta,
+            is_pv,
+            allow_null,
+            excluded_move,
+            ctx,
+            &clock,
+        );
         self.lmr_trace_root_ply = None;
         score
     }
@@ -1951,12 +2231,42 @@ impl AlphaBetaMover {
         &self.ffp_skipped_moves
     }
 
+    /// Test-only accessor for the per-`go` SE extensions counter (M5.G).
+    /// Mirrors `nmp_firings_for_test` / `rfp_firings_for_test` /
+    /// `ffp_firings_for_test`. Production code never reads the counter through
+    /// this accessor.
+    #[cfg(test)]
+    pub(super) fn se_extensions_for_test(&self) -> u32 {
+        self.se_extensions
+    }
+
+    /// Test-only accessor for the effective depth used when searching the TT
+    /// move through the non-LMR path (M5.G). `Some(d)` means the TT move was
+    /// dispatched at depth `d`; `None` means either LMR consumed i==0 or the
+    /// TT move was never dispatched (e.g., excluded, or the position had no
+    /// legal moves). Reset to `None` at each `negamax_for_test` invocation.
+    #[cfg(test)]
+    pub(super) fn se_tt_move_search_depth_for_test(&self) -> Option<u32> {
+        self.se_tt_move_search_depth
+    }
+
     /// Test-only setter to install a TT directly without going through
     /// `Search::go`. Production code never sets this — the per-`go` install
     /// happens at the top of `Search::go`.
     #[cfg(test)]
     pub(super) fn set_tt_for_test(&mut self, tt: Option<Arc<TranspositionTable>>) {
         self.tt = tt;
+    }
+
+    /// Test-only setter for the aborted flag. Pre-setting `aborted = true`
+    /// before calling `negamax_for_test` exercises the abort-propagation path
+    /// without relying on node-count boundaries: the first move-loop
+    /// `if self.aborted { return 0; }` check fires immediately, simulating
+    /// an abort that arrived from a sibling subtree. `negamax_for_test` does
+    /// NOT reset `aborted`, so the pre-set value persists into the search.
+    #[cfg(test)]
+    pub(super) fn set_aborted_for_test(&mut self, aborted: bool) {
+        self.aborted = aborted;
     }
 
     /// Test-only: return a reference to the killer table. Mirrors
@@ -3549,7 +3859,17 @@ mod tests {
         let other_zobrist: u64 = 0xDEAD_BEEF_CAFE_0000;
         ab.history = vec![pos.zobrist(), other_zobrist, pos.zobrist()];
 
-        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, true, true, &ctx_depth2);
+        let score = ab.negamax_for_test(
+            &mut pos.clone(),
+            2,
+            1,
+            -INF,
+            INF,
+            true,
+            true,
+            None,
+            &ctx_depth2,
+        );
         assert_eq!(
             score, 0,
             "repetition at ply > 0 must return score 0; got {score}"
@@ -3567,7 +3887,17 @@ mod tests {
         let mut ab = AlphaBetaMover::new();
         ab.history = vec![pos.zobrist()];
 
-        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, true, true, &ctx_depth2);
+        let score = ab.negamax_for_test(
+            &mut pos.clone(),
+            2,
+            1,
+            -INF,
+            INF,
+            true,
+            true,
+            None,
+            &ctx_depth2,
+        );
         assert_eq!(
             score, 0,
             "50-move draw at halfmove=100 must return score 0; got {score}"
@@ -4614,7 +4944,7 @@ mod tests {
         let mut ab = AlphaBetaMover::new();
         ab.history = vec![pos.zobrist()];
         let (ctx, _stop) = non_aborting_ctx();
-        let score = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, true, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, true, None, &ctx);
 
         assert!(
             score < 700,
@@ -5828,7 +6158,7 @@ mod tests {
         ab.history = vec![pos.zobrist()];
         ab.set_tt_for_test(Some(tt.clone()));
 
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, -100, -99, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, -100, -99, false, true, None, &ctx);
 
         let entry = tt
             .probe(pos.zobrist())
@@ -5884,7 +6214,7 @@ mod tests {
         ab2.history = vec![pos2.zobrist()];
         ab2.set_tt_for_test(Some(tt2.clone()));
         ab2.aborted = true;
-        let _ = ab2.negamax_for_test(&mut pos2.clone(), 2, 0, -INF, INF, true, true, &ctx2);
+        let _ = ab2.negamax_for_test(&mut pos2.clone(), 2, 0, -INF, INF, true, true, None, &ctx2);
         assert!(
             tt2.probe(pos2.zobrist()).is_none(),
             "negamax with self.aborted=true must not store a TT entry"
@@ -6003,7 +6333,7 @@ mod tests {
         ab.set_tt_for_test(Some(tt.clone()));
 
         let nodes_before = ab.nodes;
-        let score = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, true, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, true, None, &ctx);
         let nodes_consumed = ab.nodes - nodes_before;
 
         assert_eq!(
@@ -6039,7 +6369,7 @@ mod tests {
         ab.set_tt_for_test(Some(tt.clone()));
 
         let nodes_before = ab.nodes;
-        let score = ab.negamax_for_test(&mut pos.clone(), 3, 0, -100, INF, false, true, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 3, 0, -100, INF, false, true, None, &ctx);
         let nodes_consumed = ab.nodes - nodes_before;
 
         assert_eq!(
@@ -6079,7 +6409,7 @@ mod tests {
         ab.set_tt_for_test(Some(tt.clone()));
 
         let nodes_before = ab.nodes;
-        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, None, &ctx);
         let nodes_consumed = ab.nodes - nodes_before;
 
         assert!(
@@ -6131,7 +6461,7 @@ mod tests {
         let mut ab_a = AlphaBetaMover::new();
         ab_a.history = vec![pos.zobrist()];
         ab_a.set_tt_for_test(Some(tt_a.clone()));
-        let _ = ab_a.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx_a);
+        let _ = ab_a.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, None, &ctx_a);
         let nodes_unhinted = ab_a.nodes;
 
         // Run (b): pre-populate TT with last_move at insufficient depth so
@@ -6150,7 +6480,7 @@ mod tests {
         let mut ab_b = AlphaBetaMover::new();
         ab_b.history = vec![pos.zobrist()];
         ab_b.set_tt_for_test(Some(tt_b.clone()));
-        let _ = ab_b.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx_b);
+        let _ = ab_b.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, None, &ctx_b);
         let nodes_hinted = ab_b.nodes;
 
         assert_ne!(
@@ -6267,7 +6597,7 @@ mod tests {
         ab.history = vec![pos.zobrist(), other_zobrist, pos.zobrist()];
         ab.set_tt_for_test(Some(tt.clone()));
 
-        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, false, true, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, false, true, None, &ctx);
         assert_eq!(
             score, 0,
             "repetition (returns 0) must run BEFORE TT probe; got {score} (TT score=999)"
@@ -6298,7 +6628,7 @@ mod tests {
         ab.history = vec![pos.zobrist()];
         ab.set_tt_for_test(Some(tt.clone()));
 
-        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, false, true, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, false, true, None, &ctx);
         assert_eq!(
             score, 0,
             "50-move draw (returns 0) must run BEFORE TT probe; got {score} (TT score=999)"
@@ -6331,7 +6661,7 @@ mod tests {
         ab1.history = vec![pos.zobrist()];
         ab1.set_tt_for_test(Some(tt.clone()));
         let nodes_before_a = ab1.nodes;
-        let _ = ab1.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, true, &ctx);
+        let _ = ab1.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, true, None, &ctx);
         let nodes_with_hit = ab1.nodes - nodes_before_a;
 
         tt.clear();
@@ -6340,7 +6670,7 @@ mod tests {
         ab2.history = vec![pos.zobrist()];
         ab2.set_tt_for_test(Some(tt.clone()));
         let nodes_before_b = ab2.nodes;
-        let _ = ab2.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, true, &ctx);
+        let _ = ab2.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, true, None, &ctx);
         let nodes_after_clear = ab2.nodes - nodes_before_b;
 
         assert!(
@@ -6377,7 +6707,7 @@ mod tests {
         ab.history = vec![pos.zobrist()];
         ab.set_tt_for_test(Some(tt.clone()));
 
-        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, true, None, &ctx);
 
         let pv = ab.pv_root_for_test();
         assert!(
@@ -6429,7 +6759,17 @@ mod tests {
         let mut ab_ref = AlphaBetaMover::new();
         ab_ref.history = vec![pos.zobrist()];
         ab_ref.set_tt_for_test(Some(tt_ref.clone()));
-        let _ = ab_ref.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx_ref);
+        let _ = ab_ref.negamax_for_test(
+            &mut pos.clone(),
+            3,
+            0,
+            -INF,
+            INF,
+            true,
+            true,
+            None,
+            &ctx_ref,
+        );
         let nodes_ref = ab_ref.nodes;
 
         // Pre-populated run: every child of root has an Exact, depth=10
@@ -6454,7 +6794,7 @@ mod tests {
         let mut ab = AlphaBetaMover::new();
         ab.history = vec![pos.zobrist()];
         ab.set_tt_for_test(Some(tt.clone()));
-        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, None, &ctx);
         let nodes_with_tt = ab.nodes;
 
         assert!(
@@ -7204,7 +7544,7 @@ mod tests {
         let (ctx, _stop) = non_aborting_ctx_at_depth(2);
 
         // Narrow window forces a quick beta cutoff at some ply.
-        let _ = mover.negamax_for_test(&mut pos.clone(), 2, 0, -100, -50, true, true, &ctx);
+        let _ = mover.negamax_for_test(&mut pos.clone(), 2, 0, -100, -50, true, true, None, &ctx);
 
         // Find the first ply with a populated killer slot.
         let killers = mover.killers_for_test();
@@ -7262,7 +7602,17 @@ mod tests {
         // Run with a tight fail-high window: any capture will overshoot and
         // produce a beta cutoff. The gate `if is_quiet(mv)` must prevent
         // the capture from populating killers[0][0].
-        let _ = mover.negamax_for_test(&mut pos.clone(), 1, 0, 10000, 10001, false, true, &ctx);
+        let _ = mover.negamax_for_test(
+            &mut pos.clone(),
+            1,
+            0,
+            10000,
+            10001,
+            false,
+            true,
+            None,
+            &ctx,
+        );
 
         // killers[0][0] must remain the default sentinel (no capture recorded).
         assert_eq!(
@@ -7311,7 +7661,8 @@ mod tests {
         let mut mover_a = AlphaBetaMover::new();
         mover_a.history = vec![pos.zobrist()];
         let (ctx_a, _stop_a) = non_aborting_ctx_at_depth(3);
-        let _ = mover_a.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx_a);
+        let _ =
+            mover_a.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, None, &ctx_a);
         let nodes_a = mover_a.nodes;
 
         // Pick the lexicographically-last white quiet move from startpos
@@ -7367,7 +7718,8 @@ mod tests {
         init_killers[2][0] = chosen_quiet;
         mover_b.set_killers_for_test(init_killers);
         let (ctx_b, _stop_b) = non_aborting_ctx_at_depth(3);
-        let _ = mover_b.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, &ctx_b);
+        let _ =
+            mover_b.negamax_for_test(&mut pos.clone(), 3, 0, -INF, INF, true, true, None, &ctx_b);
         let nodes_b = mover_b.nodes;
 
         assert_ne!(
@@ -7540,7 +7892,7 @@ mod tests {
         let (ctx, _stop) = non_aborting_ctx();
         // Tight window at zero centipawns: any move with positive eval will
         // immediately fail-high, producing a quiet beta-cutoff.
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, true, None, &ctx);
 
         // After the cutoff fires, exactly one quiet `(side, from, to)` triple
         // must hold the +4 bonus (depth=2, depth*depth=4). Sweep all entries
@@ -7598,7 +7950,7 @@ mod tests {
         ab.history = vec![pos.zobrist()];
         let (ctx, _stop) = non_aborting_ctx();
         // Tighten the window so Qxd4 (winning material) fail-highs.
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, true, None, &ctx);
 
         for side in [Color::White, Color::Black] {
             for from in 0..64u8 {
@@ -7643,7 +7995,7 @@ mod tests {
         ab.history = vec![pos.zobrist()];
         ab.set_tt_for_test(Some(tt.clone()));
 
-        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -INF, 100, false, true, None, &ctx);
 
         for side in [Color::White, Color::Black] {
             for from in 0..64u8 {
@@ -7685,7 +8037,7 @@ mod tests {
         ab.history_table.clear();
         ab.history = history;
         let (ctx, _stop) = non_aborting_ctx();
-        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, true, true, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, true, true, None, &ctx);
 
         assert_eq!(score, 0, "rep-return at ply > 0 must yield 0");
         for side in [Color::White, Color::Black] {
@@ -7728,7 +8080,17 @@ mod tests {
             "fixture preconditions: alpha={alpha}, mating_value={mating_value} — \
              alpha must be >= mating_value to trigger upper-bound MD pruning"
         );
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, ply, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            2,
+            ply,
+            alpha,
+            beta,
+            false,
+            true,
+            None,
+            &ctx,
+        );
 
         for side in [Color::White, Color::Black] {
             for from in 0..64u8 {
@@ -7770,7 +8132,7 @@ mod tests {
         ab.history = vec![pos.zobrist()];
         let (ctx, _stop) = non_aborting_ctx();
         let depth: u32 = 2;
-        let _ = ab.negamax_for_test(&mut pos.clone(), depth, 0, 0, 1, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), depth, 0, 0, 1, false, true, None, &ctx);
 
         let bonus = (depth as i32) * (depth as i32); // = 4
         let mut plus_count = 0;
@@ -7834,7 +8196,7 @@ mod tests {
         let (ctx, _stop) = non_aborting_ctx();
         // Wide-ish window so multiple cutoffs fire at varying plies but
         // not so wide as to suppress all cuts.
-        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -50, 50, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 3, 0, -50, 50, false, true, None, &ctx);
 
         let mut has_negative = false;
         let mut has_positive = false;
@@ -7914,7 +8276,7 @@ mod tests {
         let (ctx, _stop) = non_aborting_ctx();
         // Window (0, 1): Qxe7+ → Kxe7 returns 0 (no cut); any quiet
         // returns ~+688 (cut).
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, true, None, &ctx);
 
         assert_eq!(
             ab.history_table.score(Color::White, cap_from, cap_to),
@@ -7975,7 +8337,7 @@ mod tests {
         // depth=2 is NOT safe here: root's second and later children are
         // searched with a narrowed window (negate(updated_alpha, INF)) and
         // their depth=1 children CAN cut, updating history.
-        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, true, None, &ctx);
 
         for side in [Color::White, Color::Black] {
             for from in 0..64u8 {
@@ -8012,7 +8374,7 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         // Pre-set aborted as well so the post-recursion check fires.
         ab.aborted = true;
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, -INF, INF, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, -INF, INF, false, true, None, &ctx);
 
         for side in [Color::White, Color::Black] {
             for from in 0..64u8 {
@@ -8048,7 +8410,7 @@ mod tests {
         ab.history_table.clear();
         ab.history = vec![pos.zobrist()];
         let (ctx, _stop) = non_aborting_ctx();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 0, 0, 1, false, true, None, &ctx);
 
         let mut white_nonzero = 0;
         let mut black_nonzero = 0;
@@ -8104,7 +8466,7 @@ mod tests {
         // fire (static_eval ≈ 477 for K+R vs K; margin at depth=2 is 200;
         // 477−200=277 < 350 → gate fails). Window still tight enough to
         // trigger a quiet beta-cutoff (first rook move returns ≈477 > 350).
-        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 1, 0, 350, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 2, 1, 0, 350, false, true, None, &ctx);
 
         let mut white_nonzero = 0;
         let mut black_nonzero = 0;
@@ -8226,7 +8588,7 @@ mod tests {
         }
         ab.history = vec![pos.zobrist()];
         let (ctx, _stop) = non_aborting_ctx();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 0, 0, 1, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 0, 0, 1, false, true, None, &ctx);
 
         // The cutter's entry must clamp at MAX_HISTORY. Sweep all White
         // quiets and find at least one entry equal to MAX_HISTORY (the
@@ -9817,11 +10179,13 @@ mod tests {
         let alpha = -INF;
 
         let mut ab_skip = AlphaBetaMover::new();
-        let _ = ab_skip.negamax_for_test(&mut pos.clone(), 4, 0, alpha, beta, false, true, &ctx);
+        let _ =
+            ab_skip.negamax_for_test(&mut pos.clone(), 4, 0, alpha, beta, false, true, None, &ctx);
         let nodes_skip = ab_skip.nodes;
 
         let mut ab_pass = AlphaBetaMover::new();
-        let _ = ab_pass.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let _ =
+            ab_pass.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, None, &ctx);
         let nodes_pass = ab_pass.nodes;
 
         assert!(
@@ -9885,8 +10249,17 @@ mod tests {
         let beta = beta_in.min(beta_no);
 
         let mut ab_in = AlphaBetaMover::new();
-        let _ =
-            ab_in.negamax_for_test(&mut pos_check.clone(), 3, 1, alpha, beta, false, true, &ctx);
+        let _ = ab_in.negamax_for_test(
+            &mut pos_check.clone(),
+            3,
+            1,
+            alpha,
+            beta,
+            false,
+            true,
+            None,
+            &ctx,
+        );
         let nodes_in = ab_in.nodes;
 
         let mut ab_no = AlphaBetaMover::new();
@@ -9898,6 +10271,7 @@ mod tests {
             beta,
             false,
             true,
+            None,
             &ctx,
         );
         let nodes_no = ab_no.nodes;
@@ -9923,11 +10297,12 @@ mod tests {
         let alpha = -INF;
 
         let mut ab_pv = AlphaBetaMover::new();
-        let _ = ab_pv.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, true, true, &ctx);
+        let _ = ab_pv.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, true, true, None, &ctx);
         let nodes_pv = ab_pv.nodes;
 
         let mut ab_nonpv = AlphaBetaMover::new();
-        let _ = ab_nonpv.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let _ =
+            ab_nonpv.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, None, &ctx);
         let nodes_nonpv = ab_nonpv.nodes;
 
         assert!(
@@ -9956,11 +10331,22 @@ mod tests {
         let alpha = -INF;
 
         let mut ab_allow = AlphaBetaMover::new();
-        let _ = ab_allow.negamax_for_test(&mut pos.clone(), 6, 1, alpha, beta, false, true, &ctx);
+        let _ =
+            ab_allow.negamax_for_test(&mut pos.clone(), 6, 1, alpha, beta, false, true, None, &ctx);
         let nodes_allow = ab_allow.nodes;
 
         let mut ab_deny = AlphaBetaMover::new();
-        let _ = ab_deny.negamax_for_test(&mut pos.clone(), 6, 1, alpha, beta, false, false, &ctx);
+        let _ = ab_deny.negamax_for_test(
+            &mut pos.clone(),
+            6,
+            1,
+            alpha,
+            beta,
+            false,
+            false,
+            None,
+            &ctx,
+        );
         let nodes_deny = ab_deny.nodes;
 
         assert!(
@@ -9989,15 +10375,33 @@ mod tests {
         // Skip case: beta > static_eval (gate fails).
         let beta_skip = static_eval + 100;
         let mut ab_skip = AlphaBetaMover::new();
-        let _ =
-            ab_skip.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta_skip, false, true, &ctx);
+        let _ = ab_skip.negamax_for_test(
+            &mut pos.clone(),
+            4,
+            1,
+            alpha,
+            beta_skip,
+            false,
+            true,
+            None,
+            &ctx,
+        );
         let nodes_skip = ab_skip.nodes;
 
         // Pass case: beta < static_eval (gate passes).
         let beta_pass = static_eval - 50;
         let mut ab_pass = AlphaBetaMover::new();
-        let _ =
-            ab_pass.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta_pass, false, true, &ctx);
+        let _ = ab_pass.negamax_for_test(
+            &mut pos.clone(),
+            4,
+            1,
+            alpha,
+            beta_pass,
+            false,
+            true,
+            None,
+            &ctx,
+        );
         let nodes_pass = ab_pass.nodes;
 
         assert!(
@@ -10031,11 +10435,31 @@ mod tests {
         let beta = beta_kp.min(beta_n);
 
         let mut ab_kp = AlphaBetaMover::new();
-        let _ = ab_kp.negamax_for_test(&mut kp_only.clone(), 3, 1, alpha, beta, false, true, &ctx);
+        let _ = ab_kp.negamax_for_test(
+            &mut kp_only.clone(),
+            3,
+            1,
+            alpha,
+            beta,
+            false,
+            true,
+            None,
+            &ctx,
+        );
         let nodes_kp = ab_kp.nodes;
 
         let mut ab_n = AlphaBetaMover::new();
-        let _ = ab_n.negamax_for_test(&mut kp_with_n.clone(), 3, 1, alpha, beta, false, true, &ctx);
+        let _ = ab_n.negamax_for_test(
+            &mut kp_with_n.clone(),
+            3,
+            1,
+            alpha,
+            beta,
+            false,
+            true,
+            None,
+            &ctx,
+        );
         let nodes_n = ab_n.nodes;
 
         assert!(
@@ -10064,11 +10488,11 @@ mod tests {
         let alpha = -INF;
 
         let mut ab_2 = AlphaBetaMover::new();
-        let _ = ab_2.negamax_for_test(&mut pos.clone(), 2, 1, alpha, beta, false, true, &ctx);
+        let _ = ab_2.negamax_for_test(&mut pos.clone(), 2, 1, alpha, beta, false, true, None, &ctx);
         let firings_2 = ab_2.nmp_firings_for_test();
 
         let mut ab_4 = AlphaBetaMover::new();
-        let _ = ab_4.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let _ = ab_4.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, None, &ctx);
         let firings_4 = ab_4.nmp_firings_for_test();
 
         // Depth-2 must produce zero NMP firings at this node (the depth gate
@@ -10096,7 +10520,8 @@ mod tests {
         let alpha = -INF;
 
         let mut ab = AlphaBetaMover::new();
-        let score = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let score =
+            ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, None, &ctx);
 
         assert!(
             score >= beta,
@@ -10202,6 +10627,7 @@ mod tests {
             beta,
             false,
             true,
+            None,
             &ctx,
         );
 
@@ -10241,7 +10667,7 @@ mod tests {
         let alpha = -INF;
 
         let mut ab = AlphaBetaMover::new();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 8, 1, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 8, 1, alpha, beta, false, true, None, &ctx);
         let firings = ab.nmp_firings_for_test();
 
         // The pinned firings count is observed at impl time; the assertion
@@ -10277,8 +10703,17 @@ mod tests {
 
         let mut ab = AlphaBetaMover::new();
         ab.set_tt_for_test(Some(Arc::clone(&tt)));
-        let returned =
-            ab.negamax_for_test(&mut pos.clone(), depth, ply, alpha, beta, false, true, &ctx);
+        let returned = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            alpha,
+            beta,
+            false,
+            true,
+            None,
+            &ctx,
+        );
         // Sanity: NMP fired and produced a cutoff at this node.
         assert!(
             returned >= beta,
@@ -10361,7 +10796,17 @@ mod tests {
 
         let mut ab = AlphaBetaMover::new();
         ab.set_tt_for_test(Some(Arc::clone(&tt)));
-        let _ = ab.negamax_for_test(&mut pos.clone(), depth, ply, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            alpha,
+            beta,
+            false,
+            true,
+            None,
+            &ctx,
+        );
 
         let entry = tt
             .probe(pos.zobrist())
@@ -10403,7 +10848,7 @@ mod tests {
         let pre_len = ab.history.len();
         let pre_history = ab.history.clone();
 
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, None, &ctx);
 
         // Sanity: NMP actually fired (otherwise this test would trivially pass).
         assert!(
@@ -10458,10 +10903,11 @@ mod tests {
         let alpha = -INF;
 
         let mut ab_pv = AlphaBetaMover::new();
-        let _ = ab_pv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, true, true, &ctx);
+        let _ = ab_pv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, true, true, None, &ctx);
 
         let mut ab_nonpv = AlphaBetaMover::new();
-        let _ = ab_nonpv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+        let _ =
+            ab_nonpv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
 
         assert_eq!(
             ab_pv.rfp_firings_for_test(),
@@ -10508,8 +10954,17 @@ mod tests {
         let beta = stm_static_eval(&pos_no_check) - reverse_futility_margin(1) - 50;
 
         let mut ab_check = AlphaBetaMover::new();
-        let _ =
-            ab_check.negamax_for_test(&mut pos_check.clone(), 1, 1, alpha, beta, false, true, &ctx);
+        let _ = ab_check.negamax_for_test(
+            &mut pos_check.clone(),
+            1,
+            1,
+            alpha,
+            beta,
+            false,
+            true,
+            None,
+            &ctx,
+        );
 
         let mut ab_no = AlphaBetaMover::new();
         let _ = ab_no.negamax_for_test(
@@ -10520,6 +10975,7 @@ mod tests {
             beta,
             false,
             true,
+            None,
             &ctx,
         );
 
@@ -10554,10 +11010,12 @@ mod tests {
         let alpha = -INF;
 
         let mut ab_ply0 = AlphaBetaMover::new();
-        let _ = ab_ply0.negamax_for_test(&mut pos.clone(), 1, 0, alpha, beta, false, true, &ctx);
+        let _ =
+            ab_ply0.negamax_for_test(&mut pos.clone(), 1, 0, alpha, beta, false, true, None, &ctx);
 
         let mut ab_ply1 = AlphaBetaMover::new();
-        let _ = ab_ply1.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+        let _ =
+            ab_ply1.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
 
         assert_eq!(
             ab_ply0.rfp_firings_for_test(),
@@ -10608,14 +11066,34 @@ mod tests {
         // at depth=7).
         let beta_d7 = 950;
         let mut ab_d7 = AlphaBetaMover::new();
-        let _ = ab_d7.negamax_for_test(&mut pos.clone(), 7, 1, alpha, beta_d7, false, true, &ctx);
+        let _ = ab_d7.negamax_for_test(
+            &mut pos.clone(),
+            7,
+            1,
+            alpha,
+            beta_d7,
+            false,
+            true,
+            None,
+            &ctx,
+        );
 
         // depth=6: gate passes (6 == RFP_MAX_DEPTH). beta just below threshold
         // so root fires and immediately returns (no movegen → no children →
         // rfp_firings exactly 1). Catches `<= → <` mutation.
         let beta_d6 = static_eval - reverse_futility_margin(6) - 1;
         let mut ab_d6 = AlphaBetaMover::new();
-        let _ = ab_d6.negamax_for_test(&mut pos.clone(), 6, 1, alpha, beta_d6, false, true, &ctx);
+        let _ = ab_d6.negamax_for_test(
+            &mut pos.clone(),
+            6,
+            1,
+            alpha,
+            beta_d6,
+            false,
+            true,
+            None,
+            &ctx,
+        );
 
         assert_eq!(
             ab_d7.rfp_firings_for_test(),
@@ -10669,6 +11147,7 @@ mod tests {
             beta_mate,
             false,
             true,
+            None,
             &ctx,
         );
 
@@ -10681,6 +11160,7 @@ mod tests {
             beta_finite,
             false,
             true,
+            None,
             &ctx,
         );
 
@@ -10713,14 +11193,32 @@ mod tests {
         // Skip case: beta = static_eval - margin + 50 (gate fails: S - M < S - M + 50).
         let beta_skip = static_eval - margin + 50;
         let mut ab_skip = AlphaBetaMover::new();
-        let _ =
-            ab_skip.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta_skip, false, true, &ctx);
+        let _ = ab_skip.negamax_for_test(
+            &mut pos.clone(),
+            4,
+            1,
+            alpha,
+            beta_skip,
+            false,
+            true,
+            None,
+            &ctx,
+        );
 
         // Pass case: beta = static_eval - margin - 50 (gate passes: S - M >= S - M - 50).
         let beta_pass = static_eval - margin - 50;
         let mut ab_pass = AlphaBetaMover::new();
-        let _ =
-            ab_pass.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta_pass, false, true, &ctx);
+        let _ = ab_pass.negamax_for_test(
+            &mut pos.clone(),
+            4,
+            1,
+            alpha,
+            beta_pass,
+            false,
+            true,
+            None,
+            &ctx,
+        );
 
         assert_eq!(
             ab_skip.rfp_firings_for_test(),
@@ -10750,7 +11248,8 @@ mod tests {
         let alpha = -INF;
 
         let mut ab = AlphaBetaMover::new();
-        let score = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let score =
+            ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, None, &ctx);
 
         assert_eq!(
             ab.rfp_firings_for_test(),
@@ -10783,7 +11282,7 @@ mod tests {
 
         let mut ab = AlphaBetaMover::new();
         ab.set_tt_for_test(Some(Arc::clone(&tt)));
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, None, &ctx);
 
         assert_eq!(
             ab.rfp_firings_for_test(),
@@ -10818,7 +11317,7 @@ mod tests {
         let alpha = -INF;
 
         let mut ab = AlphaBetaMover::new();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, None, &ctx);
 
         assert_eq!(
             ab.rfp_firings_for_test(),
@@ -10847,7 +11346,7 @@ mod tests {
         let alpha = -INF;
 
         let mut ab = AlphaBetaMover::new();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, None, &ctx);
 
         assert_eq!(
             ab.rfp_firings_for_test(),
@@ -10886,7 +11385,7 @@ mod tests {
         );
 
         let mut ab = AlphaBetaMover::new();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, None, &ctx);
 
         assert_eq!(
             ab.rfp_firings_for_test(),
@@ -10920,15 +11419,33 @@ mod tests {
         // Pass case: beta = static_eval - 100 → fires (boundary equality: S - 100 >= S - 100).
         let beta_pass = static_eval - 100;
         let mut ab_pass = AlphaBetaMover::new();
-        let _ =
-            ab_pass.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta_pass, false, true, &ctx);
+        let _ = ab_pass.negamax_for_test(
+            &mut pos.clone(),
+            1,
+            1,
+            alpha,
+            beta_pass,
+            false,
+            true,
+            None,
+            &ctx,
+        );
 
         // Skip case: beta = static_eval - 99 → does not fire (S - 100 >= S - 99 is false).
         // pins margin-comparison operator >=; intentionally 1-cp boundary
         let beta_skip = static_eval - 99;
         let mut ab_skip = AlphaBetaMover::new();
-        let _ =
-            ab_skip.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta_skip, false, true, &ctx);
+        let _ = ab_skip.negamax_for_test(
+            &mut pos.clone(),
+            1,
+            1,
+            alpha,
+            beta_skip,
+            false,
+            true,
+            None,
+            &ctx,
+        );
 
         assert_eq!(
             ab_pass.rfp_firings_for_test(),
@@ -11119,7 +11636,7 @@ mod tests {
             (LMR_HIGH_HISTORY_THRESHOLD - 1) as i32,
         );
 
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, None, &ctx);
 
         assert!(
             !ab.lmr_reduced_moves_for_test().contains(&first_quiet),
@@ -11148,7 +11665,17 @@ mod tests {
 
         // Sister run: no preseeded killers → verify LMR fires at all (anti-vacuous).
         let mut ab_no_killer = AlphaBetaMover::new();
-        let _ = ab_no_killer.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+        let _ = ab_no_killer.negamax_for_test(
+            &mut pos.clone(),
+            4,
+            1,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
         assert!(
             ab_no_killer.lmr_reduced_searches_for_test() > 0,
             "sister run without killer must confirm LMR fires; got {}",
@@ -11162,7 +11689,7 @@ mod tests {
         killers[1][1] = mate_quiet;
         ab.set_killers_for_test(killers);
 
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, None, &ctx);
 
         assert!(
             ab.lmr_reduced_searches_for_test() > 0,
@@ -11191,8 +11718,17 @@ mod tests {
 
         // Sister run: no preseeded history → verify LMR fires at all (anti-vacuous).
         let mut ab_no_history = AlphaBetaMover::new();
-        let _ =
-            ab_no_history.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+        let _ = ab_no_history.negamax_for_test(
+            &mut pos.clone(),
+            4,
+            1,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
         assert!(
             ab_no_history.lmr_reduced_searches_for_test() > 0,
             "sister run without high history must confirm LMR fires; got {}",
@@ -11214,7 +11750,7 @@ mod tests {
             LMR_HIGH_HISTORY_THRESHOLD as i32,
         );
 
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, None, &ctx);
 
         assert!(
             ab.lmr_reduced_searches_for_test() > 0,
@@ -11236,10 +11772,11 @@ mod tests {
         let (ctx, _stop) = non_aborting_ctx_at_depth(4);
 
         let mut ab_pv = AlphaBetaMover::new();
-        let _ = ab_pv.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, true, true, &ctx);
+        let _ = ab_pv.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, true, true, None, &ctx);
 
         let mut ab_nonpv = AlphaBetaMover::new();
-        let _ = ab_nonpv.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+        let _ =
+            ab_nonpv.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, None, &ctx);
 
         assert_eq!(
             ab_pv.lmr_reduced_searches_for_test(),
@@ -11259,10 +11796,21 @@ mod tests {
         let (ctx, _stop) = non_aborting_ctx_at_depth(4);
 
         let mut ab_root = AlphaBetaMover::new();
-        let _ = ab_root.negamax_for_test(&mut pos.clone(), 4, 0, -INF, INF, false, true, &ctx);
+        let _ =
+            ab_root.negamax_for_test(&mut pos.clone(), 4, 0, -INF, INF, false, true, None, &ctx);
 
         let mut ab_interior = AlphaBetaMover::new();
-        let _ = ab_interior.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+        let _ = ab_interior.negamax_for_test(
+            &mut pos.clone(),
+            4,
+            1,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
 
         assert_eq!(
             ab_root.lmr_reduced_searches_for_test(),
@@ -11293,8 +11841,17 @@ mod tests {
         let (ctx, _stop) = non_aborting_ctx_at_depth(4);
 
         let mut ab_check = AlphaBetaMover::new();
-        let _ =
-            ab_check.negamax_for_test(&mut pos_check.clone(), 4, 1, -INF, INF, false, true, &ctx);
+        let _ = ab_check.negamax_for_test(
+            &mut pos_check.clone(),
+            4,
+            1,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
 
         let mut ab_no = AlphaBetaMover::new();
         let _ = ab_no.negamax_for_test(
@@ -11305,6 +11862,7 @@ mod tests {
             INF,
             false,
             true,
+            None,
             &ctx,
         );
 
@@ -11327,10 +11885,10 @@ mod tests {
         let (ctx3, _stop3) = non_aborting_ctx_at_depth(3);
 
         let mut ab_d2 = AlphaBetaMover::new();
-        let _ = ab_d2.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, false, true, &ctx2);
+        let _ = ab_d2.negamax_for_test(&mut pos.clone(), 2, 1, -INF, INF, false, true, None, &ctx2);
 
         let mut ab_d3 = AlphaBetaMover::new();
-        let _ = ab_d3.negamax_for_test(&mut pos.clone(), 3, 1, -INF, INF, false, true, &ctx3);
+        let _ = ab_d3.negamax_for_test(&mut pos.clone(), 3, 1, -INF, INF, false, true, None, &ctx3);
 
         assert_eq!(
             ab_d2.lmr_reduced_searches_for_test(),
@@ -11356,7 +11914,7 @@ mod tests {
             LMR_HIGH_HISTORY_THRESHOLD as i32,
         );
 
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, None, &ctx);
 
         assert!(
             ab.lmr_reduced_searches_for_test() > 0,
@@ -11383,7 +11941,7 @@ mod tests {
 
         let alpha = -INF;
         let beta = INF;
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, alpha, beta, false, true, None, &ctx);
 
         assert!(
             ab.lmr_reduced_searches_for_test() > 0,
@@ -11408,7 +11966,7 @@ mod tests {
         let pos = Position::starting_position();
         let (ctx, _stop) = non_aborting_ctx_at_depth(4);
         let mut ab = AlphaBetaMover::new();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, 900, INF, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, 900, INF, false, true, None, &ctx);
 
         let reduced_only: Vec<Move> = ab
             .lmr_reduced_moves_for_test()
@@ -11492,7 +12050,7 @@ mod tests {
         let pos = Position::starting_position();
         let (ctx, _stop) = non_aborting_ctx_at_depth(4);
         let mut ab = AlphaBetaMover::new();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, 900, INF, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, 900, INF, false, true, None, &ctx);
 
         assert!(
             ab.lmr_reduced_searches_for_test() > 0,
@@ -11656,7 +12214,7 @@ mod tests {
         let mut ab = AlphaBetaMover::new();
         // Full window so the search completes without beta cutoffs, ensuring
         // the first quiet (quiet_index=1) is searched at full depth and recorded.
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, None, &ctx);
 
         let candidates = ab.lmr_history_candidates_for_test();
         assert!(
@@ -11870,10 +12428,11 @@ mod tests {
         let beta = MATE_IN_MAX_PLY;
 
         let mut ab_pv = AlphaBetaMover::new();
-        let _ = ab_pv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, true, true, &ctx);
+        let _ = ab_pv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, true, true, None, &ctx);
 
         let mut ab_nonpv = AlphaBetaMover::new();
-        let _ = ab_nonpv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+        let _ =
+            ab_nonpv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
 
         assert_eq!(
             ab_pv.ffp_firings_for_test(),
@@ -11900,10 +12459,12 @@ mod tests {
         let beta = MATE_IN_MAX_PLY;
 
         let mut ab_ply0 = AlphaBetaMover::new();
-        let _ = ab_ply0.negamax_for_test(&mut pos.clone(), 1, 0, alpha, beta, false, true, &ctx);
+        let _ =
+            ab_ply0.negamax_for_test(&mut pos.clone(), 1, 0, alpha, beta, false, true, None, &ctx);
 
         let mut ab_ply1 = AlphaBetaMover::new();
-        let _ = ab_ply1.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+        let _ =
+            ab_ply1.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
 
         assert_eq!(
             ab_ply0.ffp_firings_for_test(),
@@ -11967,6 +12528,7 @@ mod tests {
             beta,
             false,
             true,
+            None,
             &ctx,
         );
 
@@ -11979,6 +12541,7 @@ mod tests {
             beta,
             false,
             true,
+            None,
             &ctx,
         );
 
@@ -12023,6 +12586,7 @@ mod tests {
             beta,
             false,
             true,
+            None,
             &ctx,
         );
 
@@ -12036,6 +12600,7 @@ mod tests {
             beta,
             false,
             true,
+            None,
             &ctx,
         );
 
@@ -12066,8 +12631,17 @@ mod tests {
         // FFP never fires.
         let alpha_mate = MATE_IN_MAX_PLY;
         let mut ab_mate = AlphaBetaMover::new();
-        let _ =
-            ab_mate.negamax_for_test(&mut pos.clone(), 1, 1, alpha_mate, beta, false, true, &ctx);
+        let _ = ab_mate.negamax_for_test(
+            &mut pos.clone(),
+            1,
+            1,
+            alpha_mate,
+            beta,
+            false,
+            true,
+            None,
+            &ctx,
+        );
 
         // Sister: ordinary high alpha (FFP fires).
         let static_eval = stm_static_eval(&pos);
@@ -12087,6 +12661,7 @@ mod tests {
             MATE_IN_MAX_PLY,
             false,
             true,
+            None,
             &ctx,
         );
 
@@ -12126,7 +12701,7 @@ mod tests {
         let beta = MATE_IN_MAX_PLY;
 
         let mut ab = AlphaBetaMover::new();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
 
         // The capture move d5xe6: assert it is NOT in the FFP-skipped move list.
         let capture = Move::from_uci("d5e6", &pos).expect("d5e6 must be a legal capture");
@@ -12173,7 +12748,7 @@ mod tests {
         let beta = MATE_IN_MAX_PLY;
 
         let mut ab = AlphaBetaMover::new();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
 
         assert!(
             ab.ffp_firings_for_test() > 0,
@@ -12205,7 +12780,7 @@ mod tests {
         );
 
         let mut ab = AlphaBetaMover::new();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
 
         assert_eq!(
             ab.ffp_firings_for_test(),
@@ -12233,7 +12808,7 @@ mod tests {
         let beta = MATE_IN_MAX_PLY;
 
         let mut ab = AlphaBetaMover::new();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
 
         let skipped: Vec<Move> = ab.ffp_skipped_moves_for_test().to_vec();
         let history_candidates: Vec<Move> = ab.lmr_history_candidates_for_test().to_vec();
@@ -12268,7 +12843,7 @@ mod tests {
             Position::from_fen("4k3/8/8/8/8/8/8/2R1K3 w - - 0 1").expect("KR vs K FEN must parse");
         let (ctx, _stop) = non_aborting_ctx_at_depth(4);
         let mut ab = AlphaBetaMover::new();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, None, &ctx);
 
         // FFP did not fire at all (alpha = -INF blocks every positive margin).
         assert_eq!(
@@ -12332,7 +12907,7 @@ mod tests {
         let beta = MATE_IN_MAX_PLY;
 
         let mut ab = AlphaBetaMover::new();
-        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
 
         assert!(
             ab.ffp_firings_for_test() > 0,
@@ -12371,7 +12946,8 @@ mod tests {
         let beta = MATE_IN_MAX_PLY;
 
         let mut ab = AlphaBetaMover::new();
-        let score = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx);
+        let score =
+            ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
 
         // Anti-stub: if the implementation always returned static_eval+margin
         // without firing FFP, this assertion would still pass — but the
@@ -12485,8 +13061,17 @@ mod tests {
         // Advance the generation once (mirroring `Search::go`'s behavior — the
         // store path requires the per-search generation counter to be set).
         tt_test.new_search();
-        let returned_score =
-            ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, &ctx_test);
+        let returned_score = ab.negamax_for_test(
+            &mut pos.clone(),
+            1,
+            1,
+            alpha,
+            beta,
+            false,
+            true,
+            None,
+            &ctx_test,
+        );
         let firings = ab.ffp_firings_for_test();
         assert!(
             firings > 0,
@@ -12535,8 +13120,17 @@ mod tests {
         let mut ab_sister = AlphaBetaMover::new();
         ab_sister.set_tt_for_test(Some(tt_sister.clone()));
         tt_sister.new_search();
-        let _ =
-            ab_sister.negamax_for_test(&mut pos.clone(), 1, 1, -INF, INF, false, true, &ctx_sister);
+        let _ = ab_sister.negamax_for_test(
+            &mut pos.clone(),
+            1,
+            1,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx_sister,
+        );
         assert_eq!(
             ab_sister.ffp_firings_for_test(),
             0,
@@ -14881,7 +15475,7 @@ mod tests {
         ab.set_tt_for_test(Some(Arc::clone(&tt)));
         let (ctx, _stop) = non_aborting_ctx_at_depth_with_tt(2, Arc::clone(&tt));
 
-        let score = ab.negamax_for_test(&mut pos.clone(), 2, 0, -INF, INF, true, true, &ctx);
+        let score = ab.negamax_for_test(&mut pos.clone(), 2, 0, -INF, INF, true, true, None, &ctx);
 
         // Negamax at depth=2 must NOT use the depth=0 entry for cutoff.
         // At startpos depth=2, the score should be a centipawn score, not 9999.
@@ -14963,7 +15557,7 @@ mod tests {
         let mut ab_a = AlphaBetaMover::new();
         ab_a.history = vec![pos.zobrist()];
         let (ctx_a, _stop_a) = non_aborting_ctx_at_depth(2);
-        let _ = ab_a.negamax_for_test(&mut pos.clone(), 2, 0, -INF, INF, true, true, &ctx_a);
+        let _ = ab_a.negamax_for_test(&mut pos.clone(), 2, 0, -INF, INF, true, true, None, &ctx_a);
         let nodes_a = ab_a.nodes;
 
         // Run (b): TT has depth=0, best_move=Qxd4. Negamax probe at depth=2
@@ -14982,7 +15576,7 @@ mod tests {
         ab_b.history = vec![pos.zobrist()];
         ab_b.set_tt_for_test(Some(Arc::clone(&tt_b)));
         let (ctx_b, _stop_b) = non_aborting_ctx_at_depth_with_tt(2, Arc::clone(&tt_b));
-        let _ = ab_b.negamax_for_test(&mut pos.clone(), 2, 0, -INF, INF, true, true, &ctx_b);
+        let _ = ab_b.negamax_for_test(&mut pos.clone(), 2, 0, -INF, INF, true, true, None, &ctx_b);
         let nodes_b = ab_b.nodes;
 
         // Ordering changes via extracted tt_move → node count changes.
@@ -15198,6 +15792,1647 @@ mod tests {
         assert_eq!(
             stores_after_second, 1,
             "each qsearch_for_test call must produce exactly 1 store on this fixture"
+        );
+    }
+
+    // M5.G — Singular extensions.
+    //
+    // Tests for:
+    //   §8 helper-level tests (pure functions `singular_beta`,
+    //   `verification_depth`, `singular_extension_eligible`) and
+    //   §8 integration tests (actual `negamax` driving SE via
+    //   `negamax_for_test` with pre-populated TT entries).
+    //
+    // Counter resets are wired in `negamax_for_test` (clears `se_extensions`),
+    // so back-to-back invocations are independent. Per plan §8.
+    // -----------------------------------------------------------------------
+
+    // ===== Helper tests for `singular_beta` =====
+
+    /// Base case: score=0, depth=0 → 0. Pins `raw = 0` and that the floor
+    /// `max(-(MATE-1))` doesn't alter a non-negative result.
+    #[test]
+    fn singular_beta_zero_score_zero_depth_returns_zero() {
+        assert_eq!(singular_beta(0, 0), 0);
+    }
+
+    /// Formula pin: `tt_score=100, depth=8` → `100 - 8*SE_MARGIN_PER_DEPTH`.
+    /// At `SE_MARGIN_PER_DEPTH = 1` this yields `100 - 8 = 92`.
+    #[test]
+    fn singular_beta_subtracts_margin_per_depth() {
+        let expected = 100 - SE_MARGIN_PER_DEPTH * 8_i32;
+        assert_eq!(
+            singular_beta(100, 8),
+            expected,
+            "singular_beta(100, 8) must equal {expected}"
+        );
+    }
+
+    /// Floor clamp: when `raw` would go below `-(MATE - 1)`, the result is
+    /// pinned at `-(MATE - 1)`. Input `tt_score = -(MATE_IN_MAX_PLY + 1)` at
+    /// any depth drives raw well below the floor.
+    #[test]
+    fn singular_beta_floors_at_negative_mate_minus_one() {
+        // Any deeply negative score must be floored.
+        let very_negative = -(MATE - 2); // just above -(MATE-1) boundary
+        let floor = -(MATE - 1);
+        let result = singular_beta(very_negative, 100);
+        assert_eq!(
+            result, floor,
+            "singular_beta at very negative input must floor at -(MATE-1); \
+             got {result}, floor={floor}"
+        );
+    }
+
+    /// Saturating subtraction prevents `i32` underflow when `tt_score` is
+    /// near `i32::MIN`. `SE_MARGIN_PER_DEPTH * depth` could overflow if not
+    /// handled — `saturating_sub` is the guard.
+    #[test]
+    fn singular_beta_saturating_handles_negative_score_near_min_int() {
+        // i32::MIN saturating_sub with large depth must not panic in debug.
+        let result = singular_beta(i32::MIN, u32::MAX);
+        // saturating_sub yields i32::MIN, then max(-(MATE-1)) applies.
+        let floor = -(MATE - 1);
+        assert_eq!(
+            result, floor,
+            "singular_beta with i32::MIN input must return floor; got {result}"
+        );
+    }
+
+    /// Gate boundary: when `tt_score = MATE_IN_MAX_PLY - 1` (highest allowed
+    /// by clause 8) and `depth = SE_MIN_DEPTH = 8`, `singular_beta` must still
+    /// be strictly below `MATE_IN_MAX_PLY`. Pins that the gate (clause 8) plus
+    /// the helper together keep `singular_beta` out of the mate band.
+    #[test]
+    fn singular_beta_at_max_allowed_tt_score_is_below_mate_in_max_ply() {
+        let max_tt_score = MATE_IN_MAX_PLY - 1;
+        let result = singular_beta(max_tt_score, SE_MIN_DEPTH);
+        assert!(
+            result < MATE_IN_MAX_PLY,
+            "singular_beta at max allowed tt_score must stay below MATE_IN_MAX_PLY; \
+             got {result}, MATE_IN_MAX_PLY={MATE_IN_MAX_PLY}"
+        );
+    }
+
+    // ===== Helper tests for `verification_depth` =====
+
+    /// `(SE_MIN_DEPTH - 1) / 2 = (6 - 1) / 2 = 2` (integer division). Pins the
+    /// formula at the minimum depth that triggers SE. Value updated at v2
+    /// landing (SE_MIN_DEPTH retuned 8 → 6 per `bench/sprt/2026-05-10-m5.g-v2-min-depth-6-vs-m5f-mixed-tc.md`).
+    #[test]
+    fn verification_depth_at_se_min_depth_is_two() {
+        assert_eq!(
+            verification_depth(SE_MIN_DEPTH),
+            2,
+            "verification_depth(SE_MIN_DEPTH = {SE_MIN_DEPTH}) must equal (SE_MIN_DEPTH-1)/2 = 2"
+        );
+    }
+
+    /// Monotone property: `verification_depth` is non-decreasing in `depth`.
+    /// Checked exhaustively for `depth` in `[SE_MIN_DEPTH, SE_MIN_DEPTH + 16]`.
+    #[test]
+    fn verification_depth_monotonic_in_depth() {
+        for d in SE_MIN_DEPTH..(SE_MIN_DEPTH + 16) {
+            assert!(
+                verification_depth(d) <= verification_depth(d + 1),
+                "verification_depth must be monotone non-decreasing; \
+                 verification_depth({d}) > verification_depth({})",
+                d + 1
+            );
+        }
+    }
+
+    // ===== Helper tests for `singular_extension_eligible` =====
+
+    /// Helper to build a representative happy-path call to
+    /// `singular_extension_eligible` with all 9 clauses passing.
+    fn se_eligible_happy_path() -> bool {
+        singular_extension_eligible(
+            None,                 // clause 1: no excluded move
+            1,                    // clause 2: ply > 0
+            false,                // clause 3: not PV
+            false,                // clause 4: not in check
+            SE_MIN_DEPTH,         // clause 5: depth >= SE_MIN_DEPTH
+            TtBound::Lower,       // clause 6: Lower bound
+            (SE_MIN_DEPTH) as u8, // clause 7: tt_depth >= depth - SE_TT_DEPTH_DELTA
+            0,                    // clause 8: score 0 < MATE_IN_MAX_PLY
+            1,                    // clause 9: non-zero tt_move
+        )
+    }
+
+    /// Happy path: all 9 clauses pass → returns `true`.
+    #[test]
+    fn singular_extension_eligible_passes_full_gate() {
+        assert!(
+            se_eligible_happy_path(),
+            "all 9 clauses passing must return true"
+        );
+    }
+
+    /// Clause 1: `excluded_move = Some(...)` → immediate re-entrancy guard rejects.
+    #[test]
+    fn singular_extension_eligible_rejects_when_excluded_move_some() {
+        let dummy_move = Move::from_bits(1);
+        let result = singular_extension_eligible(
+            Some(dummy_move), // clause 1: excluded move set → reject
+            1,
+            false,
+            false,
+            SE_MIN_DEPTH,
+            TtBound::Lower,
+            SE_MIN_DEPTH as u8,
+            0,
+            1,
+        );
+        assert!(!result, "excluded_move = Some(...) must reject");
+    }
+
+    /// Clause 2: `ply == 0` → root guard rejects.
+    #[test]
+    fn singular_extension_eligible_rejects_at_root_ply() {
+        let result = singular_extension_eligible(
+            None,
+            0, // clause 2: ply == 0 → reject
+            false,
+            false,
+            SE_MIN_DEPTH,
+            TtBound::Lower,
+            SE_MIN_DEPTH as u8,
+            0,
+            1,
+        );
+        assert!(!result, "ply == 0 must reject");
+    }
+
+    /// Clause 3: `is_pv = true` → PV guard rejects.
+    #[test]
+    fn singular_extension_eligible_rejects_at_pv() {
+        let result = singular_extension_eligible(
+            None,
+            1,
+            true, // clause 3: is_pv → reject
+            false,
+            SE_MIN_DEPTH,
+            TtBound::Lower,
+            SE_MIN_DEPTH as u8,
+            0,
+            1,
+        );
+        assert!(!result, "is_pv = true must reject");
+    }
+
+    /// Clause 4: `in_check_flag = true` → check guard rejects.
+    #[test]
+    fn singular_extension_eligible_rejects_in_check() {
+        let result = singular_extension_eligible(
+            None,
+            1,
+            false,
+            true, // clause 4: in_check → reject
+            SE_MIN_DEPTH,
+            TtBound::Lower,
+            SE_MIN_DEPTH as u8,
+            0,
+            1,
+        );
+        assert!(!result, "in_check = true must reject");
+    }
+
+    /// Clause 5: `depth < SE_MIN_DEPTH` → depth guard rejects.
+    #[test]
+    fn singular_extension_eligible_rejects_below_min_depth() {
+        let result = singular_extension_eligible(
+            None,
+            1,
+            false,
+            false,
+            SE_MIN_DEPTH - 1, // clause 5: below threshold → reject
+            TtBound::Lower,
+            SE_MIN_DEPTH as u8,
+            0,
+            1,
+        );
+        assert!(!result, "depth < SE_MIN_DEPTH must reject");
+    }
+
+    /// Clause 6a: `tt_bound = Exact` → Lower-only gate rejects.
+    #[test]
+    fn singular_extension_eligible_rejects_on_exact_bound() {
+        let result = singular_extension_eligible(
+            None,
+            1,
+            false,
+            false,
+            SE_MIN_DEPTH,
+            TtBound::Exact, // clause 6: Exact → reject
+            SE_MIN_DEPTH as u8,
+            0,
+            1,
+        );
+        assert!(!result, "TtBound::Exact must reject (Lower-only gate)");
+    }
+
+    /// Clause 6b: `tt_bound = Upper` → Lower-only gate rejects.
+    #[test]
+    fn singular_extension_eligible_rejects_on_upper_bound() {
+        let result = singular_extension_eligible(
+            None,
+            1,
+            false,
+            false,
+            SE_MIN_DEPTH,
+            TtBound::Upper, // clause 6: Upper → reject
+            SE_MIN_DEPTH as u8,
+            0,
+            1,
+        );
+        assert!(!result, "TtBound::Upper must reject (Lower-only gate)");
+    }
+
+    /// Clause 7: `tt_depth < depth - SE_TT_DEPTH_DELTA` → stale TT rejects.
+    #[test]
+    fn singular_extension_eligible_rejects_on_stale_tt_depth() {
+        let depth = SE_MIN_DEPTH;
+        let stale_tt_depth = (depth - SE_TT_DEPTH_DELTA - 1) as u8;
+        let result = singular_extension_eligible(
+            None,
+            1,
+            false,
+            false,
+            depth,
+            TtBound::Lower,
+            stale_tt_depth, // clause 7: too stale → reject
+            0,
+            1,
+        );
+        assert!(!result, "stale tt_depth must reject");
+    }
+
+    /// Clause 8: `tt_score >= MATE_IN_MAX_PLY` → mate-score guard rejects.
+    #[test]
+    fn singular_extension_eligible_rejects_on_mate_score() {
+        let result = singular_extension_eligible(
+            None,
+            1,
+            false,
+            false,
+            SE_MIN_DEPTH,
+            TtBound::Lower,
+            SE_MIN_DEPTH as u8,
+            MATE_IN_MAX_PLY, // clause 8: mate-range score → reject
+            1,
+        );
+        assert!(!result, "tt_score >= MATE_IN_MAX_PLY must reject");
+    }
+
+    /// Clause 9: `tt_move == 0` → sentinel TT move rejects.
+    #[test]
+    fn singular_extension_eligible_rejects_on_zero_tt_move() {
+        let result = singular_extension_eligible(
+            None,
+            1,
+            false,
+            false,
+            SE_MIN_DEPTH,
+            TtBound::Lower,
+            SE_MIN_DEPTH as u8,
+            0,
+            0, // clause 9: zero tt_move → reject
+        );
+        assert!(!result, "tt_move == 0 must reject");
+    }
+
+    /// Clause 5 boundary (pass): `depth == SE_MIN_DEPTH` must pass.
+    #[test]
+    fn singular_extension_eligible_passes_at_exact_threshold_depth() {
+        let result = singular_extension_eligible(
+            None,
+            1,
+            false,
+            false,
+            SE_MIN_DEPTH, // exactly at threshold → pass
+            TtBound::Lower,
+            SE_MIN_DEPTH as u8,
+            0,
+            1,
+        );
+        assert!(result, "depth == SE_MIN_DEPTH must pass clause 5");
+    }
+
+    /// Clause 5 boundary (reject): `depth == SE_MIN_DEPTH - 1` must reject.
+    #[test]
+    fn singular_extension_eligible_rejects_one_below_threshold_depth() {
+        let result = singular_extension_eligible(
+            None,
+            1,
+            false,
+            false,
+            SE_MIN_DEPTH - 1, // one below threshold → reject
+            TtBound::Lower,
+            (SE_MIN_DEPTH - 1) as u8, // fresh enough if depth were valid
+            0,
+            1,
+        );
+        assert!(!result, "depth == SE_MIN_DEPTH - 1 must reject clause 5");
+    }
+
+    /// Clause 7 boundary (pass): `tt_depth == depth - SE_TT_DEPTH_DELTA` must pass.
+    #[test]
+    fn singular_extension_eligible_passes_at_tt_depth_delta_boundary() {
+        let depth = SE_MIN_DEPTH;
+        let min_fresh_tt_depth = (depth - SE_TT_DEPTH_DELTA) as u8;
+        let result = singular_extension_eligible(
+            None,
+            1,
+            false,
+            false,
+            depth,
+            TtBound::Lower,
+            min_fresh_tt_depth, // exactly at the minimum fresh depth → pass
+            0,
+            1,
+        );
+        assert!(
+            result,
+            "tt_depth == depth - SE_TT_DEPTH_DELTA must pass clause 7; \
+             tt_depth={min_fresh_tt_depth}, depth={depth}"
+        );
+    }
+
+    /// Clause 7 boundary (reject): `tt_depth == depth - SE_TT_DEPTH_DELTA - 1` must reject.
+    #[test]
+    fn singular_extension_eligible_rejects_at_tt_depth_one_below_boundary() {
+        let depth = SE_MIN_DEPTH;
+        let too_stale = (depth - SE_TT_DEPTH_DELTA - 1) as u8;
+        let result = singular_extension_eligible(
+            None,
+            1,
+            false,
+            false,
+            depth,
+            TtBound::Lower,
+            too_stale, // one below minimum fresh depth → reject
+            0,
+            1,
+        );
+        assert!(
+            !result,
+            "tt_depth == depth - SE_TT_DEPTH_DELTA - 1 must reject clause 7; \
+             tt_depth={too_stale}, depth={depth}"
+        );
+    }
+
+    // ===== Property tests =====
+
+    proptest::proptest! {
+        /// `singular_beta` is monotone non-increasing in `depth` for a fixed
+        /// `tt_score` in the valid range. Sanity check on the formula.
+        #[test]
+        fn singular_beta_is_monotone_decreasing_in_depth_for_fixed_tt_score(
+            tt_score in -5000_i32..5000,
+            depth in SE_MIN_DEPTH..(SE_MIN_DEPTH + 32),
+        ) {
+            let sb_d = singular_beta(tt_score, depth);
+            let sb_d1 = singular_beta(tt_score, depth + 1);
+            proptest::prop_assert!(
+                sb_d >= sb_d1,
+                "singular_beta({tt_score}, {depth})={sb_d} must be >= singular_beta({tt_score}, {})={sb_d1}",
+                depth + 1
+            );
+        }
+
+        /// `singular_extension_eligible` is invariant under `tt_score`
+        /// perturbations within `(-MATE_IN_MAX_PLY, MATE_IN_MAX_PLY)` (clause 8
+        /// passes for all, other clauses held constant and passing).
+        #[test]
+        fn singular_extension_eligible_independent_of_score_within_mate_band(
+            tt_score in -(MATE_IN_MAX_PLY - 1)..(MATE_IN_MAX_PLY),
+        ) {
+            // All other clauses fixed and passing; only tt_score varies.
+            let result = singular_extension_eligible(
+                None,
+                1,
+                false,
+                false,
+                SE_MIN_DEPTH,
+                TtBound::Lower,
+                SE_MIN_DEPTH as u8,
+                tt_score, // varies within mate band
+                1,
+            );
+            proptest::prop_assert!(
+                result,
+                "singular_extension_eligible must pass for all tt_score within \
+                 (-MATE_IN_MAX_PLY, MATE_IN_MAX_PLY); tt_score={tt_score}"
+            );
+        }
+    }
+
+    // ===== Integration tests for SE in `negamax` =====
+    //
+    // Each integration test needs a position + a pre-seeded TT entry that drives
+    // a specific SE scenario. The approach: use a tactical position where the
+    // best move is well-established (high-eval), pre-seed the parent's TT entry
+    // as Lower bound at sufficient depth, and verify the counter / behavior.
+    //
+    // Position: "r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9"
+    // (E1 — standard quiet middlegame, White-to-move, used extensively elsewhere).
+
+    /// Helper: the standard SE test position.
+    fn se_test_pos() -> Position {
+        Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+            .expect("SE test position FEN must parse")
+    }
+
+    /// Helper: get the first legal move at `pos` as a `u16` bits-packed move.
+    /// This is used as the `best_move` for TT seeding so that step-12 promotes
+    /// it to `moves_vec[0]` (provided it's the highest-scored move, which a
+    /// pre-run depth-1 search confirms).
+    fn se_first_legal_move_bits(pos: &Position) -> u16 {
+        use crate::movegen::{MoveList, generate_moves};
+        let mut ml = MoveList::new();
+        generate_moves(pos, &mut ml);
+        ml.iter()
+            .next()
+            .expect("SE test position must have legal moves")
+            .bits()
+    }
+
+    /// Helper: run `negamax_for_test` at `depth=1` to find the best move at the
+    /// test position, returning its bits. Used to seed TT entries with a real
+    /// best move so that step-12 promotes it and `moves_vec[0].bits() == tt_move`
+    /// holds.
+    fn se_find_best_move_bits(pos: &Position) -> u16 {
+        let mut ab = AlphaBetaMover::new();
+        let (ctx, _) = non_aborting_ctx();
+        ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, true, None, &ctx);
+        // The best move is pv[0][0] after a depth-1 PV search.
+        if ab.pv.lengths[0] > 0 {
+            ab.pv.moves[0][0].bits()
+        } else {
+            se_first_legal_move_bits(pos)
+        }
+    }
+
+    /// SE does NOT fire at depth < SE_MIN_DEPTH. Clause 5 rejects.
+    /// Uses depth = SE_MIN_DEPTH - 1 even with an ideal TT entry.
+    #[test]
+    fn negamax_se_block_does_not_fire_below_min_depth() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH - 1;
+        let ply = 1_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        let tt_score = 50_i32;
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: score_to_tt(tt_score, ply as i32) as i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "depth = SE_MIN_DEPTH - 1 must not fire SE (clause 5); got {}",
+            ab.se_extensions_for_test()
+        );
+    }
+
+    /// SE does NOT fire at a PV node. Clause 3 rejects.
+    #[test]
+    fn negamax_se_block_does_not_fire_at_pv_node() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 50_i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        // is_pv = true → clause 3 rejects
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            true,
+            true,
+            None,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "is_pv = true must not fire SE (clause 3); got {}",
+            ab.se_extensions_for_test()
+        );
+    }
+
+    /// SE does NOT fire at ply == 0. Clause 2 rejects.
+    #[test]
+    fn negamax_se_block_does_not_fire_at_ply_zero() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 0_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 50_i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        // ply = 0 → clause 2 rejects
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "ply == 0 must not fire SE (clause 2); got {}",
+            ab.se_extensions_for_test()
+        );
+    }
+
+    /// SE does NOT fire when TT bound is Exact. Clause 6 rejects (Lower-only).
+    #[test]
+    fn negamax_se_block_does_not_fire_when_tt_bound_is_exact() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 50_i16,
+                depth: depth as u8,
+                bound: TtBound::Exact, // not Lower → clause 6 rejects
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "TtBound::Exact must not fire SE (clause 6); got {}",
+            ab.se_extensions_for_test()
+        );
+    }
+
+    /// SE does NOT fire when TT bound is Upper. Clause 6 rejects (Lower-only).
+    #[test]
+    fn negamax_se_block_does_not_fire_when_tt_bound_is_upper() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 50_i16,
+                depth: depth as u8,
+                bound: TtBound::Upper, // not Lower → clause 6 rejects
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "TtBound::Upper must not fire SE (clause 6); got {}",
+            ab.se_extensions_for_test()
+        );
+    }
+
+    /// SE does NOT fire when TT score is in the mate band. Clause 8 rejects.
+    #[test]
+    fn negamax_se_block_does_not_fire_when_tt_score_is_mate() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        let mate_score = MATE_IN_MAX_PLY; // in the mate band
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: mate_score as i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "tt_score in mate band must not fire SE (clause 8); got {}",
+            ab.se_extensions_for_test()
+        );
+    }
+
+    /// SE does NOT fire when TT depth is too stale (clause 7).
+    /// `tt_depth = depth - SE_TT_DEPTH_DELTA - 1` is one below the minimum.
+    #[test]
+    fn negamax_se_block_does_not_fire_when_tt_depth_is_stale() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        let stale_depth = (depth - SE_TT_DEPTH_DELTA - 1) as u8; // one below the threshold
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 50_i16,
+                depth: stale_depth,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "stale tt_depth must not fire SE (clause 7); stale_depth={stale_depth}, \
+             threshold={}, got {}",
+            depth - SE_TT_DEPTH_DELTA,
+            ab.se_extensions_for_test()
+        );
+    }
+
+    /// Re-entrancy guard: calling `negamax_for_test` with `excluded_move = Some(...)`
+    /// directly (simulating the verification frame) must NOT fire SE (clause 1
+    /// rejects). The TT entry is otherwise ideal for SE.
+    #[test]
+    fn negamax_se_re_entrancy_clause_blocks_immediate_verification_frame() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        let excluded = Move::from_bits(best_move_bits);
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 50_i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        // Pass `excluded_move = Some(...)` directly, simulating the verification frame.
+        // Clause 1 must reject SE at this frame.
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            Some(excluded),
+            &ctx,
+        );
+
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "excluded_move = Some(...) must block SE via clause 1 (re-entrancy guard); \
+             got {}",
+            ab.se_extensions_for_test()
+        );
+    }
+
+    /// SE counter resets per `negamax_for_test` invocation. Back-to-back calls
+    /// on the same mover must each start fresh. The first call uses a Lower-bound
+    /// TT entry with a very high `tt_score` (same fixture as the self-cutoff test)
+    /// so SE actually fires → `after_first == 1`. The second call gets a fresh
+    /// counter → reads 0 initially, and if SE fires again it reads 1 (not 2).
+    #[test]
+    fn negamax_se_counter_resets_per_test_invocation() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        // Lower bound with MATE_IN_MAX_PLY - 1: verification will fail low (high bar),
+        // guaranteeing SE fires on this call.
+        let tt_score_raw = MATE_IN_MAX_PLY - 1;
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: score_to_tt(tt_score_raw, ply as i32) as i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+        let after_first = ab.se_extensions_for_test();
+
+        // First call must fire SE (Lower bound, high score, balanced position).
+        assert_eq!(
+            after_first, 1,
+            "first negamax_for_test call with Lower TT entry must fire SE once; \
+             got after_first={after_first}"
+        );
+
+        // Second call on the same `ab`: counter must reset to 0 at entry.
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+        let after_second = ab.se_extensions_for_test();
+
+        // The key invariant: `negamax_for_test` resets `se_extensions` to 0 at entry,
+        // so `after_second` reflects only what the second call did, not first + second.
+        // If SE fires again (same fixture), after_second == 1 (not 2).
+        // The TT may have been populated by the first call's subtree, but the top-level
+        // seeded entry at pos.zobrist() may have been evicted; either way, after_second
+        // must be 0 or 1, not the cumulative 2 that a missing reset would give.
+        assert!(
+            after_second <= 1,
+            "second negamax_for_test call must start with a fresh counter (reset at entry); \
+             after_first={after_first}, after_second={after_second} (expected <= 1, not 2)"
+        );
+    }
+
+    /// The verification-frame TT cutoff is suppressed (load-bearing SE guard).
+    /// This test constructs an ideal SE scenario (Lower TT entry, depth ≥ 8,
+    /// non-PV, ply ≥ 1, etc.) and asserts `se_extensions >= 1`. Without the
+    /// `excluded_move.is_none()` guard at step-7's cutoff branch, the same
+    /// Lower entry would self-cut the verification frame every time, returning
+    /// `tt_score >= singular_beta` and causing SE to never extend (counter = 0).
+    ///
+    /// This test fires SE via a real search; if SE fires, `se_extensions == 1`.
+    /// If the step-7 cutoff guard is removed (mutant), `se_extensions == 0`.
+    #[test]
+    fn negamax_se_verification_frame_does_not_self_cutoff_via_tt_probe() {
+        // Choose a middlegame position; run a depth-1 search first to get the
+        // best move so the TT entry's `best_move` points to a real legal move
+        // that step-12 promotes to `moves_vec[0]`.
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH; // 8
+        let ply = 1_u32;
+
+        // Find the best move by running a depth-1 PV search.
+        let best_move_bits = se_find_best_move_bits(&pos);
+
+        // Seed the TT: Lower bound, tt_depth == depth (fresh enough), score
+        // chosen well above `singular_beta = tt_score - depth * SE_MARGIN = tt_score - 8`.
+        // For SE to extend, the verification search at (depth-1)/2 = 3, with all
+        // other moves available but no TT entries for them, must fail below
+        // `singular_beta = tt_score - 8`. We choose a low positive `tt_score` so
+        // `singular_beta = tt_score - 8` is negative, and the verification
+        // (searching only non-TT-move moves at depth 3) should return around
+        // `stm_static_eval` which in a balanced middlegame is near 0, potentially
+        // below `singular_beta` only when `singular_beta` is highly negative.
+        //
+        // To guarantee the verification fails low (needed for `se_extensions >= 1`),
+        // use a large `tt_score` so `singular_beta = tt_score - 8` is still positive
+        // but the verification returns a score well below that (since the non-TT moves
+        // in a non-trivial position should not all beat a large singular_beta).
+        //
+        // Conservative approach: set tt_score = MATE_IN_MAX_PLY - 1 (max allowed by
+        // clause 8). Then singular_beta = tt_score - 8 = MATE_IN_MAX_PLY - 9.
+        // The verification at depth 3 without the TT move will very likely fail
+        // low against such a high bar (essentially proving no move is nearly as
+        // good as the TT move).
+        let tt_score_raw = MATE_IN_MAX_PLY - 1;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: score_to_tt(tt_score_raw, ply as i32) as i16,
+                depth: depth as u8, // exactly at threshold (depth - 0 >= depth - SE_TT_DEPTH_DELTA)
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            1,
+            "SE must fire exactly once when all eligibility clauses pass and verification fails low; \
+             se_extensions = {}. This test also pins the step-7 cutoff-suppression guard: \
+             without `excluded_move.is_none()` the verification frame self-cuts and \
+             se_extensions would be 0.",
+            ab.se_extensions_for_test()
+        );
+
+        // Sister assertion: the verification search must have recursed into at
+        // least one child of `pos` (excluding `best_move_bits`). Confirm that the
+        // TT was written at a child zobrist — i.e. the verification search was
+        // not a no-op but actually explored the position.
+        use crate::mov::make_move;
+        use crate::movegen::{MoveList, generate_moves};
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let child_has_tt_entry = ml.iter().any(|mv| {
+            if mv.bits() == best_move_bits {
+                return false; // skip the excluded (TT) move
+            }
+            let mut child = pos;
+            let _undo = make_move(&mut child, mv);
+            tt.probe(child.zobrist()).is_some()
+        });
+        assert!(
+            child_has_tt_entry,
+            "verification search must have stored at least one TT entry at a child of pos \
+             (excluding the TT move); implies the verification actually ran its move loop"
+        );
+    }
+
+    /// Excluded-move skip: with `excluded_move = Some(mv)`, the move `mv` is
+    /// never searched in the move loop. Pins the `continue` at the top of the
+    /// loop. Direct evidence: call `negamax_for_test` with an excluded move
+    /// and assert the search completes without that move being played from the
+    /// position (the PV from the frame doesn't start with the excluded move).
+    #[test]
+    fn negamax_skips_excluded_move_in_move_loop() {
+        let pos = se_test_pos();
+        let depth = 2_u32;
+        let ply = 1_u32;
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        let excluded = Move::from_bits(best_move_bits);
+
+        let (ctx, _) = non_aborting_ctx();
+
+        // Score WITHOUT exclusion — normal search, the excluded move may be chosen.
+        let mut ab_full = AlphaBetaMover::new();
+        let score_full = ab_full.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            true,
+            true,
+            None,
+            &ctx,
+        );
+
+        // Score WITH exclusion — excluded move is unconditionally skipped.
+        let mut ab_excl = AlphaBetaMover::new();
+        let score_excl = ab_excl.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            true,
+            true,
+            Some(excluded),
+            &ctx,
+        );
+
+        // If `excluded` is the best move, the score with exclusion must be no better
+        // than the score without it. (Equal scores can happen when another move ties.)
+        // This is unconditional: the excluded move is the depth-1 best move, so
+        // restricting it cannot improve the score from the same position.
+        assert!(
+            score_excl <= score_full,
+            "excluding the best move must not improve the score; \
+             score_full={score_full}, score_excl={score_excl}, excluded={excluded:?}"
+        );
+
+        // The PV at ply must NOT start with the excluded move.
+        // Length is always > 0 because the position has legal non-excluded moves.
+        assert!(
+            ab_excl.pv.lengths[ply as usize] > 0,
+            "search with excluded move must still return a PV (other legal moves exist)"
+        );
+        let pv_first = ab_excl.pv.moves[ply as usize][0];
+        assert_ne!(
+            pv_first, excluded,
+            "excluded move must not appear as PV[0] at ply {ply}; excluded={excluded:?}"
+        );
+    }
+
+    /// Post-loop TT store is suppressed at the verification frame.
+    /// Call `negamax_for_test` with `excluded_move = Some(mv)` and assert no
+    /// new TT entry appears at `pos.zobrist()` after the call.
+    /// (The move-loop children still store at THEIR zobrist keys — different from
+    /// the parent's key — so the TT may have entries, just not at pos.zobrist().)
+    #[test]
+    fn negamax_does_not_store_tt_at_verification_frame() {
+        let pos = se_test_pos();
+        let depth = 2_u32;
+        let ply = 1_u32;
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        let excluded = Move::from_bits(best_move_bits);
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        // Install TT in the context so the store would fire if not gated.
+        let (ctx, _) = non_aborting_ctx_with_tt(Arc::clone(&tt));
+        tt.new_search();
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            Some(excluded),
+            &ctx,
+        );
+
+        // The verification frame must NOT have stored at pos.zobrist().
+        assert!(
+            tt.probe(pos.zobrist()).is_none(),
+            "verification frame (excluded_move = Some) must not store at pos.zobrist()"
+        );
+    }
+
+    /// NMP store is suppressed at the verification frame.
+    /// Set up conditions so NMP fires at the verification frame (depth ≥ NMP_MIN_DEPTH,
+    /// static_eval >= beta, non-PV, non-check, has non-pawn material) while
+    /// `excluded_move = Some(...)`. Assert no TT entry appears at pos.zobrist().
+    #[test]
+    fn negamax_nmp_does_not_store_tt_at_verification_frame() {
+        // Position where NMP is likely to fire: non-PV, not in check, with
+        // non-pawn material (standard middlegame), beta set very low so
+        // static_eval >> beta.
+        let pos = se_test_pos();
+        let static_eval = stm_static_eval(&pos);
+        // Choose beta well below static_eval so the NMP gate's `static_eval >= beta`
+        // fires. At depth = NMP_MIN_DEPTH = 3, NMP is eligible.
+        let depth = NMP_MIN_DEPTH; // 3
+        let beta = static_eval - 500; // well below static_eval
+        let alpha = beta - 1;
+        let ply = 1_u32;
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        let excluded = Move::from_bits(best_move_bits);
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_with_tt(Arc::clone(&tt));
+        tt.new_search();
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            alpha,
+            beta,
+            false,
+            true,
+            Some(excluded),
+            &ctx,
+        );
+
+        // NMP may have fired (ab.nmp_firings > 0), but must NOT store at pos.zobrist().
+        assert!(
+            tt.probe(pos.zobrist()).is_none(),
+            "NMP store at verification frame (excluded_move = Some) must be suppressed"
+        );
+    }
+
+    /// The `se_extensions` counter is zero at node-depth below SE_MIN_DEPTH,
+    /// confirming the depth-budget invariant: at parent_depth = SE_MIN_DEPTH,
+    /// verification runs at depth (SE_MIN_DEPTH-1)/2 = 3, and that subtree
+    /// cannot itself fire SE (clause 5 rejects at depth < 8).
+    #[test]
+    fn negamax_se_in_deep_subtree_bounded_by_depth_halving() {
+        // Run at SE_MIN_DEPTH with an ideal TT entry (same as the
+        // _does_not_self_cutoff test). At most 1 SE extension should fire
+        // (the parent's own), and no recursive SE in the verification subtree
+        // (which runs at depth 3, well below SE_MIN_DEPTH = 8).
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        let tt_score_raw = MATE_IN_MAX_PLY - 1;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: score_to_tt(tt_score_raw, ply as i32) as i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        // At SE_MIN_DEPTH, the verification subtree depth is (8-1)/2 = 3 < 8 =
+        // SE_MIN_DEPTH, so no recursive SE fires. Exactly 1 extension fires at the
+        // parent frame; none fire recursively inside the verification subtree.
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            1,
+            "at parent_depth = SE_MIN_DEPTH = 8, exactly 1 SE extension must fire \
+             (depth-halving bounds recursive SE to 0); got {} extensions",
+            ab.se_extensions_for_test()
+        );
+    }
+
+    /// Verification fail-high: when the verification search returns `>= singular_beta`,
+    /// no extension fires. This pins the `<` operator against `<=`: a `<=` mutant
+    /// would extend when `verif_score == singular_beta` (fail-equal), which is wrong.
+    ///
+    /// Strategy: use a very low `tt_score` so `singular_beta = tt_score - depth`
+    /// is also low (around -8). A depth-3 search of a balanced middlegame returns
+    /// roughly `stm_static_eval` which is near 0, far above -8, guaranteeing
+    /// `verif_score >= singular_beta` (fail-high). No extension fires.
+    ///
+    /// Complementary to `negamax_se_verification_frame_does_not_self_cutoff_via_tt_probe`
+    /// (which uses a very high `tt_score` to guarantee fail-low → extension fires).
+    #[test]
+    fn negamax_skips_extension_when_verification_fails_high() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH; // 8
+        let ply = 1_u32;
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+
+        // Low tt_score so singular_beta = 0 - 8 = -8.
+        // The verification at depth 3 returns roughly static_eval ≈ 0 >> -8 → fail-high.
+        let tt_score_raw: i32 = 0;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: score_to_tt(tt_score_raw, ply as i32) as i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        // Verification returns > singular_beta = -8 (balanced position ≈ 0), so no extension.
+        // A `<=` mutant at the `verif_score < s_beta` check would still not fire here
+        // unless verif_score == s_beta exactly, but together with the fail-low test it
+        // covers both sides of the boundary.
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "verification fail-high must NOT fire SE extension; \
+             tt_score={tt_score_raw}, singular_beta={}, se_extensions={}",
+            singular_beta(tt_score_raw, depth),
+            ab.se_extensions_for_test()
+        );
+    }
+
+    /// Positive SE integration test: with all eligibility clauses passing and a
+    /// very high `tt_score` (so `singular_beta` is unreachably high for the
+    /// verification search), `se_extensions` increments exactly once.
+    ///
+    /// Complementary to `negamax_skips_extension_when_verification_fails_high`
+    /// (fail-high → no extension). This test pins the fail-low branch of the
+    /// `if verif_score < s_beta` check. Distinct from the self-cutoff test in
+    /// intent: this test focuses on "extension IS set when verification fails low",
+    /// not on "the cutoff guard is present".
+    #[test]
+    fn negamax_sets_extension_when_verification_fails_low() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        // Very high tt_score so singular_beta = tt_score - depth is also very high.
+        // Verification at depth 3 cannot beat this bar → fail-low → extension fires.
+        let tt_score_raw = MATE_IN_MAX_PLY - 1;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: score_to_tt(tt_score_raw, ply as i32) as i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            1,
+            "SE must fire exactly once when verification fails low; got {}",
+            ab.se_extensions_for_test()
+        );
+    }
+
+    /// When SE fires, the TT move (i == 0) is searched at `depth` (= depth - 1 + 1)
+    /// instead of `depth - 1`. The `se_tt_move_search_depth_for_test` field records
+    /// the effective depth for the TT move's non-LMR dispatch. Without the extension
+    /// (`move_extension == 0`), the TT move would be searched at `depth - 1`.
+    #[test]
+    fn negamax_se_extension_increments_child_depth_by_one() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        let tt_score_raw = MATE_IN_MAX_PLY - 1; // guarantees SE fires (fail-low verification)
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: score_to_tt(tt_score_raw, ply as i32) as i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        // SE must have fired (precondition for testing the depth increment).
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            1,
+            "SE must fire before the depth-increment assertion can be meaningful"
+        );
+
+        // The TT move was dispatched at `depth - 1 + move_extension`.
+        // When SE fires, `move_extension == 1`, so effective depth == depth.
+        assert_eq!(
+            ab.se_tt_move_search_depth_for_test(),
+            Some(depth),
+            "SE extension must increment TT move dispatch depth from {} to {}; got {:?}",
+            depth - 1,
+            depth,
+            ab.se_tt_move_search_depth_for_test()
+        );
+    }
+
+    /// Companion to `negamax_se_block_does_not_fire_below_min_depth`: at depth <
+    /// SE_MIN_DEPTH (clause 5 blocks), `move_extension == 0` for all moves and
+    /// the `se_tt_move_search_depth` recorder (which only fires when
+    /// `move_extension > 0`) stays `None`. Pins clause-5 blocking via the
+    /// search-depth-recorder discriminator, complementing the counter-based
+    /// guard. Does NOT pin the `if i == 0 { tt_move_extension } else { 0 }`
+    /// per-iteration predicate — that mutation surface is structurally covered
+    /// (the predicate is the only consumer of `tt_move_extension` and a mutant
+    /// flipping `i == 0` to `i == 1` would break the `se_tt_move_search_depth
+    /// == Some(depth)` assertion in `negamax_se_extension_increments_child_depth_by_one`).
+    #[test]
+    fn negamax_se_below_min_depth_does_not_record_extension_depth() {
+        let pos = se_test_pos();
+        // Use depth < SE_MIN_DEPTH so SE is guaranteed not to fire (clause 5).
+        let depth = SE_MIN_DEPTH - 1; // 7: SE won't fire
+        let ply = 1_u32;
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: score_to_tt(MATE_IN_MAX_PLY - 1, ply as i32) as i16,
+                depth: depth as u8,
+                bound: TtBound::Lower, // Lower but depth < SE_MIN_DEPTH → clause 5 blocks
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        // No SE fires at depth < SE_MIN_DEPTH.
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "SE must not fire at depth = SE_MIN_DEPTH - 1 (clause 5); got {}",
+            ab.se_extensions_for_test()
+        );
+
+        // `se_tt_move_search_depth` is only set when `move_extension > 0`.
+        // With SE blocked, `move_extension == 0` for all moves, so the field stays None.
+        assert_eq!(
+            ab.se_tt_move_search_depth_for_test(),
+            None,
+            "without SE, se_tt_move_search_depth must be None (extension never applied); got {:?}",
+            ab.se_tt_move_search_depth_for_test()
+        );
+    }
+
+    /// Double-extension guard: SE cannot fire recursively at depth < SE_MIN_DEPTH,
+    /// so a single-ply SE extension from a depth-8 node creates a depth-9 child;
+    /// that child's depth (9) is still >= SE_MIN_DEPTH, but the re-entrancy guard
+    /// (clause 1: `excluded_move.is_none()`) prevents nested SE at the verification
+    /// frame. In a normal call (non-verification), the child at depth 9 could in
+    /// principle fire SE, raising the counter to 2.
+    ///
+    /// The `negamax_se_in_deep_subtree_bounded_by_depth_halving` test already asserts
+    /// `se_extensions == 1` for the SE_MIN_DEPTH fixture, which implicitly confirms
+    /// that the depth-halving keeps verification depth at 3 (< SE_MIN_DEPTH) so no
+    /// recursive SE fires inside the verification subtree. That test is the
+    /// "double-extension does not happen in the verification subtree" guard.
+    ///
+    /// A true "double-extension in the normal call tree" scenario requires a deeper
+    /// search (depth >= SE_MIN_DEPTH + 1 = 9) with multiple qualifying TT entries at
+    /// different plies, which is infeasible to control deterministically in a unit
+    /// test without engine-level fixture engineering. The depth-halving bound in
+    /// `verification_depth` (plan §6.4) makes the verification subtree structurally
+    /// excluded from recursive SE. No explicit double-extension unit test is added;
+    /// the depth-halving test covers the in-verification case, and the property is
+    /// documented here.
+    #[allow(dead_code)]
+    fn negamax_se_extension_does_not_double() {
+        // See doc comment above. This function is intentionally not annotated
+        // with `#[test]`; it documents the "double-extension" reasoning inline.
+        // The actual guard is exercised by `negamax_se_in_deep_subtree_bounded_by_depth_halving`.
+    }
+
+    /// SE does NOT fire when the node is in check. Clause 4 rejects.
+    /// Construct a position where the side to move is in check.
+    #[test]
+    fn negamax_se_block_does_not_fire_in_check() {
+        // White king on e1, Black queen on e2: White is in check from the queen.
+        let pos = Position::from_fen("4k3/8/8/8/8/8/4q3/4K3 w - - 0 1").expect("FEN must parse");
+
+        use crate::movegen::in_check;
+        assert!(in_check(&pos), "test fixture: White must be in check");
+
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        // Find the first legal evasion move to use as tt_move.
+        use crate::movegen::{MoveList, generate_moves};
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let first_move_bits = ml
+            .iter()
+            .next()
+            .expect("in-check position must have legal moves")
+            .bits();
+
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 50_i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: first_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "in_check = true must not fire SE (clause 4); got {}",
+            ab.se_extensions_for_test()
+        );
+    }
+
+    /// Abort during verification propagates correctly: the SE block checks
+    /// `self.aborted` after the verification call and returns 0 immediately,
+    /// without incrementing the SE extensions counter.
+    ///
+    /// Strategy: pre-set `ab.aborted = true` via `set_aborted_for_test` before
+    /// calling `negamax_for_test`. The abort flag is NOT reset by `negamax_for_test`,
+    /// so it persists. Inside the SE verification call, the first move-loop
+    /// `if self.aborted { return 0; }` guard fires immediately after the first
+    /// child returns (even if the child ran normally), making the verification
+    /// return 0. Back in the SE block, `if self.aborted { return 0; }` then fires,
+    /// preventing `se_extensions` from being incremented.
+    ///
+    /// This is deterministic: the pre-set abort flag is always visible to every
+    /// `if self.aborted { return 0; }` check in the move loops, regardless of
+    /// node count or search depth.
+    #[test]
+    fn negamax_aborts_during_verification_propagate_correctly() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        let tt_score_raw = MATE_IN_MAX_PLY - 1;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: score_to_tt(tt_score_raw, ply as i32) as i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        // Pre-set the aborted flag. `negamax_for_test` does NOT reset it, so
+        // the flag persists into the search. The first move-loop abort check
+        // inside the verification fires, causing verification to return 0.
+        ab.set_aborted_for_test(true);
+        let returned = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        // The pre-set abort flag is observed by the SE block's post-verification
+        // `if self.aborted { return 0; }` guard. This guard fires BEFORE the
+        // `if verif_score < s_beta { se_extensions += 1; }` site.
+        assert!(ab.aborted, "aborted flag must remain true after the search");
+        assert_eq!(returned, 0, "aborted search must return 0; got {returned}");
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "abort observed after verification must prevent se_extensions increment; got {}",
+            ab.se_extensions_for_test()
         );
     }
 }

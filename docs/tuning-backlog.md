@@ -35,6 +35,31 @@ Each search-feature ADR also carries an "Open SPRT-tunable parameters" section t
 
 ---
 
+### M5.G singular-extensions — verification-window boundary mutants + tunable-space sweep
+
+**Why active.** M5.G's `cargo mutants --in-diff` campaign caught 58/60 viable mutants (96.7%). The two missed mutants are **both at `src/search.rs:1770:24`** — the `s_beta - 1` expression in the verification call's alpha argument:
+1. `replace - with +` → window becomes `(s_beta + 1, s_beta)` (alpha > beta, inverted/degenerate).
+2. `replace - with /` → window becomes `(s_beta, s_beta)` (alpha == beta, zero-width).
+
+Neither is observably distinct from the original `(s_beta - 1, s_beta)` null window on the M5.G integration-test fixtures: the test corpus drives `verif_score` either far below `s_beta` (fail-low — both windows agree, extension fires) or far above `s_beta` (fail-high — both windows agree, no extension). The boundary case `verif_score == s_beta` is the only place where the windows differentiate, and no fixture engineers an exact-equality boundary.
+
+**Tunable space and follow-up tests.**
+
+1. **`negamax_se_extension_at_singular_beta_boundary` test** (boundary-engineering fixture). Synthesize a TT entry whose `score` and a hand-tuned position make the depth-3 verification's max-child-score land exactly at `s_beta`. Assert `verif_score == s_beta` boundary case → `se_extensions == 0` (strict `<` rejects equality). This kills both missed mutants and the `<` → `<=` mutant from the test-suite review pass-2 should-fix. Cost: ~30 LOC + fixture engineering.
+2. **`SE_MARGIN_PER_DEPTH = 2` retune** (Stockfish-historical default). Current value is 1 (Xiphos / Ethereal). A wider margin tightens the verification's eligibility (fewer extensions, less verification cost) at the price of missing some genuinely-singular nodes. SPRT should resolve. Cost: 0 LOC + mixed-TC SPRT.
+3. **`SE_MIN_DEPTH = 6` retune** (Xiphos default). Current value is 8 (literature majority). Lowering enables SE on shallower nodes, increasing firing rate. Cost: 0 LOC + mixed-TC SPRT.
+4. **Lower+Exact gate at clause 6.** Currently Lower-only. At non-PV nodes Exact entries are rare but extend SE's eligibility surface. Cost: ~5 LOC + SPRT.
+5. **Multi-cut on verification fail-high.** When ≥ N moves beat `s_beta` at verification, return `s_beta` as a fail-high cutoff (turning the lost SE bet into a pruning win). Cost: ~30 LOC + SPRT.
+6. **Double extensions** (extend by +2 when verification fails low strongly, e.g. `verif_score < s_beta - 50`). Cost: ~20 LOC + SPRT.
+7. **PV-SE** (extend SE eligibility to PV nodes). Cost: ~5 LOC + SPRT.
+8. **Propagated `singular_ext_active` flag** through `search_child` (Stockfish-style stack tracking) — only relevant if SPRT shows verification-subtree NPS regression at deep TC. Cost: ~80 LOC (parameter migration through `search_child`) + SPRT.
+
+**Validation methodology.** Mixed-TC SPRT against `baseline/m5g-singular` per the M5 convention. Item 1 is a test-only addition (no Elo impact). Items 2–8 each independent; SPRT each separately.
+
+**Cross-references.** ADR-0029 §11; `bench/sprt/2026-05-09-m5.g-vs-m5f-mixed-tc.md` (landing); `docs/milestones/m5.g.md`.
+
+---
+
 ### ML-tuned aspiration window sizing
 
 **Purpose.** Replace M4.D's fixed `±25 → ±100 → full` widening schedule with a learned policy that predicts the optimal first-try window from cheap features, maximizing expected node savings.
