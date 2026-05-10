@@ -108,4 +108,16 @@ Three SPSA-tunable params. Empirically this baseline captures 60-80% of the ML m
 
 ---
 
+## M5.H2 SEE-split capture stage (good vs bad captures)
+
+**Pulled from M5.H1 plan §1 / ADR-0030 §8.** Split the captures stage into "good captures" (SEE ≥ 0) yielded immediately after TT and "bad captures" (SEE < 0) yielded last, after quiets. Per CPW Static Exchange Evaluation + Move Ordering pages.
+
+**Prerequisites.** SEE infrastructure (no current ETA in roadmap; M9+ candidate alongside NNUE training). Without SEE, the MVV-LVA-only capture sort is the recommended starting point per research §6.2.
+
+**Estimated Elo gain.** Hard to disentangle from SEE itself; captures-split is one of several SEE consumers. Tuning-backlog entry rather than roadmap-promised.
+
+**Estimated size.** ~50–100 LOC inside `MoveStager` once SEE exists.
+
+---
+
 *Active queue ends here. New items append above this line.*

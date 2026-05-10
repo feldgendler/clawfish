@@ -1458,7 +1458,7 @@ impl AlphaBetaMover {
         ctx: &SearchContext,
         clock: &SearchClock,
     ) -> i32 {
-        use crate::movegen::{MoveList, generate_moves, in_check};
+        use crate::movegen::in_check;
 
         // 1. Clear this ply's PV slot. Stays BEFORE the depth==0 delegation so
         //    even leaves reset their slot — otherwise a prior subtree at the
@@ -1679,24 +1679,30 @@ impl AlphaBetaMover {
             }
         }
 
-        // 10. Generate moves.
-        let mut ml = MoveList::new();
-        generate_moves(pos, &mut ml);
-        let mut moves_vec = ml.iter().collect::<Vec<_>>();
+        // 10-12. Construct the stager. Eagerly generates, partitions, and sorts.
+        //        searchmoves filter folded into new() — root-only.
+        let killer0 = self.killers[ply as usize][0];
+        let killer1 = self.killers[ply as usize][1];
+        let searchmoves_filter = if ply == 0 {
+            ctx.limits.searchmoves.as_deref()
+        } else {
+            None
+        };
+        let mut stager = MoveStager::new(
+            pos,
+            killer0,
+            killer1,
+            &self.history_table,
+            tt_move,
+            searchmoves_filter,
+        );
 
-        // Searchmoves filter at root only.
-        if ply == 0
-            && let Some(filter) = &ctx.limits.searchmoves
-        {
-            moves_vec.retain(|m| filter.contains(m));
-        }
-
-        // 11. Terminal: no legal moves.
+        // 11. Terminal: no legal moves (post-filter).
         //     At ply==0 with searchmoves filter active, an empty list is a degenerate
         //     user input (all-illegal or empty filter). Short-circuit BEFORE the
         //     in_check triage — otherwise a check position with a degenerate filter
         //     would falsely return -MATE.
-        if moves_vec.is_empty() {
+        if stager.is_empty() {
             if ply == 0 && ctx.limits.searchmoves.is_some() {
                 return 0;
             }
@@ -1707,53 +1713,30 @@ impl AlphaBetaMover {
             }
         }
 
-        // 12. Order: killer-aware scoring (captures > killers > history-scored
-        //     quiets) descending via `order_moves` (extended for M4.C to consult
-        //     the history table); then promote the TT move (if any) to index 0.
-        //     `Move::default().bits() == 0` is the no-move sentinel and is
-        //     never produced by movegen, so `tt_move == 0` falls through.
-        //     The legality scan over the legal-move list rejects garbage
-        //     values (ADR-0018 §12).
-        let killer0 = self.killers[ply as usize][0];
-        let killer1 = self.killers[ply as usize][1];
-        order_moves(
-            &mut moves_vec,
-            pos,
-            killer0,
-            killer1,
-            &self.history_table,
-            tt_move,
-        );
-
         // 12.5  Singular-extension verification (M5.G — ADR-0029).
         //
         // Fire only when:
         //   - step 7 captured a probe snapshot (tt_probe_snapshot.is_some());
-        //   - moves_vec[0].bits() == snapshot.tt_move (step-12 promoted a non-zero,
-        //     legal TT move to the front; without this match, snapshot.tt_move is
+        //   - stager.peek().bits() == snapshot.tt_move (stager has a non-zero,
+        //     legal TT move at the front; without this match, snapshot.tt_move is
         //     either 0 or a stale-but-illegal value and we don't fire);
         //   - singular_extension_eligible passes all 9 clauses (clause 9 is
-        //     `tt_move != 0` for defense-in-depth against a future order_moves
-        //     refactor).
+        //     `tt_move != 0` for defense-in-depth).
         //
         // On verification fail-low (verif_score < singular_beta), set tt_move_extension = 1.
         // On verification fail-high or non-fire, tt_move_extension stays 0.
         //
         // `in_check(pos)` is read lazily — the cheap predicates (snapshot present,
-        // moves_vec non-empty post-step-11 — `debug_assert!`'d for defense-in-depth,
-        // `moves_vec[0]` matches the TT move) gate the read so that frames where SE
-        // could not possibly fire don't pay the in_check cost. Per ADR-0024 §6 /
-        // ADR-0026 §3 lazy-dup convention. The full eligibility predicate is then
-        // called once with the computed flag; SE fires only at depth ≥ SE_MIN_DEPTH = 8
-        // where the overhead of one extra in_check call is negligible.
-        debug_assert!(
-            !moves_vec.is_empty(),
-            "step 11 must have returned on empty move list"
-        );
+        // stager non-empty post-step-11, `stager.peek()` matches the TT move) gate
+        // the read so that frames where SE could not possibly fire don't pay the
+        // in_check cost. Per ADR-0024 §6 / ADR-0026 §3 lazy-dup convention. The
+        // full eligibility predicate is then called once with the computed flag; SE
+        // fires only at depth ≥ SE_MIN_DEPTH = 6 where the overhead of one extra
+        // in_check call is negligible.
 
         let mut tt_move_extension: u32 = 0;
         if let Some(snapshot) = &tt_probe_snapshot
-            && moves_vec[0].bits() == snapshot.tt_move
+            && stager.peek().map_or(0, Move::bits) == snapshot.tt_move
             && singular_extension_eligible(
                 excluded_move,
                 ply,
@@ -1775,9 +1758,13 @@ impl AlphaBetaMover {
                 ply,
                 s_beta - 1,
                 s_beta,
-                false,              // is_pv (verification is non-PV by design)
-                true,               // allow_null (research §6.1: allowed inside verif)
-                Some(moves_vec[0]), // exclude the TT move from the verification's move loop
+                false, // is_pv (verification is non-PV by design)
+                true,  // allow_null (research §6.1: allowed inside verif)
+                Some(
+                    stager
+                        .peek()
+                        .expect("peek post-non-empty post-gate-pass cannot be None"),
+                ), // exclude the TT move
                 ctx,
                 clock,
             );
@@ -1833,7 +1820,10 @@ impl AlphaBetaMover {
         };
 
         let mut quiet_index: u32 = 0;
-        for (i, &mv) in moves_vec.iter().enumerate() {
+        let mut i: usize = 0;
+        while let Some(mv) = stager.next() {
+            let cur_i = i;
+            i += 1;
             // M5.G: skip the excluded move at the verification frame. This skip
             // fires BEFORE `child_is_pv`, `quiet_move`, and `quiet_index` so that
             // `quiet_index` semantics (ADR-0025 §3) are preserved — skipped moves
@@ -1842,13 +1832,13 @@ impl AlphaBetaMover {
                 continue;
             }
 
-            // M5.G: per-iteration extension. Only the TT move (i == 0) is eligible
-            // for singular extension; all other moves are searched at depth - 1.
-            // The SE block above computes `tt_move_extension` (1 when singular, 0
-            // otherwise); it is zero for non-SE nodes and non-TT moves.
-            let move_extension: u32 = if i == 0 { tt_move_extension } else { 0 };
+            // M5.G: per-iteration extension. Only the TT move (cur_i == 0) is
+            // eligible for singular extension; all other moves are searched at
+            // depth - 1. The SE block above computes `tt_move_extension` (1 when
+            // singular, 0 otherwise); it is zero for non-SE nodes and non-TT moves.
+            let move_extension: u32 = if cur_i == 0 { tt_move_extension } else { 0 };
 
-            let child_is_pv = is_pv && i == 0;
+            let child_is_pv = is_pv && cur_i == 0;
             let quiet_move = is_quiet(mv);
             let mut move_is_full_depth = true;
 
@@ -1978,15 +1968,15 @@ impl AlphaBetaMover {
                     reduced_score
                 }
             } else {
-                // M5.G: the TT move (i == 0) may be extended by 1 ply when
+                // M5.G: the TT move (cur_i == 0) may be extended by 1 ply when
                 // singular_extension_eligible passed and verification returned
                 // fail-low. All other moves use `move_extension = 0` (plain
                 // `depth - 1`). The compile-time invariant `FFP_MAX_DEPTH <
                 // SE_MIN_DEPTH` guarantees SE and FFP never co-fire at the same
-                // node; the `i == 0` predicate guarantees SE and LMR (which
+                // node; the `cur_i == 0` predicate guarantees SE and LMR (which
                 // requires `quiet_index >= 2`) never co-fire on the same move.
                 #[cfg(test)]
-                if i == 0 && move_extension > 0 && self.se_tt_move_search_depth.is_none() {
+                if cur_i == 0 && move_extension > 0 && self.se_tt_move_search_depth.is_none() {
                     // Record the effective depth only when SE extension actually applies
                     // (move_extension > 0). This isolates the singular-extension depth
                     // increment from normal i==0 dispatches in recursive sub-calls.
@@ -2749,6 +2739,8 @@ impl AlphaBetaMover {
 /// history-rated quiet, regardless of how high the captures' raw MVV-LVA
 /// values run. Pinned by `score_tier_invariants_compile` (compile-time
 /// const-assert at the bottom of this section).
+// Used by order_moves (test-only post-M5.H1) and the compile-time invariant.
+#[allow(dead_code)]
 const CAPTURE_OFFSET: i32 = 1_000_000;
 
 /// Bonus score for the most-recent quiet beta-cutoff at this ply (slot 0).
@@ -2761,12 +2753,16 @@ const CAPTURE_OFFSET: i32 = 1_000_000;
 /// `MAX_HISTORY` and shifting captures above the killer band via
 /// `CAPTURE_OFFSET`. The relative ordering invariants are unchanged from
 /// M4.B; only the absolute-score scale shifted.
+// Used by order_moves (test-only post-M5.H1) and the compile-time invariant.
+#[allow(dead_code)]
 const KILLER0_SCORE: i32 = 100_001;
 
 /// Bonus score for the prior quiet beta-cutoff at this ply (slot 1).
 /// Must satisfy `KILLER1_SCORE < KILLER0_SCORE` and
 /// `KILLER1_SCORE > MAX_HISTORY` (so killers always rank above the best
 /// history-rated quiet).
+// Used by order_moves (test-only post-M5.H1) and the compile-time invariant.
+#[allow(dead_code)]
 const KILLER1_SCORE: i32 = 100_000;
 
 /// Compile-time check that the score tiers are strictly ordered:
@@ -2854,6 +2850,9 @@ fn update_history_on_quiet_cutoff(
 /// compile-time const-assert above; runtime tests S23
 /// (smallest-capture-above-killer0) and HS12 (capture above killer above
 /// history-quiet at MAX_HISTORY) re-pin the discipline against drift.
+///
+/// Called by `MoveStager::new` (production), `order_moves` (test-only
+/// post-M5.H1), and `ordered_moves_for_test`.
 fn negamax_move_order_score(
     mv: Move,
     pos: &Position,
@@ -2890,6 +2889,11 @@ fn negamax_move_order_score(
 /// value or 0, and the post-sort order is identical to the empty-killer
 /// baseline. Pinned by S24f. Mirrors M4.A's TT-move legality scan
 /// (ADR-0018 §12).
+///
+/// Demoted to `#[cfg(test)]` at M5.H1: the production call site now uses
+/// `MoveStager::new` (plan §1.1). The 14+ test call sites in the H1-P1
+/// proptest and S24/S24* fixtures still use this function as a reference.
+#[cfg(test)]
 #[allow(clippy::ptr_arg)]
 fn order_moves(
     moves_vec: &mut Vec<Move>,
@@ -3230,6 +3234,218 @@ pub(crate) fn max_depth_from_limits(limits: &SearchLimits) -> u32 {
 pub fn is_fifty_move_draw(halfmove_clock: u8) -> bool {
     halfmove_clock >= 100
 }
+
+// ---------------------------------------------------------------------------
+// M5.H1 — MoveStager: iterator over the negamax move sequence.
+//
+// H1 v2 implementation: thin wrapper around a single eager-sorted Vec, matching
+// M5.G's `order_moves` per-node cost exactly. The earlier H1 v1 design used a
+// stage-state machine with per-stage Vecs (captures, quiets), which was
+// bench-equivalent at depth 7 but introduced ~3× per-node allocation pressure
+// and a second `sort_by_cached_key` call. That cost surfaced under sustained
+// game-load as a ~3.5% NPS regression at deep search and ~50 Elo regression
+// in the defensive SPRT confirmation match — both invisible to the bench
+// snapshot. The thin-wrapper restores per-node cost parity with M5.G while
+// preserving the API surface (`new` / `next` / `peek` / `len` / `is_empty` /
+// `yield_sequence`) that the M5.G SE block, the position-counter pattern, and
+// future M5.H2 lazy generation will consume.
+//
+// M5.H2's contract is then: keep the same public API, swap the internal Vec
+// for per-stage lazy generation. The five logical stages (TT → captures →
+// killer 0 → killer 1 → quiets) are still produced by `negamax_move_order_score`
+// — they are encoded in the comparator's score tiers, not in a separate enum.
+// Plan: docs/plans/m5.h1.md §3.  ADR-0030.
+// ---------------------------------------------------------------------------
+
+/// M5.H1 — iterator over the negamax move sequence.
+///
+/// Yields the same byte-equivalent move sequence as today's `order_moves` +
+/// `for mv in moves_vec.iter()` pattern. Internally backed by a single
+/// `Vec<Move>` sorted by `negamax_move_order_score` with TT promotion to
+/// index 0 — identical algorithm and per-node cost to M5.G.
+///
+/// **H1 generation discipline.** All moves are generated by a single
+/// `generate_moves` call at construction. M5.H2 will switch to lazy
+/// per-stage generation; the public API stays the same.
+///
+/// `total_len` is the pre-iteration count computed at construction and is NOT
+/// decremented by `next()` (see §3.1 of the plan). Do NOT call `is_empty()`
+/// mid-iteration; the negamax caller honours this by checking once at step 11.
+pub(crate) struct MoveStager {
+    /// Pre-ordered move sequence (single sort by `negamax_move_order_score`
+    /// + TT promotion to index 0). Iterated by index.
+    moves: Vec<Move>,
+    /// Index of the next move `next()` will yield.
+    idx: usize,
+    /// Pre-iteration total. `len()` returns this regardless of how far
+    /// `next()` has advanced (temporal-contract pin: H1-S17).
+    total_len: usize,
+}
+
+impl MoveStager {
+    /// Eagerly generate, optionally apply searchmoves filter, sort by
+    /// `negamax_move_order_score`, and promote TT to index 0.
+    ///
+    /// `tt_move == 0` → no TT promotion. `killer{0,1}.bits() == 0` (the
+    /// `Move::default()` sentinel) → that slot is unset (the comparator's
+    /// `mv == killer{0,1}` test never matches). `searchmoves_filter == None`
+    /// → no filter (typical at ply > 0).
+    pub(crate) fn new(
+        pos: &Position,
+        killer0: Move,
+        killer1: Move,
+        history: &HistoryTable,
+        tt_move: u16,
+        searchmoves_filter: Option<&[Move]>,
+    ) -> Self {
+        use crate::movegen::generate_moves;
+        // Eager full generation.
+        let mut ml = MoveList::new();
+        generate_moves(pos, &mut ml);
+        let mut moves: Vec<Move> = ml.iter().collect();
+
+        // Searchmoves filter (root-only; None at non-root). Mirrors today's
+        // `moves_vec.retain(|m| filter.contains(m))` BEFORE order_moves.
+        if let Some(filter) = searchmoves_filter {
+            moves.retain(|m| filter.contains(m));
+        }
+
+        // Single sort by the M5.G score-tier comparator: captures (with
+        // CAPTURE_OFFSET) > killer0 (KILLER0_SCORE) > killer1 (KILLER1_SCORE)
+        // > history-quiets. Stable; movegen-emit order preserved within ties.
+        moves.sort_by_cached_key(|&m| {
+            -negamax_move_order_score(m, pos, killer0, killer1, history)
+        });
+
+        // TT promotion (mirrors M5.G's `order_moves` post-sort step).
+        // `tt_move == 0` (Move::default sentinel) short-circuits without
+        // scanning. `Vec::remove(idx)` + `insert(0, mv)` is order-preserving
+        // for all non-moved elements.
+        if tt_move != 0
+            && let Some(idx) = moves.iter().position(|m| m.bits() == tt_move)
+            && idx != 0
+        {
+            let mv = moves.remove(idx);
+            moves.insert(0, mv);
+        }
+
+        let total_len = moves.len();
+        Self {
+            moves,
+            idx: 0,
+            total_len,
+        }
+    }
+
+    /// Advance one move. Returns `None` once the sequence is exhausted.
+    #[inline]
+    pub(crate) fn next(&mut self) -> Option<Move> {
+        let mv = self.moves.get(self.idx).copied()?;
+        self.idx += 1;
+        Some(mv)
+    }
+
+    /// Return what `next()` would yield without advancing.
+    ///
+    /// **Idempotency invariant.** `peek()` takes `&self` (not `&mut self`):
+    /// consecutive calls return identical `Option<Move>` values. Load-bearing
+    /// for the M5.G SE block, which calls `peek()` twice.
+    #[inline]
+    pub(crate) fn peek(&self) -> Option<Move> {
+        self.moves.get(self.idx).copied()
+    }
+
+    /// Pre-iteration total move count. Does NOT decrement as `next()` advances.
+    // Not called from production paths (is_empty covers the negamax gate); used by tests.
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        self.total_len
+    }
+
+    /// `true` iff `len() == 0`. Same temporal contract as `len()`.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.total_len == 0
+    }
+
+    /// Test-only: materialise the full yield sequence (clone-and-drain).
+    /// Used by the H1-P1 equivalence proptest and the H1-S* yield-order tests.
+    #[cfg(test)]
+    pub(crate) fn yield_sequence(&self) -> Vec<Move> {
+        // From the current `idx` onwards. `plain_stager(&pos)` constructs a
+        // fresh stager with `idx = 0`, so this returns the full ordered list
+        // for tests that consume `MoveStager::new(...).yield_sequence()`.
+        self.moves[self.idx..].to_vec()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M5.H1 — partition / sort / extract helpers.
+//
+// Originally introduced in H1 v1 (per-stage stager) and used by
+// `MoveStager::new` to partition into captures/quiets and sort each tier.
+// H1 v2 (this file's current `MoveStager`) collapses the per-stage sorts back
+// into a single `negamax_move_order_score` sort to match M5.G's per-node cost
+// (the v1 design's ~3× allocation pressure caused a sustained-load NPS
+// regression invisible to bench but visible in SPRT — see `MoveStager`'s
+// header comment for context). The helpers below remain `#[cfg(test)]`-only
+// as the H1-H1..H10 mutation-discrimination surface; M5.H2's per-stage lazy
+// generation may resurrect them as production code paths, in which case they
+// can be un-cfg-tested without API change.
+// ---------------------------------------------------------------------------
+
+/// Remove and return the first move in `v` whose `bits()` equal `target`.
+/// `Vec::remove` (O(N), order-preserving) — chosen over `swap_remove` so
+/// post-removal element order matches today's `order_moves` semantics.
+/// `target == 0` returns `None` without scanning.
+#[cfg(test)]
+fn extract_move_by_bits(v: &mut Vec<Move>, target: u16) -> Option<Move> {
+    if target == 0 {
+        return None;
+    }
+    let idx = v.iter().position(|m| m.bits() == target)?;
+    Some(v.remove(idx))
+}
+
+/// Same as `extract_move_by_bits` but compares against a full `Move`
+/// (flag bits included). Used for killer-slot extraction.
+#[cfg(test)]
+fn extract_move_by_eq(v: &mut Vec<Move>, target: Move) -> Option<Move> {
+    let idx = v.iter().position(|&m| m == target)?;
+    Some(v.remove(idx))
+}
+
+/// Partition `all` into `(captures, quiets)` by `is_quiet`. Manual
+/// implementation rather than `Iterator::partition` to make the
+/// order-preservation guarantee explicit. Within each output Vec, original
+/// movegen-emit order is preserved.
+#[cfg(test)]
+fn partition_captures_quiets(all: Vec<Move>) -> (Vec<Move>, Vec<Move>) {
+    let mut captures: Vec<Move> = Vec::with_capacity(all.len());
+    let mut quiets: Vec<Move> = Vec::with_capacity(all.len());
+    for m in all {
+        if is_quiet(m) {
+            quiets.push(m);
+        } else {
+            captures.push(m);
+        }
+    }
+    (captures, quiets)
+}
+
+/// MVV-LVA-desc stable sort. Stable within ties (movegen-order preserved).
+#[cfg(test)]
+fn mvv_lva_sort_in_place(captures: &mut [Move], pos: &Position) {
+    captures.sort_by_cached_key(|&m| -mvv_lva_score(m, pos));
+}
+
+/// History-score-desc stable sort over a slice of quiet moves.
+#[cfg(test)]
+fn history_sort_in_place(quiets: &mut [Move], pos: &Position, history: &HistoryTable) {
+    let stm = pos.side_to_move();
+    quiets.sort_by_cached_key(|&m| -(history.score(stm, m.from_square(), m.to_square()) as i32));
+}
+
+// ---------------------------------------------------------------------------
 
 /// Pinned NMP firings count for the
 /// `negamax_passes_allow_null_false_in_null_subsearch` test (M5.A).
@@ -17434,5 +17650,1625 @@ mod tests {
             "abort observed after verification must prevent se_extensions increment; got {}",
             ab.se_extensions_for_test()
         );
+    }
+
+    // ===================================================================
+    // M5.H1 — MoveStager tests.
+    //
+    // H1-S*  : pure unit tests on MoveStager construction / iteration.
+    // H1-H*  : pure unit tests on helper functions (extract_move_by_bits etc.)
+    // H1-I*  : negamax integration tests (driven through negamax_for_test).
+    // H1-B*  : bench/E51 pin tests (H1-B2 is the renamed E51 pin — see below).
+    // H1-P1  : equivalence proptest: MoveStager::yield_sequence == order_moves.
+    //
+    // Plan: docs/plans/m5.h1.md §8.
+    // ===================================================================
+
+    // -------------------------------------------------------------------
+    // Test helpers shared by H1-S / H1-H tests.
+    // -------------------------------------------------------------------
+
+    /// Build a `MoveStager` with all-default (sentinel) killer/TT inputs.
+    fn plain_stager(pos: &Position) -> MoveStager {
+        MoveStager::new(
+            pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+            None,
+        )
+    }
+
+    /// Return the legal-move list for `pos` (in generate_moves emit order).
+    fn legal_moves(pos: &Position) -> Vec<Move> {
+        let mut ml = MoveList::new();
+        generate_moves(pos, &mut ml);
+        ml.iter().collect()
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S1 — empty (stalemate) position yields nothing.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_empty_position_yields_nothing() {
+        // "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1" — stalemate (Black has no legal moves).
+        let pos =
+            Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").expect("stalemate FEN must parse");
+        let mut stager = plain_stager(&pos);
+        assert_eq!(stager.len(), 0, "H1-S1: stalemate → len == 0");
+        assert!(stager.is_empty(), "H1-S1: stalemate → is_empty");
+        assert_eq!(stager.next(), None, "H1-S1: stalemate → next() == None");
+        assert_eq!(stager.peek(), None, "H1-S1: stalemate → peek() == None");
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S2 — TT move is yielded first when its bits are in the legal list.
+    //          Uses a middle-index move so the move would NOT naturally sort
+    //          first — pins that the stager actually promotes it.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_yields_tt_first_when_in_legal_list() {
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        assert!(
+            all.len() >= 5,
+            "H1-S2 fixture must have ≥5 legal moves; starting position has 20"
+        );
+        // Use a middle-index move — it would not naturally sort first (movegen
+        // order is neither MVV-LVA-first nor history-first), so a stager that
+        // merely returns the first legal move would fail this test.
+        let tt_target = all[all.len() / 2];
+        let history = HistoryTable::new();
+        let stager = MoveStager::new(
+            &pos,
+            Move::default(),
+            Move::default(),
+            &history,
+            tt_target.bits(),
+            None,
+        );
+        assert_eq!(
+            stager.peek().map(|m| m.bits()),
+            Some(tt_target.bits()),
+            "H1-S2: TT move must be promoted to position 0 even when it would not naturally sort first"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S3 — stale/absent TT bits → no TT yield.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_skips_tt_when_bits_not_in_legal_list() {
+        let pos = Position::starting_position();
+        // A bits value that no legal move can have: pick 0xFFFF (garbage).
+        let stale_tt_bits: u16 = 0xFFFF;
+        let stager = MoveStager::new(
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            stale_tt_bits,
+            None,
+        );
+        // The stager must still yield the legal moves (no TT stage).
+        let seq = stager.yield_sequence();
+        assert!(
+            seq.iter().all(|m| m.bits() != stale_tt_bits),
+            "H1-S3: stale TT bits must never appear in the yield sequence"
+        );
+        // Total moves should equal the full legal-move count (stale TT is
+        // silently ignored, not subtracted from the count).
+        let legal_count = legal_moves(&pos).len();
+        assert_eq!(
+            stager.len(),
+            legal_count,
+            "H1-S3: stale TT → len must equal full legal-move count ({legal_count})"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S4 — tt_move == 0 → no TT yield.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_skips_tt_when_tt_move_zero() {
+        let pos = Position::starting_position();
+        let legal_count = legal_moves(&pos).len();
+        let stager = MoveStager::new(
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            0, // zero → no TT
+            None,
+        );
+        let seq = stager.yield_sequence();
+        // No move should have bits == 0 (Move::default() is never in legal list).
+        assert!(
+            seq.iter().all(|m| m.bits() != 0),
+            "H1-S4: tt_move == 0 must produce no zero-bits move in yield sequence"
+        );
+        assert_eq!(
+            stager.len(),
+            legal_count,
+            "H1-S4: tt_move == 0 → len must equal full legal-move count ({legal_count})"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S5 — captures are yielded in MVV-LVA-desc order.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_yields_captures_in_mvv_lva_desc_order() {
+        // Kiwipete: rich capture landscape (8+ captures available).
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+
+        let stager = plain_stager(&pos);
+        let seq = stager.yield_sequence();
+
+        // Collect the capture-stage moves.  tt_move == 0 so no TT stage.
+        let captures: Vec<Move> = seq.iter().copied().filter(|&m| !is_quiet(m)).collect();
+
+        // Precondition: kiwipete must have captures so the ordering check is
+        // non-vacuous.  If this fires, the fixture or the filter changed.
+        assert!(
+            !captures.is_empty(),
+            "H1-S5 fixture must have at least one capture (kiwipete); got empty — \
+             either the fixture FEN changed or the stub is not filtering correctly"
+        );
+
+        for window in captures.windows(2) {
+            let s0 = mvv_lva_score(window[0], &pos);
+            let s1 = mvv_lva_score(window[1], &pos);
+            assert!(
+                s0 >= s1,
+                "H1-S5: capture block must be MVV-LVA non-increasing; \
+                 got score({:?})={s0} < score({:?})={s1}",
+                window[0],
+                window[1]
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S5b — tied MVV-LVA captures preserve movegen-emit order (plan §4.1
+    //           Case 3: stable sort within equal-score groups).
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_tied_mvv_lva_captures_preserve_movegen_emit_order() {
+        // Two white pawns on c4/e4, black pawn on d5.  Both cxd5 and exd5
+        // score identically (PAWN*16 - PAWN), so the stager must preserve
+        // movegen-emit order within the tied group.
+        // Kings on e1/e8 satisfy the FEN parser's MissingKing invariant
+        // without participating in captures at d5 (different rank, different
+        // file alignment).
+        let pos = Position::from_fen("4k3/8/8/3p4/2P1P3/8/8/4K3 w - - 0 1")
+            .expect("tied-capture FEN must parse");
+
+        let stager = plain_stager(&pos);
+        let seq = stager.yield_sequence();
+
+        // Collect only the capture moves from the sequence.
+        let captures: Vec<Move> = seq.iter().copied().filter(|&m| !is_quiet(m)).collect();
+        assert!(
+            captures.len() >= 2,
+            "H1-S5b: fixture must have at least 2 captures (cxd5 and exd5); got {}",
+            captures.len()
+        );
+
+        // Confirm all captured pairs are tied on MVV-LVA.
+        let s0 = mvv_lva_score(captures[0], &pos);
+        let s1 = mvv_lva_score(captures[1], &pos);
+        assert_eq!(
+            s0, s1,
+            "H1-S5b: fixture expects tied MVV-LVA scores; got s0={s0} s1={s1} — fixture changed?"
+        );
+
+        // Build the reference order from movegen (what order did the generator
+        // emit these two captures?).
+        let all = legal_moves(&pos);
+        let gen_caps: Vec<Move> = all.iter().copied().filter(|&m| !is_quiet(m)).collect();
+        assert!(
+            gen_caps.len() >= 2,
+            "H1-S5b: movegen must see at least 2 captures; got {}",
+            gen_caps.len()
+        );
+
+        // The stager's capture block must equal the movegen-emit order
+        // (stable sort preserves relative order within tied score group).
+        assert_eq!(
+            captures.iter().map(|m| m.bits()).collect::<Vec<_>>(),
+            gen_caps.iter().map(|m| m.bits()).collect::<Vec<_>>(),
+            "H1-S5b: tied-MVV-LVA captures must appear in movegen-emit order;\n\
+             stager: {:?}\n\
+             movegen: {:?}",
+            captures.iter().map(|m| m.bits()).collect::<Vec<u16>>(),
+            gen_caps.iter().map(|m| m.bits()).collect::<Vec<u16>>(),
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S6 — TT capture excluded from capture stage.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_excludes_tt_capture_from_capture_stage() {
+        // Use kiwipete — has captures.
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+
+        // Find the first non-quiet (capture) legal move to use as TT.
+        let all = legal_moves(&pos);
+        let capture_mv = all.iter().find(|&&m| !is_quiet(m)).copied();
+        let Some(cap) = capture_mv else {
+            // If no captures available, this test is vacuous.
+            return;
+        };
+
+        let stager = MoveStager::new(
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            cap.bits(),
+            None,
+        );
+        let seq = stager.yield_sequence();
+
+        // The TT move must appear exactly once.
+        let count = seq.iter().filter(|&&m| m.bits() == cap.bits()).count();
+        assert_eq!(
+            count, 1,
+            "H1-S6: TT capture must appear exactly once in yield sequence; found {count}"
+        );
+
+        // If TT was yielded first, it must not reappear in the capture block.
+        if seq.first().map(|m| m.bits()) == Some(cap.bits()) {
+            let cap_stage: Vec<Move> = seq[1..].iter().copied().filter(|&m| !is_quiet(m)).collect();
+            assert!(
+                cap_stage.iter().all(|m| m.bits() != cap.bits()),
+                "H1-S6: TT capture must not appear in the capture stage after being yielded first"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S7 — killer0 yielded iff it is a legal quiet.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_yields_killer0_iff_present_and_quiet() {
+        // Use kiwipete for a richer position: has both captures and quiets
+        // so we can exercise both the "captures-before-killer" and
+        // "killer-before-quiets" ordering constraints.
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+        let all = legal_moves(&pos);
+        let Some(k0) = all.iter().find(|&&m| is_quiet(m)).copied() else {
+            return;
+        };
+        let killer1 = Move::default();
+
+        let stager = MoveStager::new(&pos, k0, killer1, &HistoryTable::new(), 0, None);
+        let seq = stager.yield_sequence();
+
+        // k0 must appear exactly once.
+        let count = seq.iter().filter(|&&m| m == k0).count();
+        assert_eq!(
+            count, 1,
+            "H1-S7: legal killer0 quiet must appear exactly once in the sequence; found {count}"
+        );
+
+        let k0_idx = seq
+            .iter()
+            .position(|&m| m == k0)
+            .expect("k0 must be in seq");
+
+        // All captures (non-quiet) must appear before k0.
+        for (idx, &mv) in seq.iter().enumerate() {
+            if !is_quiet(mv) {
+                assert!(
+                    idx < k0_idx,
+                    "H1-S7: all captures must appear before killer0; \
+                     capture at {idx} but k0 at {k0_idx}"
+                );
+            }
+        }
+
+        // All non-killer quiets must appear after k0 (killer0 < quiets ordering).
+        let first_non_killer_quiet_idx = seq
+            .iter()
+            .position(|&m| is_quiet(m) && m != k0 && m != killer1);
+        if let Some(q_idx) = first_non_killer_quiet_idx {
+            assert!(
+                k0_idx < q_idx,
+                "H1-S7: killer0 must appear before non-killer quiets; \
+                 k0 at {k0_idx} but first non-killer quiet at {q_idx}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S8 — killer0 == TT → killer0 not separately yielded.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_skips_killer0_when_equal_to_tt() {
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        // Use the first quiet as both TT move and killer0.
+        let Some(quiet_mv) = all.iter().find(|&&m| is_quiet(m)).copied() else {
+            return;
+        };
+
+        let stager = MoveStager::new(
+            &pos,
+            quiet_mv, // killer0 == TT
+            Move::default(),
+            &HistoryTable::new(),
+            quiet_mv.bits(), // tt_move == killer0
+            None,
+        );
+        let seq = stager.yield_sequence();
+
+        // The move must appear exactly once (as the TT yield, not again as k0).
+        let count = seq.iter().filter(|&&m| m.bits() == quiet_mv.bits()).count();
+        assert_eq!(
+            count, 1,
+            "H1-S8: move used as both TT and killer0 must appear exactly once; found {count}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S9 — killer1 == killer0 → killer1 not separately yielded.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_skips_killer1_when_equal_to_killer0() {
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        let quiets: Vec<Move> = all.into_iter().filter(|&m| is_quiet(m)).collect();
+        if quiets.is_empty() {
+            return;
+        }
+        let k = quiets[0];
+
+        let stager = MoveStager::new(
+            &pos,
+            k, // killer0
+            k, // killer1 == killer0
+            &HistoryTable::new(),
+            0,
+            None,
+        );
+        let seq = stager.yield_sequence();
+
+        // k must appear exactly once.
+        let count = seq.iter().filter(|&&m| m == k).count();
+        assert_eq!(
+            count, 1,
+            "H1-S9: killer1 == killer0 → the move appears exactly once; found {count}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S10 — killer1 == TT → killer1 not separately yielded.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_skips_killer1_when_equal_to_tt() {
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        let quiets: Vec<Move> = all.into_iter().filter(|&m| is_quiet(m)).collect();
+        if quiets.len() < 2 {
+            return;
+        }
+        let k0 = quiets[0];
+        let tt_quiet = quiets[1]; // this will be TT and also killer1
+
+        let stager = MoveStager::new(
+            &pos,
+            k0,
+            tt_quiet, // killer1 == TT
+            &HistoryTable::new(),
+            tt_quiet.bits(), // tt_move == killer1
+            None,
+        );
+        let seq = stager.yield_sequence();
+
+        // tt_quiet must appear exactly once.
+        let count = seq.iter().filter(|&&m| m.bits() == tt_quiet.bits()).count();
+        assert_eq!(
+            count, 1,
+            "H1-S10: move used as both TT and killer1 must appear exactly once; found {count}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S11 — quiet stage has TT, k0, k1 deduped.
+    //           Uses a non-first quiet as TT (quiets[2]) so TT promotion is
+    //           exercised rather than the naturally-first slot.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_yields_quiets_history_desc_with_tt_killer_dedup() {
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        let quiets: Vec<Move> = all.into_iter().filter(|&m| is_quiet(m)).collect();
+        if quiets.len() < 3 {
+            return;
+        }
+        // tt_q is quiets[2] (non-first) to ensure TT promotion is exercised;
+        // k0 and k1 are quiets[0] and quiets[1].
+        let (k0_q, k1_q, tt_q) = (quiets[0], quiets[1], quiets[2]);
+
+        let stager = MoveStager::new(&pos, k0_q, k1_q, &HistoryTable::new(), tt_q.bits(), None);
+        let seq = stager.yield_sequence();
+
+        // Each of the three moves appears exactly once in the full sequence.
+        for (name, mv) in [("TT", tt_q), ("k0", k0_q), ("k1", k1_q)] {
+            let count = seq.iter().filter(|&&m| m == mv).count();
+            assert_eq!(
+                count, 1,
+                "H1-S11: {name} move must appear exactly once; found {count}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S12 — total_len matches legal-move count when no filter.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_total_len_matches_legal_count() {
+        let pos = Position::starting_position();
+        let legal_count = legal_moves(&pos).len();
+        let stager = plain_stager(&pos);
+        assert_eq!(
+            stager.len(),
+            legal_count,
+            "H1-S12: len() must equal the legal-move count ({legal_count})"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S13 — peek() is idempotent under repeated calls; next() returns same.
+    //           Pins idempotency at TWO stage positions: pre-iteration and
+    //           mid-iteration.  The SE block calls peek() twice per M5.G
+    //           design (once in the gate predicate, once in the verification
+    //           excluded_move argument) so mid-flow stability is load-bearing.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_peek_idempotent_under_repeated_calls() {
+        let pos = Position::starting_position();
+        let history = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, Move::default(), Move::default(), &history, 0, None);
+
+        // (a) Pre-iteration: peek must be Some (starting position has 20 legal moves).
+        let p0 = stager.peek();
+        assert!(
+            p0.is_some(),
+            "H1-S13: starting position has 20 legal moves; pre-iteration peek must be Some"
+        );
+        assert_eq!(
+            stager.peek(),
+            p0,
+            "H1-S13: peek call 2 must return same as call 1"
+        );
+        assert_eq!(
+            stager.peek(),
+            p0,
+            "H1-S13: peek call 3 must return same as call 1"
+        );
+
+        // (b) Pre-iteration: next() yields what peek() reported.
+        let yielded = stager.next();
+        assert_eq!(
+            yielded, p0,
+            "H1-S13: first next() must yield what peek() reported"
+        );
+
+        // (c) Mid-iteration: after one next(), peek must still be Some and stable.
+        //     19 moves remain after yielding one from a 20-move position.
+        let p1 = stager.peek();
+        assert!(
+            p1.is_some(),
+            "H1-S13: after first next(), 19 moves remain; mid-iteration peek must be Some"
+        );
+        assert_eq!(
+            stager.peek(),
+            p1,
+            "H1-S13: mid-iteration peek call 2 must equal call 1"
+        );
+        assert_eq!(
+            stager.peek(),
+            p1,
+            "H1-S13: mid-iteration peek call 3 must equal call 1"
+        );
+
+        // (d) Mid-iteration: next() yields what the mid-iteration peek reported.
+        let yielded2 = stager.next();
+        assert_eq!(
+            yielded2, p1,
+            "H1-S13: second next() must yield what mid-iteration peek() reported"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S13b — peek() at Stage::Captures returns the next capture without
+    //           advancing.  H1-S13 only exercises peek at Stage::Tt and
+    //           Stage::Quiets (starting position has no captures); this test
+    //           specifically lands peek() at Stage::Captures so the helper
+    //           `peek_from_captures` is on the call path.
+    //
+    //           Mutation discrimination: kills the
+    //           `replace < with > in MoveStager::peek_from_captures`
+    //           mutant (`if self.cap_idx < self.captures.len()` arm).
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_peek_at_captures_stage_returns_next_capture() {
+        let pos = Position::from_fen(
+            // Kiwipete — many captures.
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("Kiwipete FEN must parse");
+        let mut stager = plain_stager(&pos);
+
+        // Consume the Tt stage (no TT move; first next() advances to Captures
+        // and yields the first capture).
+        let first_yield = stager.next();
+        assert!(first_yield.is_some(), "Kiwipete must yield at least one move");
+        // The first yielded move must be a capture or promo (since no TT was
+        // set, the first stage with content is Captures).  If for some reason
+        // the position had no captures the test would degenerate; assert.
+        assert!(
+            !is_quiet(first_yield.unwrap()),
+            "Kiwipete fixture must have captures; first non-TT yield must be a capture"
+        );
+
+        // Now stager.stage == Stage::Captures with cap_idx > 0.  peek() routes
+        // through peek_from_captures and must return the SECOND capture (the
+        // value `next()` would yield next).
+        let peeked_a = stager.peek();
+        let peeked_b = stager.peek();
+        let peeked_c = stager.peek();
+        assert!(
+            peeked_a.is_some(),
+            "after consuming first capture, more captures remain in Kiwipete; peek must be Some"
+        );
+        assert_eq!(peeked_b, peeked_a, "peek call 2 at Captures must equal call 1");
+        assert_eq!(peeked_c, peeked_a, "peek call 3 at Captures must equal call 1");
+
+        // The yielded next move must equal what peek reported.
+        let next_yield = stager.next();
+        assert_eq!(
+            next_yield, peeked_a,
+            "next() at Captures must yield the move peek_from_captures reported"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S14 — peek() returns None after full iteration.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_peek_after_done_returns_none() {
+        let pos = Position::starting_position();
+        let mut stager = plain_stager(&pos);
+        // Drain all moves.
+        while stager.next().is_some() {}
+        assert_eq!(
+            stager.peek(),
+            None,
+            "H1-S14: peek() must return None after full iteration"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S15a — searchmoves filter constrains yield set.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_searchmoves_filter_constrains_yield_set() {
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        if all.len() < 2 {
+            return;
+        }
+        let filter = &all[..2];
+        let stager = MoveStager::new(
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+            Some(filter),
+        );
+        let seq = stager.yield_sequence();
+        for mv in &seq {
+            assert!(
+                filter.iter().any(|f| f == mv),
+                "H1-S15a: every yielded move must be in the filter; {:?} is not",
+                mv
+            );
+        }
+        assert_eq!(
+            stager.len(),
+            filter.len(),
+            "H1-S15a: len() must equal filter length when all filter moves are legal"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S15b — filter excluding TT bits → no TT stage; non-TT moves still yielded.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_searchmoves_filter_excluding_tt_yields_no_tt_stage() {
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        if all.len() < 2 {
+            return;
+        }
+        // TT is all[0]; filter is all[1..] (excludes TT).
+        let tt_mv = all[0];
+        let filter: Vec<Move> = all[1..].to_vec();
+        let expected_count = filter.len();
+
+        let stager = MoveStager::new(
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            tt_mv.bits(),
+            Some(&filter),
+        );
+        let seq = stager.yield_sequence();
+
+        // Negative: TT bits must not appear.
+        assert!(
+            seq.iter().all(|m| m.bits() != tt_mv.bits()),
+            "H1-S15b: TT move excluded by filter must not appear in yield sequence"
+        );
+        // Positive: all non-TT legal moves must still be yielded.
+        assert_eq!(
+            seq.len(),
+            expected_count,
+            "H1-S15b: stager must yield all {expected_count} non-TT legal moves; \
+             got {} — filter must not suppress non-TT moves",
+            seq.len()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S15c — filter excluding killer0 → no killer0 stage; other moves yielded.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_searchmoves_filter_excluding_killer_yields_no_killer_stage() {
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        let quiets: Vec<Move> = all.iter().copied().filter(|&m| is_quiet(m)).collect();
+        if quiets.is_empty() || all.len() < 2 {
+            return;
+        }
+        let k0 = quiets[0];
+        // Filter excludes k0; all other legal moves are included.
+        let filter: Vec<Move> = all.iter().copied().filter(|&m| m != k0).collect();
+        if filter.is_empty() {
+            return;
+        }
+        let expected_count = filter.len();
+
+        let stager = MoveStager::new(
+            &pos,
+            k0,
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+            Some(&filter),
+        );
+        let seq = stager.yield_sequence();
+
+        // Negative: killer0 must not appear.
+        assert!(
+            seq.iter().all(|&m| m != k0),
+            "H1-S15c: killer0 excluded by filter must not appear in yield sequence"
+        );
+        // Positive: all non-k0 legal moves must still be yielded.
+        assert_eq!(
+            seq.len(),
+            expected_count,
+            "H1-S15c: stager must yield all {expected_count} non-killer0 legal moves; \
+             got {} — filter must not suppress non-killer moves",
+            seq.len()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S15d — Some(&[]) filter → empty yield.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_searchmoves_filter_empty_yields_nothing() {
+        let pos = Position::starting_position();
+        let mut stager = MoveStager::new(
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+            Some(&[]), // empty filter
+        );
+        assert_eq!(stager.len(), 0, "H1-S15d: empty filter → len == 0");
+        assert!(stager.is_empty(), "H1-S15d: empty filter → is_empty");
+        assert_eq!(
+            stager.next(),
+            None,
+            "H1-S15d: empty filter → next() == None"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S15e — None filter is identical to no-filter.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_searchmoves_filter_none_is_no_op() {
+        let pos = Position::starting_position();
+        let legal_count = legal_moves(&pos).len();
+        let stager = MoveStager::new(
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+            None,
+        );
+        assert_eq!(
+            stager.len(),
+            legal_count,
+            "H1-S15e: None filter → len equals full legal-move count ({legal_count})"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S16 — total_len reflects filtered count.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_total_len_post_filter_correct() {
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        if all.len() < 3 {
+            return;
+        }
+        let filter = &all[..3];
+        let stager = MoveStager::new(
+            &pos,
+            Move::default(),
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+            Some(filter),
+        );
+        assert_eq!(
+            stager.len(),
+            3,
+            "H1-S16: three-move filter → len == 3; got {}",
+            stager.len()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S17 — total_len is unchanged after full iteration (temporal contract).
+    //           Uses legal_moves().len() as the absolute reference so the test
+    //           catches both "wrong initial len" and "len decrements on next()"
+    //           bugs independently.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_done_after_full_iteration_total_len_unchanged() {
+        let pos = Position::starting_position();
+        // Absolute reference: the real legal-move count (20 for starting position).
+        let expected_len = legal_moves(&pos).len();
+        let history = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, Move::default(), Move::default(), &history, 0, None);
+
+        // Pre-iteration: len must equal the legal-move count.
+        assert_eq!(
+            stager.len(),
+            expected_len,
+            "H1-S17: pre-iteration len must equal legal-move count ({expected_len})"
+        );
+
+        // Drain all moves.
+        let mut yielded = 0usize;
+        while stager.next().is_some() {
+            yielded += 1;
+        }
+
+        // Post-iteration: next() returns None.
+        assert_eq!(
+            stager.next(),
+            None,
+            "H1-S17: next() after exhaustion must return None"
+        );
+        // Temporal contract: len() must NOT have decremented.
+        assert_eq!(
+            stager.len(),
+            expected_len,
+            "H1-S17: len() after full iteration must be unchanged (temporal contract; \
+             must not decrement on next()); expected {expected_len}, got {}",
+            stager.len()
+        );
+        // All moves must have been yielded.
+        assert_eq!(
+            yielded, expected_len,
+            "H1-S17: yielded move count must equal pre-iteration len; \
+             yielded {yielded} but legal count is {expected_len}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S18 — capture in killer slot is not yielded as a killer
+    //           (defensive: ADR-0019 guarantees killers are quiets, but the
+    //           stager guards against bad caller inputs).
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_killer_with_capture_flag_not_yielded_as_killer() {
+        // Use kiwipete — has captures.
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+        let all = legal_moves(&pos);
+        // Find a capture to pass as killer0 (adversarial: violates ADR-0019).
+        let Some(cap) = all.iter().find(|&&m| !is_quiet(m)).copied() else {
+            return;
+        };
+
+        let stager = MoveStager::new(
+            &pos,
+            cap, // capture in killer0 slot — should NOT be yielded as killer
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+            None,
+        );
+        let seq = stager.yield_sequence();
+
+        // The capture must appear exactly once (in the capture stage, not again as k0).
+        let count = seq.iter().filter(|&&m| m == cap).count();
+        assert_eq!(
+            count, 1,
+            "H1-S18: capture in killer slot must appear at most once (in capture stage); \
+             found {count} occurrences"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-S19 — killer0.bits() == 0 (Move::default sentinel) is ignored.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_killer_with_default_sentinel_is_ignored() {
+        let pos = Position::starting_position();
+        let legal_count = legal_moves(&pos).len();
+        let stager = MoveStager::new(
+            &pos,
+            Move::default(), // bits == 0 → sentinel; must be ignored, not scanned
+            Move::default(),
+            &HistoryTable::new(),
+            0,
+            None,
+        );
+        // Sentinel ignored: no crash, no extra yields, len unchanged.
+        assert_eq!(
+            stager.len(),
+            legal_count,
+            "H1-S19: default killer sentinel must be ignored; \
+             len must equal legal-move count ({legal_count})"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-H1 — extract_move_by_bits(v, 0) returns None without scanning.
+    // -------------------------------------------------------------------
+    #[test]
+    fn extract_move_by_bits_zero_returns_none_without_scanning() {
+        let pos = Position::starting_position();
+        let mut v = legal_moves(&pos);
+        let original_len = v.len();
+        let result = extract_move_by_bits(&mut v, 0);
+        assert_eq!(result, None, "H1-H1: target == 0 must return None");
+        assert_eq!(
+            v.len(),
+            original_len,
+            "H1-H1: Vec must be unchanged when target == 0"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-H2 — extract_move_by_bits finds first match, order-preserving.
+    // -------------------------------------------------------------------
+    #[test]
+    fn extract_move_by_bits_finds_first_match_and_removes_in_place() {
+        let pos = Position::starting_position();
+        let mut v = legal_moves(&pos);
+        assert!(!v.is_empty());
+        let target = v[0];
+        let original_rest: Vec<Move> = v[1..].to_vec();
+
+        let result = extract_move_by_bits(&mut v, target.bits());
+
+        assert_eq!(
+            result.map(|m| m.bits()),
+            Some(target.bits()),
+            "H1-H2: must return the found move"
+        );
+        assert_eq!(
+            v, original_rest,
+            "H1-H2: remaining elements must be in original order (order-preserving removal)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-H3 — extract_move_by_bits returns None when target absent.
+    // -------------------------------------------------------------------
+    #[test]
+    fn extract_move_by_bits_returns_none_when_target_absent() {
+        let pos = Position::starting_position();
+        let mut v = legal_moves(&pos);
+        let original = v.clone();
+        // 0xFFFF is not a valid legal move.
+        let result = extract_move_by_bits(&mut v, 0xFFFF);
+        assert_eq!(result, None, "H1-H3: absent target → None");
+        assert_eq!(v, original, "H1-H3: Vec must be unchanged on miss");
+    }
+
+    // -------------------------------------------------------------------
+    // H1-H4 — extract_move_by_eq matches full Move (flag bits included).
+    // -------------------------------------------------------------------
+    #[test]
+    fn extract_move_by_eq_finds_full_move_match() {
+        use crate::mov::MoveFlag;
+        use crate::square::Square;
+
+        // Build two Moves with the same (from, to) but different flags.
+        let quiet = Move::new(Square::E2, Square::E4, MoveFlag::DoublePush);
+        let fake_capture = Move::new(Square::E2, Square::E4, MoveFlag::Capture);
+
+        // Full-Move equality on `quiet` must succeed.
+        let result = extract_move_by_eq(&mut vec![quiet], quiet);
+        assert_eq!(result, Some(quiet), "H1-H4: must find exact-flag match");
+
+        // A different flag (same from/to) on a Vec containing only `quiet`
+        // must return None — bits-only match is insufficient.
+        let result_miss = extract_move_by_eq(&mut vec![quiet], fake_capture);
+        assert_eq!(
+            result_miss, None,
+            "H1-H4: bits-only match insufficient — flag mismatch must return None"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-H5 — partition_captures_quiets partitions by is_quiet.
+    // -------------------------------------------------------------------
+    #[test]
+    fn partition_captures_quiets_partitions_by_is_quiet() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete must parse");
+        let all = legal_moves(&pos);
+        let (captures, quiets) = partition_captures_quiets(all.clone());
+        assert!(
+            captures.iter().all(|&m| !is_quiet(m)),
+            "H1-H5: all 'captures' must be non-quiet"
+        );
+        assert!(
+            quiets.iter().all(|&m| is_quiet(m)),
+            "H1-H5: all 'quiets' must be quiet"
+        );
+        assert_eq!(
+            captures.len() + quiets.len(),
+            all.len(),
+            "H1-H5: capture + quiet count must equal total move count"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-H6 — partition preserves within-partition order.
+    // -------------------------------------------------------------------
+    #[test]
+    fn partition_preserves_within_partition_order() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete must parse");
+        let all = legal_moves(&pos);
+        // Collect expected order by manually filtering.
+        let expected_caps: Vec<Move> = all.iter().copied().filter(|&m| !is_quiet(m)).collect();
+        let expected_quiets: Vec<Move> = all.iter().copied().filter(|&m| is_quiet(m)).collect();
+
+        let (caps, quiets) = partition_captures_quiets(all);
+        assert_eq!(
+            caps, expected_caps,
+            "H1-H6: capture partition must preserve movegen-emit order"
+        );
+        assert_eq!(
+            quiets, expected_quiets,
+            "H1-H6: quiet partition must preserve movegen-emit order"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-H7 — mvv_lva_sort_in_place produces non-increasing scores.
+    // -------------------------------------------------------------------
+    #[test]
+    fn mvv_lva_sort_in_place_descending() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete must parse");
+        let all = legal_moves(&pos);
+        let mut captures: Vec<Move> = all.into_iter().filter(|&m| !is_quiet(m)).collect();
+        if captures.len() < 2 {
+            return;
+        }
+        mvv_lva_sort_in_place(&mut captures, &pos);
+        for window in captures.windows(2) {
+            let s0 = mvv_lva_score(window[0], &pos);
+            let s1 = mvv_lva_score(window[1], &pos);
+            assert!(
+                s0 >= s1,
+                "H1-H7: MVV-LVA sort must be non-increasing; \
+                 got score({:?})={s0} > score({:?})={s1}",
+                window[0],
+                window[1]
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // H1-H8 — mvv_lva_sort_in_place stable within ties (movegen order preserved).
+    // -------------------------------------------------------------------
+    #[test]
+    fn mvv_lva_sort_in_place_stable_within_ties() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete must parse");
+        let all = legal_moves(&pos);
+        let mut captures: Vec<Move> = all.into_iter().filter(|&m| !is_quiet(m)).collect();
+
+        // Use sort_by_cached_key (stable) as the reference.
+        let mut reference = captures.clone();
+        reference.sort_by_cached_key(|&m| -mvv_lva_score(m, &pos));
+
+        mvv_lva_sort_in_place(&mut captures, &pos);
+        assert_eq!(
+            captures, reference,
+            "H1-H8: mvv_lva_sort_in_place must produce the same order as \
+             sort_by_cached_key(-mvv_lva_score) (stable within ties)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-H9 — history_sort_in_place produces non-increasing history scores.
+    // -------------------------------------------------------------------
+    #[test]
+    fn history_sort_in_place_descending() {
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        let mut quiets: Vec<Move> = all.into_iter().filter(|&m| is_quiet(m)).collect();
+        if quiets.len() < 2 {
+            return;
+        }
+        // Seed the history table with distinct values so there's a real ordering.
+        let mut ht = HistoryTable::new();
+        let stm = pos.side_to_move();
+        for (i, &mv) in quiets.iter().enumerate() {
+            ht.update(stm, mv.from_square(), mv.to_square(), (i as i32 + 1) * 10);
+        }
+        history_sort_in_place(&mut quiets, &pos, &ht);
+        for window in quiets.windows(2) {
+            let s0 = ht.score(stm, window[0].from_square(), window[0].to_square()) as i32;
+            let s1 = ht.score(stm, window[1].from_square(), window[1].to_square()) as i32;
+            assert!(
+                s0 >= s1,
+                "H1-H9: history sort must be non-increasing; \
+                 got score({:?})={s0} < score({:?})={s1}",
+                window[0],
+                window[1]
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // H1-H10 — history_sort_in_place stable within ties.
+    // -------------------------------------------------------------------
+    #[test]
+    fn history_sort_in_place_stable_within_ties() {
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        let mut quiets: Vec<Move> = all.into_iter().filter(|&m| is_quiet(m)).collect();
+        let ht = HistoryTable::new(); // all zeros → all tied
+
+        // Reference: stable sort by history score (all equal → original order).
+        let reference = quiets.clone();
+
+        history_sort_in_place(&mut quiets, &pos, &ht);
+        assert_eq!(
+            quiets, reference,
+            "H1-H10: equal history scores → original order preserved (stable sort)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-I1 — negamax with stager at terminal position returns terminal score.
+    // -------------------------------------------------------------------
+    #[test]
+    fn negamax_with_stager_at_terminal_position_returns_terminal_score() {
+        // Stalemate: "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1" — Black has no legal moves.
+        let pos =
+            Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").expect("stalemate FEN must parse");
+        let mut ab = AlphaBetaMover::new();
+        let (ctx, _) = non_aborting_ctx();
+        // Drive at depth 1: no legal moves → returns 0 (stalemate).
+        let score = ab.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, true, None, &ctx);
+        assert_eq!(score, 0, "H1-I1: stalemate must return 0; got {score}");
+
+        // Mate-in-1: "4k3/4Q3/3K4/8/8/8/8/8 b - - 0 1" — Black is in check with no evasions.
+        let pos_mate =
+            Position::from_fen("4k3/4Q3/3K4/8/8/8/8/8 b - - 0 1").expect("mate FEN must parse");
+        let score_mate = ab.negamax_for_test(
+            &mut pos_mate.clone(),
+            1,
+            0,
+            -INF,
+            INF,
+            true,
+            true,
+            None,
+            &ctx,
+        );
+        assert!(
+            score_mate < -MATE_IN_MAX_PLY,
+            "H1-I1: mate score must be below -MATE_IN_MAX_PLY threshold; got {score_mate}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-I2 — searchmoves filter constrains the root move loop.
+    // -------------------------------------------------------------------
+    #[test]
+    fn negamax_with_stager_searchmoves_filter_constrains_to_filter_at_root() {
+        use crate::search::SearchLimits;
+
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        // Let the filter contain exactly one move: the first legal move.
+        let filter_move = all[0];
+        let filter = vec![filter_move];
+
+        let (mut ctx, stop) = non_aborting_ctx();
+        ctx.limits = SearchLimits {
+            searchmoves: Some(filter),
+            depth: Some(2),
+            ..SearchLimits::default()
+        };
+
+        let mut ab = AlphaBetaMover::new();
+        // Drive at ply 0 with the filter active.
+        let _score = ab.negamax_for_test(&mut pos.clone(), 2, 0, -INF, INF, true, true, None, &ctx);
+        drop(stop);
+
+        // The PV root move must be the only filtered move (the search had no
+        // other option at ply 0).
+        let pv = ab.pv_root_for_test();
+        if !pv.is_empty() {
+            assert_eq!(
+                pv[0].bits(),
+                filter_move.bits(),
+                "H1-I2: root move must be the only filtered move"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // H1-I3 — SE block fires when stager.peek() matches the TT move.
+    // -------------------------------------------------------------------
+    #[test]
+    fn negamax_with_stager_se_peek_finds_tt_move_at_front() {
+        // Reuse the SE test fixture from the M5.G suite.
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 50_i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false, // non-PV so SE can fire
+            true,
+            None,
+            &ctx,
+        );
+
+        // SE should fire (or at least not be blocked by the peek() path).
+        // H1-I3 just pins that SE extensions == expected from M5.G fixtures.
+        // After M5.H1 refactor the stager's peek() replaces moves_vec[0].
+        let se_ext = ab.se_extensions_for_test();
+        assert!(
+            se_ext >= 1,
+            "H1-I3: SE must fire at least once for the SE fixture position at \
+             depth={depth}, ply={ply}; got se_extensions={se_ext}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-I4 — excluded-move skip preserves position counter semantics.
+    // -------------------------------------------------------------------
+    // Note: the cur_i off-by-one mutation (let mut i = 0 → 1, or cur_i/i++
+    // swap) is caught primarily by H1-B1 (bench-parity gate) — any deviation
+    // from M5.G's position-counter semantics changes node counts.  This test
+    // pins the SE counter; H1-B1 pins the depth-7 node-count signature.
+    // -------------------------------------------------------------------
+    #[test]
+    fn negamax_with_stager_excluded_move_skip_preserves_position_counter() {
+        // We can't directly observe cur_i from outside, but we can verify that
+        // the SE extension fires (SE extension requires cur_i == 0 for the TT
+        // move) even after the verification frame skips the excluded move.
+        // Reuse the SE test fixture.
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 50_i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false, // non-PV
+            true,
+            None,
+            &ctx,
+        );
+
+        // SE must have fired: the extension was applied at cur_i == 0 (the TT
+        // move position).  If cur_i were off-by-one (started at 1), the
+        // extension check `if cur_i == 0` would never fire for the TT move and
+        // SE extensions would be 0.
+        let se_ext = ab.se_extensions_for_test();
+        assert!(
+            se_ext >= 1,
+            "H1-I4: SE extension must fire (cur_i == 0 for TT move); got {se_ext}.\n\
+             An off-by-one in the position counter would suppress this."
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-I5 — searchmoves filter excluding TT: search completes, chosen root
+    //          move is within the filter set.
+    //
+    // Note: SE cannot fire at ply == 0 (clause 2 of singular_extension_eligible
+    // requires ply > 0).  So asserting se_extensions == 0 at root would be
+    // vacuous — the test instead pins that the filter is correctly applied:
+    // the chosen root move must be a member of the filter (i.e., not the TT
+    // move that was excluded).  Per plan §4.1 Case 8.
+    // -------------------------------------------------------------------
+    #[test]
+    fn negamax_with_stager_searchmoves_excluding_tt_does_not_promote() {
+        use crate::search::SearchLimits;
+
+        // Use the SE test fixture position.
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+
+        let best_move_bits = se_find_best_move_bits(&pos);
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 50_i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        // Build a searchmoves filter that EXCLUDES the TT move.
+        let all = legal_moves(&pos);
+        let filter: Vec<Move> = all
+            .iter()
+            .copied()
+            .filter(|m| m.bits() != best_move_bits)
+            .collect();
+        if filter.is_empty() {
+            return; // only one legal move — test is vacuous
+        }
+
+        let (mut ctx, _stop) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+        ctx.limits = SearchLimits {
+            searchmoves: Some(filter.clone()),
+            depth: Some(depth),
+            ..SearchLimits::default()
+        };
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            0, // ply == 0, searchmoves filter active
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        // The search must complete and select a move that is in the filter.
+        // A TT move outside the filter cannot be chosen as the best root move.
+        let pv = ab.pv_root_for_test();
+        assert!(
+            !pv.is_empty(),
+            "H1-I5: search with non-empty searchmoves filter must produce a root move"
+        );
+        assert!(
+            filter.iter().any(|f| f.bits() == pv[0].bits()),
+            "H1-I5: chosen root move must be in the searchmoves filter (TT move excluded); \
+             got pv[0].bits()={:#06x}, filter has {} moves",
+            pv[0].bits(),
+            filter.len()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-I6 — stale TT (bits not in legal list) does not fire SE.
+    // -------------------------------------------------------------------
+    #[test]
+    fn negamax_with_stager_stale_tt_does_not_fire_se() {
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        // Store a TT entry with bits that don't correspond to any legal move.
+        // 0xFFFF is not a valid move encoding for any legal move.
+        let stale_bits: u16 = 0xFFFF;
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: 50_i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: stale_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        // Stale TT bits not in the legal list → stager.peek().bits() won't match
+        // snapshot.tt_move → SE predicate fails → no extension.
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "H1-I6: stale TT move (bits not in legal list) must not fire SE; \
+             got se_extensions={}",
+            ab.se_extensions_for_test()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H1-B2 — E51 depth-4 pin (unchanged from M5.F / M5.G landing).
+    // Renamed from bench_signature_deterministic_across_two_runs_with_qsearch_tt
+    // per plan §8 H1-B2.  The H1-B1 bench CLI pin (1147614 nodes at depth 7)
+    // is verified via `cargo run --release -- bench` at the §12 verification
+    // gate, not as an in-process test.
+    // -------------------------------------------------------------------
+    // (H1-B2 is the existing E51 function in tests/uci_integration.rs —
+    //  name unchanged per plan §8 clarification; no rename needed here.)
+
+    // -------------------------------------------------------------------
+    // H1-P1 — Equivalence proptest: MoveStager::yield_sequence == order_moves.
+    // -------------------------------------------------------------------
+    mod h1_proptest {
+        use super::*;
+        use crate::history::{HistoryTable, MAX_HISTORY};
+        use crate::movegen::test_strategies::arb_position;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2048))]
+
+            /// For arbitrary positions, TT bits, killer slots, and history
+            /// tables, `MoveStager::yield_sequence()` must be byte-equivalent
+            /// to the output of `order_moves()` on the same inputs.
+            ///
+            /// This is the load-bearing bench-parity gate: any divergence
+            /// between the stager and `order_moves` indicates a bug that
+            /// would change node counts and invalidate bench parity.
+            #[test]
+            fn prop_stager_yield_sequence_equals_order_moves_output(
+                pos in arb_position(),
+                tt_kind in 0u8..3,
+                tt_seed in any::<u64>(),
+                killer0_kind in 0u8..3,
+                killer0_seed in any::<u64>(),
+                killer1_kind in 0u8..3,
+                killer1_seed in any::<u64>(),
+                history_seed in any::<u64>(),
+            ) {
+                use crate::movegen::{MoveList, generate_moves};
+
+                // Build the full legal-move list.
+                let mut ml = MoveList::new();
+                generate_moves(&pos, &mut ml);
+                let all_moves: Vec<Move> = ml.iter().collect();
+
+                if all_moves.is_empty() {
+                    // Terminal position — both stager and order_moves produce empty.
+                    return Ok(());
+                }
+
+                // Derive tt_move bits from tt_kind.
+                let tt_move_bits: u16 = match tt_kind % 3 {
+                    0 => 0, // no TT
+                    1 => {
+                        // TT is a real legal move (in-list).
+                        let idx = (tt_seed as usize) % all_moves.len();
+                        all_moves[idx].bits()
+                    }
+                    _ => {
+                        // TT is a stale/absent value (not in list).
+                        // Pick from u16 range but ensure it's not accidentally
+                        // a real move by XOR-scrambling with a magic constant.
+                        let raw = ((tt_seed >> 16) as u16) ^ 0xABCD;
+                        // If this accidentally matches a legal move, fall back to 0.
+                        if all_moves.iter().any(|m| m.bits() == raw) { 0 } else { raw }
+                    }
+                };
+
+                // Derive killer0 from killer0_kind.
+                let quiet_moves: Vec<Move> = all_moves.iter().copied().filter(|&m| is_quiet(m)).collect();
+                let capture_moves: Vec<Move> = all_moves.iter().copied().filter(|&m| !is_quiet(m)).collect();
+                let killer0: Move = match (killer0_kind % 3, quiet_moves.is_empty()) {
+                    (0, _) | (_, true) => Move::default(), // sentinel
+                    (1, false) => {
+                        // real legal quiet
+                        quiet_moves[(killer0_seed as usize) % quiet_moves.len()]
+                    }
+                    _ => {
+                        // A non-quiet (capture) in the killer slot — tests the
+                        // defensive path that filters out non-quiet killers.
+                        if capture_moves.is_empty() {
+                            Move::default()
+                        } else {
+                            capture_moves[(killer0_seed as usize) % capture_moves.len()]
+                        }
+                    }
+                };
+
+                // Derive killer1 from killer1_kind (must differ from killer0 for
+                // the non-dedup path to be interesting).
+                let killer1: Move = match (killer1_kind % 3, quiet_moves.is_empty()) {
+                    (0, _) | (_, true) => Move::default(),
+                    (1, false) => {
+                        let idx = (killer1_seed as usize) % quiet_moves.len();
+                        quiet_moves[idx]
+                    }
+                    _ => {
+                        // Non-quiet in killer1 slot — defensive path exercise.
+                        if capture_moves.is_empty() {
+                            Move::default()
+                        } else {
+                            capture_moves[(killer1_seed as usize) % capture_moves.len()]
+                        }
+                    }
+                };
+
+                // Build a randomised history table.
+                let mut ht = HistoryTable::new();
+                {
+                    let stm = pos.side_to_move();
+                    let mut rng = history_seed;
+                    for &mv in &quiet_moves {
+                        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let score = ((rng >> 48) as i32 % (MAX_HISTORY as i32 * 2 + 1)) - MAX_HISTORY as i32;
+                        ht.update(stm, mv.from_square(), mv.to_square(), score);
+                    }
+                }
+
+                // --- Reference: order_moves on a cloned Vec ---
+                let mut reference_vec = all_moves.clone();
+                order_moves(
+                    &mut reference_vec,
+                    &pos,
+                    killer0,
+                    killer1,
+                    &ht,
+                    tt_move_bits,
+                );
+
+                // --- Stager: yield_sequence on the same inputs ---
+                let stager = MoveStager::new(
+                    &pos,
+                    killer0,
+                    killer1,
+                    &ht,
+                    tt_move_bits,
+                    None, // no searchmoves filter (not root)
+                );
+                let stager_seq = stager.yield_sequence();
+
+                // --- Assert byte-equivalent sequences ---
+                let stager_bits: Vec<u16> = stager_seq.iter().map(|m| m.bits()).collect();
+                let ref_bits: Vec<u16> = reference_vec.iter().map(|m| m.bits()).collect();
+                proptest::prop_assert!(
+                    stager_bits == ref_bits,
+                    "{}",
+                    format!(
+                        "MoveStager::yield_sequence must be byte-equivalent to order_moves \
+                         output (bench-parity gate). \
+                         tt_move_bits={tt_move_bits}, \
+                         killer0.bits()={}, killer1.bits()={}, \
+                         position has {} legal moves;\n\
+                         stager:    {:?}\n\
+                         reference: {:?}",
+                        killer0.bits(), killer1.bits(), all_moves.len(),
+                        stager_bits, ref_bits,
+                    )
+                );
+            }
+        }
     }
 }
