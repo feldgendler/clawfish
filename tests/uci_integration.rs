@@ -1044,13 +1044,15 @@ fn bench_signature_deterministic_across_two_runs_with_lmr() {
     // tests determinism only; the M5.D depth-4 value pin lives in E51 below.
 }
 
-/// E51 — bench signature determinism with M5.F qsearch-in-TT.
+/// E51 — bench signature determinism with M5.H2 lazy-sort stager.
 ///
 /// Same shape as E50 (M5.C). Two consecutive `bench 4` invocations must
-/// produce identical node counts. The depth-4 value pin moved from M5.D's
-/// `120_856` to M5.F's `89_080` (−26.3%) when qsearch TT probe+store landed.
-/// E50 stays determinism-only per the M5.B → M5.C → M5.D precedent of
-/// dropping the prior pin's value when the new pin lands.
+/// produce identical node counts. The depth-4 value pin progression:
+/// M5.D's `120_856` → M5.F's `89_080` (-26.3% on qsearch TT probe+store) →
+/// M5.H2's `85_534` (-4.0% on lazy-after-search history-timing — research
+/// §15.6 — the literature signal). E50 stays determinism-only per the
+/// M5.B → M5.C → M5.D precedent of dropping the prior pin's value when
+/// the new pin lands.
 #[test]
 fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
     let mut child = spawn_engine();
@@ -1116,13 +1118,15 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
         "E51: bench node counts must match across two runs in the same session \
          with qsearch-in-TT active; got {nodes1} vs {nodes2}"
     );
-    // M5.F depth-4 bench-signature pin. Recorded from the production binary
-    // after M5.F qsearch TT probe+store landed. M5.D pin was 120_856;
-    // M5.F reduces depth-4 nodes by ~26% due to qsearch TT cutoffs.
-    const M5F_DEPTH4_BENCH_NODES: u64 = 89_080;
+    // M5.H2 depth-4 bench-signature pin. Recorded from the production binary
+    // after M5.H2 lazy per-stage sorting landed. M5.F pin was 89_080; the
+    // M5.H2 lazy quiet sort reads fresh history scores at sort time
+    // (research §15.6), changing quiet ordering and the search tree —
+    // bench drift is the literature signal, not a regression.
+    const M5H2_DEPTH4_BENCH_NODES: u64 = 85_534;
     assert_eq!(
-        nodes1, M5F_DEPTH4_BENCH_NODES,
-        "E51: bench node count changed from M5.F pin ({M5F_DEPTH4_BENCH_NODES} at depth=4); \
+        nodes1, M5H2_DEPTH4_BENCH_NODES,
+        "E51: bench node count changed from M5.H2 pin ({M5H2_DEPTH4_BENCH_NODES} at depth=4); \
          re-pin if intentional; got {nodes1}"
     );
 }

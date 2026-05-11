@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc ab45f3f3bf5962ed9122c0748cd9520c013874cb90ccd4ffd970f7c2df06ecec # shrinks to seed = 0
+cc 645325c1b87603db133b66e9f7a2b1964840d2bfb285855c51d85fd520f12de0 # shrinks to pos = 8 . . . . . . . k 7 . . . . . . . . 6 . r . . . . . . 5 . . . K . . . . 4 . . . P p . . . 3 . . . . . . . . 2 . . . . . . . . 1 . . . . . . . .   a b c d e f g h White to move, halfmove=13, fullmove=8, castling=-, ep=- , tt_kind = 1, tt_seed = 4457601342901707068, killer0_kind = 0, killer0_seed = 0, killer1_kind = 1, killer1_seed = 4347776221963245828, history_seed = 0
+cc 7648753d5ec866c7b43c3f67240f8e131976f222321d1bf3d3004bbda28ff471 # shrinks to pos = 8 . . . . . . . . 7 . P . . . . . r 6 . . . . . . . . 5 K . p p . . . . 4 . . . . . P P k 3 . . . . . . . . 2 . . . . . . . R 1 . . . . . . . .   a b c d e f g h Black to move, halfmove=1, fullmove=8, castling=-, ep=- , tt_kind = 1, tt_seed = 1830328660027364142, killer0_kind = 0, killer0_seed = 0, killer1_kind = 1, killer1_seed = 0, history_seed = 0

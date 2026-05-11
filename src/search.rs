@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::history::{HistoryTable, MAX_HISTORY};
+use crate::history::HistoryTable;
+#[cfg(test)]
+use crate::history::MAX_HISTORY;
 use crate::tt::{TranspositionTable, TtBound, TtData, score_from_tt, score_to_tt};
 use crate::{Color, Move, MoveList, PieceKind, Position};
 
@@ -518,6 +520,24 @@ const _: () = assert!(FFP_MAX_DEPTH < LMR_MIN_DEPTH);
 /// shallow to justify the verification-search cost, and the literature
 /// majority sets the threshold here. ADR-0029 §1.
 pub(crate) const SE_MIN_DEPTH: u32 = 6;
+
+/// M5.H2 v4 — minimum remaining depth at which the lazy (post-captures-search)
+/// quiet sort fires. Below this, the history table is too sparse and noisy
+/// for post-search updates to be signal vs noise, so the stager sorts quiets
+/// eagerly at construction (pre-captures-search snapshot — matches M5.H1 v2
+/// thin-wrapper / M5.G behavior).
+///
+/// **Empirical motivation**: H2 v1-v2 (always-lazy) showed a bimodal SPRT
+/// pattern: −95 Elo at 20+0.2 (engine reaches depth ~10), +65 Elo at 40+0.4
+/// (engine reaches depth ~14-18). The 40+0.4 signal IS the literature
+/// "fresh history" benefit; the 20+0.2 regression is the cost of reading
+/// noisy post-search history at shallow depth. Depth-gating at 6 (mirroring
+/// SE_MIN_DEPTH) restricts lazy mode to nodes where the freshness benefit
+/// is documented and avoids the shallow-depth noise penalty.
+///
+/// Tunable via SPRT campaign if the threshold doesn't capture the right
+/// signal — try 8 if 6 still regresses, try 4 if 6 leaves Elo on the table.
+pub(crate) const LAZY_QUIET_SORT_MIN_DEPTH: u32 = 6;
 
 /// M5.G singular-extension margin per ply. `singular_beta = tt_score - depth *
 /// SE_MARGIN_PER_DEPTH`. Xiphos / Ethereal defaults; conservative starting
@@ -1112,6 +1132,18 @@ pub(crate) struct AlphaBetaMover {
     /// `depth - 1`. Reset to `None` at each `negamax_for_test` invocation.
     #[cfg(test)]
     se_tt_move_search_depth: Option<u32>,
+    /// M5.H2: captures-sort firings observed at the traced negamax frame
+    /// (`lmr_trace_root_ply`).  Captured from `stager.captures_sorts_for_test()`
+    /// post-move-loop inside negamax by the H2 impl pass.  Under H1-v2 always 0
+    /// (the stager stub initialises the field at construction but never
+    /// increments it; the impl pass will add the post-loop record).  Used by
+    /// H2-I integration tests.
+    #[cfg(test)]
+    last_stager_captures_sorts: u32,
+    /// M5.H2: quiet-sort firings observed at the traced negamax frame.
+    /// Same discipline as `last_stager_captures_sorts`.
+    #[cfg(test)]
+    last_stager_quiets_sorts: u32,
 }
 
 impl AlphaBetaMover {
@@ -1158,6 +1190,10 @@ impl AlphaBetaMover {
             se_extensions: 0,
             #[cfg(test)]
             se_tt_move_search_depth: None,
+            #[cfg(test)]
+            last_stager_captures_sorts: 0,
+            #[cfg(test)]
+            last_stager_quiets_sorts: 0,
         }
     }
 }
@@ -1195,6 +1231,8 @@ impl Search for AlphaBetaMover {
             self.qsearch_tt_probes = 0;
             self.qsearch_tt_stores = 0;
             self.se_extensions = 0;
+            self.last_stager_captures_sorts = 0;
+            self.last_stager_quiets_sorts = 0;
         }
         // M4.A: install the TT and advance its generation once per `go` (ADR-0018 §9).
         self.tt = ctx.tt.clone();
@@ -1692,9 +1730,10 @@ impl AlphaBetaMover {
             pos,
             killer0,
             killer1,
-            &self.history_table,
             tt_move,
             searchmoves_filter,
+            depth,
+            &self.history_table,
         );
 
         // 11. Terminal: no legal moves (post-filter).
@@ -1821,7 +1860,7 @@ impl AlphaBetaMover {
 
         let mut quiet_index: u32 = 0;
         let mut i: usize = 0;
-        while let Some(mv) = stager.next() {
+        while let Some(mv) = stager.next(pos, &self.history_table) {
             let cur_i = i;
             i += 1;
             // M5.G: skip the excluded move at the verification frame. This skip
@@ -2057,6 +2096,13 @@ impl AlphaBetaMover {
             }
         }
 
+        // M5.H2: record lazy-sort firings for H2-I integration tests.
+        #[cfg(test)]
+        if self.lmr_trace_root_ply == Some(ply) {
+            self.last_stager_captures_sorts = stager.captures_sorts_for_test();
+            self.last_stager_quiets_sorts = stager.quiets_sorts_for_test();
+        }
+
         // 14. Store on completion. Skip on abort (partial bounds are not real)
         //     and never mid-loop (the abort path returns above without storing).
         //     Together this guarantees aborted iterations never overwrite a
@@ -2141,6 +2187,9 @@ impl AlphaBetaMover {
         // M5.G: reset SE extensions counter and depth-recording field.
         self.se_extensions = 0;
         self.se_tt_move_search_depth = None;
+        // M5.H2: reset stager sort-firings counters.
+        self.last_stager_captures_sorts = 0;
+        self.last_stager_quiets_sorts = 0;
         self.lmr_trace_root_ply = Some(ply);
         let score = self.negamax(
             pos,
@@ -2238,6 +2287,21 @@ impl AlphaBetaMover {
     #[cfg(test)]
     pub(super) fn se_tt_move_search_depth_for_test(&self) -> Option<u32> {
         self.se_tt_move_search_depth
+    }
+
+    /// M5.H2 test-only accessor: captures-sort firings observed at the traced
+    /// negamax frame post-move-loop.  Under H1-v2 always 0 (the H2 impl pass
+    /// will wire up the post-loop record inside `negamax`).  Used by H2-I tests.
+    #[cfg(test)]
+    pub(super) fn last_stager_captures_sorts_for_test(&self) -> u32 {
+        self.last_stager_captures_sorts
+    }
+
+    /// M5.H2 test-only accessor: quiet-sort firings observed at the traced
+    /// negamax frame.  Same discipline as `last_stager_captures_sorts_for_test`.
+    #[cfg(test)]
+    pub(super) fn last_stager_quiets_sorts_for_test(&self) -> u32 {
+        self.last_stager_quiets_sorts
     }
 
     /// Test-only setter to install a TT directly without going through
@@ -2739,7 +2803,8 @@ impl AlphaBetaMover {
 /// history-rated quiet, regardless of how high the captures' raw MVV-LVA
 /// values run. Pinned by `score_tier_invariants_compile` (compile-time
 /// const-assert at the bottom of this section).
-// Used by order_moves (test-only post-M5.H1) and the compile-time invariant.
+// Used by order_moves (test-only post-M5.H2) and the compile-time invariant.
+#[cfg(test)]
 #[allow(dead_code)]
 const CAPTURE_OFFSET: i32 = 1_000_000;
 
@@ -2753,7 +2818,8 @@ const CAPTURE_OFFSET: i32 = 1_000_000;
 /// `MAX_HISTORY` and shifting captures above the killer band via
 /// `CAPTURE_OFFSET`. The relative ordering invariants are unchanged from
 /// M4.B; only the absolute-score scale shifted.
-// Used by order_moves (test-only post-M5.H1) and the compile-time invariant.
+// Used by order_moves (test-only post-M5.H2) and the compile-time invariant.
+#[cfg(test)]
 #[allow(dead_code)]
 const KILLER0_SCORE: i32 = 100_001;
 
@@ -2761,20 +2827,21 @@ const KILLER0_SCORE: i32 = 100_001;
 /// Must satisfy `KILLER1_SCORE < KILLER0_SCORE` and
 /// `KILLER1_SCORE > MAX_HISTORY` (so killers always rank above the best
 /// history-rated quiet).
-// Used by order_moves (test-only post-M5.H1) and the compile-time invariant.
+// Used by order_moves (test-only post-M5.H2) and the compile-time invariant.
+#[cfg(test)]
 #[allow(dead_code)]
 const KILLER1_SCORE: i32 = 100_000;
 
-/// Compile-time check that the score tiers are strictly ordered:
+/// Compile-time check that the score tiers are strictly ordered.
 ///
 /// ```text
 /// CAPTURE_OFFSET > KILLER0_SCORE > KILLER1_SCORE > MAX_HISTORY > -MAX_HISTORY
 /// ```
 ///
-/// This fixes the relative discipline between the four tunables in one
-/// place. If any of them is changed in a way that violates the ordering,
-/// the crate fails to compile rather than silently producing wrong
-/// move-ordering decisions at runtime.
+/// At M5.H2, the hierarchy is enforced structurally by stage separation
+/// (captures before killers before quiets) rather than by score numerics.
+/// The const-asserts remain as documentation.
+#[cfg(test)]
 const _SCORE_TIER_INVARIANTS: () = {
     assert!(CAPTURE_OFFSET > KILLER0_SCORE);
     assert!(KILLER0_SCORE > KILLER1_SCORE);
@@ -2851,8 +2918,11 @@ fn update_history_on_quiet_cutoff(
 /// (smallest-capture-above-killer0) and HS12 (capture above killer above
 /// history-quiet at MAX_HISTORY) re-pin the discipline against drift.
 ///
-/// Called by `MoveStager::new` (production), `order_moves` (test-only
-/// post-M5.H1), and `ordered_moves_for_test`.
+/// Test-only at M5.H2: the H2 stager sorts captures by `mvv_lva_score` and
+/// quiets by `history.score(...)` per stage rather than via the unified
+/// comparator. Retained as the H1-P1 equivalence-baseline and for S20-S26
+/// / HS9/HS12 test fixtures.
+#[cfg(test)]
 fn negamax_move_order_score(
     mv: Move,
     pos: &Position,
@@ -3236,123 +3306,372 @@ pub fn is_fifty_move_draw(halfmove_clock: u8) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// M5.H1 — MoveStager: iterator over the negamax move sequence.
+// M5.H2 — MoveStager: stage-aware iterator over the negamax move sequence
+// with lazy per-stage sorting.
 //
-// H1 v2 implementation: thin wrapper around a single eager-sorted Vec, matching
-// M5.G's `order_moves` per-node cost exactly. The earlier H1 v1 design used a
-// stage-state machine with per-stage Vecs (captures, quiets), which was
-// bench-equivalent at depth 7 but introduced ~3× per-node allocation pressure
-// and a second `sort_by_cached_key` call. That cost surfaced under sustained
-// game-load as a ~3.5% NPS regression at deep search and ~50 Elo regression
-// in the defensive SPRT confirmation match — both invisible to the bench
-// snapshot. The thin-wrapper restores per-node cost parity with M5.G while
-// preserving the API surface (`new` / `next` / `peek` / `len` / `is_empty` /
-// `yield_sequence`) that the M5.G SE block, the position-counter pattern, and
-// future M5.H2 lazy generation will consume.
+// H2 resurrects the H1-v1 stage-state machine with two surviving Vecs
+// (captures + quiets) and adds lazy per-stage sort flags so a beta cutoff at
+// an earlier stage skips the later sort entirely. The history-score timing
+// benefit (quiet sort fires after captures/killers have been searched, reading
+// fresh history scores at sort time) is the literature Elo signal (research
+// §15.6).
 //
-// M5.H2's contract is then: keep the same public API, swap the internal Vec
-// for per-stage lazy generation. The five logical stages (TT → captures →
-// killer 0 → killer 1 → quiets) are still produced by `negamax_move_order_score`
-// — they are encoded in the comparator's score tiers, not in a separate enum.
-// Plan: docs/plans/m5.h1.md §3.  ADR-0030.
+// H1-v2 thin-wrapper history: v2 collapsed the stage machine to a single
+// `Vec<Move>` sorted by `negamax_move_order_score`; it matched M5.G per-node
+// cost exactly but could not skip the quiet sort on early cutoffs. H2 restores
+// the stage machine with lazy sorts. ADR-0030 §11.
 // ---------------------------------------------------------------------------
 
-/// M5.H1 — iterator over the negamax move sequence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stage {
+    Tt,
+    Captures,
+    Killer0,
+    Killer1,
+    Quiets,
+    Done,
+}
+
+/// M5.H2 — stage-aware iterator over the negamax move sequence with lazy
+/// per-stage sorting.
 ///
-/// Yields the same byte-equivalent move sequence as today's `order_moves` +
-/// `for mv in moves_vec.iter()` pattern. Internally backed by a single
-/// `Vec<Move>` sorted by `negamax_move_order_score` with TT promotion to
-/// index 0 — identical algorithm and per-node cost to M5.G.
+/// **Yield order** (unchanged from H1):
+///   1. TT move (if `tt_move != 0` and bits found in legal list).
+///   2. Captures (and queen promos) sorted MVV-LVA descending — **sorted lazily
+///      on first `Stage::Captures` entry**.
+///   3. Killer slot 0 (post-validation: present in legal-quiets, distinct from TT).
+///   4. Killer slot 1 (post-validation: present, distinct from TT and killer 0).
+///   5. Remaining quiets sorted by history score descending — **sorted lazily
+///      on first `Stage::Quiets` entry**, reading fresh history scores at
+///      sort time (research §15.6 — the literature Elo signal).
 ///
-/// **H1 generation discipline.** All moves are generated by a single
-/// `generate_moves` call at construction. M5.H2 will switch to lazy
-/// per-stage generation; the public API stays the same.
+/// **Generation discipline.** All moves are generated by a single
+/// `generate_moves` call at construction (eager generation). **Sorts** are
+/// lazy: `mvv_lva_sort_in_place` and `history_sort_in_place` fire only when
+/// the consumer's `next()` first transitions into the respective stage.
 ///
-/// `total_len` is the pre-iteration count computed at construction and is NOT
-/// decremented by `next()` (see §3.1 of the plan). Do NOT call `is_empty()`
-/// mid-iteration; the negamax caller honours this by checking once at step 11.
+/// **Borrow discipline.** `MoveStager` carries no `&HistoryTable` borrow.
+/// The `&HistoryTable` reference is passed to `next()` as a per-call
+/// argument; the lazy quiet sort uses it only for the duration of the
+/// `history_sort_in_place` call. The borrow is released when `next()`
+/// returns, leaving `&mut self.search_child(...)` recursion and
+/// `update_history_on_quiet_cutoff(&mut self.history_table, ...)` (in-loop
+/// on cutoff) sound by construction. ADR-0030 §11.3.
 pub(crate) struct MoveStager {
-    /// Pre-ordered move sequence (single sort by `negamax_move_order_score`
-    /// + TT promotion to index 0). Iterated by index.
+    // No `pos: Position` field — the &Position reference is passed to next()
+    // as a per-call argument. The move loop's `pos: &Position` parameter
+    // outlives every `next()` call. See ADR-0030 §11.3 for the borrow
+    // discipline.
+
+    // No `history: &HistoryTable` field — same per-call rationale.
+
+    // M5.H2 v3 — SINGLE-VEC IN-PLACE design (allocation-parity with v2 thin-wrapper).
+    //
+    // v2 thin-wrapper: 1 Vec, 1 sort, eager. Allocation pattern matches M5.G.
+    // v3 (THIS): 1 Vec, partitioned in-place (captures-prefix + quiets-suffix),
+    // lazy sub-slice sort. Allocation pattern matches v2.
+    //
+    // The prior H2 v1-v2 design (per-stage Vecs) made 3 allocations per node
+    // (`all` collect + `captures` + `quiets`), causing TC-fragile regressions
+    // (especially at 20+0.2: -95 Elo per the 277-game SPRT) — see ADR-0030 §11.
+    // v3 collapses to a single Vec and partitions in-place; TT and killers are
+    // tracked as Option<Move> for stage-yielding AND their bit-patterns are
+    // remembered for skip-during-iteration so we don't have to physically
+    // remove them from the buffer (no shift/swap cost).
+    //
+    /// Single backing storage for all moves. Layout after construction:
+    ///   - moves[0..caps_count] = captures (movegen-emit order; unsorted)
+    ///   - moves[caps_count..total] = quiets (movegen-emit order; unsorted)
+    /// TT, k0, k1 are NOT removed from `moves` (cheaper than Vec::remove +
+    /// shift); instead they're skipped during stage iteration via Move-eq.
+    /// Lazy MVV-LVA sort fires on first Stage::Captures entry over the
+    /// captures sub-slice. Lazy history sort fires on first Stage::Quiets
+    /// entry over the quiets sub-slice.
     moves: Vec<Move>,
-    /// Index of the next move `next()` will yield.
-    idx: usize,
-    /// Pre-iteration total. `len()` returns this regardless of how far
-    /// `next()` has advanced (temporal-contract pin: H1-S17).
+    /// Partition boundary: captures occupy `[0..caps_count)` in `moves`.
+    caps_count: usize,
+
+    /// TT move, if found in the (filtered) legal list at construction.
+    /// Yielded first at Stage::Tt. Skipped during captures/quiets iteration
+    /// (whichever stage matches its kind) via Move-eq.
+    tt: Option<Move>,
+    /// Killer slot 0 — found in quiets at construction. `None` iff slot was
+    /// 0/invalid/not-in-quiets/duplicate of TT. Yielded at Stage::Killer0.
+    /// Skipped during quiets iteration via Move-eq.
+    k0: Option<Move>,
+    /// Killer slot 1 — same as k0 with additional dedup against k0.
+    k1: Option<Move>,
+
+    /// Stage state machine cursor.
+    stage: Stage,
+    /// Lazy-sort flags. Set on first transition into the corresponding stage;
+    /// ensure the per-stage sort runs at most once per stager.
+    captures_sorted: bool,
+    quiets_sorted: bool,
+
+    /// Index of the next move to consider from `moves[0..caps_count]`.
+    cap_idx: usize,
+    /// Index of the next move to consider from `moves[caps_count..]`.
+    quiet_idx: usize,
+
+    /// Pre-iteration total. Set at construction; never decremented by `next()`.
     total_len: usize,
+
+    /// Test-only counters for the H2 lazy-sort instrumentation. Incremented
+    /// by `next()` on the lazy-sort firing edge.
+    #[cfg(test)]
+    captures_sorts: u32,
+    #[cfg(test)]
+    quiets_sorts: u32,
 }
 
 impl MoveStager {
-    /// Eagerly generate, optionally apply searchmoves filter, sort by
-    /// `negamax_move_order_score`, and promote TT to index 0.
+    /// Eagerly generate, optionally apply searchmoves filter, partition into
+    /// captures + quiets, and extract TT + killer slots. **Captures and quiets
+    /// are NOT sorted at construction** — sorts are lazy per stage in `next()`.
     ///
-    /// `tt_move == 0` → no TT promotion. `killer{0,1}.bits() == 0` (the
-    /// `Move::default()` sentinel) → that slot is unset (the comparator's
-    /// `mv == killer{0,1}` test never matches). `searchmoves_filter == None`
-    /// → no filter (typical at ply > 0).
+    /// `tt_move == 0` → no TT stage. `killer{0,1}.bits() == 0` (sentinel) →
+    /// that slot is unset. `searchmoves_filter == None` → no filter (typical
+    /// at ply > 0).
+    ///
+    /// **M5.H2 v4 — depth-gated lazy quiet sort.** The `depth` argument is the
+    /// remaining search depth at this node. When `depth >= LAZY_QUIET_SORT_MIN_DEPTH`
+    /// (default 6), the quiet sort is deferred to first Stage::Quiets entry
+    /// (lazy — reads fresh history at sort time, the literature signal). When
+    /// `depth < LAZY_QUIET_SORT_MIN_DEPTH`, the quiet sort fires eagerly at
+    /// construction using the `history` reference (matches M5.H1 v2 thin-wrapper
+    /// / M5.G behavior). Rationale: at shallow depth, history is too sparse for
+    /// post-captures-search updates to be signal vs noise, so eager (pre-search)
+    /// sort outperforms lazy. SPRT-tuned threshold. ADR-0030 §11 / §12.
     pub(crate) fn new(
         pos: &Position,
         killer0: Move,
         killer1: Move,
-        history: &HistoryTable,
         tt_move: u16,
         searchmoves_filter: Option<&[Move]>,
+        depth: u32,
+        history: &HistoryTable,
     ) -> Self {
         use crate::movegen::generate_moves;
-        // Eager full generation.
+
+        // Step A. Eager full generation. Stack-allocated MoveList (no heap).
         let mut ml = MoveList::new();
         generate_moves(pos, &mut ml);
-        let mut moves: Vec<Move> = ml.iter().collect();
 
-        // Searchmoves filter (root-only; None at non-root). Mirrors today's
-        // `moves_vec.retain(|m| filter.contains(m))` BEFORE order_moves.
+        // Step B. Collect into a SINGLE Vec<Move> with capacity matching the
+        // legal-move ceiling (256). This is the only Vec allocation made by
+        // the stager — allocation-parity with M5.G / H1-v2. Then apply
+        // searchmoves filter (root-only; None at non-root) via in-place
+        // retain to avoid a second allocation.
+        let mut moves: Vec<Move> = Vec::with_capacity(ml.len());
+        moves.extend(ml.iter());
         if let Some(filter) = searchmoves_filter {
             moves.retain(|m| filter.contains(m));
         }
 
-        // Single sort by the M5.G score-tier comparator: captures (with
-        // CAPTURE_OFFSET) > killer0 (KILLER0_SCORE) > killer1 (KILLER1_SCORE)
-        // > history-quiets. Stable; movegen-emit order preserved within ties.
-        moves.sort_by_cached_key(|&m| {
-            -negamax_move_order_score(m, pos, killer0, killer1, history)
-        });
+        // Step C. Find TT move (membership lookup by bits). DO NOT remove —
+        // keep in `moves` and skip during stage iteration via Move-eq.
+        // `tt_move == 0` short-circuits (no scan).
+        let tt: Option<Move> = if tt_move == 0 {
+            None
+        } else {
+            moves.iter().copied().find(|m| m.bits() == tt_move)
+        };
 
-        // TT promotion (mirrors M5.G's `order_moves` post-sort step).
-        // `tt_move == 0` (Move::default sentinel) short-circuits without
-        // scanning. `Vec::remove(idx)` + `insert(0, mv)` is order-preserving
-        // for all non-moved elements.
-        if tt_move != 0
-            && let Some(idx) = moves.iter().position(|m| m.bits() == tt_move)
-            && idx != 0
-        {
-            let mv = moves.remove(idx);
-            moves.insert(0, mv);
-        }
+        // Step D. In-place captures-vs-quiets partition. Stable variant: walk
+        // the slice and bubble captures (is_quiet == false) to the front,
+        // preserving relative order within each partition. Equivalent to
+        // `partition_captures_quiets` (which allocated two Vecs) but does it
+        // in-place on the single `moves` buffer.
+        let caps_count = partition_captures_quiets_in_place(&mut moves);
 
+        // Step E. Find killer slots inside the quiets sub-slice. Same skip-
+        // not-remove approach. `bits() != 0` guards against the Move::default
+        // sentinel; `killer1 != killer0` dedups slot 1 against slot 0; and
+        // an additional dedup against TT prevents double-yield when TT and
+        // killer happen to be the same move (TT yielded at Stage::Tt; the
+        // killer slot is then None so it isn't re-yielded at Stage::Killer0).
+        let quiets_slice = &moves[caps_count..];
+        let tt_eq_killer0 = tt.is_some() && tt == Some(killer0);
+        let k0: Option<Move> = if killer0.bits() != 0 && !tt_eq_killer0 {
+            quiets_slice.iter().copied().find(|&m| m == killer0)
+        } else {
+            None
+        };
+        let tt_eq_killer1 = tt.is_some() && tt == Some(killer1);
+        let k1: Option<Move> = if killer1.bits() != 0 && killer1 != killer0 && !tt_eq_killer1 {
+            quiets_slice.iter().copied().find(|&m| m == killer1)
+        } else {
+            None
+        };
+
+        // Step F. Compute total length. The full yield sequence is:
+        //   TT (if Some) + remaining captures (caps_count − (1 if TT was a capture else 0))
+        //   + k0 (if Some) + k1 (if Some) + remaining quiets (quiets.len() − (1 if TT was quiet) − k0/k1 counts).
+        //
+        // Net: total moves in the legal list, minus 1 if TT exists and is in
+        // the list (it'll be yielded once at Stage::Tt and skipped in its
+        // category stage), plus 0 for killers (they're in the quiets slice
+        // and will be yielded at killer stages, skipped during quiet stage —
+        // so no net contribution beyond the legal list count). Simpler form:
+        // total_len = moves.len(), because every move is yielded exactly once
+        // (either in its category stage or, for TT/k0/k1, at their dedicated
+        // stage instead of the category — net same count).
         let total_len = moves.len();
+
+        // Step G. Depth-gated lazy quiet sort. At `depth < LAZY_QUIET_SORT_MIN_DEPTH`,
+        // sort quiets eagerly at construction (matches M5.H1 v2 thin-wrapper /
+        // M5.G behavior; pre-captures-search history snapshot). At deeper nodes,
+        // defer to first Stage::Quiets entry (lazy — post-captures-search
+        // history snapshot, the literature signal).
+        //
+        // Captures sort stays lazy regardless of depth: MVV-LVA scoring doesn't
+        // depend on history, so deferring captures sort only saves work at
+        // TT-cutoff nodes. No correctness implication.
+        let eager_quiets_at_shallow = depth < LAZY_QUIET_SORT_MIN_DEPTH;
+        let did_eager_quiet_sort = eager_quiets_at_shallow && caps_count < moves.len();
+        if did_eager_quiet_sort {
+            history_sort_in_place(&mut moves[caps_count..], pos, history);
+        }
+        #[cfg(test)]
+        let initial_quiets_sorts: u32 = did_eager_quiet_sort as u32;
         Self {
             moves,
-            idx: 0,
+            caps_count,
+            tt,
+            k0,
+            k1,
+            stage: Stage::Tt,
+            captures_sorted: false,
+            quiets_sorted: eager_quiets_at_shallow,
+            cap_idx: 0,
+            quiet_idx: 0,
             total_len,
+            #[cfg(test)]
+            captures_sorts: 0,
+            #[cfg(test)]
+            quiets_sorts: initial_quiets_sorts,
         }
     }
 
-    /// Advance one move. Returns `None` once the sequence is exhausted.
-    #[inline]
-    pub(crate) fn next(&mut self) -> Option<Move> {
-        let mv = self.moves.get(self.idx).copied()?;
-        self.idx += 1;
-        Some(mv)
+    /// Advance one move. Returns `None` once `Stage::Done` is reached.
+    ///
+    /// On first transition into `Stage::Captures` or `Stage::Quiets`, triggers
+    /// the corresponding lazy sort exactly once. The `pos` and `history`
+    /// references are borrowed only for the duration of this call — after
+    /// `next()` returns, no borrow is held by the stager. This makes in-loop
+    /// `&mut self.search_child(...)` recursion and `update_history_on_quiet_cutoff`
+    /// calls (on the cutoff arm) sound by construction. ADR-0030 §11.3.
+    pub(crate) fn next(&mut self, pos: &Position, history: &HistoryTable) -> Option<Move> {
+        loop {
+            match self.stage {
+                Stage::Tt => {
+                    self.stage = Stage::Captures;
+                    if let Some(mv) = self.tt {
+                        return Some(mv);
+                    }
+                    // Fall through to Captures.
+                }
+                Stage::Captures => {
+                    // Lazy MVV-LVA sort of the captures sub-slice (in-place
+                    // over `moves[0..caps_count]`). Gated to skip the no-op
+                    // sort on an empty sub-slice — counter stays at 0.
+                    // `pos` borrow held only across this sort call.
+                    if !self.captures_sorted && self.caps_count > 0 {
+                        mvv_lva_sort_in_place(&mut self.moves[..self.caps_count], pos);
+                        self.captures_sorted = true;
+                        #[cfg(test)]
+                        {
+                            self.captures_sorts += 1;
+                        }
+                    }
+                    // Yield captures one by one, skipping the TT move (if it
+                    // was a capture and already yielded at Stage::Tt).
+                    while self.cap_idx < self.caps_count {
+                        let mv = self.moves[self.cap_idx];
+                        self.cap_idx += 1;
+                        if Some(mv) == self.tt {
+                            continue;
+                        }
+                        return Some(mv);
+                    }
+                    self.stage = Stage::Killer0;
+                    // Fall through.
+                }
+                Stage::Killer0 => {
+                    self.stage = Stage::Killer1;
+                    if let Some(mv) = self.k0 {
+                        return Some(mv);
+                    }
+                }
+                Stage::Killer1 => {
+                    self.stage = Stage::Quiets;
+                    if let Some(mv) = self.k1 {
+                        return Some(mv);
+                    }
+                }
+                Stage::Quiets => {
+                    // Lazy history sort of the quiets sub-slice (in-place
+                    // over `moves[caps_count..]`). Gated to skip the no-op
+                    // sort on an empty sub-slice. The lazy quiet sort reads
+                    // fresh history scores at this moment — captures and
+                    // killers may have updated history during their recursive
+                    // searches. Research §15.6 — the literature Elo signal.
+                    // `pos` and `history` borrows held only across this call.
+                    if !self.quiets_sorted && self.caps_count < self.moves.len() {
+                        history_sort_in_place(&mut self.moves[self.caps_count..], pos, history);
+                        self.quiets_sorted = true;
+                        #[cfg(test)]
+                        {
+                            self.quiets_sorts += 1;
+                        }
+                    }
+                    // Yield quiets one by one, skipping TT (if quiet), k0, k1.
+                    while self.caps_count + self.quiet_idx < self.moves.len() {
+                        let mv = self.moves[self.caps_count + self.quiet_idx];
+                        self.quiet_idx += 1;
+                        if Some(mv) == self.tt {
+                            continue;
+                        }
+                        if Some(mv) == self.k0 {
+                            continue;
+                        }
+                        if Some(mv) == self.k1 {
+                            continue;
+                        }
+                        return Some(mv);
+                    }
+                    self.stage = Stage::Done;
+                }
+                Stage::Done => return None,
+            }
+        }
     }
 
     /// Return what `next()` would yield without advancing.
     ///
-    /// **Idempotency invariant.** `peek()` takes `&self` (not `&mut self`):
-    /// consecutive calls return identical `Option<Move>` values. Load-bearing
-    /// for the M5.G SE block, which calls `peek()` twice.
-    #[inline]
+    /// **Production-call invariant.** All production callers (the M5.G SE block
+    /// at `src/search.rs:1737-1782`) call `peek()` ONLY when `self.stage ==
+    /// Stage::Tt` — i.e., before any `next()` call. At `Stage::Tt`, peek reads
+    /// `self.tt` directly, no lazy sort, no `&mut self`. This is the load-
+    /// bearing invariant for keeping `peek()` `&self`-receiver and idempotent
+    /// for the SE block's double-call. Pinned by H2-S-peek-only-fires-at-tt-stage.
+    ///
+    /// **Non-Tt stages panic** via `unreachable!()` rather than silently
+    /// returning a pre-sort move (which would be a silent-bad-data footgun —
+    /// the head of the unsorted slice is not the MVV-LVA-desc head). Loud
+    /// panic forces an explicit redesign when a future consumer needs non-Tt
+    /// peek. ADR-0030 §11 / plan §4.2.
     pub(crate) fn peek(&self) -> Option<Move> {
-        self.moves.get(self.idx).copied()
+        match self.stage {
+            Stage::Tt => self.tt,
+            Stage::Captures | Stage::Killer0 | Stage::Killer1 | Stage::Quiets | Stage::Done => {
+                unreachable!(
+                    "MoveStager::peek() is valid only at Stage::Tt; \
+                 see ADR-0030 §11 and H2-S-peek-only-fires-at-tt-stage"
+                )
+            }
+        }
     }
 
     /// Pre-iteration total move count. Does NOT decrement as `next()` advances.
@@ -3367,30 +3686,48 @@ impl MoveStager {
         self.total_len == 0
     }
 
-    /// Test-only: materialise the full yield sequence (clone-and-drain).
-    /// Used by the H1-P1 equivalence proptest and the H1-S* yield-order tests.
+    /// Test-only: materialise the full yield sequence by repeatedly calling
+    /// `next(pos, history)`. Forces both lazy sorts (captures + quiets).
+    /// Used by H1-S* yield-order tests (via `yield_sequence` alias) and H2-P1.
     #[cfg(test)]
-    pub(crate) fn yield_sequence(&self) -> Vec<Move> {
-        // From the current `idx` onwards. `plain_stager(&pos)` constructs a
-        // fresh stager with `idx = 0`, so this returns the full ordered list
-        // for tests that consume `MoveStager::new(...).yield_sequence()`.
-        self.moves[self.idx..].to_vec()
+    pub(crate) fn yield_sequence(&mut self, pos: &Position, history: &HistoryTable) -> Vec<Move> {
+        let mut result = Vec::new();
+        while let Some(mv) = self.next(pos, history) {
+            result.push(mv);
+        }
+        result
+    }
+
+    /// Alias for `yield_sequence` — used by H2-P1 and any test that explicitly
+    /// names the H2 variant.
+    #[cfg(test)]
+    pub(crate) fn yield_sequence_for_h2_test(
+        &mut self,
+        pos: &Position,
+        history: &HistoryTable,
+    ) -> Vec<Move> {
+        self.yield_sequence(pos, history)
+    }
+
+    /// Test-only accessor for the lazy-capture-sort firings counter.
+    #[cfg(test)]
+    pub(crate) fn captures_sorts_for_test(&self) -> u32 {
+        self.captures_sorts
+    }
+
+    /// Test-only accessor for the lazy-quiet-sort firings counter.
+    #[cfg(test)]
+    pub(crate) fn quiets_sorts_for_test(&self) -> u32 {
+        self.quiets_sorts
     }
 }
 
 // ---------------------------------------------------------------------------
-// M5.H1 — partition / sort / extract helpers.
+// M5.H2 — partition / sort / extract helpers (production code).
 //
-// Originally introduced in H1 v1 (per-stage stager) and used by
-// `MoveStager::new` to partition into captures/quiets and sort each tier.
-// H1 v2 (this file's current `MoveStager`) collapses the per-stage sorts back
-// into a single `negamax_move_order_score` sort to match M5.G's per-node cost
-// (the v1 design's ~3× allocation pressure caused a sustained-load NPS
-// regression invisible to bench but visible in SPRT — see `MoveStager`'s
-// header comment for context). The helpers below remain `#[cfg(test)]`-only
-// as the H1-H1..H10 mutation-discrimination surface; M5.H2's per-stage lazy
-// generation may resurrect them as production code paths, in which case they
-// can be un-cfg-tested without API change.
+// Introduced in H1 v1 as per-stage stager helpers; kept as #[cfg(test)] in
+// H1 v2 (thin-wrapper); promoted back to production at H2 where `MoveStager`
+// calls them directly. H1-H1..H10 mutation-discrimination tests carry over.
 // ---------------------------------------------------------------------------
 
 /// Remove and return the first move in `v` whose `bits()` equal `target`.
@@ -3408,6 +3745,10 @@ fn extract_move_by_bits(v: &mut Vec<Move>, target: u16) -> Option<Move> {
 
 /// Same as `extract_move_by_bits` but compares against a full `Move`
 /// (flag bits included). Used for killer-slot extraction.
+///
+/// **M5.H2 v3**: `#[cfg(test)]`-only — the production stager no longer
+/// physically removes TT/killers from the buffer (it skips them via
+/// Move-eq during iteration), so this helper is test-only now.
 #[cfg(test)]
 fn extract_move_by_eq(v: &mut Vec<Move>, target: Move) -> Option<Move> {
     let idx = v.iter().position(|&m| m == target)?;
@@ -3418,6 +3759,10 @@ fn extract_move_by_eq(v: &mut Vec<Move>, target: Move) -> Option<Move> {
 /// implementation rather than `Iterator::partition` to make the
 /// order-preservation guarantee explicit. Within each output Vec, original
 /// movegen-emit order is preserved.
+///
+/// **M5.H2 v3 disposition**: now `#[cfg(test)]`-only. The production stager
+/// uses `partition_captures_quiets_in_place` below to avoid the two-Vec
+/// allocation cost that drove the H1-v1 and H2 v1-v2 TC-fragile regressions.
 #[cfg(test)]
 fn partition_captures_quiets(all: Vec<Move>) -> (Vec<Move>, Vec<Move>) {
     let mut captures: Vec<Move> = Vec::with_capacity(all.len());
@@ -3432,17 +3777,70 @@ fn partition_captures_quiets(all: Vec<Move>) -> (Vec<Move>, Vec<Move>) {
     (captures, quiets)
 }
 
+/// In-place stable partition: reorders `moves` so captures occupy a prefix
+/// `[0..caps_count)` and quiets occupy the suffix `[caps_count..moves.len())`.
+/// Within each partition, original movegen-emit order is preserved (stable).
+/// Returns `caps_count`.
+///
+/// **Algorithm**: two-pass approach to maintain stability without extra
+/// storage. Pass 1: count captures. Pass 2: build the partitioned output in
+/// a single Vec scratch swap — actually, we just use the simpler "scan and
+/// rotate" approach which preserves stability by construction.
+///
+/// Concretely: walk left-to-right; maintain `write` index for the next
+/// capture slot. When a capture is found at position `read`, rotate the
+/// sub-range `[write..=read]` right by 1 (moving the capture to `write` and
+/// shifting the intermediate quiets one slot right). This is O(N²) worst
+/// case (all-captures-at-end), but typical position has 5-15 captures out
+/// of ~35 total moves, so the rotation distances are bounded.
+///
+/// For very-large rotations, this could be slower than the v1 two-Vec
+/// allocation approach; but allocation pressure is a per-node cost
+/// regardless of position complexity, while rotation cost scales with the
+/// actual partition imbalance — and the typical chess position is partition-
+/// balanced enough to keep rotations short. SPRT will tell.
+///
+/// **M5.H2 v3** — single-Vec in-place design.
+fn partition_captures_quiets_in_place(moves: &mut Vec<Move>) -> usize {
+    let mut write = 0;
+    let mut read = 0;
+    while read < moves.len() {
+        if !is_quiet(moves[read]) {
+            // Capture at `read`. Rotate it to `write`, shifting any
+            // intermediate quiets right by 1. Stable.
+            moves[write..=read].rotate_right(1);
+            write += 1;
+        }
+        read += 1;
+    }
+    write // caps_count
+}
+
 /// MVV-LVA-desc stable sort. Stable within ties (movegen-order preserved).
-#[cfg(test)]
+///
+/// **M5.H2 v4 — `sort_by` (no per-call allocation)**. Previously used
+/// `sort_by_cached_key`, which allocates a `Vec<(K, usize)>` per call to
+/// cache keys. For small slices (typical capture count ~5-15), the
+/// allocation cost dominates the key-recomputation cost. `sort_by` re-evaluates
+/// the comparator for each comparison but avoids per-call heap allocation —
+/// a net win at chess-engine slice sizes. Stability is preserved (Rust's
+/// `slice::sort_by` is a stable sort).
 fn mvv_lva_sort_in_place(captures: &mut [Move], pos: &Position) {
-    captures.sort_by_cached_key(|&m| -mvv_lva_score(m, pos));
+    captures.sort_by(|&a, &b| mvv_lva_score(b, pos).cmp(&mvv_lva_score(a, pos)));
 }
 
 /// History-score-desc stable sort over a slice of quiet moves.
-#[cfg(test)]
+///
+/// Same `sort_by` (no per-call allocation) rationale as `mvv_lva_sort_in_place`.
+/// `history.score` is O(1) bitboard-index lookup, cheap to re-evaluate per
+/// comparison.
 fn history_sort_in_place(quiets: &mut [Move], pos: &Position, history: &HistoryTable) {
     let stm = pos.side_to_move();
-    quiets.sort_by_cached_key(|&m| -(history.score(stm, m.from_square(), m.to_square()) as i32));
+    quiets.sort_by(|&a, &b| {
+        history
+            .score(stm, b.from_square(), b.to_square())
+            .cmp(&history.score(stm, a.from_square(), a.to_square()))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -17670,14 +18068,7 @@ mod tests {
 
     /// Build a `MoveStager` with all-default (sentinel) killer/TT inputs.
     fn plain_stager(pos: &Position) -> MoveStager {
-        MoveStager::new(
-            pos,
-            Move::default(),
-            Move::default(),
-            &HistoryTable::new(),
-            0,
-            None,
-        )
+        MoveStager::new(pos, Move::default(), Move::default(), 0, None, 100, &HistoryTable::new())
     }
 
     /// Return the legal-move list for `pos` (in generate_moves emit order).
@@ -17695,11 +18086,17 @@ mod tests {
         // "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1" — stalemate (Black has no legal moves).
         let pos =
             Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").expect("stalemate FEN must parse");
+        let history = HistoryTable::new();
         let mut stager = plain_stager(&pos);
         assert_eq!(stager.len(), 0, "H1-S1: stalemate → len == 0");
         assert!(stager.is_empty(), "H1-S1: stalemate → is_empty");
-        assert_eq!(stager.next(), None, "H1-S1: stalemate → next() == None");
+        // peek() at Stage::Tt with tt=None returns None (valid pre-next() call).
         assert_eq!(stager.peek(), None, "H1-S1: stalemate → peek() == None");
+        assert_eq!(
+            stager.next(&pos, &history),
+            None,
+            "H1-S1: stalemate → next() == None"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -17719,14 +18116,14 @@ mod tests {
         // order is neither MVV-LVA-first nor history-first), so a stager that
         // merely returns the first legal move would fail this test.
         let tt_target = all[all.len() / 2];
-        let history = HistoryTable::new();
         let stager = MoveStager::new(
             &pos,
             Move::default(),
             Move::default(),
-            &history,
             tt_target.bits(),
             None,
+            100,
+            &HistoryTable::new(),
         );
         assert_eq!(
             stager.peek().map(|m| m.bits()),
@@ -17743,16 +18140,11 @@ mod tests {
         let pos = Position::starting_position();
         // A bits value that no legal move can have: pick 0xFFFF (garbage).
         let stale_tt_bits: u16 = 0xFFFF;
-        let stager = MoveStager::new(
-            &pos,
-            Move::default(),
-            Move::default(),
-            &HistoryTable::new(),
-            stale_tt_bits,
-            None,
-        );
+        let ht = HistoryTable::new();
+        let mut stager =
+            MoveStager::new(&pos, Move::default(), Move::default(), stale_tt_bits, None, 100, &HistoryTable::new());
         // The stager must still yield the legal moves (no TT stage).
-        let seq = stager.yield_sequence();
+        let seq = stager.yield_sequence(&pos, &ht);
         assert!(
             seq.iter().all(|m| m.bits() != stale_tt_bits),
             "H1-S3: stale TT bits must never appear in the yield sequence"
@@ -17774,15 +18166,9 @@ mod tests {
     fn stager_skips_tt_when_tt_move_zero() {
         let pos = Position::starting_position();
         let legal_count = legal_moves(&pos).len();
-        let stager = MoveStager::new(
-            &pos,
-            Move::default(),
-            Move::default(),
-            &HistoryTable::new(),
-            0, // zero → no TT
-            None,
-        );
-        let seq = stager.yield_sequence();
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, Move::default(), Move::default(), 0, None, 100, &HistoryTable::new());
+        let seq = stager.yield_sequence(&pos, &ht);
         // No move should have bits == 0 (Move::default() is never in legal list).
         assert!(
             seq.iter().all(|m| m.bits() != 0),
@@ -17806,8 +18192,9 @@ mod tests {
         )
         .expect("kiwipete FEN must parse");
 
-        let stager = plain_stager(&pos);
-        let seq = stager.yield_sequence();
+        let ht = HistoryTable::new();
+        let mut stager = plain_stager(&pos);
+        let seq = stager.yield_sequence(&pos, &ht);
 
         // Collect the capture-stage moves.  tt_move == 0 so no TT stage.
         let captures: Vec<Move> = seq.iter().copied().filter(|&m| !is_quiet(m)).collect();
@@ -17848,8 +18235,9 @@ mod tests {
         let pos = Position::from_fen("4k3/8/8/3p4/2P1P3/8/8/4K3 w - - 0 1")
             .expect("tied-capture FEN must parse");
 
-        let stager = plain_stager(&pos);
-        let seq = stager.yield_sequence();
+        let ht = HistoryTable::new();
+        let mut stager = plain_stager(&pos);
+        let seq = stager.yield_sequence(&pos, &ht);
 
         // Collect only the capture moves from the sequence.
         let captures: Vec<Move> = seq.iter().copied().filter(|&m| !is_quiet(m)).collect();
@@ -17909,15 +18297,9 @@ mod tests {
             return;
         };
 
-        let stager = MoveStager::new(
-            &pos,
-            Move::default(),
-            Move::default(),
-            &HistoryTable::new(),
-            cap.bits(),
-            None,
-        );
-        let seq = stager.yield_sequence();
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, Move::default(), Move::default(), cap.bits(), None, 100, &HistoryTable::new());
+        let seq = stager.yield_sequence(&pos, &ht);
 
         // The TT move must appear exactly once.
         let count = seq.iter().filter(|&&m| m.bits() == cap.bits()).count();
@@ -17954,8 +18336,9 @@ mod tests {
         };
         let killer1 = Move::default();
 
-        let stager = MoveStager::new(&pos, k0, killer1, &HistoryTable::new(), 0, None);
-        let seq = stager.yield_sequence();
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, k0, killer1, 0, None, 100, &HistoryTable::new());
+        let seq = stager.yield_sequence(&pos, &ht);
 
         // k0 must appear exactly once.
         let count = seq.iter().filter(|&&m| m == k0).count();
@@ -18005,15 +18388,9 @@ mod tests {
             return;
         };
 
-        let stager = MoveStager::new(
-            &pos,
-            quiet_mv, // killer0 == TT
-            Move::default(),
-            &HistoryTable::new(),
-            quiet_mv.bits(), // tt_move == killer0
-            None,
-        );
-        let seq = stager.yield_sequence();
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, quiet_mv, Move::default(), quiet_mv.bits(), None, 100, &HistoryTable::new());
+        let seq = stager.yield_sequence(&pos, &ht);
 
         // The move must appear exactly once (as the TT yield, not again as k0).
         let count = seq.iter().filter(|&&m| m.bits() == quiet_mv.bits()).count();
@@ -18036,15 +18413,9 @@ mod tests {
         }
         let k = quiets[0];
 
-        let stager = MoveStager::new(
-            &pos,
-            k, // killer0
-            k, // killer1 == killer0
-            &HistoryTable::new(),
-            0,
-            None,
-        );
-        let seq = stager.yield_sequence();
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, k, k, 0, None, 100, &HistoryTable::new());
+        let seq = stager.yield_sequence(&pos, &ht);
 
         // k must appear exactly once.
         let count = seq.iter().filter(|&&m| m == k).count();
@@ -18068,15 +18439,9 @@ mod tests {
         let k0 = quiets[0];
         let tt_quiet = quiets[1]; // this will be TT and also killer1
 
-        let stager = MoveStager::new(
-            &pos,
-            k0,
-            tt_quiet, // killer1 == TT
-            &HistoryTable::new(),
-            tt_quiet.bits(), // tt_move == killer1
-            None,
-        );
-        let seq = stager.yield_sequence();
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, k0, tt_quiet, tt_quiet.bits(), None, 100, &HistoryTable::new());
+        let seq = stager.yield_sequence(&pos, &ht);
 
         // tt_quiet must appear exactly once.
         let count = seq.iter().filter(|&&m| m.bits() == tt_quiet.bits()).count();
@@ -18103,8 +18468,9 @@ mod tests {
         // k0 and k1 are quiets[0] and quiets[1].
         let (k0_q, k1_q, tt_q) = (quiets[0], quiets[1], quiets[2]);
 
-        let stager = MoveStager::new(&pos, k0_q, k1_q, &HistoryTable::new(), tt_q.bits(), None);
-        let seq = stager.yield_sequence();
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, k0_q, k1_q, tt_q.bits(), None, 100, &HistoryTable::new());
+        let seq = stager.yield_sequence(&pos, &ht);
 
         // Each of the three moves appears exactly once in the full sequence.
         for (name, mv) in [("TT", tt_q), ("k0", k0_q), ("k1", k1_q)] {
@@ -18132,23 +18498,40 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // H1-S13 — peek() is idempotent under repeated calls; next() returns same.
-    //           Pins idempotency at TWO stage positions: pre-iteration and
-    //           mid-iteration.  The SE block calls peek() twice per M5.G
-    //           design (once in the gate predicate, once in the verification
-    //           excluded_move argument) so mid-flow stability is load-bearing.
+    // H1-S13 — peek() is idempotent under repeated calls at Stage::Tt;
+    //           next() yields what peek() reported.
+    //
+    //           At M5.H2, peek() is ONLY valid at Stage::Tt (before any
+    //           next() call). The SE block calls peek() twice before the move
+    //           loop (gate predicate + verification argument), so pre-iteration
+    //           idempotency at Stage::Tt is the production-critical invariant.
+    //           Mid-iteration peek() would panic — see H2-S-peek-at-non-tt-panics.
     // -------------------------------------------------------------------
     #[test]
     fn stager_peek_idempotent_under_repeated_calls() {
+        // Use a TT move so peek() at Stage::Tt returns Some (the TT move).
         let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        assert!(
+            !all.is_empty(),
+            "H1-S13: starting position must have legal moves"
+        );
+        // Use a quiet from the legal list as TT so the TT stage is non-empty.
+        let tt_mv = all[0];
         let history = HistoryTable::new();
-        let mut stager = MoveStager::new(&pos, Move::default(), Move::default(), &history, 0, None);
+        let mut stager =
+            MoveStager::new(&pos, Move::default(), Move::default(), tt_mv.bits(), None, 100, &HistoryTable::new());
 
-        // (a) Pre-iteration: peek must be Some (starting position has 20 legal moves).
+        // (a) Pre-iteration (Stage::Tt): peek must return the TT move.
         let p0 = stager.peek();
         assert!(
             p0.is_some(),
-            "H1-S13: starting position has 20 legal moves; pre-iteration peek must be Some"
+            "H1-S13: TT move set; pre-iteration peek must return Some"
+        );
+        assert_eq!(
+            p0.map(|m| m.bits()),
+            Some(tt_mv.bits()),
+            "H1-S13: peek must return the TT move"
         );
         assert_eq!(
             stager.peek(),
@@ -18161,105 +18544,36 @@ mod tests {
             "H1-S13: peek call 3 must return same as call 1"
         );
 
-        // (b) Pre-iteration: next() yields what peek() reported.
-        let yielded = stager.next();
+        // (b) next() must yield what peek() reported (the TT move).
+        let yielded = stager.next(&pos, &history);
         assert_eq!(
             yielded, p0,
-            "H1-S13: first next() must yield what peek() reported"
-        );
-
-        // (c) Mid-iteration: after one next(), peek must still be Some and stable.
-        //     19 moves remain after yielding one from a 20-move position.
-        let p1 = stager.peek();
-        assert!(
-            p1.is_some(),
-            "H1-S13: after first next(), 19 moves remain; mid-iteration peek must be Some"
-        );
-        assert_eq!(
-            stager.peek(),
-            p1,
-            "H1-S13: mid-iteration peek call 2 must equal call 1"
-        );
-        assert_eq!(
-            stager.peek(),
-            p1,
-            "H1-S13: mid-iteration peek call 3 must equal call 1"
-        );
-
-        // (d) Mid-iteration: next() yields what the mid-iteration peek reported.
-        let yielded2 = stager.next();
-        assert_eq!(
-            yielded2, p1,
-            "H1-S13: second next() must yield what mid-iteration peek() reported"
+            "H1-S13: first next() must yield what peek() reported at Stage::Tt"
         );
     }
 
+    // H1-S13b deleted at M5.H2: peek() at non-Tt stages now panics via
+    // unreachable!() (plan §4.2). The H2-S-peek-at-non-tt-panics test takes
+    // over the mutation-discrimination role.
+
     // -------------------------------------------------------------------
-    // H1-S13b — peek() at Stage::Captures returns the next capture without
-    //           advancing.  H1-S13 only exercises peek at Stage::Tt and
-    //           Stage::Quiets (starting position has no captures); this test
-    //           specifically lands peek() at Stage::Captures so the helper
-    //           `peek_from_captures` is on the call path.
+    // H1-S14 — next() returns None after full iteration (stager exhaustion).
     //
-    //           Mutation discrimination: kills the
-    //           `replace < with > in MoveStager::peek_from_captures`
-    //           mutant (`if self.cap_idx < self.captures.len()` arm).
+    //           At M5.H2, peek() panics at Stage::Done (unreachable!).
+    //           This test is rewritten to check next() → None instead of
+    //           peek() → None after exhaustion.
     // -------------------------------------------------------------------
     #[test]
-    fn stager_peek_at_captures_stage_returns_next_capture() {
-        let pos = Position::from_fen(
-            // Kiwipete — many captures.
-            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-        )
-        .expect("Kiwipete FEN must parse");
-        let mut stager = plain_stager(&pos);
-
-        // Consume the Tt stage (no TT move; first next() advances to Captures
-        // and yields the first capture).
-        let first_yield = stager.next();
-        assert!(first_yield.is_some(), "Kiwipete must yield at least one move");
-        // The first yielded move must be a capture or promo (since no TT was
-        // set, the first stage with content is Captures).  If for some reason
-        // the position had no captures the test would degenerate; assert.
-        assert!(
-            !is_quiet(first_yield.unwrap()),
-            "Kiwipete fixture must have captures; first non-TT yield must be a capture"
-        );
-
-        // Now stager.stage == Stage::Captures with cap_idx > 0.  peek() routes
-        // through peek_from_captures and must return the SECOND capture (the
-        // value `next()` would yield next).
-        let peeked_a = stager.peek();
-        let peeked_b = stager.peek();
-        let peeked_c = stager.peek();
-        assert!(
-            peeked_a.is_some(),
-            "after consuming first capture, more captures remain in Kiwipete; peek must be Some"
-        );
-        assert_eq!(peeked_b, peeked_a, "peek call 2 at Captures must equal call 1");
-        assert_eq!(peeked_c, peeked_a, "peek call 3 at Captures must equal call 1");
-
-        // The yielded next move must equal what peek reported.
-        let next_yield = stager.next();
-        assert_eq!(
-            next_yield, peeked_a,
-            "next() at Captures must yield the move peek_from_captures reported"
-        );
-    }
-
-    // -------------------------------------------------------------------
-    // H1-S14 — peek() returns None after full iteration.
-    // -------------------------------------------------------------------
-    #[test]
-    fn stager_peek_after_done_returns_none() {
+    fn stager_next_after_done_returns_none() {
         let pos = Position::starting_position();
+        let history = HistoryTable::new();
         let mut stager = plain_stager(&pos);
         // Drain all moves.
-        while stager.next().is_some() {}
+        while stager.next(&pos, &history).is_some() {}
         assert_eq!(
-            stager.peek(),
+            stager.next(&pos, &history),
             None,
-            "H1-S14: peek() must return None after full iteration"
+            "H1-S14: next() must return None after the stager is exhausted"
         );
     }
 
@@ -18274,15 +18588,9 @@ mod tests {
             return;
         }
         let filter = &all[..2];
-        let stager = MoveStager::new(
-            &pos,
-            Move::default(),
-            Move::default(),
-            &HistoryTable::new(),
-            0,
-            Some(filter),
-        );
-        let seq = stager.yield_sequence();
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, Move::default(), Move::default(), 0, Some(filter), 100, &HistoryTable::new());
+        let seq = stager.yield_sequence(&pos, &ht);
         for mv in &seq {
             assert!(
                 filter.iter().any(|f| f == mv),
@@ -18312,15 +18620,17 @@ mod tests {
         let filter: Vec<Move> = all[1..].to_vec();
         let expected_count = filter.len();
 
-        let stager = MoveStager::new(
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(
             &pos,
             Move::default(),
             Move::default(),
-            &HistoryTable::new(),
             tt_mv.bits(),
             Some(&filter),
+            100,
+            &HistoryTable::new(),
         );
-        let seq = stager.yield_sequence();
+        let seq = stager.yield_sequence(&pos, &ht);
 
         // Negative: TT bits must not appear.
         assert!(
@@ -18356,15 +18666,9 @@ mod tests {
         }
         let expected_count = filter.len();
 
-        let stager = MoveStager::new(
-            &pos,
-            k0,
-            Move::default(),
-            &HistoryTable::new(),
-            0,
-            Some(&filter),
-        );
-        let seq = stager.yield_sequence();
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, k0, Move::default(), 0, Some(&filter), 100, &HistoryTable::new());
+        let seq = stager.yield_sequence(&pos, &ht);
 
         // Negative: killer0 must not appear.
         assert!(
@@ -18387,18 +18691,12 @@ mod tests {
     #[test]
     fn stager_searchmoves_filter_empty_yields_nothing() {
         let pos = Position::starting_position();
-        let mut stager = MoveStager::new(
-            &pos,
-            Move::default(),
-            Move::default(),
-            &HistoryTable::new(),
-            0,
-            Some(&[]), // empty filter
-        );
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, Move::default(), Move::default(), 0, Some(&[]), 100, &HistoryTable::new());
         assert_eq!(stager.len(), 0, "H1-S15d: empty filter → len == 0");
         assert!(stager.is_empty(), "H1-S15d: empty filter → is_empty");
         assert_eq!(
-            stager.next(),
+            stager.next(&pos, &ht),
             None,
             "H1-S15d: empty filter → next() == None"
         );
@@ -18411,14 +18709,7 @@ mod tests {
     fn stager_searchmoves_filter_none_is_no_op() {
         let pos = Position::starting_position();
         let legal_count = legal_moves(&pos).len();
-        let stager = MoveStager::new(
-            &pos,
-            Move::default(),
-            Move::default(),
-            &HistoryTable::new(),
-            0,
-            None,
-        );
+        let stager = MoveStager::new(&pos, Move::default(), Move::default(), 0, None, 100, &HistoryTable::new());
         assert_eq!(
             stager.len(),
             legal_count,
@@ -18437,14 +18728,7 @@ mod tests {
             return;
         }
         let filter = &all[..3];
-        let stager = MoveStager::new(
-            &pos,
-            Move::default(),
-            Move::default(),
-            &HistoryTable::new(),
-            0,
-            Some(filter),
-        );
+        let stager = MoveStager::new(&pos, Move::default(), Move::default(), 0, Some(filter), 100, &HistoryTable::new());
         assert_eq!(
             stager.len(),
             3,
@@ -18465,7 +18749,7 @@ mod tests {
         // Absolute reference: the real legal-move count (20 for starting position).
         let expected_len = legal_moves(&pos).len();
         let history = HistoryTable::new();
-        let mut stager = MoveStager::new(&pos, Move::default(), Move::default(), &history, 0, None);
+        let mut stager = MoveStager::new(&pos, Move::default(), Move::default(), 0, None, 100, &HistoryTable::new());
 
         // Pre-iteration: len must equal the legal-move count.
         assert_eq!(
@@ -18476,13 +18760,13 @@ mod tests {
 
         // Drain all moves.
         let mut yielded = 0usize;
-        while stager.next().is_some() {
+        while stager.next(&pos, &history).is_some() {
             yielded += 1;
         }
 
         // Post-iteration: next() returns None.
         assert_eq!(
-            stager.next(),
+            stager.next(&pos, &history),
             None,
             "H1-S17: next() after exhaustion must return None"
         );
@@ -18520,15 +18804,9 @@ mod tests {
             return;
         };
 
-        let stager = MoveStager::new(
-            &pos,
-            cap, // capture in killer0 slot — should NOT be yielded as killer
-            Move::default(),
-            &HistoryTable::new(),
-            0,
-            None,
-        );
-        let seq = stager.yield_sequence();
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, cap, Move::default(), 0, None, 100, &HistoryTable::new());
+        let seq = stager.yield_sequence(&pos, &ht);
 
         // The capture must appear exactly once (in the capture stage, not again as k0).
         let count = seq.iter().filter(|&&m| m == cap).count();
@@ -18546,14 +18824,7 @@ mod tests {
     fn stager_killer_with_default_sentinel_is_ignored() {
         let pos = Position::starting_position();
         let legal_count = legal_moves(&pos).len();
-        let stager = MoveStager::new(
-            &pos,
-            Move::default(), // bits == 0 → sentinel; must be ignored, not scanned
-            Move::default(),
-            &HistoryTable::new(),
-            0,
-            None,
-        );
+        let stager = MoveStager::new(&pos, Move::default(), Move::default(), 0, None, 100, &HistoryTable::new());
         // Sentinel ignored: no crash, no extra yields, len unchanged.
         assert_eq!(
             stager.len(),
@@ -19132,11 +19403,21 @@ mod tests {
 
             /// For arbitrary positions, TT bits, killer slots, and history
             /// tables, `MoveStager::yield_sequence()` must be byte-equivalent
-            /// to the output of `order_moves()` on the same inputs.
+            /// to the output of `order_moves()` on the same inputs **when the
+            /// history table is held constant from construction to full
+            /// iteration**.
             ///
-            /// This is the load-bearing bench-parity gate: any divergence
-            /// between the stager and `order_moves` indicates a bug that
-            /// would change node counts and invalidate bench parity.
+            /// At M5.H1-v2, this was THE bench-parity gate (yield-equivalence
+            /// at every node implied identical search trees and identical
+            /// bench counts). At M5.H2 the gate weakens: lazy quiet sort reads
+            /// fresh history at sort time (research §15.6 — the literature
+            /// signal) — different from `order_moves` which reads history at
+            /// construction. Equivalence holds only under the constant-history
+            /// fixture used by this proptest. Bench drift is now expected and
+            /// landed (1147614 → 1153734); this proptest still pins that the
+            /// stager's algorithm is correct relative to `order_moves` modulo
+            /// the documented history-timing intent. See H2-P1 below for the
+            /// lazy-sort-firings-at-completion sibling assertion.
             #[test]
             fn prop_stager_yield_sequence_equals_order_moves_output(
                 pos in arb_position(),
@@ -19240,15 +19521,11 @@ mod tests {
                 );
 
                 // --- Stager: yield_sequence on the same inputs ---
-                let stager = MoveStager::new(
-                    &pos,
-                    killer0,
-                    killer1,
-                    &ht,
-                    tt_move_bits,
-                    None, // no searchmoves filter (not root)
-                );
-                let stager_seq = stager.yield_sequence();
+                // History is held constant from construction through iteration
+                // (same `&ht` passed to every next() call) — the H1-P1 bench-
+                // parity contract.
+                let mut stager = MoveStager::new(&pos, killer0, killer1, tt_move_bits, None, 100, &HistoryTable::new());
+                let stager_seq = stager.yield_sequence(&pos, &ht);
 
                 // --- Assert byte-equivalent sequences ---
                 let stager_bits: Vec<u16> = stager_seq.iter().map(|m| m.bits()).collect();
@@ -19268,6 +19545,952 @@ mod tests {
                         stager_bits, ref_bits,
                     )
                 );
+            }
+        }
+    }
+
+    // ===================================================================
+    // M5.H2 — MoveStager lazy-sort instrumentation tests.
+    //
+    // H2-S*  : pure unit tests targeting the lazy-sort firings counters
+    //          (`captures_sorts` / `quiets_sorts`) on `MoveStager`.
+    // H2-I*  : negamax integration tests for skip-on-cutoff behaviour.
+    // H2-P*  : equivalence proptest (H2-P1 redefines H1-P1 contract).
+    //
+    // **RED/GREEN status against H1-v2 baseline.**
+    //   GREEN (pass against H1-v2): H2-S-lazy-no-next, H2-S-peek-at-tt-*,
+    //     H2-S-lazy-both-sorts-fire-on-full-iteration (counter stays 0 —
+    //     but wait, this would pass trivially with 0 != 1 asserting failure),
+    //     H2-I-borrow-soundness.
+    //   RED  (fail against H1-v2, green after H2 impl): all tests that
+    //     assert `captures_sorts == 1` or `quiets_sorts == 1`, the
+    //     fresh-history ordering test, and H2-S-peek-at-non-tt-panics.
+    //
+    // Plan: docs/plans/m5.h2.md §8.2–§8.4.
+    // ===================================================================
+
+    // -------------------------------------------------------------------
+    // H2-S-lazy-no-next — pre-`next()` both counters are 0.
+    //
+    // GREEN against H1-v2: the stub fields are always 0. Also correct for
+    // the H2 impl (no sort fired at construction time).
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_construction_does_not_fire_any_sort() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+        let stager = plain_stager(&pos);
+        assert_eq!(
+            stager.captures_sorts_for_test(),
+            0,
+            "H2-S-lazy-no-next: captures_sorts must be 0 immediately after construction"
+        );
+        assert_eq!(
+            stager.quiets_sorts_for_test(),
+            0,
+            "H2-S-lazy-no-next: quiets_sorts must be 0 immediately after construction"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H2-S-lazy-tt-only — yielding only the TT move does not fire the
+    // captures sort.
+    //
+    // Fixture: kiwipete (has captures); TT set to a legal capture.
+    // After one next() call the TT move is yielded and we are at the
+    // transition into Stage::Captures — the lazy sort must NOT fire yet.
+    //
+    // RED against H1-v2: counter stays 0 but test asserts == 0, so this
+    // is actually GREEN trivially under v2. Wait — if captures_sorts is
+    // always 0 under v2, then asserting == 0 PASSES. So this test is
+    // GREEN against H1-v2 but it's also "correct" (the intent holds under
+    // both v2 and H2 for this specific assertion).
+    //
+    // next() is the v2 signature here; impl-pass slice B changes to
+    // next(pos, history) at every callsite.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_yielding_only_tt_does_not_fire_captures_sort() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+        let all = legal_moves(&pos);
+        // Find a legal capture to use as TT move so the TT stage is non-empty.
+        let Some(cap) = all.iter().find(|&&m| !is_quiet(m)).copied() else {
+            return; // vacuous if somehow no captures
+        };
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(&pos, Move::default(), Move::default(), cap.bits(), None, 100, &HistoryTable::new());
+        // Consume the TT stage.
+        let first = stager.next(&pos, &ht);
+        assert_eq!(
+            first.map(|m| m.bits()),
+            Some(cap.bits()),
+            "H2-S-lazy-tt-only: first yield must be the TT move"
+        );
+        assert_eq!(
+            stager.captures_sorts_for_test(),
+            0,
+            "H2-S-lazy-tt-only: captures_sorts must be 0 after yielding only the TT move \
+             (captures stage not yet entered)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H2-S-lazy-captures-fires-on-first-capture-yield — captures sort
+    // fires exactly once on the first capture yield, then is idempotent.
+    //
+    // RED against H1-v2: captures_sorts is always 0 under v2; the test
+    // asserts == 1 after the first capture is yielded.
+    //
+    // next() is the v2 signature here; impl-pass slice B changes to
+    // next(pos, history) at every callsite.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_captures_sort_fires_exactly_once_on_first_capture_yield() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+        // No TT move — first next() must enter Stage::Captures directly.
+        let mut stager = plain_stager(&pos);
+
+        // Pre-condition: kiwipete must have captures so the test is non-vacuous.
+        let cap_count = legal_moves(&pos).iter().filter(|&&m| !is_quiet(m)).count();
+        assert!(
+            cap_count > 0,
+            "H2-S-lazy-captures-fires: kiwipete fixture must have captures; got 0 — fixture changed?"
+        );
+
+        let ht = HistoryTable::new();
+
+        // First next() — enters Stage::Captures (no TT), triggers lazy sort.
+        let first = stager.next(&pos, &ht);
+        assert!(
+            first.is_some(),
+            "H2-S-lazy-captures-fires: kiwipete must yield at least one move"
+        );
+        assert_eq!(
+            stager.captures_sorts_for_test(),
+            1,
+            "H2-S-lazy-captures-fires: captures_sorts must be 1 after first capture is yielded \
+             (lazy sort fires on first Stage::Captures entry)"
+        );
+
+        // Second next() — still in Stage::Captures; sort must NOT re-fire.
+        let _ = stager.next(&pos, &ht);
+        assert_eq!(
+            stager.captures_sorts_for_test(),
+            1,
+            "H2-S-lazy-captures-fires: captures_sorts must still be 1 after second yield \
+             (sort is idempotent — fires at most once per stager)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H2-S-lazy-quiets-skip-on-cap-cutoff — consuming captures but not
+    // proceeding to quiets keeps quiets_sorts at 0.
+    //
+    // This is the load-bearing lazy-sort test: it pins that a beta cutoff
+    // at the captures stage avoids the quiet sort entirely.
+    //
+    // GREEN against H1-v2: quiets_sorts is always 0; asserting == 0 passes.
+    //
+    // next() is the v2 signature here; impl-pass slice B changes to
+    // next(pos, history) at every callsite.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_consumed_to_captures_only_does_not_fire_quiets_sort() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+        let all = legal_moves(&pos);
+        let cap_count = all.iter().filter(|&&m| !is_quiet(m)).count();
+        assert!(
+            cap_count > 0,
+            "H2-S-lazy-quiets-skip: kiwipete must have captures"
+        );
+
+        let ht = HistoryTable::new();
+        let mut stager = plain_stager(&pos);
+
+        // Run exactly cap_count iterations to exhaust the captures stage without entering Stage::Quiets.
+        for _ in 0..cap_count {
+            let mv = stager.next(&pos, &ht);
+            assert!(
+                mv.is_some(),
+                "H2-S-lazy-quiets-skip: unexpected early exhaustion"
+            );
+        }
+
+        assert_eq!(
+            stager.quiets_sorts_for_test(),
+            0,
+            "H2-S-lazy-quiets-skip: quiets_sorts must be 0 after consuming only captures \
+             (lazy quiet sort must not fire before Stage::Quiets is entered)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H2-S-lazy-quiets-fires-on-first-quiet-yield — quiet sort fires
+    // exactly once on the first quiet yield, then is idempotent.
+    //
+    // RED against H1-v2: quiets_sorts is always 0; asserts == 1.
+    //
+    // next() is the v2 signature here; impl-pass slice B changes to
+    // next(pos, history) at every callsite.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_quiets_sort_fires_exactly_once_on_first_quiet_yield() {
+        // Use starting position — all 20 legal moves are quiets; no captures
+        // in the opening position.
+        let pos = Position::starting_position();
+        let ht = HistoryTable::new();
+        let mut stager = plain_stager(&pos);
+
+        // All moves are quiet at the starting position; first next() enters
+        // Stage::Quiets immediately (no TT, no captures, no killers).
+        let first = stager.next(&pos, &ht);
+        assert!(
+            first.is_some(),
+            "H2-S-lazy-quiets-fires: starting position must have moves"
+        );
+        assert_eq!(
+            stager.quiets_sorts_for_test(),
+            1,
+            "H2-S-lazy-quiets-fires: quiets_sorts must be 1 after first quiet is yielded \
+             (lazy sort fires on first Stage::Quiets entry)"
+        );
+
+        // Second quiet — sort must not re-fire.
+        let _ = stager.next(&pos, &ht);
+        assert_eq!(
+            stager.quiets_sorts_for_test(),
+            1,
+            "H2-S-lazy-quiets-fires: quiets_sorts must still be 1 after second quiet yield \
+             (idempotent)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H2-S-next-with-fresh-history-uses-fresh-scores — lazy quiet sort reads
+    // history at CALL TIME, not at construction time.
+    //
+    // This is the load-bearing literature-signal test (research §15.6).
+    // Build a two-quiet fixture where the unmutated history yields [A, B]
+    // but the mutated history (applied after consuming captures + killers)
+    // yields [B, A].  Under H2, the lazy sort reads the mutated history and
+    // yields [B, A].  Under H1-v2, the sort happens at construction so the
+    // pre-mutation order [A, B] is observed.
+    //
+    // RED against H1-v2: v2 sorts at construction; mutation applied after
+    // construction is invisible to the yield order.
+    //
+    // next() is the v2 signature here; impl-pass slice B changes to
+    // next(pos, history) at every callsite.
+    //
+    // Fixture: starting position (all quiets), two specific moves A and B.
+    // History seeded so A > B (A sorts first).  After asserting A is NOT
+    // yielded first from the pre-mutation stager (RED: v2 yields A first,
+    // violating the post-mutation [B, A] contract), we instead confirm:
+    //   — under H2: B is yielded first (fresh-history post-mutation order).
+    //   — under H1-v2: A is yielded first (construction-time order).
+    // The test ASSERTS the H2 contract; it is therefore RED on H1-v2.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_lazy_quiet_sort_reads_history_at_call_time_not_construction_time() {
+        // Starting position: all 20 legal moves are quiets.
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        let quiets: Vec<Move> = all.into_iter().filter(|&m| is_quiet(m)).collect();
+        assert!(
+            quiets.len() >= 2,
+            "H2-S-fresh-history: starting position must have at least 2 quiet moves"
+        );
+
+        // Choose move A = quiets[0], move B = quiets[1].
+        let (mv_a, mv_b) = (quiets[0], quiets[1]);
+        let stm = pos.side_to_move();
+
+        // Seed history so A scores higher than B (A yields first under construction-time order).
+        let mut ht = HistoryTable::new();
+        ht.update(stm, mv_a.from_square(), mv_a.to_square(), 200);
+        ht.update(stm, mv_b.from_square(), mv_b.to_square(), 100);
+
+        // Construct stager with NO history snapshot — the lazy sort will read
+        // from `&ht` passed to next() at sort time.
+        let mut stager = MoveStager::new(&pos, Move::default(), Move::default(), 0, None, 100, &HistoryTable::new());
+
+        // Mutate history AFTER construction: give B a higher score than A.
+        // This simulates the H2 scenario where history updates from earlier
+        // searched moves (captures/killers) affect the quiet-sort order.
+        ht.update(stm, mv_b.from_square(), mv_b.to_square(), 500);
+        ht.update(stm, mv_a.from_square(), mv_a.to_square(), 50);
+
+        // Under H2: the lazy quiet sort fires when the first quiet is yielded;
+        // it reads the POST-MUTATION `&ht` passed to next() → B scores 500 >
+        // A scores 50 → B yields first.
+        let first = stager.next(&pos, &ht);
+        assert_eq!(
+            first.map(|m| m.bits()),
+            Some(mv_b.bits()),
+            "H2-S-fresh-history: first quiet must be B (post-mutation higher score); \
+             got A instead — this indicates the lazy sort read construction-time history \
+             rather than call-time history (H1-v2 behaviour, expected to fail on this test)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H2-S-lazy-both-sorts-fire-on-full-iteration — after iterating all
+    // moves, both counters are 1 (when both stages are non-empty).
+    //
+    // RED against H1-v2: counters are always 0.
+    //
+    // next() is the v2 signature here; impl-pass slice B changes to
+    // next(pos, history) at every callsite.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_full_iteration_fires_each_sort_exactly_once() {
+        // Kiwipete has both captures and quiets — both stages are non-empty.
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+        let ht = HistoryTable::new();
+        let mut stager = plain_stager(&pos);
+
+        // Drain all moves.
+        while stager.next(&pos, &ht).is_some() {}
+
+        assert_eq!(
+            stager.captures_sorts_for_test(),
+            1,
+            "H2-S-both-sorts: captures_sorts must be exactly 1 after full iteration"
+        );
+        assert_eq!(
+            stager.quiets_sorts_for_test(),
+            1,
+            "H2-S-both-sorts: quiets_sorts must be exactly 1 after full iteration"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H2-S-lazy-position-no-captures-stays-zero — position with only quiet
+    // legal moves keeps captures_sorts at 0 even after full iteration.
+    //
+    // The Stage::Captures arm's `!self.captures.is_empty()` guard skips the
+    // no-op sort when the captures Vec is empty.
+    //
+    // GREEN against H1-v2: captures_sorts is always 0.
+    //
+    // next() is the v2 signature here; impl-pass slice B changes to
+    // next(pos, history) at every callsite.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_position_with_zero_captures_keeps_captures_sorts_at_zero() {
+        // Starting position has only quiet moves (no captures at move 1).
+        let pos = Position::starting_position();
+        let all = legal_moves(&pos);
+        assert!(
+            all.iter().all(|&m| is_quiet(m)),
+            "H2-S-no-captures: starting position must have only quiet legal moves"
+        );
+
+        let ht = HistoryTable::new();
+        let mut stager = plain_stager(&pos);
+        while stager.next(&pos, &ht).is_some() {}
+
+        assert_eq!(
+            stager.captures_sorts_for_test(),
+            0,
+            "H2-S-no-captures: captures_sorts must stay 0 when position has no captures \
+             (the empty-Vec guard prevents the no-op sort from incrementing the counter)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H2-S-lazy-position-no-quiets-stays-zero — position with only capture
+    // legal moves keeps quiets_sorts at 0 even after full iteration.
+    //
+    // GREEN against H1-v2: quiets_sorts is always 0.
+    //
+    // next() is the v2 signature here; impl-pass slice B changes to
+    // next(pos, history) at every callsite.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_position_with_zero_quiets_keeps_quiets_sorts_at_zero() {
+        // Construct a position where the side to move has ONLY captures.
+        // "4k3/8/8/3q4/8/8/4P3/4K3 w - - 0 1":
+        //   White: King e1, Pawn e2.  No quiet pawn moves (e3/e4) because the
+        //   black queen on d5 controls e3 and e4 diagonally. Wait, Qd5 doesn't
+        //   block pawn pushes (pawns push straight, not diagonally).
+        //
+        // Better: "4k3/8/8/8/3pP3/8/8/4K3 w - d3 0 1":
+        //   White pawn on e4, black pawn on d4, en passant on d3.
+        //   White can capture exd (en passant). Pawn on e4 CANNOT advance to e5
+        //   if there is a blocking piece or if we set up the position carefully.
+        //
+        // Simplest approach: use a position where White has only one legal move
+        // and that move is a capture.  "8/8/8/3k4/8/8/8/3K1r2 w - - 0 1":
+        //   White King d1, Black King d5, Black Rook f1.
+        //   White King can move to: c1 (blocked by Rf1 attack), c2 (safe), d2
+        //   (safe), e2 (safe), e1 (safe? — Rf1 attacks f1 not e1).
+        //   Actually this gives White 4 quiet moves.  Let's pick differently.
+        //
+        // Use a mate-in-1-by-capture setup: "4k3/4Q3/3K4/8/8/8/8/8 b - - 0 1"
+        // is a mating position; Black HAS no moves at all (already mated or
+        // stalemate). We need Black to have only captures.
+        //
+        // "8/8/8/3k4/2p1P3/8/8/3K4 b - - 0 1":
+        //   Black King d5, Black Pawn c4, White Pawn e4, White King d1.
+        //   Black King can move to c5, e5, d4 (captures white e4? no, e4 is two
+        //   squares away), c6, e6.  Actually these are quiet moves.
+        //
+        // The cleanest approach: use a position already tested elsewhere that is
+        // a "check-and-only-capture-evades" — but we already use stalemate for
+        // other tests.  Let me use a direct construction via legal-move filter.
+        //
+        // "5k2/8/8/8/1b6/2P5/8/4K3 w - - 0 1":
+        //   White King e1, White pawn c3, Black bishop b4.
+        //   White can: Kd1, Kd2, Ke2, Kf1, Kf2 (quiet), cxb4 (capture).
+        //   Still has quiet moves.
+        //
+        // Simplest verified approach: programmatically build a stager over the
+        // capture-only subset of an existing rich position by using the
+        // searchmoves filter.  This tests the same `!quiets.is_empty()` gate
+        // regardless of whether the position itself is capture-only.
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+        let all = legal_moves(&pos);
+        let captures_only: Vec<Move> = all.into_iter().filter(|&m| !is_quiet(m)).collect();
+        assert!(
+            !captures_only.is_empty(),
+            "H2-S-no-quiets: kiwipete must have captures for the filter"
+        );
+
+        // Pass only the captures as the searchmoves filter — the stager sees
+        // no quiets, so the quiets Vec is empty and the empty-Vec guard must
+        // prevent the counter from incrementing.
+        let ht = HistoryTable::new();
+        let mut stager = MoveStager::new(
+            &pos,
+            Move::default(),
+            Move::default(),
+            0,
+            Some(&captures_only),
+            100,
+            &HistoryTable::new(),
+        );
+        while stager.next(&pos, &ht).is_some() {}
+
+        assert_eq!(
+            stager.quiets_sorts_for_test(),
+            0,
+            "H2-S-no-quiets: quiets_sorts must stay 0 when no quiet moves are present \
+             (the empty-Vec guard prevents the no-op sort from incrementing the counter)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H2-S-peek-at-tt-does-not-fire-lazy-sort — repeated peek() calls at
+    // Stage::Tt (before any next()) leave both sort counters at 0.
+    //
+    // GREEN against H1-v2: counters are always 0.
+    // -------------------------------------------------------------------
+    #[test]
+    fn stager_peek_at_tt_stage_does_not_fire_any_lazy_sort() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+        let all = legal_moves(&pos);
+        // Find a legal capture for the TT move so the TT stage is non-empty.
+        let Some(cap) = all.iter().find(|&&m| !is_quiet(m)).copied() else {
+            return;
+        };
+        let stager = MoveStager::new(&pos, Move::default(), Move::default(), cap.bits(), None, 100, &HistoryTable::new());
+        // At Stage::Tt (no next() calls yet), repeated peek() must not fire
+        // any lazy sort.
+        let p0 = stager.peek();
+        let p1 = stager.peek();
+        let p2 = stager.peek();
+        assert_eq!(p0, p1, "H2-S-peek-tt: peek must be idempotent");
+        assert_eq!(p1, p2, "H2-S-peek-tt: peek must be idempotent (call 3)");
+        assert_eq!(
+            p0.map(|m| m.bits()),
+            Some(cap.bits()),
+            "H2-S-peek-tt: peek at Stage::Tt must return the TT move"
+        );
+        assert_eq!(
+            stager.captures_sorts_for_test(),
+            0,
+            "H2-S-peek-tt: captures_sorts must remain 0 after repeated peek at Stage::Tt"
+        );
+        assert_eq!(
+            stager.quiets_sorts_for_test(),
+            0,
+            "H2-S-peek-tt: quiets_sorts must remain 0 after repeated peek at Stage::Tt"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H2-S-peek-at-non-tt-panics — peek() after advancing past Stage::Tt
+    // must panic with an "Stage::Tt" message (per plan §4.2 `unreachable!`).
+    //
+    // RED against H1-v2: v2's peek() returns `self.moves.get(self.idx)` at
+    // any stage — it never panics.  Under H2, peek() at non-Tt stages fires
+    // the `unreachable!("MoveStager::peek() is valid only at Stage::Tt ...")`.
+    //
+    // next() is the v2 signature here; impl-pass slice B changes to
+    // next(pos, history) at every callsite.
+    // -------------------------------------------------------------------
+    #[test]
+    #[should_panic(expected = "Stage::Tt")]
+    fn stager_peek_at_captures_stage_panics() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+        // No TT move: first next() transitions past Stage::Tt directly into
+        // Stage::Captures (kiwipete has captures so the first yield is a capture).
+        let ht = HistoryTable::new();
+        let mut stager = plain_stager(&pos);
+        // Advance past Stage::Tt (no TT move, so first next() transitions
+        // Tt → Captures and yields the first capture).
+        let _ = stager.next(&pos, &ht);
+        // Now stage == Stage::Captures. peek() must panic.
+        let _ = stager.peek();
+    }
+
+    // -------------------------------------------------------------------
+    // H2-I — Negamax integration tests for lazy-sort skip-on-cutoff.
+    //
+    // All three H2-I tests drive search through `negamax_for_test`.  The
+    // sort-firing counts are harvested from `last_stager_*_for_test()` on
+    // `AlphaBetaMover`, which the H2 impl pass will wire up post-move-loop
+    // inside `negamax` (gated by `lmr_trace_root_ply == Some(ply)`).
+    //
+    // Under H1-v2, `last_stager_captures_sorts` and
+    // `last_stager_quiets_sorts` are always 0 — the H2-I tests that assert
+    // specific non-zero values are RED.
+    //
+    // H2-I-cutoff-at-captures-skips-quiet-sort and H2-I-tt-cutoff-skips-
+    // both-sorts are RED against H1-v2.
+    // H2-I-borrow-soundness is GREEN (it only checks the search completes
+    // without panic, which v2 satisfies trivially).
+    // -------------------------------------------------------------------
+
+    // -------------------------------------------------------------------
+    // M5.H2 v4 — `negamax_beta_cutoff_at_capture_stage_does_not_fire_quiet_sort`
+    // was removed: the test asserted "lazy quiet sort skips on capture cutoff,"
+    // which was a v3 (always-lazy) invariant. Under v4 depth-gating, at
+    // depth < LAZY_QUIET_SORT_MIN_DEPTH the stager sorts quiets EAGERLY at
+    // construction (regardless of cutoff path), so the property is now
+    // depth-conditional and brittle to fixture choice. The same coverage is
+    // provided structurally by:
+    //   - H2-S-lazy-quiets-skip-on-cap-cutoff (unit-level: drive the stager
+    //     directly through captures, never enter Stage::Quiets, assert
+    //     quiets_sorts == 0). This holds unconditionally at any depth ≥ 6.
+    //   - The `negamax_full_search_records_at_least_one_sort_firing` positive
+    //     test below catches the dual failure (recording wiring broken).
+    //   - Bench + SPRT validate the algorithmic invariant end-to-end.
+    // -------------------------------------------------------------------
+    // H2-I-tt-cutoff-skips-both-sorts — when the TT move alone causes a
+    // cutoff (TT hit with depth >= current depth), neither sort fires.
+    //
+    // RED against H1-v2: same vacuous-pass reasoning as above (counters
+    // always 0 under v2 stub).
+    // -------------------------------------------------------------------
+    #[test]
+    fn negamax_tt_move_beta_cutoff_does_not_fire_either_sort() {
+        let pos = se_test_pos();
+        let depth = 4_u32;
+        let ply = 1_u32;
+
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _stop) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+
+        // Store a TT entry with a very high score (MATE-ish) and depth >= current
+        // depth and TtBound::Lower so the TT cutoff path fires immediately.
+        let best_move_bits = se_find_best_move_bits(&pos);
+        tt.new_search();
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                // Score = MATE_IN_MAX_PLY (29936). Combined with beta = MATE_IN_MAX_PLY,
+                // the step-7 condition `tt_score >= beta` is 29936 >= 29936 = true.
+                score: MATE_IN_MAX_PLY as i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: best_move_bits,
+            },
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        // Window [MATE_IN_MAX_PLY-1, MATE_IN_MAX_PLY]: TT score is MATE_IN_MAX_PLY (29936)
+        // and beta is also MATE_IN_MAX_PLY (29936), so `tt_score >= beta` is
+        // 29936 >= 29936 = TRUE — the Lower-bound TT cutoff fires at step 7.
+        // The RFP guard `beta.abs() < MATE_IN_MAX_PLY` evaluates to false, so RFP is
+        // skipped and only the TT cutoff fires, returning before the stager is built.
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            MATE_IN_MAX_PLY - 1,
+            MATE_IN_MAX_PLY,
+            false, // non-PV so TT cutoff fires
+            true,
+            None,
+            &ctx,
+        );
+
+        // Under H2 with impl-pass wiring: TT cutoff at step 7 returns
+        // before any stager construction → both counters 0.
+        // Under H1-v2: always 0 (stub) — vacuously passes.
+        assert_eq!(
+            ab.last_stager_captures_sorts_for_test(),
+            0,
+            "H2-I-tt-cutoff: captures_sorts must be 0 when TT causes beta cutoff; got {}",
+            ab.last_stager_captures_sorts_for_test()
+        );
+        assert_eq!(
+            ab.last_stager_quiets_sorts_for_test(),
+            0,
+            "H2-I-tt-cutoff: quiets_sorts must be 0 when TT causes beta cutoff; got {}",
+            ab.last_stager_quiets_sorts_for_test()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H2-I-positive-sort-firings — positive discriminator: at least one
+    // frame must have fired both lazy sorts after a real depth-4 search.
+    //
+    // This test is the antidote to the vacuous-pass problem: all other H2-I
+    // tests assert `== 0` (correctly, because early cutoffs skip later stages).
+    // Without this test, if the H2 impl pass accidentally never wires the sort
+    // recording, the `== 0` tests would pass vacuously and the broken impl
+    // would slip through.
+    //
+    // RED against H1-v2: the stub counters are always 0 → `>= 1` assertions
+    //   FAIL.  This is the intended discriminator.
+    // GREEN under H2 correct impl: a depth-4 search from startpos will explore
+    //   many frames that exhaust both captures and quiet stages, incrementing
+    //   the accumulated counters to well above 1.
+    // -------------------------------------------------------------------
+    #[test]
+    fn negamax_full_search_records_at_least_one_sort_firing() {
+        // Starting position at depth 4: enough tree size to guarantee that
+        // We use `negamax_for_test` (not `go_alpha_beta_no_sink`) so that
+        // `lmr_trace_root_ply` is set to Some(1).  The H2 impl pass records
+        // the per-stager sort counters into `last_stager_*_sorts` only when
+        // `lmr_trace_root_ply == Some(ply)` (mirroring the FFP/LMR recording
+        // discipline at line 1884) — under `go()`, that field is None and no
+        // recording fires.
+        //
+        // Kiwipete at depth 4 with a wide window guarantees the traced frame
+        // (ply 1) generates BOTH a non-empty captures Vec (kiwipete has many
+        // captures available to either side) and a non-empty quiets Vec, AND
+        // the search progresses through both stages without an early cutoff.
+        // At the traced ply-1 frame: is_pv=true disables RFP/NMP/FFP/LMR;
+        // tt=None means no step-7 TT cutoff; alpha=-INF/beta=INF means no
+        // beta cutoff at this frame is possible.  (Children at deeper plies
+        // still apply normal alpha-beta windows and may cut early — but the
+        // tracing only records the ply-1 frame's stager counters.)
+        //
+        // Discrimination: under v2 stubs `last_stager_*_sorts` are always 0
+        // (the impl pass hasn't wired the recording yet) → the `>= 1`
+        // assertions below FAIL (RED).  Under H2's impl-pass wiring, the
+        // traced ply-1 frame fires both lazy sorts → counters become 1
+        // (GREEN).
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+        let mut ab = AlphaBetaMover::new();
+        let (ctx, _stop) = non_aborting_ctx();
+
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            4,
+            1, // ply 1 so lmr_trace_root_ply == Some(1) — recording fires
+            -INF,
+            INF,
+            true, // PV (allow full exploration; we WANT both stages reached)
+            true, // allow null
+            None,
+            &ctx,
+        );
+
+        assert!(
+            ab.last_stager_captures_sorts_for_test() >= 1,
+            "H2-I-positive: traced frame must fire the lazy captures sort \
+             in a depth-4 kiwipete search at ply 1; got {} — impl-pass wiring \
+             of sort recording is missing",
+            ab.last_stager_captures_sorts_for_test()
+        );
+        assert!(
+            ab.last_stager_quiets_sorts_for_test() >= 1,
+            "H2-I-positive: traced frame must fire the lazy quiets sort \
+             in a depth-4 kiwipete search at ply 1; got {} — impl-pass wiring \
+             of sort recording is missing",
+            ab.last_stager_quiets_sorts_for_test()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H2-I-borrow-soundness-history-update-during-loop — smoke test that
+    // the search completes without panic when the in-loop cutoff arm's
+    // `update_history_on_quiet_cutoff` runs.
+    //
+    // GREEN against H1-v2: v2's borrow design is fine; this test trivially
+    // passes.  Under H2's per-call `next(pos, history)` argument form, the
+    // test confirms the borrow design compiles AND doesn't deadlock or panic
+    // at runtime: the stager holds no borrow of `self.history_table` between
+    // `next()` calls, so the in-loop `update_history_on_quiet_cutoff(&mut
+    // self.history_table, ...)` on the cutoff arm is sound.
+    // -------------------------------------------------------------------
+    #[test]
+    fn negamax_history_table_mutation_in_cutoff_arm_runs_without_panic() {
+        // Use the starting position at a moderate depth to ensure that:
+        //   (a) at least one quiet move is searched (exercising the non-cutoff
+        //       `self.search_child(...)` recursive path), AND
+        //   (b) at least one quiet cutoff fires (exercising the in-loop
+        //       `update_history_on_quiet_cutoff` path).
+        let pos = Position::starting_position();
+        let mut ab = AlphaBetaMover::new();
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+
+        // Drive a full non-PV search at ply 1, depth 4.  This depth is
+        // sufficient to encounter both recursive children (non-cutoff path)
+        // and beta cutoffs (cutoff arm with history mutation).
+        let score = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, None, &ctx);
+
+        // Primary assertion: the search completed (no panic).
+        // Score must be in a sane range.
+        assert!(
+            score.abs() < MATE_IN_MAX_PLY * 2,
+            "H2-I-borrow: search must return a sane non-mate score for starting position; \
+             got {score}"
+        );
+
+        // Secondary: after a depth-4 search with quiet beta cutoffs, at least
+        // one history entry must be non-zero (cutoff updates are real).
+        let any_nonzero_history = (0u8..64).any(|from| {
+            (0u8..64).any(|to| {
+                let f = crate::Square::new(from).expect("0..64 is always a valid square");
+                let t = crate::Square::new(to).expect("0..64 is always a valid square");
+                ab.history_table_for_test().score(Color::White, f, t) != 0
+                    || ab.history_table_for_test().score(Color::Black, f, t) != 0
+            })
+        });
+        assert!(
+            any_nonzero_history,
+            "post-search history table should have at least one non-zero entry from cutoff updates"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // H2-P1 — Equivalence proptest: `yield_sequence_for_h2_test()` output
+    // is byte-equivalent to `order_moves` output when history is constant
+    // from construction through full iteration.
+    //
+    // This is the H2 redefinition of H1-P1 (plan §8.4).  H1-P1 remains
+    // in the `h1_proptest` module above (unchanged behaviour); H2-P1 is
+    // here in `h2_proptest`.
+    //
+    // The contract: when history is frozen (same table from `new()` to the
+    // last `next()` call), the H2 stager's yield sequence must be
+    // byte-equivalent to `order_moves` on the same inputs.  This pins:
+    //   (a) the H2 algorithm is correct in the constant-history case;
+    //   (b) lazy-sort fires exactly once per non-empty stage.
+    //
+    // Under H1-v2, `yield_sequence_for_h2_test()` delegates to `next()`
+    // (which reads `self.moves` — the eagerly sorted Vec) so this test is
+    // GREEN against v2 (equivalent to H1-P1's contract).  Under H2, the
+    // lazy sorts fire during iteration but must produce the same result
+    // as `order_moves` when history is not mutated.
+    //
+    // Plan: docs/plans/m5.h2.md §8.4.
+    // -------------------------------------------------------------------
+    mod h2_proptest {
+        use super::*;
+        use crate::history::{HistoryTable, MAX_HISTORY};
+        use crate::movegen::test_strategies::arb_position;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2048))]
+
+            /// `yield_sequence_for_h2_test()` is byte-equivalent to `order_moves`
+            /// on the same inputs when history is held constant.  Covers 2048
+            /// random (position, TT, killer, history) combinations.
+            ///
+            /// Also asserts that both lazy-sort counters equal 1 after full
+            /// iteration on positions where both stage Vecs are non-empty (the
+            /// non-empty guard means the assertion is skipped on empty Vecs).
+            #[test]
+            fn prop_stager_yield_sequence_equals_order_moves_when_history_constant(
+                pos in arb_position(),
+                tt_kind in 0u8..3,
+                tt_seed in any::<u64>(),
+                killer0_kind in 0u8..3,
+                killer0_seed in any::<u64>(),
+                killer1_kind in 0u8..3,
+                killer1_seed in any::<u64>(),
+                history_seed in any::<u64>(),
+            ) {
+                use crate::movegen::{MoveList, generate_moves};
+
+                let mut ml = MoveList::new();
+                generate_moves(&pos, &mut ml);
+                let all_moves: Vec<Move> = ml.iter().collect();
+
+                if all_moves.is_empty() {
+                    return Ok(());
+                }
+
+                let tt_move_bits: u16 = match tt_kind % 3 {
+                    0 => 0,
+                    1 => {
+                        let idx = (tt_seed as usize) % all_moves.len();
+                        all_moves[idx].bits()
+                    }
+                    _ => {
+                        let raw = ((tt_seed >> 16) as u16) ^ 0xABCD;
+                        if all_moves.iter().any(|m| m.bits() == raw) { 0 } else { raw }
+                    }
+                };
+
+                let quiet_moves: Vec<Move> = all_moves.iter().copied().filter(|&m| is_quiet(m)).collect();
+                let capture_moves: Vec<Move> = all_moves.iter().copied().filter(|&m| !is_quiet(m)).collect();
+                let killer0: Move = match (killer0_kind % 3, quiet_moves.is_empty()) {
+                    (0, _) | (_, true) => Move::default(),
+                    (1, false) => quiet_moves[(killer0_seed as usize) % quiet_moves.len()],
+                    _ => {
+                        if capture_moves.is_empty() { Move::default() }
+                        else { capture_moves[(killer0_seed as usize) % capture_moves.len()] }
+                    }
+                };
+                let killer1: Move = match (killer1_kind % 3, quiet_moves.is_empty()) {
+                    (0, _) | (_, true) => Move::default(),
+                    (1, false) => {
+                        let idx = (killer1_seed as usize) % quiet_moves.len();
+                        quiet_moves[idx]
+                    }
+                    _ => {
+                        if capture_moves.is_empty() { Move::default() }
+                        else { capture_moves[(killer1_seed as usize) % capture_moves.len()] }
+                    }
+                };
+
+                let mut ht = HistoryTable::new();
+                {
+                    let stm = pos.side_to_move();
+                    let mut rng = history_seed;
+                    for &mv in &quiet_moves {
+                        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let score = ((rng >> 48) as i32 % (MAX_HISTORY as i32 * 2 + 1)) - MAX_HISTORY as i32;
+                        ht.update(stm, mv.from_square(), mv.to_square(), score);
+                    }
+                }
+
+                // Reference: order_moves on the same inputs.
+                let mut reference_vec = all_moves.clone();
+                order_moves(&mut reference_vec, &pos, killer0, killer1, &ht, tt_move_bits);
+
+                // Stager: yield_sequence_for_h2_test (history constant — not mutated
+                // between construction and full iteration).
+                let mut stager = MoveStager::new(&pos, killer0, killer1, tt_move_bits, None, 100, &HistoryTable::new());
+                let stager_seq = stager.yield_sequence_for_h2_test(&pos, &ht);
+
+                let stager_bits: Vec<u16> = stager_seq.iter().map(|m| m.bits()).collect();
+                let ref_bits: Vec<u16> = reference_vec.iter().map(|m| m.bits()).collect();
+                proptest::prop_assert!(
+                    stager_bits == ref_bits,
+                    "{}",
+                    format!(
+                        "H2-P1: yield_sequence_for_h2_test must be byte-equivalent to order_moves \
+                         when history is constant. \
+                         tt_move_bits={tt_move_bits}, \
+                         killer0.bits()={}, killer1.bits()={}, \
+                         position has {} legal moves;\n\
+                         stager:    {:?}\n\
+                         reference: {:?}",
+                        killer0.bits(), killer1.bits(), all_moves.len(),
+                        stager_bits, ref_bits,
+                    )
+                );
+
+                // Plan §8.4 — when both stages are non-empty after killer
+                // extraction, the H2 lazy sorts must each fire EXACTLY ONCE
+                // during the full iteration.  Discriminates against an impl
+                // that produces correct yield order but forgets to wire the
+                // sort counters.
+                //
+                // Conditional on non-empty stages: arbitrary positions may
+                // have zero captures (no captures to sort) or zero quiets
+                // remaining after killers are extracted (everything was a
+                // capture or extracted as a killer).  Pre-killer-extraction
+                // counts are derived from `capture_moves` and `quiet_moves`
+                // computed above; killer extraction further drains quiets.
+                let killer0_extracted_from_quiets =
+                    killer0 != Move::default()
+                    && quiet_moves.contains(&killer0);
+                let killer1_extracted_from_quiets =
+                    killer1 != Move::default()
+                    && killer1 != killer0
+                    && quiet_moves.contains(&killer1);
+                let post_killer_quiet_count = quiet_moves.len()
+                    - usize::from(killer0_extracted_from_quiets)
+                    - usize::from(killer1_extracted_from_quiets);
+                // TT extraction may also remove a capture or quiet; account
+                // for it conservatively (if TT was a capture and present).
+                let tt_was_capture = tt_move_bits != 0
+                    && capture_moves.iter().any(|m| m.bits() == tt_move_bits);
+                let tt_was_quiet_in_residual =
+                    tt_move_bits != 0
+                    && quiet_moves.iter().any(|m|
+                        m.bits() == tt_move_bits
+                        && *m != killer0
+                        && *m != killer1);
+                let post_extraction_capture_count = capture_moves.len()
+                    - usize::from(tt_was_capture);
+                let post_extraction_quiet_count = post_killer_quiet_count
+                    - usize::from(tt_was_quiet_in_residual);
+
+                if post_extraction_capture_count > 0 {
+                    proptest::prop_assert_eq!(
+                        stager.captures_sorts_for_test(), 1,
+                        "H2-P1: captures_sorts must be 1 after full iteration \
+                         when post-extraction captures Vec is non-empty \
+                         ({} captures); under H2 the lazy MVV-LVA sort fires \
+                         once on first Stage::Captures entry.  RED against \
+                         H1-v2 (counter is stub-zero); pin against impl-pass \
+                         that produces correct order but forgets the counter \
+                         increment.",
+                        post_extraction_capture_count
+                    );
+                }
+                if post_extraction_quiet_count > 0 {
+                    proptest::prop_assert_eq!(
+                        stager.quiets_sorts_for_test(), 1,
+                        "H2-P1: quiets_sorts must be 1 after full iteration \
+                         when post-extraction quiets Vec is non-empty \
+                         ({} quiets); under H2 the lazy history sort fires \
+                         once on first Stage::Quiets entry.  RED against \
+                         H1-v2 (counter is stub-zero); pin against impl-pass \
+                         that produces correct order but forgets the counter \
+                         increment.",
+                        post_extraction_quiet_count
+                    );
+                }
             }
         }
     }
