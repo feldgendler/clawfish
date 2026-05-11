@@ -8,6 +8,47 @@ This file also tracks **deferred features awaiting a precondition** — items re
 
 ---
 
+### M5.I aspiration third tier — DEFERRED 2026-05-11 (Elo-neutral; no per-TC signal to anchor follow-up tuning)
+
+**Status (2026-05-11).** M5.I v1 (`ASPIRATION_INTERMEDIATE_HALF_WIDTH = 150`, fires at all `depth >= ASPIRATION_MIN_DEPTH = 6`) ran mixed-TC SPRT vs `baseline/m5h1-stager-refactor` (seed `0xC1ABF15AE10DD011`).
+
+**Final result at 400 games**:
+- Verdict: `continue` (llr=−0.22; LLR between H0/H1 bounds).
+- Δ Elo: **+1.74 [−22.00, +25.49]** (pentanomial 95% CI; statistically flat).
+- Aggregate score: 50.25% (W=108, L=106, D=186).
+- Per-TC (all near 50% within wide noise bands):
+  - 10+0.1: 49.5% (Δ Elo ≈ −4) — 92 games
+  - 20+0.2: 51.7% (Δ Elo ≈ +12) — 116 games
+  - 40+0.4: 48.1% (Δ Elo ≈ −13) — 80 games
+  - 60+0.6: 50.9% (Δ Elo ≈ +6) — 112 games
+
+**Decision: revert per plan §11 outcome 2.** Production HEAD remains at `baseline/m5h1-stager-refactor` (commit `339fd7e`). The intermediate aspiration tier produces **no measurable strength change** at clawfish's current strength/TC profile.
+
+**Important lesson from the SPRT run.** Mid-SPRT samples produced a dramatic-looking bimodal pattern at 168 games (10+0.1 +41 Elo, 20+0.2 −71 Elo). That signal was **sample-variance noise** — at full N=92-116 per TC bucket, all per-TC scores converged to ~50%. **Do not iterate on per-TC SPRT signals at <200 games.** Per-TC CIs are ±10-12% at N=80; the "TC-bimodal" failure pattern from M5.G v1 / M5.H2 needs the full mixed-TC run to confirm. (M5.G v1's actual bimodal pattern at 400 games was: 10+0.1 +66, 60+0.6 +5, 20+0.2 −60, 40+0.4 −44 — strong magnitudes that survived to convergence. M5.I had no such surviving signal.)
+
+**Diagnostic suites (post-SPRT, head vs M5.H1 baseline)**:
+- WAC: 274/300 vs M5.H1 baseline 267 (+7, within wallclock noise).
+- STS: 8872/15000 vs M5.H1 baseline 8822 (+50, within ±68 noise per prior M5-phase deltas).
+- Stockfish UCI_Elo=2641 at 10+0.1: Δ Elo **−107.54 [−156.89, −62.08]** (200 games). Note: TC-specific point estimate at fast TC; not directly comparable to M5.B/M5.C `UCI_LimitStrength` numbers.
+
+The modest tactical lean (WAC +7, STS +50) is consistent with the SPRT's +1.74 Elo mean but cannot be distinguished from wallclock noise. No actionable signal.
+
+**Revisit conditions** (analogous to M5.H2's deferral):
+- Clawfish reaches **depth ≥ 14 at typical TCs** (currently ~depth 8-12 at mixed-TC). At deeper search, score-continuity improves and the intermediate-tier mechanism's literature payoff (Crafty / Meesha / RobboLito reports of +10-20 Elo) is more plausibly realizable.
+- OR: the engine's ordering quality improves substantially (e.g., post-M9 NNUE) so that tier-1 failure rates drop and tier-2 firings become rarer-but-more-targeted.
+
+**Tunables preserved for future revisit** (in case a future iteration reaches the revisit conditions):
+- `ASPIRATION_INTERMEDIATE_HALF_WIDTH` (v1 was 150 — Crafty-proportional): try `100`, `200`, `250` if revisiting.
+- **Depth-gated tier 2** (untested in v1; potential v2 if revisiting): `ASPIRATION_INTERMEDIATE_MAX_DEPTH` constant capping where tier 2 fires. Without per-TC signal to anchor the cap value, no specific candidate is motivated.
+- **Asymmetric intermediate widths** (untested): decouple fail-high vs fail-low widths.
+- **Score-volatility-adaptive width**: width as a function of `|score(d-1) − score(d-2)|` (the cheap delta-baseline from the ML-tuned-aspiration backlog item §"ML-tuned aspiration window sizing").
+
+**Why v2/v3 were not attempted at landing time.** Plan §11 outcome 2 + user confirmation (2026-05-11): with v1 showing no per-TC signal, follow-up variants (v2 depth-gating, v3 width retune, v4 asymmetric) lack empirical anchoring. The M5.G v1/v2 retune precedent (v2 succeeded because v1 had a clear-but-bimodal signal at full N) does not apply here — v1's signal is Elo-zero at full N. Iterating against a null-signal baseline is essentially random search through the tunable space. Defer to a future M-stage where the engine's strength/depth profile provides a clearer signal substrate.
+
+**Cross-references.** `docs/plans/m5.i.md`; `docs/research/m5-aspiration-third-tier.md`; `docs/research/m4-aspiration-windows.md` §13; `bench/sprt/2026-05-11-m5.i-v1-vs-m5h1-mixed-tc.md`; `docs/milestones/m5.i.md` (retrospective). The M5.H2 deferral structure (ADR-0030 §11) is the workflow analog: attempted, Elo-neutral / flat at current strength, deferred with revisit conditions documented.
+
+---
+
 ### M5.H2 lazy quiet sort — REVISIT when typical-TC search reaches depth 14+
 
 **Status.** Rejected 2026-05-11 across four implementation variants (v1-v4); see ADR-0030 §11 and `docs/milestones/m5.h2.md`. Production reverted to M5.H1 v2 thin-wrapper baseline. v4 working code preserved on branch `experiment/m5h2-v4` at origin (commit `7984106`, branched from M5.H1 baseline `339fd7e`).
