@@ -4,6 +4,33 @@ Parameter-tuning campaigns (SPRT or SPSA) deferred from a feature's initial land
 
 Each search-feature ADR also carries an "Open SPRT-tunable parameters" section that records the per-feature tunable space at landing time (ADR-0023 NMP, 0024 RFP, 0025 LMR, 0026 FFP, 0027 qsearch correctness). This file is the consolidated **active queue** — items that have been promoted to current tuning candidates because their parent feature shipped with a borderline SPRT signal, or because the per-feature tunable space crosses ADRs.
 
+This file also tracks **deferred features awaiting a precondition** — items rejected at attempt time because the engine wasn't strong enough or deep enough, with a documented trigger condition for revisit.
+
+---
+
+### M5.H2 lazy quiet sort — REVISIT when typical-TC search reaches depth 14+
+
+**Status.** Rejected 2026-05-11 across four implementation variants (v1-v4); see ADR-0030 §11 and `docs/milestones/m5.h2.md`. Production reverted to M5.H1 v2 thin-wrapper baseline. v4 working code preserved in `git stash` (run `git stash list | grep m5h2-v4` to locate; recover via `git stash pop`).
+
+**Why deferred, not abandoned.** The literature signal (research §15.6: +5–15 Elo from post-captures-search history-score timing) DID manifest at 40+0.4 (+65 Elo decisive) in the M5.H2 v1/v2 SPRT. The failure mode was the per-TC bimodal pattern: at fast TCs where clawfish reaches only depth 8–12, the post-search history table is too sparse and noisy to outperform pre-search history (−95 Elo at 20+0.2). The literature signal is real but conditional on the engine reaching depths where history accumulates enough signal-to-noise.
+
+**Trigger condition for revisit.** Three precondition checks should ALL pass before re-attempting M5.H2:
+
+1. **Typical-TC depth reach ≥ 14.** Measure: median ID depth reached at 20+0.2 from a 20-position mixed corpus. Currently clawfish reaches depth 10–12; the M5.H2 v1/v2 SPRT bucket showed +65 Elo decisive at 40+0.4 where median depth is ~14. The break-even is roughly there.
+2. **History table accumulation rate per game ≥ 4000 entries.** Measure: instrument the history table to count nonzero entries at end of game; sample 10 games at 20+0.2. M5.H2 v1/v2 failure was diagnosed (research §3.1) as "history too sparse" at fast TC; the bound here is project-empirical (Stockfish-derived literature suggests ~4000 as the saturation point).
+3. **No higher-leverage feature is also pending.** If M6 eval improvements are in flight, the depth gain from those would shift the engine through threshold 1 above; revisit M5.H2 only after those have shipped and re-measured.
+
+**Recommended approach at revisit.**
+
+- **Start from v4 stash** (`git stash pop` of the `m5h2-v4` entry), not from scratch. v4 has the depth-gated single-Vec in-place design with `LAZY_QUIET_SORT_MIN_DEPTH=6`. The eager-sort-at-shallow cost was the failure mode at clawfish's current depth profile; that cost shrinks proportionally to the fraction-of-shallow-nodes when depth reach increases. If depth-12+ is reached at 20+0.2, the shallow fraction drops and v4's tradeoff changes sign.
+- **Re-tune the threshold via SPRT campaign.** v4 used threshold=6 (matching SE_MIN_DEPTH). At higher depth reach, 8 or 10 might dominate. Sweep [4, 6, 8, 10, 14] at 200 games each.
+- **Alternative: selection sort on quiet sub-slice** (research §3.2). Reads fresh history at each yield, O(N²) per node. Not attempted in M5.H2 v1-v4 — orthogonal design point worth a quick prototype before committing to depth-gated v4.
+- **Independent research note** at `docs/research/m5-staged-movegen-allocation.md` covers prior art on allocation patterns, selection-sort, depth-gating thresholds, and binned history sort (research §3.4).
+
+**Expected impact at revisit.** If preconditions hold, recovery of the +65 Elo signal observed at 40+0.4 in M5.H2 v1/v2, applied across all TC buckets. Total: +30–65 Elo conditional on threshold tuning. Time budget at revisit: ~6 hours (recover v4 from stash, re-build, re-test, SPRT sweep across thresholds, validate winner).
+
+**Hard rejection criteria.** If the revisit shows the same bimodal pattern even at depth ≥ 14 reach, abandon M5.H2 permanently; the engine's history-score noise floor is structurally incompatible with lazy-after-search sort, and no further investment is warranted.
+
 ---
 
 ### M5.F qsearch-in-TT — bound semantics, PV suppression, path gating

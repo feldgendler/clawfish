@@ -3313,9 +3313,7 @@ impl MoveStager {
         // Single sort by the M5.G score-tier comparator: captures (with
         // CAPTURE_OFFSET) > killer0 (KILLER0_SCORE) > killer1 (KILLER1_SCORE)
         // > history-quiets. Stable; movegen-emit order preserved within ties.
-        moves.sort_by_cached_key(|&m| {
-            -negamax_move_order_score(m, pos, killer0, killer1, history)
-        });
+        moves.sort_by_cached_key(|&m| -negamax_move_order_score(m, pos, killer0, killer1, history));
 
         // TT promotion (mirrors M5.G's `order_moves` post-sort step).
         // `tt_move == 0` (Move::default sentinel) short-circuits without
@@ -18217,7 +18215,10 @@ mod tests {
         // Consume the Tt stage (no TT move; first next() advances to Captures
         // and yields the first capture).
         let first_yield = stager.next();
-        assert!(first_yield.is_some(), "Kiwipete must yield at least one move");
+        assert!(
+            first_yield.is_some(),
+            "Kiwipete must yield at least one move"
+        );
         // The first yielded move must be a capture or promo (since no TT was
         // set, the first stage with content is Captures).  If for some reason
         // the position had no captures the test would degenerate; assert.
@@ -18236,8 +18237,14 @@ mod tests {
             peeked_a.is_some(),
             "after consuming first capture, more captures remain in Kiwipete; peek must be Some"
         );
-        assert_eq!(peeked_b, peeked_a, "peek call 2 at Captures must equal call 1");
-        assert_eq!(peeked_c, peeked_a, "peek call 3 at Captures must equal call 1");
+        assert_eq!(
+            peeked_b, peeked_a,
+            "peek call 2 at Captures must equal call 1"
+        );
+        assert_eq!(
+            peeked_c, peeked_a,
+            "peek call 3 at Captures must equal call 1"
+        );
 
         // The yielded next move must equal what peek reported.
         let next_yield = stager.next();
