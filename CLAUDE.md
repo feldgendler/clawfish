@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**M5.H milestone closed 2026-05-11. M5.H1 landed (architectural refactor, bench-neutral); M5.H2 (lazy quiet sort) was attempted across four implementation variants and rejected per plan §13 outcome 4 (see ADR-0030 §11). Production HEAD = M5.H1 v2 thin-wrapper baseline at commit 339fd7e (`baseline/m5h1-stager-refactor`). M5.H2 v4 experiments preserved in git stash (`git stash list | grep m5h2-v4`). Next phase: M6 (eval improvements).**
+**M5.H milestone closed 2026-05-11. M5.H1 landed (architectural refactor, bench-neutral); M5.H2 (lazy quiet sort) was attempted across four implementation variants and rejected per plan §13 outcome 4 (see ADR-0030 §11). Production HEAD = M5.H1 v2 thin-wrapper baseline at commit 339fd7e (`baseline/m5h1-stager-refactor`). M5.H2 v4 experiments preserved on the `experiment/m5h2-v4` branch at origin (commit `7984106`). Next phase: M6 (eval improvements).**
 
 ### M5.H2 rejection summary (2026-05-11)
 
@@ -18,7 +18,7 @@ Four implementation variants of lazy quiet sort attempted; all failed SPRT again
 
 **Root cause** (per `docs/research/m5-staged-movegen-allocation.md` + ADR-0030 §11): the literature signal "+5–15 Elo from history-score timing" applies to engines reaching depth 14+ consistently. clawfish at current strength is time-bound to depth 8–12 at typical TCs; at those depths the post-search history table is too sparse and noisy to outperform pre-search history. The +65 Elo at 40+0.4 is the literature signal manifesting; the −95 at 20+0.2 is the cost dominating elsewhere. No variant of the lazy-sort technique reconciled the two.
 
-**M5.H2 artifacts preserved**: `docs/plans/m5.h2.md` (plan), `docs/decisions/0030-staged-movegen.md` §11 (rejection record + four-variant analysis), `docs/research/m5-staged-movegen-allocation.md` (independent research on allocation patterns + TC fragility, by chess-researcher agent during failure investigation). v4 working code archived in `git stash` with message `M5.H2 v4 experiments (in-process + depth-gating; failed SPRT/sustained-load)`. M5.H3 (typed lazy generation) is **no longer scheduled** in its original form — the lazy-sort technique itself doesn't fit clawfish's CURRENT strength/TC profile.
+**M5.H2 artifacts preserved**: `docs/plans/m5.h2.md` (plan), `docs/decisions/0030-staged-movegen.md` §11 (rejection record + four-variant analysis), `docs/research/m5-staged-movegen-allocation.md` (independent research on allocation patterns + TC fragility, by chess-researcher agent during failure investigation). v4 working code archived on the `experiment/m5h2-v4` branch at origin (commit `7984106`, branched from M5.H1 baseline `339fd7e`). M5.H3 (typed lazy generation) is **no longer scheduled** in its original form — the lazy-sort technique itself doesn't fit clawfish's CURRENT strength/TC profile.
 
 **M5.H2 is DEFERRED (not abandoned)**: scheduled for revisit when clawfish reaches depth ≥ 14 at typical TCs (20+0.2). See `docs/tuning-backlog.md` §"M5.H2 lazy quiet sort — REVISIT" for the precondition checklist (3 gates) and recommended approach (recover v4 from stash, re-tune the depth threshold via SPRT sweep). Hard-rejection criterion documented for if revisit also fails.
 

@@ -128,7 +128,7 @@ At ~15ns/node × 200K nodes/sec = 3µs/sec extra. Bench's snapshot measurement o
 
 ## §11. H2 lazy per-stage sorting — REJECTED (per plan §13 outcome 4)
 
-**Status.** Attempted across four implementation variants (v1, v2, v3, v4) during a single overnight session (2026-05-10 → 2026-05-11). All four failed SPRT against `baseline/m5h1-stager-refactor` (M5.H1 v2 thin-wrapper). M5.H milestone closes at H1; the H2 lazy quiet sort literature signal (research §15.6, predicted +5–15 Elo) does not manifest for clawfish at its current strength and TC range. Working code preserved in git stash for archival. Production code: REVERTED to M5.H1 v2 thin-wrapper.
+**Status.** Attempted across four implementation variants (v1, v2, v3, v4) during a single overnight session (2026-05-10 → 2026-05-11). All four failed SPRT against `baseline/m5h1-stager-refactor` (M5.H1 v2 thin-wrapper). M5.H milestone closes at H1; the H2 lazy quiet sort literature signal (research §15.6, predicted +5–15 Elo) does not manifest for clawfish at its current strength and TC range. Working code preserved on branch `experiment/m5h2-v4` at origin (commit `7984106`). Production code: REVERTED to M5.H1 v2 thin-wrapper.
 
 ### §11.1 What was tried
 
@@ -150,15 +150,15 @@ Either we pay allocation cost (v1/v2) OR we pay sort-overhead cost at shallow de
 
 The literature signal predicts +5–15 Elo for deeper search engines. The +65 Elo at 40+0.4 in the SPRT data confirms this fires for clawfish at deep TC. But the regression at fast TC (where clawfish reaches only depth 8–10) dominates the aggregate.
 
-### §11.3 Implementation artifacts (in git stash, archival)
+### §11.3 Implementation artifacts (on `experiment/m5h2-v4` branch, archival)
 
-`git stash list` shows `On main: M5.H2 v4 experiments (in-place + depth-gating; failed SPRT/sustained-load)`. Contains:
+Preserved on branch `experiment/m5h2-v4` at origin (commit `7984106`, branched from M5.H1 baseline `339fd7e`). Contains:
 
 - `src/search.rs` — v4 `MoveStager` (single-Vec in-place + depth-gated lazy quiet sort) + `Stage` enum (production) + `partition_captures_quiets_in_place` helper + `LAZY_QUIET_SORT_MIN_DEPTH` constant + 26 updated test call sites + sort-counter `last_stager_*_sorts` recording in negamax.
 - `tests/uci_integration.rs` — E51 depth-4 pin updated to `85_534` (v3/v4 depth-4 bench).
 - `proptest-regressions/search.txt` — proptest regression artifacts.
 
-Recovery: `git stash pop` (if a future contributor wants to revisit M5.H2 with a different approach).
+Recovery: `git fetch && git checkout experiment/m5h2-v4 -- <files>` to selectively recover (will likely need conflict resolution if `main` has drifted), or `git cherry-pick 7984106` to apply the whole v4 delta on top of current main.
 
 ### §11.4 Lessons
 
