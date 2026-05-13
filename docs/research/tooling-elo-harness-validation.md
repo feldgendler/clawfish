@@ -205,7 +205,7 @@ All four pass deterministically against fixed SplitMix64 seeds (`0xC1AB_F15A_E10
 
 The Part 2b back-validation gate — re-run the M4.D mixed-TC SPRT through the new in-process SPRT mode and confirm statistical equivalence to the historical fastchess outcome — runs as a follow-up commit after the manual replay completes. Per ELOH.B/ELOH.C/ELOH.D precedent.
 
-Configuration: `baseline/alpha-beta-tt-killer-history` vs HEAD, `--tc-sample 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1`, α=β=0.05, elo0=0 elo1=5 (M4.D's actual bounds), startpos-only, `taskpolicy` P-core pinning, `--virtual-clock`.
+Configuration: `M4.C` vs HEAD, `--tc-sample 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1`, α=β=0.05, elo0=0 elo1=5 (M4.D's actual bounds), startpos-only, `taskpolicy` P-core pinning, `--virtual-clock`.
 
 Pass criteria (statistical, not bit-equivalence, since both PRNG and pair-scheduling differ from fastchess):
 - (a) Verdict is H1 accepted (matches the historical fastchess result).

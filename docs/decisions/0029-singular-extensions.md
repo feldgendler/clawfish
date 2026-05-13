@@ -100,7 +100,7 @@ Test-only `u32` field on `AlphaBetaMover`, incremented on verification fail-low 
 - WAC (clean re-run on v2 binary): **278/300 (92.7%)** vs M5.F 267/300 — **+11 positions, well above ±2 wallclock-noise band**. Strong tactical positive.
 - STS (clean re-run on v2 binary): **9239/15000 (61.6%, est. 2499 STS-Elo)** vs M5.F 8822/15000 (58.8%, est. 2376) — **+417 credit, well above ±68 wallclock-noise band, est. +123 STS-Elo**. Decisive tactical+strategic positive.
 - Mixed-TC rating estimate vs Stockfish UCI_Elo=2641 (seed `_00E`, 200 games + a 200-game independent confirmation run): Δ Elo **+3.47 [−40.84, +47.90]** (and confirmation run −6.95 [−51.16, +37.04]). Combined estimate ~**2639 ± 44 Elo** on Stockfish UCI_LimitStrength scale — statistically indistinguishable from M5.F's 2636, M5.E's 2622, and M5.D-v2's 2641. Both runs CPU-contended (concurrent rating-estimates); qualitative CI-straddling-zero result robust to contention.
-- Mixed-TC SPRT vs `baseline/m5f-qsearch-in-tt` (seed `0xC1ABF15AE10DD00C`): **`verdict=continue` at 400 games, Δ Elo +23.49 [+0.65, +46.53]**, pentanomial `[10,40,71,71,8]`. Per-TC: 10+0.1 51.2%, 20+0.2 51.0%, 40+0.4 64.6% (decisive!), 60+0.6 48.9%. Plan §11 outcome 2 (small-but-not-regression).
+- Mixed-TC SPRT vs `M5.F` (seed `0xC1ABF15AE10DD00C`): **`verdict=continue` at 400 games, Δ Elo +23.49 [+0.65, +46.53]**, pentanomial `[10,40,71,71,8]`. Per-TC: 10+0.1 51.2%, 20+0.2 51.0%, 40+0.4 64.6% (decisive!), 60+0.6 48.9%. Plan §11 outcome 2 (small-but-not-regression).
 
 **At v1 and v3 (rejected configurations):**
 

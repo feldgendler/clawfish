@@ -344,20 +344,20 @@ These tests are the parser's contract anchored to the actual data files — they
 
 ## 9. Backfill methodology
 
-For each baseline tag in `git tag -l 'baseline/*'` except `random-mover` (no search; scores zero):
+For each baseline tag in `git tag -l 'M[0-9]*'` except `M2.E` (no search; scores zero):
 
 1. Build the tag's binary in a `git worktree`-isolated checkout under `target/epd-baselines/<tag-slug>/` (mirrors `scripts/sprt.sh`'s pattern).
 2. Run `epd-suite --engine <bin> --suite wac --epd bench/data/wac.epd --movetime 1000 --concurrency 4 --hash 16`; record total/solved.
 3. Run the same with `--suite sts`; record total credit, max credit, per-theme breakdown, Elo estimate.
 4. Append a row to `bench/epd-suites.md`.
 
-**Caveat per the M3.E inflection.** `baseline/material-greedy` (M3.A) and `baseline/alpha-beta-no-tt` (M3.C) predate iterative deepening + time management. Their search shape is depth-fixed; `go movetime` is accepted syntactically but doesn't budget time. **Pre-flight required:** before backfilling those tags at `--movetime 1000`, run a 5-position smoke at the same TC. If the engine emits `bestmove` synchronously at native depth (i.e., faster than the harness's 10× movetime ceiling), the row is meaningful as "what this engine outputs at its native search shape" — annotated as "fixed-depth point" in the table. If the engine hangs or trips the ceiling, exclude the tag from the backfill rather than recording a 0 that's a measurement artifact, not a tactical miss.
+**Caveat per the M3.E inflection.** `M3.A` (M3.A) and `M3.F` (M3.C) predate iterative deepening + time management. Their search shape is depth-fixed; `go movetime` is accepted syntactically but doesn't budget time. **Pre-flight required:** before backfilling those tags at `--movetime 1000`, run a 5-position smoke at the same TC. If the engine emits `bestmove` synchronously at native depth (i.e., faster than the harness's 10× movetime ceiling), the row is meaningful as "what this engine outputs at its native search shape" — annotated as "fixed-depth point" in the table. If the engine hangs or trips the ceiling, exclude the tag from the backfill rather than recording a 0 that's a measurement artifact, not a tactical miss.
 
 **M5.E qsearch-shape annotation.** M3.D through M5.D-v2 use the *uncorrected* qsearch (CLAUDE.md "M3.D" through "M5.D"); M5.E onward uses the corrected qsearch (single-reply extension, true-stalemate detection, stalemate-conditional under-promo, MAX_PLY ceiling guard). The M5.E bench result was unchanged from M5.D-v2 because the corner cases don't fire on the 16-position bench corpus, but WAC's 300 tactical positions and STS's 1500 strategic positions are broader corpora — corner-case fire rates may differ. Annotate the M5.E row in `bench/epd-suites.md` with "qsearch corrections active" so a step change between M5.D-v2 and M5.E is not misread as an SPRT-relevant regression.
 
 **STS Elo regression citation.** The `Elo ≈ 44.523 · (points/100) − 242.85` formula is from Swaminathan Natarajan's STS calibration post (linked from <https://sites.google.com/site/strategictestsuite/about> and from the Chess Programming Wiki's Strategic Test Suite article). Vendor the citation as a comment on the `STS_ELO_SLOPE`/`STS_ELO_INTERCEPT` constants in `src/bin/epd-suite.rs` so a future session can confirm the regression's provenance.
 
-`baseline/random-mover` is excluded — score would be ~0 by construction (random move from legal moves; tactical hits are < 1/N).
+`M2.E` is excluded — score would be ~0 by construction (random move from legal moves; tactical hits are < 1/N).
 
 For tags that fail to build under the current toolchain (Rust edition mismatch, etc.), record "build failed" in the table. Old enough tags may use `chess` as the package name; the worktree-build step reads from the tag's `Cargo.toml`.
 

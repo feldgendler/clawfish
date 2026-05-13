@@ -24,18 +24,18 @@
 #                              cross-validation: pit HEAD vs Stockfish at the engine's
 #                              hypothesized Elo and check the score is ~50%.
 #
-# Usage: scripts/sprt.sh sprt baseline/random-mover
-#        scripts/sprt.sh match baseline/random-mover
+# Usage: scripts/sprt.sh sprt M5.H1
+#        scripts/sprt.sh match M5.H1
 #        scripts/sprt.sh rating-estimate
-#        SPRT_GAMES=400 scripts/sprt.sh sprt baseline/random-mover  (override)
-#        SPRT_TC=10+0.1 scripts/sprt.sh sprt baseline/random-mover  (override)
+#        SPRT_GAMES=400 scripts/sprt.sh sprt M5.H1  (override)
+#        SPRT_TC=10+0.1 scripts/sprt.sh sprt M5.H1  (override)
 #        SPRT_TC_SAMPLE='10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1' scripts/sprt.sh sprt <tag>
 #                                                                    (mixed-TC per ELOH.D;
 #                                                                    mutually exclusive with SPRT_TC)
 #        SPRT_SEED=0xC1ABF15AE10DD005 scripts/sprt.sh sprt <tag>     (deterministic per-pair
 #                                                                    TC stream)
-#        SPRT_CONCURRENCY=6 scripts/sprt.sh sprt baseline/random-mover
-#        SPRT_REBUILD=1 scripts/sprt.sh sprt baseline/random-mover  (force rebuild
+#        SPRT_CONCURRENCY=6 scripts/sprt.sh sprt M5.H1
+#        SPRT_REBUILD=1 scripts/sprt.sh sprt M5.H1  (force rebuild
 #                                                                    of cached baseline)
 
 set -euo pipefail
@@ -100,7 +100,7 @@ else
     # Verify baseline tag exists.
     if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/tags/$BASELINE_TAG" >/dev/null; then
         echo "ERROR: baseline tag '$BASELINE_TAG' not found." >&2
-        echo "  Available tags: $(git -C "$REPO_ROOT" tag -l 'baseline/*' | tr '\n' ' ')" >&2
+        echo "  Available tags: $(git -C "$REPO_ROOT" tag -l 'M[0-9]*' | tr '\n' ' ')" >&2
         exit 1
     fi
 

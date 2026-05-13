@@ -14,11 +14,11 @@ Sources: WAC from [arasan-chess/tests/wacnew.epd](https://github.com/jdart1/aras
 
 **Caveats.**
 
-- **`baseline/material-greedy` is M3.A** (depth-1 GreedyMover). It accepts `go movetime` syntactically but doesn't budget time — it returns a depth-1 move instantly regardless of TC. The row is meaningful as "what this engine does at its native search shape" but is not TC-comparable to M3.E+ rows.
-- **`baseline/alpha-beta-no-tt` is the M3.F commit** (post-M3.E iterative deepening + time management; pre-M4.A TT). The "no-tt" suffix is historical: the tag was created at the moment before the TT was added.
+- **`M3.A` is M3.A** (depth-1 GreedyMover). It accepts `go movetime` syntactically but doesn't budget time — it returns a depth-1 move instantly regardless of TC. The row is meaningful as "what this engine does at its native search shape" but is not TC-comparable to M3.E+ rows.
+- **`M3.F` is the M3.F commit** (post-M3.E iterative deepening + time management; pre-M4.A TT). The "no-tt" suffix is historical: the tag was created at the moment before the TT was added.
 - **M5.E qsearch shape change.** M3.D through M5.D-v2 use the *uncorrected* qsearch; M5.E onward uses the corrected qsearch (single-reply extension, true-stalemate detection, stalemate-conditional under-promo, MAX_PLY ceiling guard). The 16-position bench corpus didn't surface the corner cases, but WAC's 300 tactical positions and STS's 1500 strategic positions are broader corpora — small step changes between M5.D-v2 and M5.E rows may reflect this rather than direct strength signal.
 - **STS-Elo regression** uses Swaminathan Natarajan's published formula `Elo ≈ 44.523 · score_pct − 242.85`, where `score_pct` is the engine's percentage of max credit (e.g. a 58.9% scoring engine maps to `44.523 × 58.9 − 242.85 = 2380` STS-Elo). The formula is calibrated for the CCRL band 2000-2800; extrapolation outside degrades. STS systematically underestimates game-playing strength by ~200-300 Elo relative to game-based ratings because it scores strategic correctness only, with no credit for tactical sharpness. The relative ranking across baseline tags is the load-bearing signal; the absolute Elo number is advisory. Source: [STS site](https://sites.google.com/site/strategictestsuite/) and [Chess Programming Wiki](https://www.chessprogramming.org/Strategic_Test_Suite).
-- **`baseline/random-mover` is excluded** — score would be ~0/300 by construction (random move from legal moves).
+- **`M2.E` is excluded** — score would be ~0/300 by construction (random move from legal moves).
 
 ## Results — 2026-05-09
 
@@ -48,9 +48,9 @@ vs the displaced M5.E HEAD row (265 / 8832):
 - WAC: 267 vs 265 = **+2 positions** (within ±2 wallclock-noise band).
 - STS: 8822 vs 8832 = **−10 credit** (well within ±68 wallclock-noise band; M5.E's own run-vs-run variance was higher).
 
-M5.F's diagnostic-suite signal is **flat**. Bench drops 26.9% (1466436 → 1072309 nodes) without an EPD-detectable correctness regression. Earlier (now-overwritten) tentative numbers showed an apparent regression of −11 WAC / −302 STS — that run shared CPU with an in-flight 6-concurrency SPRT match against `baseline/m5e-qsearch-correctness` and was depressed by load contention; the clean re-run above is the load-bearing measurement.
+M5.F's diagnostic-suite signal is **flat**. Bench drops 26.9% (1466436 → 1072309 nodes) without an EPD-detectable correctness regression. Earlier (now-overwritten) tentative numbers showed an apparent regression of −11 WAC / −302 STS — that run shared CPU with an in-flight 6-concurrency SPRT match against `M5.E` and was depressed by load contention; the clean re-run above is the load-bearing measurement.
 
-The SPRT remains the load-bearing strength gate. M5.F's mixed-TC SPRT vs `baseline/m5e-qsearch-correctness`: Δ Elo **+13.03 [−10.92, +37.12]**, verdict=continue at 400 games, per-TC bimodal (10+0.1: 59.8%, 60+0.6: 46.5%). Landed as "small-but-not-regression" per plan §11 spirit (mean positive, CI lower 0.92 Elo below the −10 threshold, diagnostic-suite flat). Full SPRT log: [`bench/sprt/2026-05-09-m5.f-vs-m5e-mixed-tc.md`](sprt/2026-05-09-m5.f-vs-m5e-mixed-tc.md).
+The SPRT remains the load-bearing strength gate. M5.F's mixed-TC SPRT vs `M5.E`: Δ Elo **+13.03 [−10.92, +37.12]**, verdict=continue at 400 games, per-TC bimodal (10+0.1: 59.8%, 60+0.6: 46.5%). Landed as "small-but-not-regression" per plan §11 spirit (mean positive, CI lower 0.92 Elo below the −10 threshold, diagnostic-suite flat). Full SPRT log: [`bench/sprt/2026-05-09-m5.f-vs-m5e-mixed-tc.md`](sprt/2026-05-09-m5.f-vs-m5e-mixed-tc.md).
 
 ### Observations
 

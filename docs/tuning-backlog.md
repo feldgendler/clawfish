@@ -10,7 +10,7 @@ This file also tracks **deferred features awaiting a precondition** — items re
 
 ### M5.I aspiration third tier — DEFERRED 2026-05-11 (Elo-neutral; no per-TC signal to anchor follow-up tuning)
 
-**Status (2026-05-11).** M5.I v1 (`ASPIRATION_INTERMEDIATE_HALF_WIDTH = 150`, fires at all `depth >= ASPIRATION_MIN_DEPTH = 6`) ran mixed-TC SPRT vs `baseline/m5h1-stager-refactor` (seed `0xC1ABF15AE10DD011`).
+**Status (2026-05-11).** M5.I v1 (`ASPIRATION_INTERMEDIATE_HALF_WIDTH = 150`, fires at all `depth >= ASPIRATION_MIN_DEPTH = 6`) ran mixed-TC SPRT vs `M5.H1` (seed `0xC1ABF15AE10DD011`).
 
 **Final result at 400 games**:
 - Verdict: `continue` (llr=−0.22; LLR between H0/H1 bounds).
@@ -22,7 +22,7 @@ This file also tracks **deferred features awaiting a precondition** — items re
   - 40+0.4: 48.1% (Δ Elo ≈ −13) — 80 games
   - 60+0.6: 50.9% (Δ Elo ≈ +6) — 112 games
 
-**Decision: revert per plan §11 outcome 2.** Production HEAD remains at `baseline/m5h1-stager-refactor` (commit `339fd7e`). The intermediate aspiration tier produces **no measurable strength change** at clawfish's current strength/TC profile.
+**Decision: revert per plan §11 outcome 2.** Production HEAD remains at `M5.H1` (commit `339fd7e`). The intermediate aspiration tier produces **no measurable strength change** at clawfish's current strength/TC profile.
 
 **Important lesson from the SPRT run.** Mid-SPRT samples produced a dramatic-looking bimodal pattern at 168 games (10+0.1 +41 Elo, 20+0.2 −71 Elo). That signal was **sample-variance noise** — at full N=92-116 per TC bucket, all per-TC scores converged to ~50%. **Do not iterate on per-TC SPRT signals at <200 games.** Per-TC CIs are ±10-12% at N=80; the "TC-bimodal" failure pattern from M5.G v1 / M5.H2 needs the full mixed-TC run to confirm. (M5.G v1's actual bimodal pattern at 400 games was: 10+0.1 +66, 60+0.6 +5, 20+0.2 −60, 40+0.4 −44 — strong magnitudes that survived to convergence. M5.I had no such surviving signal.)
 
@@ -97,7 +97,7 @@ The modest tactical lean (WAC +7, STS +50) is consistent with the SPRT's +1.74 E
 7. **Per-path enable/disable for paths B/C/D/E.** Corner-case stores that fire rarely. Disabling individually has small per-path effect; mostly a code-size argument once SPRT-confirmed inert.
 8. **Hash-size interaction sweep.** Qsearch entries roughly double TT pressure. The default `Hash` may now be undersized; tuning the harness's `Hash` setting upward could shift the equilibrium. Cost: 0 LOC (UCI option already exists) + harness-config sweep.
 
-**Validation methodology.** Mixed-TC SPRT against `baseline/m5f-qsearch-in-tt` per the M5 convention. Items 1–3 are independent enough to SPRT separately; items 4–6 may interact (test in combinations once 1–3 land). Items 7–8 are diagnostic and may inform but not gate.
+**Validation methodology.** Mixed-TC SPRT against `M5.F` per the M5 convention. Items 1–3 are independent enough to SPRT separately; items 4–6 may interact (test in combinations once 1–3 land). Items 7–8 are diagnostic and may inform but not gate.
 
 **Cross-references.** ADR-0028 (the "Open SPRT-tunable parameters" section is empty — this file supersedes it for now); `bench/sprt/2026-05-09-m5.f-vs-m5e-mixed-tc.md`; `bench/sprt/2026-05-09-m5.f-probe-only-vs-probe-and-store.md`; `docs/milestones/m5.f.md`.
 
@@ -122,7 +122,7 @@ Neither is observably distinct from the original `(s_beta - 1, s_beta)` null win
 7. **PV-SE** (extend SE eligibility to PV nodes). Cost: ~5 LOC + SPRT.
 8. **Propagated `singular_ext_active` flag** through `search_child` (Stockfish-style stack tracking) — only relevant if SPRT shows verification-subtree NPS regression at deep TC. Cost: ~80 LOC (parameter migration through `search_child`) + SPRT.
 
-**Validation methodology.** Mixed-TC SPRT against `baseline/m5g-singular` per the M5 convention. Item 1 is a test-only addition (no Elo impact). Items 2–8 each independent; SPRT each separately.
+**Validation methodology.** Mixed-TC SPRT against `M5.G` per the M5 convention. Item 1 is a test-only addition (no Elo impact). Items 2–8 each independent; SPRT each separately.
 
 **Cross-references.** ADR-0029 §11; `bench/sprt/2026-05-09-m5.g-vs-m5f-mixed-tc.md` (landing); `docs/milestones/m5.g.md`.
 

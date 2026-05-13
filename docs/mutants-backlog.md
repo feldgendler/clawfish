@@ -295,5 +295,5 @@ As of 2026-04-30 the M4.B branch has been rebased onto `33a0d0d`, so the M4.A fo
 For an M4.A re-run scenario (e.g., revalidating after a search refactor), the regenerable diff is:
 
 ```sh
-git diff baseline/alpha-beta-no-tt..ecacf57 -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.a.diff"
+git diff M3.F..ecacf57 -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4.a.diff"
 ```

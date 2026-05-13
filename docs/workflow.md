@@ -356,7 +356,7 @@ Sequential Probability Ratio Test. The standard for accepting/rejecting engine c
 Worked example invocation:
 
 ```sh
-scripts/sprt.sh sprt baseline/alpha-beta-tt-killer-history-aspiration
+scripts/sprt.sh sprt M4.D
 ```
 
 Output:
@@ -385,25 +385,52 @@ The reference for any SPRT match is **a binary built from a prior git commit**, 
 
 SPRT baselines are referenced by **annotated git tags**, not bare SHAs. A bare SHA is forgettable and offers no signal in an SPRT log; an annotated tag is self-documenting.
 
-- **Format**: `baseline/<descriptive-slug>`.
-- **Slug**: lowercase, hyphen-separated, describes the engine's *behavior* at the tagged commit — not the milestone the commit landed in. The behavior name is what makes the tag legible years later in an SPRT log; milestone numbers require cross-referencing the roadmap.
-- **Annotated, not lightweight** (`git tag -a`). The annotation explains what the tag marks: which behavior, when it was last in production, and why it's a useful reference point. Pre-formatted so `git tag -ln5 baseline/random-mover` reads cleanly without consulting the roadmap.
-- **Each tag is the commit when the named behavior was last in production** — i.e., the last commit on `main` before the next phase replaced it. Tagged once and never moved or deleted (immutable historical reference).
+- **Format**: the milestone code itself — `M<digit>.<letter>` (e.g. `M3.F`, `M5.H1`) or `ELOH.<letter>` for the harness milestone. No prefix. The phase code is what readers already use elsewhere (roadmap, retrospectives, ADRs); the tag matches.
+- **Annotated, not lightweight** (`git tag -a`). The annotation explains what the tag marks: which behavior, when it was last in production, and why it's a useful reference point. Pre-formatted so `git tag -ln5 M2.E` reads cleanly without consulting the roadmap.
+- **Each tag is the commit when the named phase's behavior was last in production** — i.e., the last commit on `main` before the next phase replaced it. Tagged once and never moved or deleted (immutable historical reference).
 - **Pushed to `origin`** (the project is on GitHub at `feldgendler/clawfish`; tags push via `git push --tags` after creation).
 
-Tags created so far:
+Every milestone phase gets a tag, including ones that landed before SPRT was available (M1, M2, M3.A–E) and ones that descoped without a production change (M5.H2, M5.I — the tag points at the descope commit so the milestone is locatable in history).
 
 | Tag | Commit | Marks |
 |---|---|---|
-| `baseline/random-mover` | `08b980d` (M2.E end) | Last commit shipping uniform-random move selection as production search. The reference point for the M3 exit criterion ("beats the random mover ~100%"). |
-| `baseline/material-greedy` | M3.A end | Last commit shipping depth-1 best-eval (PeSTO MG material + PST) as production search. Reference point for any future SPRT match against the depth-1 greedy behavior. |
-| `baseline/alpha-beta-no-tt` | M3.F end | Last commit shipping alpha-beta + qsearch + ID + time-management without TT. Reference point for M4.A's SPRT (and M4.B–D thereafter). |
-
-Tags expected to be created at future milestone boundaries (illustrative — not commitments):
-
-- `baseline/alpha-beta-tt` — last commit shipping the bare TT (M4.A end / M4.B start), etc.
-
-Not every commit gets a baseline tag. The criterion: tag a commit if a future SPRT might want to cite it as a fixed reference point (typically end-of-milestone or end-of-substantial-feature). Within-milestone refactors and intermediate sub-phase commits don't get tagged — they're just steps in the history.
+| `M1.A` | `b64e212` | Project skeleton + square/bitboard primitives. Pre-SPRT. |
+| `M1.B` | `febd9ea` | Position struct + FEN parse/format. Pre-SPRT. |
+| `M1.C` | `e4c0430` | Sliding-piece attacks via fancy magic bitboards + magicgen. Pre-SPRT. |
+| `M1.D` | `41636e8` | Polyglot Zobrist hashing + EP-only-when-pseudo-legal. Pre-SPRT. |
+| `M1.E` | `1a325a0` | make/unmake with all special cases + incremental Zobrist. Pre-SPRT. |
+| `M1.F` | `d981853` | Legal-direct movegen with check-evasion specialization. Pre-SPRT. |
+| `M1.G` | `d3bf46a` | Recursive perft + criterion benchmark harness. Pre-SPRT (perft is the rules-layer correctness gate). |
+| `M2.A` | `d918acc` | UCI move encoding (`Move::to_uci`/`from_uci`). Pre-SPRT. |
+| `M2.B` | `d697de1` | UCI command parser. Pre-SPRT. |
+| `M2.C` | `06521c2` | UCI engine I/O loop + `Search` trait scaffolding (ADR-0011). Pre-SPRT. |
+| `M2.D` | `f304e25` | SplitMix64 random-mover `Search` impl + `Random_Seed` UCI option. Pre-SPRT. |
+| `M2.E` | `08b980d` | Random mover as production search + tournament harness. SPRT baseline for M3. |
+| `M3.A` | `5e3c07a` | Depth-1 best-eval (PeSTO MG material + PST) as production search. |
+| `M3.B` | `49b2810` | game_history + draw-detection plumbing (no behavior delta). |
+| `M3.C` | `7d41111` | AlphaBetaMover (fail-soft negamax + triangular PV + MVV-LVA + MDP). ADR-0016. |
+| `M3.D` | `e7b3569` | Quiescence search at the negamax horizon. |
+| `M3.E` | `dad25b2` | Iterative deepening + time management. ADR-0017. |
+| `M3.F` | `f64e07a` | `bench` UCI command + SPRT runner; closes M3. Reference for M4.A's SPRT. |
+| `M4.A` | `ecacf57` | TT added. |
+| `M4.B` | `f97a67b` | + killers. |
+| `M4.C` | `80401e6` | + history. |
+| `M4.D` | `2d0decd` | + aspiration windows; closes M4. |
+| `M5.A` | `e63eb15` | + null-move pruning. |
+| `M5.B` | `7d99ccc` | + reverse futility pruning. |
+| `M5.C` | `0f9bd88` | + late move reductions. |
+| `M5.D` | `8fa8a6e` | + frontier futility pruning (FFP_MAX_DEPTH=1). |
+| `M5.E` | `3aac5ce` | + qsearch correctness. |
+| `M5.F` | `b92c815` | + qsearch in TT. |
+| `M5.G` | `4e10297` | + singular extensions (SE_MIN_DEPTH=6 v2 retune). |
+| `M5.H1` | `339fd7e` | + staged movegen architecture refactor (`MoveStager`, bench-neutral). Current production HEAD. |
+| `M5.H2` | `d1e04b1` | Descope (lazy quiet sort, all variants SPRT-failed; deferred). Production unchanged. |
+| `M5.I` | `8760aa0` | Descope (third aspiration tier, Elo-neutral; deferred). Production unchanged. |
+| `ELOH.A` | `d71da32` | In-process Elo-iteration harness foundation. ADR-0020. |
+| `ELOH.B` | `527b583` | Statistical layer (RM K-update, σ-stopping, N-parallel, threshold adjudication). |
+| `ELOH.C` | `8fd24b7` | `VirtualClock` UCI option + harness handshake. ADR-0021. |
+| `ELOH.D` | `a88f743` | Per-pair TC sampling (`--tc-sample`, `--seed`) for mixed-TC SPRT. |
+| `ELOH.E` | `72a3b6c` | In-process pentanomial-GSPRT + fixed-games match. ADR-0022. Closes ELOH milestone. |
 
 ## Benchmarking conventions
 

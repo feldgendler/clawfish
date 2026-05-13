@@ -71,7 +71,7 @@ The online iterator's number is the most trustworthy because:
 - **TC-specific**: estimate at `tc=10+0.1`. Slower TC would likely shift the number; CCRL 40/4 standard would probably show clawfish ~50-150 Elo higher.
 - **Anchor-pool-specific**: Stockfish UCI_Elo is anchored to CCRL 40/4 calibration. Inherits any drift in that calibration (see `docs/tooling-backlog.md` discussion of pool stability).
 - **No transposition table**: clawfish at M3.F end has no TT. M4.A's TT will materially shift this number upward (typical TT-vs-no-TT delta is +50-150 Elo).
-- **Within-project deltas remain trustworthy** even if the absolute number drifts. The point of the `baseline/alpha-beta-no-tt` tag (created at this commit) is to give M4+ SPRTs a frozen reference point that doesn't depend on absolute Elo accuracy.
+- **Within-project deltas remain trustworthy** even if the absolute number drifts. The point of the `M3.F` tag (created at this commit) is to give M4+ SPRTs a frozen reference point that doesn't depend on absolute Elo accuracy.
 
 ## Methodology lessons
 

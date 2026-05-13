@@ -496,7 +496,7 @@ The math gate is a unit test (not a subprocess run). Feed `pair_counts = [5, 40,
 
 Re-run the M4.D mixed-TC SPRT through the new in-process SPRT mode and confirm statistical equivalence to the historical fastchess outcome.
 
-**Configuration.** `baseline/alpha-beta-tt-killer-history` vs HEAD at the same TC distribution `10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1`, α=β=0.05, elo0=0 elo1=5 (M4.D's actual SPRT bounds), startpos-only, taskpolicy P-core pinning, `--virtual-clock`. Through `scripts/sprt.sh sprt baseline/alpha-beta-tt-killer-history` post-rewrite (i.e. via the harness, not via fastchess).
+**Configuration.** `M4.C` vs HEAD at the same TC distribution `10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1`, α=β=0.05, elo0=0 elo1=5 (M4.D's actual SPRT bounds), startpos-only, taskpolicy P-core pinning, `--virtual-clock`. Through `scripts/sprt.sh sprt M4.C` post-rewrite (i.e. via the harness, not via fastchess).
 
 **Pass criteria.** This is a *fresh* run — different seeds, different scheduling, different RNG sources — so the gate is statistical, not deterministic.
 - (a) Verdict is H1 accepted (matches the historical fastchess result).
@@ -570,7 +570,7 @@ The §4.2 mutex covers all four modes' mutual exclusivity at parse time.
 ## 11. Doc-delta — atomic with landing
 
 - `docs/architecture.md` — tournament-harness row updated; new SPRT-runner row.
-- `docs/workflow.md` — SPRT section reworked: replace the "Run via `fastchess`" line with a `scripts/sprt.sh sprt baseline/<tag>` invocation through the harness; document the `--compliance`-stays-on-fastchess split as a one-paragraph subsection. The historical-commit-baseline methodology (lines ~360–397) stays as-is — only the *runner* inside the methodology changes, and `scripts/sprt.sh` is already the canonical entry point.
+- `docs/workflow.md` — SPRT section reworked: replace the "Run via `fastchess`" line with a `scripts/sprt.sh sprt <tag>` invocation through the harness; document the `--compliance`-stays-on-fastchess split as a one-paragraph subsection. The historical-commit-baseline methodology (lines ~360–397) stays as-is — only the *runner* inside the methodology changes, and `scripts/sprt.sh` is already the canonical entry point.
 - `docs/tooling/elo-iteration-harness.md` — new ELOH.E sub-phase row in the §"Sub-phases" table after ELOH.D; new "ELOH.E scope detail" section between ELOH.D's section and "Branches and worktrees." The new section should follow the ELOH.D structure: In scope / Out of scope / Open questions / Back-validation gate / Doc-delta. Approximately 60 LOC.
 - `docs/tooling-backlog.md` — close any sub-bullets that ELOH.E retires. Conservative grep at landing time; default zero retirements.
 - `docs/roadmap.md` — mark ELOH.E in the in-flight column or done column depending on landing posture; add to the Tooling/fuzzing row.

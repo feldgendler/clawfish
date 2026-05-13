@@ -143,7 +143,7 @@ case "$SUBCMD" in
         if [[ -n "$ARG" ]]; then
             tags=("$ARG")
         else
-            mapfile -t tags < <(git -C "$REPO_ROOT" tag -l 'baseline/*' | grep -v 'random-mover' | sort)
+            mapfile -t tags < <(git -C "$REPO_ROOT" tag -l 'M[0-9]*' | grep -v '^M2\.E$' | sort)
         fi
         echo "Backfilling ${#tags[@]} baseline tag(s) into $OUT_DIR"
         for tag in "${tags[@]}"; do

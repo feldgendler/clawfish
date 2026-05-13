@@ -37,7 +37,7 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > **M5.G (singular extensions)** landed at v2 retune `SE_MIN_DEPTH=6`
 > (after v1's literature default `SE_MIN_DEPTH=8` SPRT-failed at outcome 3
 > and v3's `SE_MARGIN_PER_DEPTH=2` at outcome 4). v2's mixed-TC SPRT vs
-> `baseline/m5f-qsearch-in-tt`: **Δ Elo +23.49 [+0.65, +46.53]** at 400
+> `M5.F`: **Δ Elo +23.49 [+0.65, +46.53]** at 400
 > games (verdict=continue, plan §11 outcome 2 small-but-not-regression).
 > Per-TC: 10+0.1 51.2%, 20+0.2 51.0%, **40+0.4 64.6% (decisive +104 Elo
 > locally)**, 60+0.6 48.9%. Bench: **1,147,614 nodes (+7.0% vs M5.F)** —
@@ -55,7 +55,7 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > **M5.F (qsearch-in-TT)** landed 2026-05-09 as "small-but-not-regression"
 > with mixed-TC SPRT Δ Elo **+13.03 [−10.92, +37.12]**. **M5.E** was a
 > correctness-only landing (4 narrow `qsearch` corrections; SPRT
-> inconclusive). `baseline/m5g-singular` tagged at the M5.G v2 landing.
+> inconclusive). `M5.G` tagged at the M5.G v2 landing.
 > Mixed-TC rating estimate via the in-process ELOH harness with frozen-K +
 > disabled σ-stop:
 >
@@ -72,19 +72,19 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > Apple M4 P-cores (utility QoS), single thread, no pondering, virtual
 > clock on clawfish. M5.G rating-estimate methodology:
 > [`bench/sprt/2026-05-10-m5.g-mixed-tc-rating-estimate.md`](bench/sprt/2026-05-10-m5.g-mixed-tc-rating-estimate.md).
-> M5.G SPRT-vs-`baseline/m5f-qsearch-in-tt` (v2-landed) log:
+> M5.G SPRT-vs-`M5.F` (v2-landed) log:
 > [`bench/sprt/2026-05-10-m5.g-v2-min-depth-6-vs-m5f-mixed-tc.md`](bench/sprt/2026-05-10-m5.g-v2-min-depth-6-vs-m5f-mixed-tc.md).
 > Full M5.G retune campaign (v1 outcome 3, v2 outcome 2 LANDED, v3 outcome 4):
 > [`bench/m5.md`](bench/m5.md) M5.G section.
 >
-> M5.C's mixed-TC SPRT vs `baseline/m5b-rfp` (M5.B end) — **H1 accepted in
+> M5.C's mixed-TC SPRT vs `M5.B` (M5.B end) — **H1 accepted in
 > 144 games / 72 pairs**, Δ Elo **+145.47 [+100.12, +196.09]** (pentanomial
 > 95% CI). All four TC buckets positive with strong slow-TC amplification
 > (40+0.4: 81.9%; 60+0.6: 78.9%; 20+0.2: 58.75%; 10+0.1: 58.3%) — typical
 > of LMR's depth-bounded selectivity. Full log:
 > [`bench/sprt/2026-05-05-m5.c-vs-m5b-mixed-tc.md`](bench/sprt/2026-05-05-m5.c-vs-m5b-mixed-tc.md).
 >
-> M5.B's mixed-TC SPRT vs `baseline/m5a-nmp` (M5.A end) — W-L-D
+> M5.B's mixed-TC SPRT vs `M5.A` (M5.A end) — W-L-D
 > **94/32/74** in 200 games / 100 pairs, score 65.5%, **logistic Elo +111**.
 > Pentanomial-GSPRT did not formally cross the `elo1=5` H1 Wald bound (the
 > chosen bound was too narrow given the actual gain magnitude — RFP
@@ -93,7 +93,7 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > H1 was treated as accepted on score-based decisioning. Full log:
 > [`bench/sprt/2026-05-02-m5.b-vs-m5a-mixed-tc.md`](bench/sprt/2026-05-02-m5.b-vs-m5a-mixed-tc.md).
 >
-> M5.A's mixed-TC SPRT vs `baseline/alpha-beta-tt-killer-history-aspiration`
+> M5.A's mixed-TC SPRT vs `M4.D`
 > (M4.D end) — **H1 accepted in 22 games / 11 pairs**, Δ Elo **+400.00
 > [+285.52, +677.51]** (pentanomial 95% CI). Full log:
 > [`bench/sprt/2026-05-01-m5.a-vs-aspiration-mixed-tc.md`](bench/sprt/2026-05-01-m5.a-vs-aspiration-mixed-tc.md).

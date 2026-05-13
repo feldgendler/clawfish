@@ -350,7 +350,7 @@ Reuse `score_to_tt` / `score_from_tt` unchanged. No qsearch-specific mate logic 
 
 ### SPRT baseline
 
-`baseline/m5e-qsearch-correctness` (as specified in CLAUDE.md). Suggested SPRT parameters: `elo0=0, elo1=10` (conservative; the Crafty "wash" is possible). Accept at H1 or run 400-game cap; the CI lower bound should be above −10 Elo to treat as "not a regression."
+`M5.E` (as specified in CLAUDE.md). Suggested SPRT parameters: `elo0=0, elo1=10` (conservative; the Crafty "wash" is possible). Accept at H1 or run 400-game cap; the CI lower bound should be above −10 Elo to treat as "not a regression."
 
 ### Node-budget consideration
 

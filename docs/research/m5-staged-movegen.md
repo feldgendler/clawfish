@@ -654,7 +654,7 @@ Out of scope for M5.H. Qsearch gets a purpose-built stager (if ever) in a later 
 **Recommend the split.**
 
 - H1 (behavior-equivalent refactor): Introduce `MoveStager` as the iterator, but generate all moves up-front and sort them at node entry exactly as today. The stager wraps the sorted `Vec<Move>` and yields from it. Node counts and bench signature are unchanged. This validates the stager API and the stage-skip logic.
-- H2 (lazy generation): Change `MoveStager` internals to generate captures lazily (on entering `GenerateCaptures` stage) and quiets lazily (on entering `GenerateQuiets` stage). This changes history-score timing and therefore node counts and bench signature. SPRT-gate H2 against `baseline/m5g-singular`.
+- H2 (lazy generation): Change `MoveStager` internals to generate captures lazily (on entering `GenerateCaptures` stage) and quiets lazily (on entering `GenerateQuiets` stage). This changes history-score timing and therefore node counts and bench signature. SPRT-gate H2 against `M5.G`.
 
 The split is supported by the literature (TalkChess t=76835 page 2 on history-score timing) and by the project's own SPRT-gating discipline. H1 gives the architectural benefit without the risk of a silent regression from history-score timing changes.
 

@@ -77,7 +77,7 @@ The H1-* tests in `src/search.rs::tests`:
 
 Bench parity at `1147614` exact (M5.G's count). Extended perft passes (`canonical_six_d4_heavy_slow`, `canonical_six_d5_slow`, `whittington_epd_d4_slow`) — the movegen-adjacent gate. Mutation testing: 60 mutants → 55 caught + 3 timeout (functionally caught via inf-loop) + 1 unviable + 1 missed-then-killed via H1-S13b; final viable catch rate 58/59 = 98.3%.
 
-50-pair defensive SPRT confirmation match vs `baseline/m5g-singular` per plan §12 step 7 (mixed-TC, seed `0xC1ABF15AE10DD00E`). H1 makes no strength claim; the SPRT confirms no-regression.
+50-pair defensive SPRT confirmation match vs `M5.G` per plan §12 step 7 (mixed-TC, seed `0xC1ABF15AE10DD00E`). H1 makes no strength claim; the SPRT confirms no-regression.
 
 ## Consequences
 
@@ -102,7 +102,7 @@ Bench parity at `1147614` exact (M5.G's count). Extended perft passes (`canonica
 
 ## §10. H1 v2 thin-wrapper retune
 
-**Symptom.** v1 implementation (per-stage state machine: `Stage::{Tt, Captures, Killer0, Killer1, Quiets, Done}` + per-stage Vecs `captures`/`quiets` + per-stage sorts) was bench-equivalent at depth 7 (`1147614 nodes` exact) and produced byte-equivalent yield sequences (verified by H1-P1 proptest at 2048 cases against `order_moves`), AND identical PV/nodes at single-shot `go depth 12` from startpos and from a 16-move mid-game position. But under sustained game-load, HEAD was ~3.5% slower at depth 14 from startpos (single-shot, byte-equivalent tree: 14201938 nodes both, but 6426ms HEAD vs 6206ms baseline) and ~5–9% slower in 20-sequential-`go-depth-10` tests. Defensive 100-game SPRT confirmation match vs `baseline/m5g-singular` (mixed-TC, seed `_00E`): Δ Elo **−110.48 [−207.37, −28.06]** at 26 games (verdict=H0). 300-game continuation Δ Elo **~−44** at 222 games (W=46 L=74 D=102, 43.7% score, sigma 8.65). Real regression.
+**Symptom.** v1 implementation (per-stage state machine: `Stage::{Tt, Captures, Killer0, Killer1, Quiets, Done}` + per-stage Vecs `captures`/`quiets` + per-stage sorts) was bench-equivalent at depth 7 (`1147614 nodes` exact) and produced byte-equivalent yield sequences (verified by H1-P1 proptest at 2048 cases against `order_moves`), AND identical PV/nodes at single-shot `go depth 12` from startpos and from a 16-move mid-game position. But under sustained game-load, HEAD was ~3.5% slower at depth 14 from startpos (single-shot, byte-equivalent tree: 14201938 nodes both, but 6426ms HEAD vs 6206ms baseline) and ~5–9% slower in 20-sequential-`go-depth-10` tests. Defensive 100-game SPRT confirmation match vs `M5.G` (mixed-TC, seed `_00E`): Δ Elo **−110.48 [−207.37, −28.06]** at 26 games (verdict=H0). 300-game continuation Δ Elo **~−44** at 222 games (W=46 L=74 D=102, 43.7% score, sigma 8.65). Real regression.
 
 **Diagnosis.** v1's per-node cost was ~3× M5.G's per-node cost on three counts:
 - 3 `Vec<Move>` allocations per node (`all`, `captures`, `quiets`) vs M5.G's 1 (`moves_vec`).
@@ -118,7 +118,7 @@ At ~15ns/node × 200K nodes/sec = 3µs/sec extra. Bench's snapshot measurement o
 - Sustained-go test (20-sequential-`go-depth-10`) post-v2: HEAD ≈ baseline (3 runs: ratio 0.967, 0.997, 0.958; avg 0.974, slightly faster).
 - Single-shot depth-14 from startpos post-v2: HEAD/baseline within ~1% (run-to-run noise).
 - Test surface: 30+ H1-* tests (H1-S/H/I/B/P) all pass against v2 (yield-order properties unchanged because v2 produces the same yield sequence as v1 — v2 just gets there with one sort instead of two).
-- Defensive 200-game SPRT confirmation match vs `baseline/m5g-singular` (seed `_010`) post-v2 — see SPRT log.
+- Defensive 200-game SPRT confirmation match vs `M5.G` (seed `_010`) post-v2 — see SPRT log.
 
 **API stability for M5.H2.** v2 preserves the public API verbatim. M5.H2's contract is unchanged: keep the same `new` / `next` / `peek` / `len` / `is_empty` / `yield_sequence` surface, swap the internal `Vec<Move> + sort` for per-stage lazy generation (TT typed-validate, captures generated on first entry to virtual `Captures` stage, etc.). The `Stage` enum was removed at v2 — H2 will reintroduce it as part of the per-stage lazy-generation work, scoped to the impl, not exposed via the API.
 
@@ -128,13 +128,13 @@ At ~15ns/node × 200K nodes/sec = 3µs/sec extra. Bench's snapshot measurement o
 
 ## §11. H2 lazy per-stage sorting — REJECTED (per plan §13 outcome 4)
 
-**Status.** Attempted across four implementation variants (v1, v2, v3, v4) during a single overnight session (2026-05-10 → 2026-05-11). All four failed SPRT against `baseline/m5h1-stager-refactor` (M5.H1 v2 thin-wrapper). M5.H milestone closes at H1; the H2 lazy quiet sort literature signal (research §15.6, predicted +5–15 Elo) does not manifest for clawfish at its current strength and TC range. Working code preserved on branch `experiment/m5h2-v4` at origin (commit `7984106`). Production code: REVERTED to M5.H1 v2 thin-wrapper.
+**Status.** Attempted across four implementation variants (v1, v2, v3, v4) during a single overnight session (2026-05-10 → 2026-05-11). All four failed SPRT against `M5.H1` (M5.H1 v2 thin-wrapper). M5.H milestone closes at H1; the H2 lazy quiet sort literature signal (research §15.6, predicted +5–15 Elo) does not manifest for clawfish at its current strength and TC range. Working code preserved on branch `experiment/m5h2-v4` at origin (commit `7984106`). Production code: REVERTED to M5.H1 v2 thin-wrapper.
 
 ### §11.1 What was tried
 
 Each variant kept the H1-P1 / H2-P1 proptest invariant (yield-sequence equivalence to `order_moves` under constant history) — algorithmic correctness was never the failure mode. The failure was always SPRT Elo loss.
 
-- **v1 (3-Vec + lazy)**: per-stage `Vec<Move>` for `all` + `captures` + `quiets` + `Stage` enum + lazy `mvv_lva_sort_in_place` and `history_sort_in_place` on first-entry. 3 allocations per node. Bench `1153734` (+0.5% vs baseline `1147614`). **SPRT vs `baseline/m5h1-stager-refactor`**: 277 games, score 47.8%, Δ Elo ≈ −15 logistic. **Per-TC bimodal**: 10+0.1: 48.4% (−10), 20+0.2: **36.8% (−95 decisive)**, 40+0.4: **59.2% (+65 decisive)**, 60+0.6: 46.9% (−22). Researcher (see §11.5) confirmed the bimodal explanation: at shallow TC the lazy sort reads post-search history that's too sparse + noisy at depths 8–10 to outperform pre-search history; at slow TC the deeper sub-tree produces enough history signal for the freshness benefit (the +65 at 40+0.4 IS the literature signal manifesting).
+- **v1 (3-Vec + lazy)**: per-stage `Vec<Move>` for `all` + `captures` + `quiets` + `Stage` enum + lazy `mvv_lva_sort_in_place` and `history_sort_in_place` on first-entry. 3 allocations per node. Bench `1153734` (+0.5% vs baseline `1147614`). **SPRT vs `M5.H1`**: 277 games, score 47.8%, Δ Elo ≈ −15 logistic. **Per-TC bimodal**: 10+0.1: 48.4% (−10), 20+0.2: **36.8% (−95 decisive)**, 40+0.4: **59.2% (+65 decisive)**, 60+0.6: 46.9% (−22). Researcher (see §11.5) confirmed the bimodal explanation: at shallow TC the lazy sort reads post-search history that's too sparse + noisy at depths 8–10 to outperform pre-search history; at slow TC the deeper sub-tree produces enough history signal for the freshness benefit (the +65 at 40+0.4 IS the literature signal manifesting).
 - **v2 (3-Vec + lazy)**: identical to v1, just different SPRT seed (`_011`). Same bimodal result.
 - **v3 (single-Vec in-place + lazy)**: collapsed the 3-Vec design to a single `Vec<Move>` with `partition_captures_quiets_in_place` (stable rotation-based partition) and skip-during-iteration for TT/killer dedup (no physical removal). **1 allocation per node** (allocation-parity with M5.G / H1-v2 baseline). Bench `1153734` (algorithm unchanged; same as v1/v2). **Sustained-load NPS: 1.53× FASTER than baseline** (20-sequential-`go-depth-10`: 230ms HEAD vs 374ms baseline). **SPRT trajectory at 32 games: 37.5% score (worse than v2's 47.8%)** — bimodal pattern persisted with the same shape. Conclusion: the regression was algorithmic, not allocation-driven. The 1.53× wallclock advantage of v3 over baseline did NOT translate to Elo at fast TC, because v3 plays at the same depth (time-pressured) as baseline but with the lazy-noisy ordering loss.
 - **v4 (v3 + depth-gating)**: added `LAZY_QUIET_SORT_MIN_DEPTH = 6` (mirroring `SE_MIN_DEPTH`). At `depth < 6`, sort quiets eagerly at construction (pre-search history snapshot — matches M5.G / H1-v2). At `depth >= 6`, use v3 lazy behavior. Required adding `depth: u32, history: &HistoryTable` arguments to `MoveStager::new`. Bench `1104493` (−3.8% vs baseline — fewer nodes via better ordering). **Sustained-load NPS: 0.38× — 2.8× SLOWER than baseline**. The eager-quiet-sort at every shallow node was substantially more expensive than baseline's single big sort (paid the partition cost + two separate sorts vs baseline's one), and the cost grew with node count (leaf-adjacent depth band dominates). Net: v4 reaches shallower depths in time-pressured games. Even with replacing `sort_by_cached_key` with `sort_by` (eliminates per-call key-cache alloc), the slowdown persisted at 0.38× — the cost is structural (extra sort firings), not the sort itself.
@@ -187,7 +187,7 @@ Plan §13 outcome 4: "verdict=H0 OR mean negative → Don't land. Investigate. .
 - v3 SPRT (32 games, killed early): trajectory matched v1/v2 bimodal pattern; would have completed at similar mean.
 - v4 sustained-load (pre-SPRT gate): failed §12 step 5 abort criterion (ratio < 0.95) — formally we shouldn't even run SPRT.
 
-**Decision: descope.** Production code reverted to `baseline/m5h1-stager-refactor`. M5.H milestone closes at H1 (architectural refactor only; no H2 lazy-generation work, no H3). The plan and this ADR §11 are preserved as a record of the failed attempt. The next milestone is M6 (eval improvements).
+**Decision: descope.** Production code reverted to `M5.H1`. M5.H milestone closes at H1 (architectural refactor only; no H2 lazy-generation work, no H3). The plan and this ADR §11 are preserved as a record of the failed attempt. The next milestone is M6 (eval improvements).
 
 ## References
 

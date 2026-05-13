@@ -70,7 +70,7 @@ let ffp_static_eval: Option<i32> = if ply > 0
 
 `ffp_static_eval == Some(_)` IS the eligibility predicate; the per-quiet branch in §6 matches on `Some(static_eval)` and skips otherwise. No separate `ffp_node_eligible: bool` to keep in sync.
 
-**Rejected alternative**: hoist `static_eval` once at the top of `negamax` and share with all three blocks. Rejected for the same reason ADR-0024 §6 rejected a shared eager read: it would change the read population on K+P endgame nodes (NMP's `has_non_pawn_material` gate currently prevents the eval read; a shared hoist would fire regardless), and it would silently change the M5.A/B byte sequences — muddying the M5.D SPRT against `baseline/m5c-lmr`.
+**Rejected alternative**: hoist `static_eval` once at the top of `negamax` and share with all three blocks. Rejected for the same reason ADR-0024 §6 rejected a shared eager read: it would change the read population on K+P endgame nodes (NMP's `has_non_pawn_material` gate currently prevents the eval read; a shared hoist would fire regardless), and it would silently change the M5.A/B byte sequences — muddying the M5.D SPRT against `M5.C`.
 
 The independent reads keep ADR-0023 §3 and ADR-0024 §6 byte-identical and make the M5.D SPRT signal attributable to FFP alone.
 
@@ -242,7 +242,7 @@ The v1 commitments are conservative and chosen for **clean SPRT attribution**, n
 
 **Positive:**
 
-- Bench node count expected to drop further on the local implementation benchmark; research §15's CPW-based prior is +20–40 Elo over `baseline/m5c-lmr`.
+- Bench node count expected to drop further on the local implementation benchmark; research §15's CPW-based prior is +20–40 Elo over `M5.C`.
 - Composes naturally with M5.A/M5.B/M5.C: prologue pruning still runs before the move loop, RFP / NMP cut whole subtrees, FFP skips individual quiets, LMR reduces individual quiets. At v1 constants, FFP and LMR have non-overlapping depth ranges, keeping the move-loop logic clean.
 - No signature changes. No new UCI options. No changes to `src/mov.rs`, `src/position.rs`, `src/tt.rs`, `src/eval.rs`, or movegen.
 

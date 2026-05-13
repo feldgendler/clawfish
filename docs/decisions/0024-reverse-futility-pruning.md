@@ -84,7 +84,7 @@ RFP at step 8 and NMP at step 9 each read `static_eval` inside their own gate. T
 **Rejected alternative**: hoist `static_eval` above both blocks, share one read. Rejected at plan-review pass 1 because:
 - It would enlarge the read population on K+P endgame nodes (where NMP's `has_non_pawn_material` gate currently prevents the read; a shared hoist would fire regardless).
 - The NMP block's behavior would silently change (the lazy-read-inside-`has_non_pawn_material` structure is load-bearing per ADR-0023 §3).
-- The SPRT would blend RFP's signal with an NMP side-channel change, muddying attribution against `baseline/m5a-nmp`.
+- The SPRT would blend RFP's signal with an NMP side-channel change, muddying attribution against `M5.A`.
 
 Keeping the reads independent preserves ADR-0023 §3 byte-identically and makes the M5.B SPRT attributable to RFP alone.
 
