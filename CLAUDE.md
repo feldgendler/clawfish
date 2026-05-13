@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**M5 milestone closed 2026-05-11 at M5.H1.** Production HEAD = `M5.H1` (commit `339fd7e`). M5.H2 (lazy quiet sort) and M5.I (third aspiration tier) both attempted and DEFERRED at the milestone close — see their retrospectives for revisit conditions.
+**M5 milestone closed 2026-05-11 at M5.H1.** Production HEAD = `M5.H1`. M5.H2 (lazy quiet sort) and M5.I (third aspiration tier) both attempted and DEFERRED at the milestone close — see their retrospectives for revisit conditions.
 
 **Next phase: M6 (eval improvements)** — tapered eval, pawn structure, king safety, mobility, passed pawns. Per-theme STS validation available via `src/bin/epd-suite.rs`; M5.H1 baseline at HEAD is 8822/15000 (58.9%) total credit. See [`docs/roadmap.md`](docs/roadmap.md) for the forward plan and [`docs/milestones/`](docs/milestones/) for per-phase retrospectives.
 

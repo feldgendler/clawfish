@@ -39,4 +39,4 @@ Each retrospective captures what landed, verification numbers, the SPRT outcome,
 
 ## Baseline tag convention
 
-Each landed phase tags its baseline so the next phase's SPRT reference is unambiguous. Tags use the milestone code itself as the tag name — `M3.F`, `M5.H1`, etc. Current production HEAD = `M5.H1` (commit `339fd7e`). Full conventions: `docs/workflow.md` §"Baseline tag naming convention".
+Each landed phase tags its baseline so the next phase's SPRT reference is unambiguous. Tags use the milestone code itself as the tag name — `M3.F`, `M5.H1`, etc. Current production HEAD = `M5.H1`. Full conventions: `docs/workflow.md` §"Baseline tag naming convention".

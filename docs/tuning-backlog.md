@@ -22,7 +22,7 @@ This file also tracks **deferred features awaiting a precondition** — items re
   - 40+0.4: 48.1% (Δ Elo ≈ −13) — 80 games
   - 60+0.6: 50.9% (Δ Elo ≈ +6) — 112 games
 
-**Decision: revert per plan §11 outcome 2.** Production HEAD remains at `M5.H1` (commit `339fd7e`). The intermediate aspiration tier produces **no measurable strength change** at clawfish's current strength/TC profile.
+**Decision: revert per plan §11 outcome 2.** Production HEAD remains at `M5.H1`. The intermediate aspiration tier produces **no measurable strength change** at clawfish's current strength/TC profile.
 
 **Important lesson from the SPRT run.** Mid-SPRT samples produced a dramatic-looking bimodal pattern at 168 games (10+0.1 +41 Elo, 20+0.2 −71 Elo). That signal was **sample-variance noise** — at full N=92-116 per TC bucket, all per-TC scores converged to ~50%. **Do not iterate on per-TC SPRT signals at <200 games.** Per-TC CIs are ±10-12% at N=80; the "TC-bimodal" failure pattern from M5.G v1 / M5.H2 needs the full mixed-TC run to confirm. (M5.G v1's actual bimodal pattern at 400 games was: 10+0.1 +66, 60+0.6 +5, 20+0.2 −60, 40+0.4 −44 — strong magnitudes that survived to convergence. M5.I had no such surviving signal.)
 
@@ -51,7 +51,7 @@ The modest tactical lean (WAC +7, STS +50) is consistent with the SPRT's +1.74 E
 
 ### M5.H2 lazy quiet sort — REVISIT when typical-TC search reaches depth 14+
 
-**Status.** Rejected 2026-05-11 across four implementation variants (v1-v4); see ADR-0030 §11 and `docs/milestones/m5.h2.md`. Production reverted to M5.H1 v2 thin-wrapper baseline. v4 working code preserved on branch `experiment/m5h2-v4` at origin (commit `7984106`, branched from M5.H1 baseline `339fd7e`).
+**Status.** Rejected 2026-05-11 across four implementation variants (v1-v4); see ADR-0030 §11 and `docs/milestones/m5.h2.md`. Production reverted to M5.H1 v2 thin-wrapper baseline. v4 working code preserved on branch `experiment/m5h2-v4` at origin (commit `7984106`, branched from M5.H1 baseline `M5.H1`).
 
 **Why deferred, not abandoned.** The literature signal (research §15.6: +5–15 Elo from post-captures-search history-score timing) DID manifest at 40+0.4 (+65 Elo decisive) in the M5.H2 v1/v2 SPRT. The failure mode was the per-TC bimodal pattern: at fast TCs where clawfish reaches only depth 8–12, the post-search history table is too sparse and noisy to outperform pre-search history (−95 Elo at 20+0.2). The literature signal is real but conditional on the engine reaching depths where history accumulates enough signal-to-noise.
 

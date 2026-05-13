@@ -521,7 +521,7 @@ This is a pure function (depth → margin), unit-testable at every depth boundar
 
 | Parameter | Value |
 |---|---|
-| Baseline tag | `M5.C` (commit `0f9bd88`) |
+| Baseline tag | `M5.C` |
 | SPRT bounds | `elo0=0, elo1=5` (FFP is moderate; +20–40 Elo prior → 5 Elo signal is credible minimum) |
 | TC sampling | `--tc-sample 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1` (mixed-TC; FFP benefits more at slow TC) |
 | Acceptance | Mixed-game SPRT H1 + Δ Elo ≥ 0 at every TC |

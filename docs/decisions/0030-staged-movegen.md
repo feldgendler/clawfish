@@ -152,7 +152,7 @@ The literature signal predicts +5–15 Elo for deeper search engines. The +65 El
 
 ### §11.3 Implementation artifacts (on `experiment/m5h2-v4` branch, archival)
 
-Preserved on branch `experiment/m5h2-v4` at origin (commit `7984106`, branched from M5.H1 baseline `339fd7e`). Contains:
+Preserved on branch `experiment/m5h2-v4` at origin (commit `7984106`, branched from M5.H1 baseline `M5.H1`). Contains:
 
 - `src/search.rs` — v4 `MoveStager` (single-Vec in-place + depth-gated lazy quiet sort) + `Stage` enum (production) + `partition_captures_quiets_in_place` helper + `LAZY_QUIET_SORT_MIN_DEPTH` constant + 26 updated test call sites + sort-counter `last_stager_*_sorts` recording in negamax.
 - `tests/uci_integration.rs` — E51 depth-4 pin updated to `85_534` (v3/v4 depth-4 bench).

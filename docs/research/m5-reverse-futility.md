@@ -359,7 +359,7 @@ The `in_check` predicate is called once per node regardless of how many prologue
 
 | Parameter | Value |
 |---|---|
-| Baseline tag | `M5.A` (commit `e63eb15`) |
+| Baseline tag | `M5.A` |
 | SPRT bounds | `elo0=0, elo1=5` (RFP is smaller than NMP; 5 Elo signal is credible) |
 | TC sampling | `--tc-sample 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1` (mixed-TC; RFP benefits more at slow TC where deeper nodes matter) |
 | Acceptance | Mixed-game SPRT H1 + Δ Elo ≥ 0 at every TC |

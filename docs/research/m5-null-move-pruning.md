@@ -421,7 +421,7 @@ Clawfish has TT + killers + history + aspiration (M4 complete). This is strong f
 
 | Parameter | Value |
 |-----------|-------|
-| Baseline tag | `M4.D` (M4.D end) |
+| Baseline tag | `M4.D` |
 | SPRT bounds | `elo0=0, elo1=10` (NMP is large enough; lower to 5 only if surprisingly weak) |
 | TC sampling | `--tc-sample 10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1` (mixed-TC; NMP amplifies with depth) |
 | Acceptance criterion | Mixed-game SPRT H1 + Δ Elo ≥ 0 at every TC |

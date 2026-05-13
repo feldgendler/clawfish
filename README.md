@@ -77,14 +77,14 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > Full M5.G retune campaign (v1 outcome 3, v2 outcome 2 LANDED, v3 outcome 4):
 > [`bench/m5.md`](bench/m5.md) M5.G section.
 >
-> M5.C's mixed-TC SPRT vs `M5.B` (M5.B end) — **H1 accepted in
+> M5.C's mixed-TC SPRT vs `M5.B` — **H1 accepted in
 > 144 games / 72 pairs**, Δ Elo **+145.47 [+100.12, +196.09]** (pentanomial
 > 95% CI). All four TC buckets positive with strong slow-TC amplification
 > (40+0.4: 81.9%; 60+0.6: 78.9%; 20+0.2: 58.75%; 10+0.1: 58.3%) — typical
 > of LMR's depth-bounded selectivity. Full log:
 > [`bench/sprt/2026-05-05-m5.c-vs-m5b-mixed-tc.md`](bench/sprt/2026-05-05-m5.c-vs-m5b-mixed-tc.md).
 >
-> M5.B's mixed-TC SPRT vs `M5.A` (M5.A end) — W-L-D
+> M5.B's mixed-TC SPRT vs `M5.A` — W-L-D
 > **94/32/74** in 200 games / 100 pairs, score 65.5%, **logistic Elo +111**.
 > Pentanomial-GSPRT did not formally cross the `elo1=5` H1 Wald bound (the
 > chosen bound was too narrow given the actual gain magnitude — RFP
