@@ -121,7 +121,7 @@ Detailed SPRT logs: `bench/sprt/2026-05-09-m5.g-vs-m5f-mixed-tc.md` (v1), `bench
 - PV-SE (extend SE eligibility to PV nodes).
 - Excluded-move TT-key separation.
 - Propagated `singular_ext_active` flag through `search_child` (revisit if verification-subtree NPS regression observed at deep TC).
-- Boundary test `negamax_se_extension_at_singular_beta_boundary` — closes the two missed mutants on the `s_beta - 1` window expression. See `docs/tuning-backlog.md`.
+- ~~Boundary test `negamax_se_extension_at_singular_beta_boundary` — closes the two missed mutants on the `s_beta - 1` window expression.~~ **Done 2026-05-14**: landed at `src/search.rs::tests::negamax_se_extension_at_singular_beta_boundary`; verified via `cargo mutants` to catch all four mutants on the verification window expression (the two `s_beta - 1` arithmetic mutants + both `verif_score < s_beta` comparison mutants). `docs/tuning-backlog.md` item 4.1 marked done.
 
 ## References
 

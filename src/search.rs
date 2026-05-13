@@ -17313,6 +17313,181 @@ mod tests {
         );
     }
 
+    /// Boundary-engineering fixture for the verification window `(s_beta - 1, s_beta)`
+    /// at `src/search.rs`'s SE verification call. Closes three mutants that survived
+    /// M5.G's `cargo mutants --in-diff` campaign:
+    ///   - `s_beta - 1` → `s_beta + 1`: inverted window (alpha > beta).
+    ///   - `s_beta - 1` → `s_beta / 1` = `s_beta`: zero-width window (alpha == beta).
+    ///   - `<` → `<=` on the outer `if verif_score < s_beta { se_extensions += 1; }`
+    ///     (test-suite review pass-2 should-fix).
+    ///
+    /// Why a boundary fixture is needed. The fail-soft cutoff at the verification
+    /// frame is `if score > best { best = score; … if alpha >= beta { break; } }`
+    /// (see step-13 move-loop body). The `alpha >= beta` check runs *inside* the
+    /// `score > best` block but *outside* the `score > alpha` alpha-update, so a
+    /// mutated alpha that is already ≥ beta at frame entry fires cutoff on the
+    /// very first move searched — returning that move's raw fail-soft score.
+    /// Production's alpha = `s_beta - 1` is strictly below beta = `s_beta`, so
+    /// production cuts off only when a child's score actually reaches `s_beta`.
+    /// Both `+` and `/` mutants enter the move loop with alpha ≥ beta and cut at
+    /// the first non-excluded child; production iterates until a child lifts best
+    /// up to `s_beta`.
+    ///
+    /// Engineered fixture. The position has many legal moves; we pre-store Exact
+    /// TT entries at every non-excluded child's zobrist so each child's step-7
+    /// probe short-circuits to a known score. The first non-excluded move in
+    /// stager order returns `s_beta - δ` (δ > 0); every later non-excluded move
+    /// returns exactly `s_beta`. Trace:
+    ///   - Production iter 1 (first non-excluded): score = `s_beta - δ`. `best`
+    ///     updates to `s_beta - δ`; alpha = `s_beta - 1` (no update — score is
+    ///     not > `s_beta - 1`); cutoff check `s_beta - 1 >= s_beta` is false;
+    ///     continue.
+    ///   - Production iter 2 (second non-excluded): score = `s_beta`. `best`
+    ///     updates to `s_beta`; alpha updates to `s_beta`; cutoff fires
+    ///     (`s_beta >= s_beta`). Returns `verif_score = s_beta`.
+    ///   - Production outer check `s_beta < s_beta` is false → `se_extensions = 0`.
+    ///   - Mutant `+` iter 1: alpha already > beta. Returns `best = s_beta - δ`.
+    ///     `verif_score = s_beta - δ < s_beta` → extension fires (se_extensions = 1).
+    ///   - Mutant `/` iter 1: alpha == beta. Same outcome as `+`.
+    ///   - Mutant `<=`: production trace, `s_beta <= s_beta` true → extension fires.
+    ///
+    /// Closes `docs/tuning-backlog.md` M5.G item 4.1 and the matching backlog
+    /// line in ADR-0029 "Open / tuning backlog".
+    #[test]
+    fn negamax_se_extension_at_singular_beta_boundary() {
+        use crate::history::HistoryTable;
+
+        let pos = se_test_pos();
+        let depth = SE_MIN_DEPTH;
+        let ply = 1_u32;
+        let tt_move_bits = se_find_best_move_bits(&pos);
+
+        // Probe the verification frame's stager yield order. The verification
+        // frame constructs MoveStager with the *same* inputs available here:
+        // ply=1 (same as parent), fresh killer table (empty at ply 1 from a
+        // newly-constructed AlphaBetaMover — no cutoff has yet fired at ply 1
+        // when the SE block runs), fresh history table, and the parent's TT
+        // move. Reproducing those inputs gives us the exact yield order the
+        // verification frame will see.
+        let probe_history = HistoryTable::new();
+        let probe_stager = MoveStager::new(
+            &pos,
+            Move::default(),
+            Move::default(),
+            &probe_history,
+            tt_move_bits,
+            None,
+        );
+        let yield_seq = probe_stager.yield_sequence();
+        assert!(
+            yield_seq.len() >= 3,
+            "fixture invariant: position must have >= 3 legal moves to give the \
+             verification frame a 'first non-excluded' AND a 'later non-excluded' \
+             move; got {} legal moves",
+            yield_seq.len()
+        );
+        assert_eq!(
+            yield_seq[0].bits(),
+            tt_move_bits,
+            "fixture invariant: TT-move promotion must place the TT move at yield \
+             index 0; got yield_seq[0]={:?}, tt_move_bits={}",
+            yield_seq[0],
+            tt_move_bits
+        );
+
+        // s_beta = 50: well below RFP-firing threshold for the verification
+        // frame's depth-2 RFP gate (margin = 200; would need static_eval ≥ 250
+        // to fire, but se_test_pos has symmetric material so |static_eval| is
+        // far smaller), and well below MATE_IN_MAX_PLY so SE clause 8 passes
+        // and `score_to_tt`/`score_from_tt` are identity transforms.
+        let s_beta_value: i32 = 50;
+        let s_beta_delta: i32 = 5;
+        let tt_score_raw: i32 = s_beta_value + depth as i32;
+        assert_eq!(
+            singular_beta(tt_score_raw, depth),
+            s_beta_value,
+            "test setup: singular_beta({tt_score_raw}, {depth}) must equal {s_beta_value}"
+        );
+
+        // Build TT and seed entries.
+        let tt = Arc::new(TranspositionTable::new(16));
+        let (ctx, _) = non_aborting_ctx_at_depth_with_tt(depth + 2, Arc::clone(&tt));
+        tt.new_search();
+
+        // Parent (the node SE fires at): Lower-bound at depth = SE_MIN_DEPTH,
+        // score = tt_score_raw. Satisfies all 9 SE eligibility clauses.
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: score_to_tt(tt_score_raw, ply as i32) as i16,
+                depth: depth as u8,
+                bound: TtBound::Lower,
+                best_move: tt_move_bits,
+            },
+        );
+
+        // Pre-store Exact entries at every non-excluded child's zobrist:
+        //   yield_seq[1] (first searched non-excluded) → score = -(s_beta - δ),
+        //     so parent's negated child return is s_beta - δ < s_beta.
+        //   yield_seq[2..] (every later non-excluded) → score = -s_beta,
+        //     so parent's negated child return is exactly s_beta.
+        //
+        // Pre-storing yield_seq[2..] uniformly (not just yield_seq[2]) defends
+        // against an unrelated child going through real step-8 RFP / step-13
+        // search at depth 1 — RFP cannot push verif_score above s_beta from the
+        // parent's perspective (RFP fires only if child static_eval ≥ 51, which
+        // forces the negated parent score to be < 50), but a real recursive
+        // search could conceivably return any value. Pre-storing every later
+        // child makes the trace fully deterministic.
+        for (idx, &mv) in yield_seq.iter().enumerate() {
+            if idx == 0 {
+                continue; // TT-move (excluded); never reached at verification frame
+            }
+            let child_score: i32 = if idx == 1 {
+                -(s_beta_value - s_beta_delta) // -45
+            } else {
+                -s_beta_value // -50
+            };
+            let mut child_pos = pos;
+            let _undo = child_pos.make_move(mv);
+            tt.store(
+                child_pos.zobrist(),
+                TtData {
+                    score: child_score as i16,
+                    depth: depth as u8,
+                    bound: TtBound::Exact,
+                    best_move: 0,
+                },
+            );
+        }
+
+        // Drive the search.
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let _ = ab.negamax_for_test(
+            &mut pos.clone(),
+            depth,
+            ply,
+            -INF,
+            INF,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+
+        // Strict `<` rejects equality at the boundary: production verif_score
+        // lands exactly at s_beta (= 50), and `50 < 50` is false → no extension.
+        // All three mutants (`+`, `/`, `<=`) flip this single assertion to 1.
+        assert_eq!(
+            ab.se_extensions_for_test(),
+            0,
+            "boundary case: verif_score landing at s_beta = {s_beta_value} must NOT \
+             extend (strict `<` rejects equality); got {}",
+            ab.se_extensions_for_test()
+        );
+    }
+
     /// Positive SE integration test: with all eligibility clauses passing and a
     /// very high `tt_score` (so `singular_beta` is unreachably high for the
     /// verification search), `se_extensions` increments exactly once.
