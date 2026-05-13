@@ -34,7 +34,7 @@ Node count is **172,312,700** in all six runs — byte-identical across both mod
 
 **Within each paired run, VC=true is 5–8% faster than VC=false** (run 0: +6.7%; run 1: +8.0%; run 2: +6.7%). The plan anticipated a small overhead from `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` vs `mach_absolute_time`; the observed direction is opposite. Likely `CLOCK_THREAD_CPUTIME_ID` is cheaper than `mach_absolute_time` on M4 hardware, but the magnitude is within the run-to-run noise band, so the direction cannot be distinguished from thermal variation without P-core pinning. Not a load-bearing finding.
 
-**Node-count signature is M3.F's (172,312,700), not M4.A's (39,964,046).** This branch (`tooling/elo-harness`) is based on M3.F's `035c115` ancestor — ELOH.A+B+C are tooling-track and have not absorbed M4.A's TT, M4.B's killer moves, or M4.C's history heuristic. When the ELOH branch eventually merges to main alongside the M4 stack, future bench runs will pick up M4.A–C's reduced node counts. This file's signature is M3.F + tooling-only changes.
+**Node-count signature is M3.F's (172,312,700), not M4.A's (39,964,046).** This branch (`tooling/elo-harness`) is based on M3.F's `f351ccf` ancestor — ELOH.A+B+C are tooling-track and have not absorbed M4.A's TT, M4.B's killer moves, or M4.C's history heuristic. When the ELOH branch eventually merges to main alongside the M4 stack, future bench runs will pick up M4.A–C's reduced node counts. This file's signature is M3.F + tooling-only changes.
 
 ## See also
 

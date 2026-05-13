@@ -29,7 +29,7 @@ NPS recorded at 3,826,959 â€” within the run-to-run noise band of ELOH.C's 4.27â
 
 ## Node-count signature lineage
 
-This signature (`172,312,700`) is M3.F's; the `tooling/elo-harness` branch is based on M3.F's `035c115` ancestor. ELOH.A/B/C/D are tooling-track and have not absorbed M4.A's TT, M4.B's killer moves, M4.C's history heuristic, or M4.D's aspiration windows. When the ELOH branch eventually merges to main alongside the M4 stack, future bench runs will pick up the M4 stack's reduced node counts.
+This signature (`172,312,700`) is M3.F's; the `tooling/elo-harness` branch is based on M3.F's `f351ccf` ancestor. ELOH.A/B/C/D are tooling-track and have not absorbed M4.A's TT, M4.B's killer moves, M4.C's history heuristic, or M4.D's aspiration windows. When the ELOH branch eventually merges to main alongside the M4 stack, future bench runs will pick up the M4 stack's reduced node counts.
 
 ## See also
 

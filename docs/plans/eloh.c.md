@@ -476,7 +476,7 @@ Extends ELOH.A/B's smoke tests:
 4. **Pre-review mechanical checks** (workflow.md step 9).
 5. **Final review loop** (workflow.md step 10).
 6. **Benchmark.**
-   - Pre-impl invocation (current `tooling/elo-harness` HEAD = ELOH.B's `301118c`): standard `bench` for the regression baseline.
+   - Pre-impl invocation (current `tooling/elo-harness` HEAD = ELOH.B's `dba6c10`): standard `bench` for the regression baseline.
    - Post-impl invocation:
      - Default path (`VirtualClock=false`): node count + NPS. Must match pre-impl bench bit-for-bit on node count (search behavior is unchanged; the only diff is the SearchContext-vs-SearchClock plumbing, which has no effect on the node visit order).
      - VC=true path: drive via `setoption name VirtualClock value true` followed by `bench`. **Expected node-count output is byte-identical** to VC=false (bench is fixed-depth-12 startpos; `caps = (MAX, MAX)` ⇒ `clock.deadline = None` ⇒ time source is unused; only `should_abort`'s clock-poll path costs change, and only via the `clock_gettime` syscall vs. `Instant::now`). NPS may differ slightly (syscall-cost delta — `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` is a vDSO call on Linux, a thread-info read on macOS; both fast but distinguishable from `mach_absolute_time`). The point of the VC=true bench is to characterize that overhead delta, NOT to compare nodes.
@@ -560,7 +560,7 @@ After this plan converges through review:
 
 ## Appendix — branches and worktrees
 
-ELOH.C lands on the existing `tooling/elo-harness` branch in `/Users/alex/clawfish-elo-harness`, on top of ELOH.B's `301118c`. The spec's earlier preference for a separate `tooling/eloh-c-hardware-invariant-tc` branch was contingent on ELOH.B having merged to `main` before ELOH.C planning began; that hasn't happened (ELOH.B is still on the harness branch awaiting ELOH-milestone-close merge). Landing all three sub-phases on the same branch and merging the ELOH milestone as one set of commits is consistent with the user's directive ("Work in the ~/clawfish-elo-harness worktree").
+ELOH.C lands on the existing `tooling/elo-harness` branch in `/Users/alex/clawfish-elo-harness`, on top of ELOH.B's `dba6c10`. The spec's earlier preference for a separate `tooling/eloh-c-hardware-invariant-tc` branch was contingent on ELOH.B having merged to `main` before ELOH.C planning began; that hasn't happened (ELOH.B is still on the harness branch awaiting ELOH-milestone-close merge). Landing all three sub-phases on the same branch and merging the ELOH milestone as one set of commits is consistent with the user's directive ("Work in the ~/clawfish-elo-harness worktree").
 
 ## Appendix — review history
 

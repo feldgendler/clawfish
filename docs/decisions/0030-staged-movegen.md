@@ -128,7 +128,7 @@ At ~15ns/node × 200K nodes/sec = 3µs/sec extra. Bench's snapshot measurement o
 
 ## §11. H2 lazy per-stage sorting — REJECTED (per plan §13 outcome 4)
 
-**Status.** Attempted across four implementation variants (v1, v2, v3, v4) during a single overnight session (2026-05-10 → 2026-05-11). All four failed SPRT against `M5.H1` (M5.H1 v2 thin-wrapper). M5.H milestone closes at H1; the H2 lazy quiet sort literature signal (research §15.6, predicted +5–15 Elo) does not manifest for clawfish at its current strength and TC range. Working code preserved on branch `experiment/m5h2-v4` at origin (commit `7984106`). Production code: REVERTED to M5.H1 v2 thin-wrapper.
+**Status.** Attempted across four implementation variants (v1, v2, v3, v4) during a single overnight session (2026-05-10 → 2026-05-11). All four failed SPRT against `M5.H1` (M5.H1 v2 thin-wrapper). M5.H milestone closes at H1; the H2 lazy quiet sort literature signal (research §15.6, predicted +5–15 Elo) does not manifest for clawfish at its current strength and TC range. Working code preserved on branch `experiment/m5h2-v4` at origin (commit `2701d23`). Production code: REVERTED to M5.H1 v2 thin-wrapper.
 
 ### §11.1 What was tried
 
@@ -152,7 +152,7 @@ The literature signal predicts +5–15 Elo for deeper search engines. The +65 El
 
 ### §11.3 Implementation artifacts (on `experiment/m5h2-v4` branch, archival)
 
-Preserved on branch `experiment/m5h2-v4` at origin (commit `7984106`, branched from M5.H1 baseline `M5.H1`). Contains:
+Preserved on branch `experiment/m5h2-v4` at origin (commit `2701d23`, branched from M5.H1 baseline `M5.H1`). Contains:
 
 - `src/search.rs` — v4 `MoveStager` (single-Vec in-place + depth-gated lazy quiet sort) + `Stage` enum (production) + `partition_captures_quiets_in_place` helper + `LAZY_QUIET_SORT_MIN_DEPTH` constant + 26 updated test call sites + sort-counter `last_stager_*_sorts` recording in negamax.
 - `tests/uci_integration.rs` — E51 depth-4 pin updated to `85_534` (v3/v4 depth-4 bench).

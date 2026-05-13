@@ -1,7 +1,7 @@
 # ELOH.A — Back-test validation
 
 **Date:** 2026-04-29.
-**Branch:** `tooling/elo-harness` at commit `4430f9a`.
+**Branch:** `tooling/elo-harness` at commit `eb0dde5`.
 **Verdict:** Harness is functionally correct. The strict Wilson-95 % gate against M3.F's 196-4-0 is **not met** (182-13-5 vs ~190–198 W); the gap is **structurally explained by two confounds** — concurrency regime (ELOH.A ran at concurrency=1 with `taskpolicy` P-core pinning; M3.F at concurrency=6 with no pin) **and** deferred threshold adjudication (resign + draw-by-score, both deferred to ELOH.B). ELOH.A is accepted; revalidation deferred to ELOH.B with both confounds controlled.
 
 ## Run command
@@ -100,7 +100,7 @@ Short-loss inspection: no fast losses (<30 plies) — distinct from M3.F where 2
 
 `cargo mutants --in-diff` was run twice during ELOH.A development.
 
-**Pass 1 — pre-test-suite-review-fix code (commit ~`4430f9a`):** 159 mutants generated. 64 caught, 77 missed, 16 unviable, 2 timeout. The 77 missed concentrated in:
+**Pass 1 — pre-test-suite-review-fix code (commit ~`eb0dde5`):** 159 mutants generated. 64 caught, 77 missed, 16 unviable, 2 timeout. The 77 missed concentrated in:
 - `main()` and `match_loop::play_one_game` (~30) — exercised end-to-end only by the `#[ignore]`-gated `e2e_smoke` test plus this manual back-test, neither of which run under default `cargo test`.
 - `driver::wait_for_uciok` / `wait_for_readyok` / `shutdown` / `send_line` (~15) — driver glue called only from `main`.
 - `parse_info_payload` arm-deletes (~5) — parser tests too permissive.

@@ -52,7 +52,7 @@ Operational decision: keep `-max_len=200` as the default for routine post-edit s
 ### 2026-05-12/13 — overnight quad campaign (Apple M4, --jobs=10, --sanitizer none)
 
 Sequential 4-sub-campaign run motivated by:
-1. UCI parser changed at commit `035c115` (M3.F `bench` command) on 2026-04-29 — post the previous fuzzing session. ADR-0013 §9's parser-change trigger had not yet fired.
+1. UCI parser changed at commit `f351ccf` (M3.F `bench` command) on 2026-04-29 — post the previous fuzzing session. ADR-0013 §9's parser-change trigger had not yet fired.
 2. Idle overnight slot — opportunistic deep run on both targets at both byte caps. Also the trigger for the cadence revision codified in workflow.md and ADR-0013 §9 (per-milestone backstop dropped; opportunistic added).
 
 cargo-fuzz 0.13.1, libfuzzer-sys 0.4.12, nightly-2026-04-01, `--sanitizer none`, `--jobs=10` (full M4 core count, machine otherwise idle), `-max_total_time=9000` per worker. Total wall-clock 10h01m (22:17:31 → 08:18:51 EEST), aggregate ~100 CPU-hours.
@@ -84,7 +84,7 @@ Operational decision update (supersedes 2026-04-28's recommendation): **prefer `
 
 - **Minimized input:** `4k2r/8/8/8/8/8/8/4K3 b  k- 0 1` (32 bytes; already minimal — the double space cannot be reduced further without changing the structural defect). No `cargo fuzz tmin` run needed.
 - **Root cause:** `parse_castling` had an `unreachable!()` predicated on the (false) assumption that an empty castling field requires a 7-token split and would have tripped `WrongFieldCount` upstream. In fact, `s.split(' ')` on an input with one double space produces 6 tokens with one empty middle token, so the gate doesn't fire.
-- **Fix:** commit `fdbdbb9` — `unreachable!()` → `return Err(FenError::BadCastlingRights(s.to_string()))`.
+- **Fix:** commit `68df7c8` — `unreachable!()` → `return Err(FenError::BadCastlingRights(s.to_string()))`.
 - **Regression test:** `parse_rejects_empty_castling_field_via_double_space` in `src/fen.rs::tests`.
 
 ## Notes on metric provenance

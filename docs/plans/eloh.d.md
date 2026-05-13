@@ -412,7 +412,7 @@ No new top-level `src/` files. ELOH.D's surface fits cleanly inside the existing
 4. **Pre-review mechanical checks** (workflow.md step 9).
 5. **Final review loop** (workflow.md step 10).
 6. **Benchmark.**
-   - Pre-impl: standard `bench` from current `tooling/elo-harness` HEAD = `6b9cbac` (ELOH.C landing). Same numbers as `bench/eloh-c.md`.
+   - Pre-impl: standard `bench` from current `tooling/elo-harness` HEAD = `b9066f2` (ELOH.C landing). Same numbers as `bench/eloh-c.md`.
    - Post-impl: `bench` again. **Expected: byte-identical to pre-impl** — ELOH.D adds zero engine-side code paths; node count and NPS are unchanged. Append a one-paragraph note to `bench/eloh-d.md` confirming the no-regression observation.
 7. **Commit + push** — atomic doc-delta per §11.
 8. **Manual back-test (Part 2, post-commit, ~30 min wallclock).**
@@ -495,7 +495,7 @@ After this plan converges through review:
 
 ## Appendix — branches and worktrees
 
-ELOH.D lands on the existing `tooling/elo-harness` branch in `/Users/alex/clawfish-elo-harness`, on top of ELOH.C's `6b9cbac`. **Deviation from spec line 200**, which originally said ELOH.D should branch off `main` with default name `tooling/eloh-d-mixed-tc` once ELOH.C had merged. Per the user's standing directive ("Work in the ~/clawfish-elo-harness worktree") and the precedent set by ELOH.C (which itself deviated from the spec's separate-branch suggestion for the same reason), ELOH.A/B/C/D land as one chain on the same branch and the ELOH milestone merges to main as a single bundle. The spec's branch suggestion is updated retrospectively to record the deviation.
+ELOH.D lands on the existing `tooling/elo-harness` branch in `/Users/alex/clawfish-elo-harness`, on top of ELOH.C's `b9066f2`. **Deviation from spec line 200**, which originally said ELOH.D should branch off `main` with default name `tooling/eloh-d-mixed-tc` once ELOH.C had merged. Per the user's standing directive ("Work in the ~/clawfish-elo-harness worktree") and the precedent set by ELOH.C (which itself deviated from the spec's separate-branch suggestion for the same reason), ELOH.A/B/C/D land as one chain on the same branch and the ELOH milestone merges to main as a single bundle. The spec's branch suggestion is updated retrospectively to record the deviation.
 
 ## Appendix — review history
 

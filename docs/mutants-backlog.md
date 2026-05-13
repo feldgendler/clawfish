@@ -41,7 +41,7 @@ _(no pending campaigns)_
 git diff 33a0d0d..<m5.b-merge-sha> -- 'src/*.rs' 'tests/*.rs' > "$TMPDIR/m4bcd-m5ab.diff"
 ```
 
-- `33a0d0d` — M4.A follow-up (cargo-mutants survivors fix); M4.B's branching point on main and the joint range's start.
+- `0fbd2c5` — M4.A follow-up (cargo-mutants survivors fix); M4.B's branching point on main and the joint range's start.
 - `<m5.b-merge-sha>` — the M5.B primary landing commit on main. Resolve at campaign-start time via `git log --grep='M5.B:' --max-count=1 --format='%H'`.
 - Pathspec `'src/*.rs' 'tests/*.rs'` — single-star glob (git pathspec doesn't expand `**`); restricts to the source + integration-test surface. M4.B + M4.C + M4.D + M5.A + M5.B modify `src/search.rs`, `src/history.rs` (new in M4.C), `src/mov.rs`, `src/movegen.rs` (M5.A `arb_position` lift), `src/position.rs` (M5.A delegators), `src/engine.rs`, `src/lib.rs`, `tests/uci_integration.rs` plus doc files; the doc files are out of scope for cargo-mutants.
 
@@ -201,7 +201,7 @@ Avoid `exclude_re` rules anchored to line numbers (per `.cargo/mutants.toml` gui
 
 ### Where the follow-up commit lands
 
-On `main` (M4.B + M4.C + M4.D + M5.A + M5.B will have merged by the time the campaign runs). The commit message follows the M4.A follow-up pattern (commit `33a0d0d`):
+On `main` (M4.B + M4.C + M4.D + M5.A + M5.B will have merged by the time the campaign runs). The commit message follows the M4.A follow-up pattern (commit `0fbd2c5`):
 
 > M4.B+M4.C+M4.D+M5.A+M5.B follow-up: address N cargo-mutants survivors
 >
@@ -284,13 +284,13 @@ See `docs/milestones/m5.c.md` "Mutation-survivor analysis" for the per-survivor 
 
 See `docs/milestones/m4.b.md`, `m4.c.md`, `m4.d.md`, `m5.a.md`, `m5.b.md` for per-phase survivor breakdowns.
 
-### M4.A — Transposition table (campaign ran 2026-04-29 on main as commit `33a0d0d`)
+### M4.A — Transposition table (campaign ran 2026-04-29 on main as commit `0fbd2c5`)
 
 The M4.A campaign already ran on main. Three survivors triaged: one real coverage gap (S13 node-count assertion tightened from `>= (n_children - 1)` to `< nodes_ref / 2`), one equivalent mutant on disjoint-OR `|` ↔ `^` in `TtEntry::pack_age_bound` (`exclude_re` rule added with rationale), one boundary gap on `score_from_tt`'s `MATE_IN_MAX_PLY` boundary (added T20c — three deterministic boundary tests pinning the no-op at `±MATE_IN_MAX_PLY` and the adjust-by-ply at `±(MATE_IN_MAX_PLY + 1)`).
 
 Resulting test count: 818 lib + 9 integration. Bench unchanged: `bench: 39964046 nodes <NPS> nps`.
 
-As of 2026-04-30 the M4.B branch has been rebased onto `33a0d0d`, so the M4.A follow-up's S13 tightening + T20c boundary tests are part of the branch's history; the M4.A retrospective at `docs/milestones/m4.a.md` is current on the branch (no stale "(populated post-mutants run.)" placeholder).
+As of 2026-04-30 the M4.B branch has been rebased onto `0fbd2c5`, so the M4.A follow-up's S13 tightening + T20c boundary tests are part of the branch's history; the M4.A retrospective at `docs/milestones/m4.a.md` is current on the branch (no stale "(populated post-mutants run.)" placeholder).
 
 For an M4.A re-run scenario (e.g., revalidating after a search refactor), the regenerable diff is:
 
