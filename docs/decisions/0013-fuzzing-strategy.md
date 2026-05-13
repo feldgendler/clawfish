@@ -70,8 +70,8 @@ Two string→AST parsers ship to date — `Position::from_fen` (M1.D) and `parse
 
 - **Not in the pre-commit hook.** Coverage-guided campaigns run in seconds-to-hours; not pre-commit-shaped.
 - **Per parser change.** Touching `src/fen.rs`, `src/uci.rs`, or anything they call → ≥30-min run on the affected target.
-- **Per major milestone.** 2-hour run on each target as a backstop, recorded analogously to `bench/<milestone>.md` summaries (in `docs/research/tooling-fuzzing-results.md` — see §10).
-- **On demand.** Any time a parser regression is suspected.
+- **On demand.** Any time a parser regression is suspected, or as opportunity allows (idle overnight, post-major-refactor, etc.).
+- **No per-milestone backstop.** Originally specified at 2026-04-28 as "2-hour run on each target per major milestone." Revised 2026-05-12 after six months of milestone work (M3.F → M5.H1) touched the parsers exactly once (M3.F's `bench` UCI command, commit `035c115`): a milestone-pegged cadence pays cost without earning signal when the parsers move rarely. The parser-change trigger remains; opportunistic deep campaigns supplement it.
 
 ### 10. Campaign result artifact
 

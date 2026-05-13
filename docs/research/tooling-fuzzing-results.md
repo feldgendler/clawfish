@@ -49,6 +49,35 @@ Findings:
 
 Operational decision: keep `-max_len=200` as the default for routine post-edit smokes (fast feedback) and per-major-milestone backstops (saturation evidence). Run `-max_len=4096` opportunistically — at minimum once per target before any future ADR-0013 cadence change, and any time the parser's input-length contract is touched. The +479 `ft` delta on fuzz_uci is signal that 200-byte saturation isn't the same as 4096-byte saturation; future work that depends on long-input correctness (e.g. PGN-to-FEN converters, position-with-move-list endpoints) should re-check.
 
+### 2026-05-12/13 — overnight quad campaign (Apple M4, --jobs=10, --sanitizer none)
+
+Sequential 4-sub-campaign run motivated by:
+1. UCI parser changed at commit `035c115` (M3.F `bench` command) on 2026-04-29 — post the previous fuzzing session. ADR-0013 §9's parser-change trigger had not yet fired.
+2. Idle overnight slot — opportunistic deep run on both targets at both byte caps. Also the trigger for the cadence revision codified in workflow.md and ADR-0013 §9 (per-milestone backstop dropped; opportunistic added).
+
+cargo-fuzz 0.13.1, libfuzzer-sys 0.4.12, nightly-2026-04-01, `--sanitizer none`, `--jobs=10` (full M4 core count, machine otherwise idle), `-max_total_time=9000` per worker. Total wall-clock 10h01m (22:17:31 → 08:18:51 EEST), aggregate ~100 CPU-hours.
+
+| target | -max_len | seed corpus* | runs | exec/s peak (aggregate) | wall-clock | cov | ft | corp (libFuzzer-internal) | crashes |
+|---|---|---|---|---|---|---|---|---|---|
+| fuzz_fen | 200 | 250 | 19,351,378,247 | 277k | 9017s | 289 | 622 | 236 | 0 |
+| fuzz_fen | 4096 | 236 | 19,792,002,776 | 253k | 9017s | 289 | 630 | 205 | 0 |
+| fuzz_uci | 200 | 30 | 13,415,196,721 | 159k | 9019s | 418 | 1638 | 1066 | 0 |
+| fuzz_uci | 4096 | 1066 | 3,214,349,872 | 65k | 9020s | 437 | 2318 | 1516 | 0 |
+
+*Each sub-campaign inherits the prior sub-campaign's final corpus state (sequential libFuzzer execution, no `cargo fuzz cmin` between). fuzz_fen entered the run with the 250 corpus files left over from the 2026-04-28 saturation campaign (35 hand-curated seeds + 215 libFuzzer discoveries, gitignored under `fuzz/.gitignore`). fuzz_uci entered with 30 hand-curated seeds only — the prior campaign's libFuzzer discoveries had been cleaned between then and now.
+
+Total: **56.4 billion executions**. Zero panics, zero OOMs, zero timeouts, zero crashes.
+
+Findings:
+
+- **fuzz_fen at full saturation.** Both 200B and 4096B held cov:289 throughout the 2.5h sub-campaign. ft crept from 622 → 630 between sub-campaigns (+8 features, marginal). The FEN parser at its current shape, against the current corpus, is at the floor of what libFuzzer can find. 39 billion executions across the two FEN sub-campaigns produced no behavioral surprises.
+- **fuzz_uci at 4096B opens code paths the 200B cap structurally cannot reach** — the **load-bearing new finding of this campaign**. cov climbed from 418 (200B saturation) → 437 (4096B) — **+19 basic blocks** the 200B cap never reached. Prior 2026-04-28 4096B run did not see this (stayed at cov:434), but that was a 900s smoke; the current 9020s run had ~10× more wallclock for mutation to discover the long-input paths. ft delta is +680 (1638 → 2318), substantially larger than the prior +479. No specific triggering inputs identified (libFuzzer doesn't emit per-block-discovery inputs); plausible candidates are long `position startpos moves <a2a4 × N>` payloads, very long `searchmoves` token sequences in `go`, or deeply-malformed bench/setoption tail-tokenization paths.
+- **`bench` command (M3.F, `parse_bench` at `src/uci.rs:215-227`) survived 16.6B executions** across both UCI sub-campaigns without panic. The four arms (empty rest / `rest.len() != 1` / `parse::<u32>()` failure / out-of-range `1..=63` bound) all robust.
+- **exec/s scaling reproduces prior observations.** fuzz_fen at 4096B vs 200B holds ~95% throughput (FEN parser body is short — input-length cost is small). fuzz_uci at 4096B vs 200B is ~22% throughput (UCI parser walks every whitespace-delimited token, so long inputs scale parser cost roughly linearly with token count).
+- **Apple M4 thermal behavior at sustained 10-job load.** Aggregate exec/s declined ~5% from sub-campaign start to end on each FEN run (peak 277k → 219k final at 200B; 253k → 218k final at 4096B), consistent with thermal soft-throttling on the passively-cooled M4 silicon under sustained 100% load. UCI sub-campaigns at lower per-input throughput showed the same pattern proportionally. No worker died from rss_limit (default 2GB × 10 workers = 20GB worst-case, well within the 32GB system).
+
+Operational decision update (supersedes 2026-04-28's recommendation): **prefer `-max_len=4096` for parser-change-triggered campaigns and opportunistic backstops** going forward. The 2.5h 4096B fuzz_uci run found code paths the 200B cap structurally cannot reach; the throughput cost (~80% of executions but in deeper code) is the right tradeoff when the goal is finding new bugs. Keep `-max_len=200` only for fast post-edit smoke checks (~10s feedback loop). The cadence rule itself was revised at this session (workflow.md §Fuzzing; ADR-0013 §9): per-milestone backstop dropped, parser-change trigger preserved, opportunistic deep runs added.
+
 ## Crashes triaged
 
 ### crash-ad3313fd7ec85772df26cda530d51185d9751093 (fuzz_fen, 2026-04-28)
