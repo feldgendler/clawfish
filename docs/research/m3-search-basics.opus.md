@@ -12,7 +12,7 @@ Sources: Chess Programming Wiki, Wikipedia, dogeystamp's chess-engine series, th
 |---|---|
 | Negamax framing | `fn negamax(&mut self, pos: &mut Position, depth: i16, ply: i16, alpha: i16, beta: i16, ctx: &SearchContext, pv: &mut PvLine) -> i16`. Pass `&mut Position` + use existing `make_move`/`unmake_move` (zero-clone hot path). |
 | Fail-soft vs fail-hard | **Fail-soft**. Wikipedia calls it "nearly universal"; CPW notes Fishburn 1983 introduced it as a strict improvement. M3 has no TT to interact pathologically with. |
-| Score type | **`i16`** with `MATE = 32000`, `INF = 32001`, `MATE_IN_MAX_PLY = MATE - MAX_PLY`. Comfortably inside `i16::MAX = 32767`. SIMD-friendly when M9 lands. |
+| Score type | **`i16`** with `MATE = 32000`, `INF = 32001`, `MATE_IN_MAX_PLY = MATE - MAX_PLY`. Comfortably inside `i16::MAX = 32767`. SIMD-friendly when M10 lands. |
 | Mate scoring | `MATE - ply` for "I deliver mate"; `-MATE + ply` for "I'm getting mated". Faster mates score higher by construction. UCI `score mate y`: `y = ((MATE - score + 1) / 2) * sign(score)` for the mater; sign flips for the mated side. |
 | Mate-distance pruning | **Defer to M4.** Marginal in fixed-depth play; cleaner to land alongside TT. |
 | PV recovery | **Triangular PV table** (`[Move; MAX_PLY * MAX_PLY / 2]` ≈ 4 KiB at MAX_PLY=64). Per-ply slice writes. No TT alternative available. |
@@ -45,7 +45,7 @@ fn negamax(
 ```
 
 - **`&mut Position` + `make_move`/`unmake_move`** — uses the existing M1.E hot path (~30 ns/cycle quiet moves per `bench/m1.e.md`). Cloning the position per node would cost ~200 B/clone × millions of nodes/sec = bandwidth-bound search.
-- **`i16` for `depth`/`ply`/`alpha`/`beta`** — branches won't exceed 127 ply in any plausible game; `i16` keeps the negamax frame small (Rust will pad to alignment anyway, but the convention matters when SIMD-friendly NNUE arrives in M9).
+- **`i16` for `depth`/`ply`/`alpha`/`beta`** — branches won't exceed 127 ply in any plausible game; `i16` keeps the negamax frame small (Rust will pad to alignment anyway, but the convention matters when SIMD-friendly NNUE arrives in M10).
 - **Separate `depth` and `ply`** — mate-score arithmetic needs `ply` (distance from root); termination needs `depth` (remaining). Conflating them is a classic bug source — recovered as a "should-fix" in TalkChess folklore on alpha-beta refactors.
 - **`pv: &mut PvLine`** — explicit, not threaded through `SearchContext`. Each frame writes to its own `PvLine` (per-ply slice into a triangular table — see §3).
 - **No `&mut self` on the search inner loop** — keeps borrow checker compliant when the search holds caches (killer table in M4, history in M4). M3 has no per-thread state to mutate from inside negamax, so the `&mut self` could be elided, but keeping it consistent with `Search::go(&mut self, ...)` simplifies the M4 transition.

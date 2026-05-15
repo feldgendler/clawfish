@@ -35,7 +35,7 @@ The modest tactical lean (WAC +7, STS +50) is consistent with the SPRT's +1.74 E
 
 **Revisit conditions** (analogous to M5.H2's deferral):
 - Clawfish reaches **depth ≥ 14 at typical TCs** (currently ~depth 8-12 at mixed-TC). At deeper search, score-continuity improves and the intermediate-tier mechanism's literature payoff (Crafty / Meesha / RobboLito reports of +10-20 Elo) is more plausibly realizable.
-- OR: the engine's ordering quality improves substantially (e.g., post-M9 NNUE) so that tier-1 failure rates drop and tier-2 firings become rarer-but-more-targeted.
+- OR: the engine's ordering quality improves substantially (e.g., post-M10 NNUE) so that tier-1 failure rates drop and tier-2 firings become rarer-but-more-targeted.
 
 **Tunables preserved for future revisit** (in case a future iteration reaches the revisit conditions):
 - `ASPIRATION_INTERMEDIATE_HALF_WIDTH` (v1 was 150 — Crafty-proportional): try `100`, `200`, `250` if revisiting.
@@ -163,14 +163,14 @@ Three SPSA-tunable params. Empirically this baseline captures 60-80% of the ML m
 - M4.D's gate is the fixed schedule passing mixed-TC SPRT; building ML training infra is a multi-week scope expansion to a phase that should land in days.
 - Prerequisites missing: tapered eval for proper phase signal (M6), SPSA / CLOP harness for the cheap baseline, position corpus, offline label-generation pipeline.
 - Elo headroom small at this layer: ~+3-5 Elo realistic ceiling for ML over hand-tuned, vs +50-80 Elo for NMP, +80-100 Elo for LMR, +400+ Elo for NNUE. Opportunity cost is poor.
-- NNUE (M9) re-trains the eval from scratch; an ML aspiration model trained on PeSTO eval would need re-training post-NNUE.
+- NNUE (M10) re-trains the eval from scratch; an ML aspiration model trained on PeSTO eval would need re-training post-NNUE.
 
 **When to land.** Four-tier escalation, each tier proceeding only if the previous shows ≥ +5 Elo of remaining headroom worth chasing:
 
 1. **Fixed schedule (M4.D)** — ±50 default, width-tuned via mixed-TC SPRT. Ships at M4.D close.
-2. **TC- or depth-adaptive parametric (post-M5, pre-M9)** — `base · max(min_factor, 1 - α·(depth - threshold))`. SPSA-tuned. Cheapest validation of the depth/TC interaction motif.
-3. **Cheap delta-baseline (post-M9 or earlier if (2) saturates)** — `window = clamp(k · |score(d-1) − score(d-2)|, MIN, MAX)`. Three SPSA-tunable params.
-4. **MLP (post-M9, only if (2)+(3) saturate)** — full feature set + hidden layer.
+2. **TC- or depth-adaptive parametric (post-M5, pre-M10)** — `base · max(min_factor, 1 - α·(depth - threshold))`. SPSA-tuned. Cheapest validation of the depth/TC interaction motif.
+3. **Cheap delta-baseline (post-M10 or earlier if (2) saturates)** — `window = clamp(k · |score(d-1) − score(d-2)|, MIN, MAX)`. Three SPSA-tunable params.
+4. **MLP (post-M10, only if (2)+(3) saturate)** — full feature set + hidden layer.
 
 **Estimated size.** Adaptive parametric: ~30-50 LOC + SPSA harness reuse. Cheap delta-baseline: ~50 LOC + SPSA harness reuse. ML model: ~500-800 LOC (feature extraction + inference + offline-training pipeline as a separate Python or Rust binary), plus the corpus + label-generation infrastructure (potentially shared with Texel tuning or NNUE data prep).
 
@@ -180,7 +180,7 @@ Three SPSA-tunable params. Empirically this baseline captures 60-80% of the ML m
 
 **Pulled from M5.H1 plan §1 / ADR-0030 §8.** Split the captures stage into "good captures" (SEE ≥ 0) yielded immediately after TT and "bad captures" (SEE < 0) yielded last, after quiets. Per CPW Static Exchange Evaluation + Move Ordering pages.
 
-**Prerequisites.** SEE infrastructure (no current ETA in roadmap; M9+ candidate alongside NNUE training). Without SEE, the MVV-LVA-only capture sort is the recommended starting point per research §6.2.
+**Prerequisites.** SEE infrastructure (no current ETA in roadmap; M10+ candidate alongside NNUE training). Without SEE, the MVV-LVA-only capture sort is the recommended starting point per research §6.2.
 
 **Estimated Elo gain.** Hard to disentangle from SEE itself; captures-split is one of several SEE consumers. Tuning-backlog entry rather than roadmap-promised.
 

@@ -31,7 +31,7 @@ Per ADR-0003, no third-party engine source code was read; CPW articles, papers, 
 **Default: depth-preferred with age bias** (overwrite if `new_depth >= old_depth`, OR if old entry's age generation != current generation). Rationale:
 - Simpler than two-tier; avoids table stagnation of pure depth-preferred.
 - The age field doubles as a probe-refresh mechanism (touch on probe; replace old-gen entries freely).
-- Directly compositional with M8 Lazy SMP: the generation counter remains meaningful in a shared TT because threads increment together.
+- Directly compositional with M9 Lazy SMP: the generation counter remains meaningful in a shared TT because threads increment together.
 
 **Second choice:** Two-tier (one depth-preferred + one always-replace per bucket). Widely cited, well-understood, but requires 2× slots or half the effective entries at the same MiB budget.
 
@@ -52,13 +52,13 @@ Per ADR-0003, no third-party engine source code was read; CPW articles, papers, 
 - XOR trick: `hashtable[idx].key = key ^ data; hashtable[idx].data = data`. On probe: `(stored_key ^ stored_data) == search_key`. If another thread partially overwrites data, the XOR check fails and the entry is discarded. [(Binary Debt blog)](https://binarydebt.wordpress.com/2013/09/29/lockless-transposition-tables/)
 - Texel's Lazy SMP implementation uses the XOR trick for its shared TT. [(TalkChess t=64824)](https://talkchess.com/viewtopic.php?t=64824)
 - With full 64-bit single-threaded: "torn reads" are impossible; the entry is either fully written or not written at all (no parallel writer). The XOR trick adds no value for correctness in single-threaded context. [(CPW Shared Hash Table)](https://www.chessprogramming.org/Shared_Hash_Table)
-- Cost of migrating to lockless at M8: if M4.A stores a full 64-bit key separately from data, moving to XOR-trick requires restructuring the data word. If the entry is laid out with `key_xor_data | data` from day one, M8 is a structural no-op.
+- Cost of migrating to lockless at M9: if M4.A stores a full 64-bit key separately from data, moving to XOR-trick requires restructuring the data word. If the entry is laid out with `key_xor_data | data` from day one, M9 is a structural no-op.
 
 ### Recommendation for M4.A
 
 **Default: full 64-bit Zobrist key stored in entry.** Single-threaded at M4; lockless XOR trick solves a concurrency problem that doesn't exist yet, and adds complexity for zero benefit now.
 
-**Migration path to M8:** Restructure the entry as a `(key_lo: u32, data: TtData)` at M8.A, with `key_lo = (zobrist >> 32) ^ data_as_u32`. No M4.A code needs to anticipate this — it's a clean M8 internal refactor. The full 64-bit key does not "paint us into a corner."
+**Migration path to M9:** Restructure the entry as a `(key_lo: u32, data: TtData)` at M9.A, with `key_lo = (zobrist >> 32) ^ data_as_u32`. No M4.A code needs to anticipate this — it's a clean M9 internal refactor. The full 64-bit key does not "paint us into a corner."
 
 **Second choice:** 32-bit partial key (upper 32 bits of Zobrist). Saves 4 bytes per entry, allowing ~33% more entries for the same MiB. With a 16 MiB default this matters, but at classical-eval strength the collision rate with 32 bits is acceptable.
 
@@ -343,7 +343,7 @@ The 50-move boundary issue is acknowledged and deferred. If it surfaces during S
 
 **Second choice:** structural pseudo-legality check (source piece, destination piece, flag consistency) without movegen. Faster but more error-prone for promotions/EP/castling edge cases. Defer to a later optimization phase when profiling shows the legal-list scan as a hotspot.
 
-**If migrating to partial-key at M8:** legality check remains mandatory.
+**If migrating to partial-key at M9:** legality check remains mandatory.
 
 ---
 
@@ -426,7 +426,7 @@ This is the same "per-game reset" contract, not "per-search reset."
 | # | Question | Recommendation | Second choice |
 |---|---|---|---|
 | 1 | Replacement scheme | Depth-preferred + age bias (replace if new_depth ≥ old_depth OR old_gen ≠ current_gen) | Two-tier (depth-preferred + always-replace) |
-| 2 | Entry key discipline | Full 64-bit Zobrist; XOR trick deferred to M8 | 32-bit partial key (saves 4 bytes/entry) |
+| 2 | Entry key discipline | Full 64-bit Zobrist; XOR trick deferred to M9 | 32-bit partial key (saves 4 bytes/entry) |
 | 3 | Entry packing | 16 bytes: u64 key + i16 score + u8 depth + u8 (age:6 + bound:2) + u16 move + u16 pad | 12 bytes with 32-bit partial key |
 | 4 | Hash UCI option | `spin default 16 min 1 max 4096` (MiB) | default 32 for larger dev boxes |
 | 5 | Mate-score adjustment | `score_to_tt = mate_score + ply`; `score_from_tt = stored − ply` (positive mate); inverted for negative; threshold `|score| > MATE − MAX_PLY = 29936` | Delayed-loss bonus (Micro-Max style) |

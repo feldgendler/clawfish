@@ -1,6 +1,6 @@
 # M2 prior-art research — UCI threading and stdin concurrency
 
-Research pass for M2 (UCI random-mover). Scope: how a UCI chess engine should structure threads, channels, and cancellation so that stdin stays responsive while the engine is searching, and so the model survives the layering of alpha-beta (M3), iterative deepening + time management (M4–M5), lazy-SMP (M8), and NNUE (M9) without rewrite.
+Research pass for M2 (UCI random-mover). Scope: how a UCI chess engine should structure threads, channels, and cancellation so that stdin stays responsive while the engine is searching, and so the model survives the layering of alpha-beta (M3), iterative deepening + time management (M4–M5), lazy-SMP (M9), and NNUE (M10) without rewrite.
 
 Sources: the UCI 2006 specification (vendored at `docs/reference/uci-protocol-2006.txt`), Chess Programming Wiki, chessprogramming.net, TalkChess threads, dogeystamp's chess-engine series, matklad on Rust worker shutdown, the Rust standard library and tokio docs, and Cute Chess issue/manpage prose. No engine source code was read; cutechess source *was* read (it's a tournament runner, not an engine — outside the prohibition in `decisions/0003`).
 
@@ -52,7 +52,7 @@ Pros:
 
 - Reader is *always* responsive. Even if the search thread is heads-down in recursion, the reader has parsed the next command into the channel.
 - Stop latency = (time from `AtomicBool::store` to next `load` in search) + (time to unwind recursion) + (time to print `bestmove`). Search polls the flag every M nodes (4096 is standard); on Apple Silicon a relaxed load is one or two cycles ([std::sync::atomic::AtomicBool](https://doc.rust-lang.org/std/sync/atomic/struct.AtomicBool.html)). End-to-end well under 1 ms in steady state. Judgment call backed by the AtomicBool docs: this is the canonical pattern for cross-thread cancellation in Rust.
-- Maps directly onto lazy-SMP. *"set abort flag for each helper and wait for each to stop searching"* — that's exactly what the CPW Lazy SMP pseudocode says ([CPW Lazy SMP](https://www.chessprogramming.org/Lazy_SMP)). The same `Arc<AtomicBool>` is shared with all worker threads in M8; they all poll it on the same cadence. Stockfish's documented mechanism is *"atomic flags and condition variables"* per the DeepWiki summary surfaced in our search results, which matches.
+- Maps directly onto lazy-SMP. *"set abort flag for each helper and wait for each to stop searching"* — that's exactly what the CPW Lazy SMP pseudocode says ([CPW Lazy SMP](https://www.chessprogramming.org/Lazy_SMP)). The same `Arc<AtomicBool>` is shared with all worker threads in M9; they all poll it on the same cadence. Stockfish's documented mechanism is *"atomic flags and condition variables"* per the DeepWiki summary surfaced in our search results, which matches.
 - `isready` answer comes from the reader thread directly — zero contention with search. **This is the single biggest argument for a reader thread**: the spec demands an immediate `readyok` answer regardless of search state, and only a separate-thread design satisfies that without polling overhead in search.
 - Minimal Rust-specific friction: `std::thread::spawn`, `std::sync::mpsc::channel`, `std::sync::Arc<AtomicBool>` are all in `std`. No `tokio`, no `crossbeam` dependency required at this layer.
 
@@ -83,11 +83,11 @@ This is the shape every nontrivial engine converges to once iterative deepening 
 - **Orchestrator**: own `Position`, `Options`, deadline, search-handle. Routes each command to either an immediate reply (`isready`, `uci`, `quit`) or an effect on the search (`go`, `stop`).
 - **Search worker**: pure compute. Reads `Position` (clone or `Arc`), reads cancellation flag and deadline, writes `info` and `bestmove`.
 
-Pros: clean separation of concerns; orchestrator is single-threaded, so option mutation, position updates, and deadline computation are race-free; search worker can be replaced (random-mover for M2, alpha-beta for M3, lazy-SMP pool for M8) without touching the reader or orchestrator.
+Pros: clean separation of concerns; orchestrator is single-threaded, so option mutation, position updates, and deadline computation are race-free; search worker can be replaced (random-mover for M2, alpha-beta for M3, lazy-SMP pool for M9) without touching the reader or orchestrator.
 
 Cons: more wiring than §2.2 if you collapse them. But "main thread *is* orchestrator" is the natural Rust idiom — no extra spawn.
 
-**Recommendation: §2.4. Reader thread + main-thread-as-orchestrator + per-`go` search worker thread, mpsc channel reader→orchestrator, `Arc<AtomicBool>` orchestrator→search.** §2.2 collapses into §2.4 if you merge orchestrator and search; the explicit split is what we want once M3 lands and `go` becomes a long-running concurrent computation. Single-threaded poll-stdin (§2.1) is rejected primarily because of the `isready`-during-search requirement and the M8 scaling story.
+**Recommendation: §2.4. Reader thread + main-thread-as-orchestrator + per-`go` search worker thread, mpsc channel reader→orchestrator, `Arc<AtomicBool>` orchestrator→search.** §2.2 collapses into §2.4 if you merge orchestrator and search; the explicit split is what we want once M3 lands and `go` becomes a long-running concurrent computation. Single-threaded poll-stdin (§2.1) is rejected primarily because of the `isready`-during-search requirement and the M9 scaling story.
 
 ---
 
@@ -392,7 +392,7 @@ Three load-bearing details in the sketch:
 2. **Null-move fallback `bestmove 0000`** per spec line 49 — needed if the search is stopped before finding any legal move, or in checkmate/stalemate positions if the GUI somehow asks us to search anyway.
 3. **`isready` answer comes from the orchestrator**, not the worker. The reader thread parses `isready`, sends `Command::IsReady` to the orchestrator, the orchestrator immediately writes `readyok`. Latency = one channel send + one print + one flush. Well under 1 ms. Spec compliance demonstrated.
 
-### Scaling to lazy-SMP (M8)
+### Scaling to lazy-SMP (M9)
 
 The architecture above is forward-compatible without refactor:
 
@@ -403,7 +403,7 @@ The architecture above is forward-compatible without refactor:
 
 This matches CPW's *"set abort flag for each helper and wait for each to stop searching"* description ([CPW Lazy SMP](https://www.chessprogramming.org/Lazy_SMP)). No new primitives needed.
 
-### Scaling to NNUE (M9)
+### Scaling to NNUE (M10)
 
 NNUE is per-position eval. It runs inside the search worker and has zero interaction with threading. The architecture above is unaffected.
 
@@ -425,7 +425,7 @@ NNUE is per-position eval. It runs inside the search worker and has zero interac
 | `isready` discipline | Answered immediately by orchestrator without touching search. |
 | `quit` discipline | Flip flag, brief join, `std::process::exit(0)`. Reader thread is abandoned. |
 | Anti-pattern firewall | Search code never touches stdin/stdout. Reader code never touches engine state. Orchestrator owns all coupling. |
-| `Search` trait | Defined now (M2), implemented as random-mover for M2, alpha-beta for M3, lazy-SMP wrapper for M8. No signature change expected. |
+| `Search` trait | Defined now (M2), implemented as random-mover for M2, alpha-beta for M3, lazy-SMP wrapper for M9. No signature change expected. |
 
 ### Open uncertainties
 

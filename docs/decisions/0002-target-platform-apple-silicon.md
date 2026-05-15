@@ -16,7 +16,7 @@ The user develops on an M4 MacBook. An Android app is a planned downstream miles
 - **ARM NEON** is the relevant SIMD ISA when SIMD becomes useful (primarily NNUE inference). Other ARM features (CRC32, AES) are unlikely to matter for chess.
 - **Profiling tools:** `samply`, Instruments (Time Profiler), `criterion` for microbenchmarks.
 - **Endianness / alignment:** ARM64 macOS is little-endian, supports unaligned loads efficiently. No portability guards needed.
-- **Mobile** is treated as a port problem at M9. Performance regressions on mobile are acceptable; functional correctness is required.
+- **Mobile** is treated as a port problem at M11. Performance regressions on mobile are acceptable; functional correctness is required.
 
 ## Rationale
 

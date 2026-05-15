@@ -177,7 +177,7 @@ impl Move {
     /// `Move::flag()` call via the `unreachable!()` arm in `flag()`. Today's
     /// only consumer is the M4.D `extract_bestmove_or_tt_fallback` reading
     /// from the TT, which only stores values produced by `Move::bits()`, so
-    /// the invariant holds by construction. A future M8 multi-threaded TT
+    /// the invariant holds by construction. A future M9 multi-threaded TT
     /// (lockless XOR-trick) would need to re-confirm this invariant or add
     /// a fast-structural-validity check at the call site.
     #[inline]

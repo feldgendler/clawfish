@@ -58,7 +58,7 @@ Not detected in eval at M3 (deferred to M6):
 
 ### 7. NNUE-readiness (consumed from ADR-0004)
 
-The incremental `static_eval_white` field is the same shape as the future NNUE accumulator. When NNUE lands (M9):
+The incremental `static_eval_white` field is the same shape as the future NNUE accumulator. When NNUE lands (M10):
 
 - `Position` gains a parallel `accumulator: NNUEAccumulator` field.
 - `make_move` / `unmake_move` apply the NNUE delta in the same place this ADR's PST delta lives.

@@ -46,7 +46,7 @@ This ADR also commits the project to a `Search` trait now (M2), so M2.D / M3 can
 
 - `Arc<AtomicBool>` with `Ordering::Relaxed`.
 - Polled inside search; set by the orchestrator on `stop` and on deadline expiry; cleared by the orchestrator at the start of each `go`.
-- Same primitive scales to lazy-SMP (M8) — every worker thread holds an `Arc` clone of the same flag.
+- Same primitive scales to lazy-SMP (M9) — every worker thread holds an `Arc` clone of the same flag.
 
 ### Inter-thread channel
 
@@ -120,8 +120,8 @@ pub trait Search {
 - **M2.C** owns: `Engine` struct, the reader thread + channel, the `Arc<AtomicBool>` and `Arc<Mutex<Stdout>>` plumbing, the `Search` trait + `SearchContext`, command handlers including a `go` handler that drives a stub `Search` impl. Latency budgets per `docs/research/m2-uci-threading.md` §4: `isready` < 1 ms, `stop` → `bestmove` < 10 ms steady state, `quit` → exit < 1 s. (The `quit` budget is met trivially because no join blocks the exit path — see "Quit discipline" above.)
 - **M2.D** plugs the random-mover `Search` impl into the existing handler skeleton — no orchestrator changes.
 - **M3** plugs alpha-beta into the same `Search` trait — no orchestrator changes.
-- **M8 (lazy-SMP)** spawns multiple workers from inside a single `Search::go` invocation, all sharing the same `Arc<AtomicBool>`. Only the *main* worker writes to stdout. Orchestrator unchanged.
-- **M9 (NNUE)** is per-position eval inside the search worker — zero interaction with threading.
+- **M9 (lazy-SMP)** spawns multiple workers from inside a single `Search::go` invocation, all sharing the same `Arc<AtomicBool>`. Only the *main* worker writes to stdout. Orchestrator unchanged.
+- **M10 (NNUE)** is per-position eval inside the search worker — zero interaction with threading.
 
 ## Variants considered and rejected
 

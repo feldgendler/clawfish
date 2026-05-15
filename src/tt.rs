@@ -126,8 +126,8 @@ pub(crate) struct TtData {
 
 /// Power-of-two-sized direct-mapped transposition table.
 ///
-/// Indexed by `key & mask`. Single-threaded for M4–M7 under the ADR-0011
-/// invariant; the lockless M8 variant replaces `UnsafeCell<Vec<TtEntry>>`
+/// Indexed by `key & mask`. Single-threaded for M4–M8 under the ADR-0011
+/// invariant; the lockless M9 variant replaces `UnsafeCell<Vec<TtEntry>>`
 /// with `Vec<AtomicU64>` pairs.
 pub(crate) struct TranspositionTable {
     entries: UnsafeCell<Vec<TtEntry>>,

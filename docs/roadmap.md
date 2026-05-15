@@ -287,35 +287,51 @@ Pruning and extension layer over M4's bookkeeping foundation (TT, killers, histo
 (M5.I's predecessor baseline is whichever phase precedes it in actual landing order — flexible because of its isolation. Its closing tag exists only if M5.I's SPRT accepts; an inconclusive M5.I lands as a no-change retrospective with no new tag.)
 
 ### M6 — Eval improvements
-Tapered eval, pawn structure, king safety, mobility, passed pawn evaluation. Texel-tuned where possible. **Per-theme STS validation now available** — `src/bin/epd-suite.rs` scores 1500 strategic positions across 15 themes. Each new eval term should defend itself via per-theme STS-credit change on the relevant theme group; M5.E baseline at HEAD is 8832/15000 (58.9%) total credit, with weakest themes "King Activity" (42.3%) and "AKPC" (46.2%) — natural empirical anchors. See `bench/epd-suites.md`.
+Tapered eval, pawn structure, king safety, mobility, passed pawn evaluation. Texel-tuned where possible. **Per-theme STS validation now available** — `src/bin/epd-suite.rs` scores 1500 strategic positions across 15 themes. Each new eval term should defend itself via per-theme STS-credit change on the relevant theme group; HEAD baseline (`bench/epd-suites.md` "Per-theme STS breakdown (HEAD)" snapshot) is 8832/15000 (58.9%) total credit, with weakest themes "King Activity" (42.3%) and "AKPC" (46.2%) — natural empirical anchors. The `bench/epd-suites.md` HEAD snapshot is slightly stale relative to M5.G v2's reported 9239/15000 (61.6%); the weakest-themes anchor is the load-bearing signal for M6 and is consistent across snapshots. See `bench/epd-suites.md`.
 
-### M7 — Skill dial (basic strength reduction)
+### M7 — Opening books + endgame tablebases
+Two data-driven integrations, both gated by ADR-0003 (no engine source, but general-purpose libraries and public chess data are fine — `CLAUDE.md` "Domain code restrictions"). Each is sub-milestone-sized; the milestone lands as a pair of sub-phases.
+
+- **M7.A — Opening books (Polyglot).** Binary `.bin` decoder over sorted `(zobrist u64, move u16, weight u16, learn u32)` records, big-endian, binary search. Polyglot move encoding → our internal `Move` (incl. castling = king-takes-own-rook). Weighted-random vs best-weight selection policy. UCI options (`OwnBook`, `BookFile`, optional `BookDepth` / `BookSelectivity`). Root probe before search; on miss, fall through to the regular search driver. The M1.D Polyglot Zobrist key set (ADR-0009) makes any published Polyglot book probable bit-identically — this milestone is pure-add. ~500–800 LOC + one ADR.
+- **M7.B — Endgame tablebases (Syzygy).** WDL probe in-tree → exact-bound TT store; DTZ probe at the root → rule-50-safe best-move selection. UCI options (`SyzygyPath`, `SyzygyProbeDepth`, `SyzygyProbeLimit`, `Syzygy50MoveRule`). **Crate-vs-in-house is an open ADR-0003 question, not a deferred maybe.** The candidate crate (`shakmaty-syzygy` and any equivalent) depends transitively on `shakmaty`, which is a full move generator + position type — i.e. a chess-engine kernel under ADR-0003's definition. Even using the Syzygy crate "as a binary-format library" pulls a chess engine in as a transitive dependency, and the probe path legitimately needs to apply moves for canonicalization (DTZ best-move selection in particular). So either (i) we accept the transitive dependency and amend ADR-0003 to permit chess-engine *libraries that don't influence our engine's algorithms* (data-decoder framing), or (ii) we commit upfront to an in-house decoder, budgeting ~2000–3000 LOC of intricate format work (canonical position indexing with symmetry reductions, Huffman/RE-Pair decompression, per-material-config table dispatch). The M7.B plan/ADR resolves this *before* implementation starts. Rule-50 / GHI interaction touches the same ground as M4.A's TT-aware halfmove story (`decisions/0018` GHI clause).
+
+**Sub-phase independence.** M7.A and M7.B may close independently — each lands its own baseline tag and its own retrospective. The Polyglot half is genuinely small-and-safe (vendored Zobrist already in tree, binary search over a sorted file); the Syzygy half is substantially larger and gated by the ADR-0003 question above. Bundling them under a single M7 close would let the easy half wait on the hard half, which is the wrong incentive. The milestone *as a whole* closes when both halves have landed.
+
+**Exit criteria.**
+- **M7.A correctness:** book play verified by hash-compat round-trip from M1.D's vendored Polyglot key set against a published `.bin` (e.g. `book_small.bin` or comparable). Weight-decode round-trip from raw bytes verified against published reference values.
+- **M7.B correctness:** WDL probe matches Stockfish-as-oracle (per ADR-0006) on a generated EPD corpus of 3-/4-/5-piece positions (target: ≥1000 positions sampled across material configs). DTZ probe matches Stockfish best-move selection at the root for a smaller curated set including the well-known KBNK-vs-mate-in-N and rule-50-near-boundary positions.
+- **Gating:** both features disabled by default at engine startup, enabled per UCI option.
+- **SPRT:** at M5/M6 typical TCs and SPRT opening-book regimes, the Elo signal of either half is small-but-not-zero. The harness supplies openings during SPRT (diluting M7.A's contribution to ~0 by design); tablebase probes do affect a non-trivial fraction of decisive long-game endings (KPK races, KRP endings, KQK proof) and *can* flip outcomes, but the per-game frequency at SPRT TCs is modest. We therefore make correctness the M7.A/M7.B landing gate (per the M5.E precedent for correctness-only milestones) and defer the Elo-confirmation regime to M12 (tournament play vs external opponents at long TC), where both features pay off most. Optional defensive SPRT against `M6.<close>` is permitted but not gating.
+
+**Schedulable earlier.** Opening books require only M2 (UCI) + M1.D (Polyglot Zobrist) — feasible at HEAD. Tablebases require M1 (legal movegen) + M4 (TT integration) modulo the ADR-0003 question — also feasible at HEAD, contingent on the ADR resolving in favor of either path. Either or both could be pulled forward as sidequests during M6 if a low-energy slot opens. Optimal landing is here, where the engine has stable post-M6 eval and the integration is in place well before NNUE (M10) and tournament play (M12).
+
+### M8 — Skill dial (basic strength reduction)
 Configurable strength reduction: UCI's standard `UCI_LimitStrength` and `UCI_Elo` options, plus a granular "skill level" knob. Mechanisms: depth/node-count caps, eval noise injection, top-N randomized move selection. Each mechanism is a pure function (TDD-able); their composition's actual Elo at each setting is calibrated empirically via self-play matches.
 
 **Exit criteria:** at advertised Elo settings, calibrated self-play matches confirm strength within a stated margin (e.g. ±50 Elo). Engine plays "interestingly bad" at low settings rather than randomly bad.
 
-**Schedulable earlier.** This milestone has no hard dependency past M3 — if the user wants to play against the engine before M7, we can pull a basic version forward. Full calibration only makes sense once eval is reasonably stable (post-M6).
+**Schedulable earlier.** This milestone has no hard dependency past M3 — if the user wants to play against the engine before M8, we can pull a basic version forward. Full calibration only makes sense once eval is reasonably stable (post-M6).
 
 See `decisions/0005-strength-dial-as-planned-milestone.md`.
 
-### M8 — Parallelism
+### M9 — Parallelism
 Lazy SMP or equivalent. Lockless TT.
 
-### M9 — NNUE
+### M10 — NNUE
 Train and integrate. Requires a data pipeline and training infrastructure separate from the engine. Replaces classical eval as the primary scoring function. Re-uses make/unmake hooks from `decisions/0004`.
 
-### M10 — Android app
-Wrap engine as a mobile app. Toy target — performance regressions vs. macOS expected and acceptable. The skill dial (M7) is the primary mechanism for making the mobile engine a plausible opponent for the user.
+### M11 — Android app
+Wrap engine as a mobile app. Toy target — performance regressions vs. macOS expected and acceptable. The skill dial (M8) is the primary mechanism for making the mobile engine a plausible opponent for the user.
 
-### M11 — Tournament play
+### M12 — Tournament play
 Enter CCRL Blitz, CEGT, or open TalkChess events to obtain external Elo.
 
-### M12 — Human-like play (optional, post-NNUE)
-A separate model (Maia-style — trained to predict human moves at a target rating band) plugged in via the same eval/policy hook used by NNUE. Distinct from M7's "skill dial," which is an engine playing weakly; this is an engine playing *like a human* of a target rating. Open question: whether worth the training infrastructure investment, given M7 may be sufficient for the app use case.
+### M13 — Human-like play (optional, post-NNUE)
+A separate model (Maia-style — trained to predict human moves at a target rating band) plugged in via the same eval/policy hook used by NNUE. Distinct from M8's "skill dial," which is an engine playing weakly; this is an engine playing *like a human* of a target rating. Open question: whether worth the training infrastructure investment, given M8 may be sufficient for the app use case.
 
 ## Long-term strength target
 
-GM-level (~2700+) is the design ceiling. Classical eval (M3–M6) targets the high-amateur to weak-master range; NNUE (M9) is what carries us into GM territory. The skill dial (M7) and optional human-like play (M12) provide the inverse — making the engine a calibrated opponent at lower levels.
+GM-level (~2700+) is the design ceiling. Classical eval (M3–M6) targets the high-amateur to weak-master range; NNUE (M10) is what carries us into GM territory. The skill dial (M8) and optional human-like play (M13) provide the inverse — making the engine a calibrated opponent at lower levels.
 
 ## Notes
 

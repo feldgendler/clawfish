@@ -12,9 +12,9 @@ Current architectural state. Decisions and their rationale live in `docs/decisio
 | Sliding-piece move gen | Magic bitboards | implied by 8×8 |
 | Move encoding | 16-bit | implied by standard chess |
 | Evaluation v1 | Classical (material, PSTs, structural terms) | (foundational) |
-| Evaluation future | NNUE — planned milestone (M9), not optional | ADR-0004 |
+| Evaluation future | NNUE — planned milestone (M10), not optional | ADR-0004 |
 | Make/unmake structure | Single function calls; clean interception point for future NNUE accumulator | ADR-0004 |
-| Strength dial | Planned milestone (M7); reuses the eval/move-selection function-call discipline | ADR-0005 |
+| Strength dial | Planned milestone (M8); reuses the eval/move-selection function-call discipline | ADR-0005 |
 | Parallelism | Not v1, but designed in (lockless TT, Lazy SMP affinity) | (foundational) |
 | Protocol | UCI | (foundational) |
 | Primary platform | Apple Silicon (ARM64) macOS; mobile is a downstream port | ADR-0002 |
@@ -132,7 +132,7 @@ The split file is `cargo mutants`-excluded at file level via `.cargo/mutants.tom
 
 **Incremental update site.** `Position::static_eval_white: i32` is maintained by `make_move` / `unmake_move` via the `update_static_eval_after_make` private helper in `src/mov.rs`. Six flag-arm deltas (one per MoveFlag category); the helper takes `mover: Piece` by value and uses `mover.color`, making it order-agnostic at the call boundary (mirrors `update_zobrist_after_make` discipline). `Undo::prior_static_eval` is captured pre-mutation; `unmake_move` restores via `refresh_static_eval_from`.
 
-**NNUE-readiness (ADR-0004 extension).** When NNUE arrives at M9, the PSQT-based incremental update slots out for the accumulator update; `make_move` / `unmake_move` signatures stay. Exactly the discrete-function shape ADR-0004 designed for.
+**NNUE-readiness (ADR-0004 extension).** When NNUE arrives at M10, the PSQT-based incremental update slots out for the accumulator update; `make_move` / `unmake_move` signatures stay. Exactly the discrete-function shape ADR-0004 designed for.
 
 See `decisions/0014-eval-material-pst.md` and `docs/research/m3-eval-material-pst.md`.
 
