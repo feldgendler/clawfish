@@ -6,7 +6,7 @@ How we work together on this project.
 
 The loop is **designed to run unattended**. The user starts a session with a prompt like "plan and implement M1.X," and the agent proceeds through every step to commit without proactively pausing. The user can interject at any point by sending a message — the agent pauses to read and respond, then resumes. But the default trajectory is end-to-end execution.
 
-The blind-review loops at steps 4, 6, and 9 are the **primary quality control**, replacing the per-step user-approval gate of more interactive workflows. Reviewer concerns surface in chat as the loop runs (so the user reading along — synchronously or after the fact — sees what was raised and how it was addressed). The user can override any concern by sending a message; otherwise the agent acts on all reviewer concerns and continues.
+The blind-review loops at steps 4, 6, and 10 are the **primary quality control**, replacing the per-step user-approval gate of more interactive workflows. Reviewer concerns surface in chat as the loop runs (so the user reading along — synchronously or after the fact — sees what was raised and how it was addressed). The user can override any concern by sending a message; otherwise the agent acts on all reviewer concerns and continues.
 
 **Stuck vs. uncertain.** If the agent gets genuinely stuck (ambiguous spec the research can't resolve, hard tool failure that's not a transient retry, an unforeseen architectural fork that contradicts ADRs), it surfaces the issue in chat and pauses. "Stuck" is the only break in the unattended trajectory. "Uncertain" is not stuck — when uncertain, the agent picks the most defensible path, notes the alternatives in chat, and continues.
 
@@ -19,11 +19,17 @@ The cycle:
 5. **Write tests** for the entire task scope, where the layer admits TDD (see TDD scope below). This includes both ordinary unit tests and property tests (via `proptest`) where the invariant is more compact than an enumeration — written and reviewed *together*, before implementation. Property tests do not replace specific unit tests; see "Property tests vs. unit tests" below. Parallelizable across coding agents per the plan.
 6. **Test-suite review loop.** Independent reviewer checks the test suite for correctness to spec, confirmation bias, adequate checks, corner case coverage. See "Test-suite review loop" below. Implementation does not begin until the test suite passes review.
 7. **Implement.** Parallelizable across coding agents per the plan.
-8. **All tests pass.** No pre-review checks or commit until they do.
+8. **All tests pass.** No pre-review checks or commit until they do. **For units touching movegen or movegen-adjacent code** (`src/movegen.rs`, make/unmake in `src/mov.rs`, the search-side move loop, `MoveStager`, TT-move / killer-move legality validation, capture/quiet bucketing), the default `cargo test` set is **not sufficient** — also run the `#[ignore]`-gated extended perft suite. See "Extended perft for movegen-adjacent units" below.
 9. **Pre-review mechanical checks.** Orchestrator runs `cargo fmt --check`, `cargo clippy`, `cargo llvm-cov`, `cargo mutants --in-diff` on the unit's diff. Triages each mutation survivor (caught / equivalent / deferred / catchable-by-adding-test) per "Pre-review mechanical checks" under "Final review loop" below. Surfaces the analysis in the reviewer's spawn prompt.
 10. **Final review loop on code + tests jointly.** Independent reviewer reads code + tests + plan + the orchestrator's mechanical-check analysis. Judges correctness, corner cases, code quality, readability, simplicity, performance considerations, AND whether the orchestrator's coverage-gap and mutation-survivor classifications are sound. Reviewer does NOT re-run cargo-mutants or cargo-llvm-cov — those are pre-review work. See "Final review loop" below.
-11. **Benchmark and profile.** Record results. Compare to previous baseline.
-12. **Commit + push.** Final step of the unit's loop. Conventional commit message describing what landed (e.g. `M1.A: project skeleton, square and bitboard primitives`). Stage only the files belonging to this unit; leave any unrelated in-flight work in the working tree alone. Push to `origin/main` after the commit lands; the project is on GitHub and the upstream branch tracks it.
+11. **Benchmark and profile.** Record results. Compare to previous baseline. Bench-only signal (UCI `bench` nodes + criterion microbenchmarks). See "Benchmarking conventions" below.
+12. **Strength validation gates.** Trigger-conditional. Run **sequentially**, never in parallel — these and `cargo mutants` are CPU-contention-sensitive and OOM-prone (see "Resource contention discipline" below):
+    - **WAC + STS diagnostic suites** — every unit that touches search or eval. Sanity-check absolute tactical/strategic accuracy against the previous baseline tag. RUN ALONE per `bench/epd-suites.md`.
+    - **SPRT vs the current baseline tag, mixed TC** — every unit that claims a strength delta or touches search/eval where neutrality isn't trivially testable. Refactors that the deterministic `bench` proves neutral are exempt.
+    - **Elo calibration vs Stockfish, mixed TC** — at every milestone close (and at intra-milestone phases that meaningfully change strength), to track the absolute rating curve.
+    
+    See "Strength validation gates" below for trigger conditions, commands, and sequencing.
+13. **Commit + push.** Final step of the unit's loop. Conventional commit message describing what landed (e.g. `M1.A: project skeleton, square and bitboard primitives`). Stage only the files belonging to this unit; leave any unrelated in-flight work in the working tree alone. Push to `origin/main` after the commit lands; the project is on GitHub and the upstream branch tracks it.
 
 Skipping any review loop strips the project of its primary quality control (the user is no longer the per-step gate; the reviewers are). When the agent skips a step, it must justify in chat.
 
@@ -67,7 +73,7 @@ The plan itself, **written to a file** (`docs/plans/<unit>.md`) so the reviewer 
 4. **Main agent surfaces the critique in chat — every concern, with its substance.** The user does not read code; the reviewer's findings are part of the design conversation he sees. Posting just counts (e.g. "5 should-fix items, 8 nits") is **not** sufficient — the user needs to see what each concern actually *is*, with enough detail to push back if the reviewer is wrong. For `must-fix` and `should-fix`, post the full text; for `nit`s, a compact one-line-per-nit list is fine. The user can override any concern before the main agent acts on it (e.g. "ignore concern 4, the reviewer is wrong about X").
 5. **Main agent incorporates the feedback** (with any user overrides from step 4), revises the plan in place, and **continues the same reviewer subagent** (via `SendMessage`) for the next pass — context stays cached (faster) and the reviewer's judgment stays consistent from pass to pass (more stable than spawning a fresh reviewer each iteration, which restarts calibration). **Prerequisite:** `SendMessage` is part of Claude Code's experimental Agent Teams and requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the env block of `.claude/settings.json`. Already set in this project; if a future session reports that `SendMessage` is unavailable, that's the first thing to check.
 6. **Loop continues** until the reviewer returns "no further substantive issues" — OR after the **3rd reviewer pass** when no `must-fix` items remain. Beyond pass 3, residual `should-fix`/`nit` items are surfaced in chat and the loop terminates; final review and the user reading along are the next safety nets. The pass cap exists because each pass re-tokenizes the plan (and reviewer cache); diminishing returns set in fast once architectural concerns are resolved. The cap applies to all three review loops (plan, test-suite, final).
-7. **Execute.** No user-approval gate by default — the reviewer's convergence is the gate. The agent proceeds directly to steps 5–11 of the per-feature loop above (tests → test-suite review → implement → final review → benchmark → commit). The user can override mid-loop at any point by sending a message ("wait, change X"); absent intervention, the agent runs through to commit.
+7. **Execute.** No user-approval gate by default — the reviewer's convergence is the gate. The agent proceeds directly to steps 5–13 of the per-feature loop above (tests → test-suite review → implement → final review → benchmark → strength validation → commit). The user can override mid-loop at any point by sending a message ("wait, change X"); absent intervention, the agent runs through to commit.
 
 **Loop convergence is the reviewer's call, not the main agent's.** The main agent does not declare a plan done.
 
@@ -224,7 +230,7 @@ Mutation testing runtime grows roughly linearly with codebase size. A full-repo 
 
 ### Default per-unit run: `--in-diff`
 
-`cargo mutants --in-diff <FILE>` accepts a unified diff and only generates mutants on lines the diff touches. At the pre-review step, the unit's work is in the working tree (uncommitted — the commit lands at step 12), so the invocation is:
+`cargo mutants --in-diff <FILE>` accepts a unified diff and only generates mutants on lines the diff touches. At the pre-review step, the unit's work is in the working tree (uncommitted — the commit lands at step 13), so the invocation is:
 
 ```sh
 git add -N $(git ls-files --others --exclude-standard 'src/**/*.rs')   # see note
@@ -439,6 +445,114 @@ Every milestone phase gets a tag, including ones that landed before SPRT was ava
 - Profile hot paths with `samply` or Instruments (macOS, Apple Silicon).
 - Use `criterion` for microbenchmarks.
 - Never optimize without profiling first; never optimize without a benchmark to compare.
+
+The `bench` UCI nodes check and criterion microbenchmarks are **bench-only signal**. Playing-strength validation runs at step 12 of the per-feature loop — see "Strength validation gates" below.
+
+## Extended perft for movegen-adjacent units
+
+The default `cargo test` set only runs the fast perft suite (`canonical_six_fast_d1_d3` and `canonical_six_fast_d4_light_only`). The deeper, slower perft tests are `#[ignore]`-gated and require `--ignored` to run. **A movegen-adjacent change can pass the standard suite while breaking deep enumeration in subtle ways** (wrong handling of EP, promotions, castling, pinned pieces, or — for search-side changes — moves missed by a new pipeline that `generate_moves` itself still emits). Extended perft is the strongest correctness gate for movegen.
+
+**Triggers (required for):** any unit whose plan modifies `src/movegen.rs`, make/unmake in `src/mov.rs`, the negamax/qsearch move loop, `MoveStager` or any move-validation predicate that mirrors `generate_moves` semantics (TT-move pseudo-legality, killer-move legality), or capture/quiet bucketing. **The rule applies even when the production change is search-side rather than `generate_moves`-side** — M5.H, for example, never edits `src/movegen.rs` itself but rewires which moves the search consumes; a bug in the new pipeline could miss moves that perft would catch.
+
+**Required tier (run before commit on every triggering unit):**
+
+```sh
+cargo test --release -- --ignored canonical_six_d4_heavy_slow     # ~15 s; Kiwipete/Pos-5/Pos-6 D4 with plain+bulk parity
+cargo test --release -- --ignored canonical_six_d5_slow            # ~minutes; full canonical-6 at D5
+cargo test --release -- --ignored whittington_epd_d4_slow          # ~2 min; 174 positions D4
+```
+
+**Optional / on-demand:** `canonical_six_d6_slow` (~95 min Kiwipete D6 alone — many hours total). Run only when the change is large enough to warrant it or a regression at depth is suspected.
+
+Surface results in chat alongside the bench number at the unit's verification step. **A perft mismatch is a hard stop — no commit until resolved.**
+
+## Strength validation gates
+
+Step 12 of the per-feature loop. Bench (UCI `bench` nodes + criterion microbench) is a deterministic regression check; the gates below validate playing strength against absolute and relative references. **All four are CPU-contention-sensitive and must run sequentially** — see "Resource contention discipline" below.
+
+### When each gate fires
+
+| Gate | Trigger | Sequencing |
+|---|---|---|
+| **WAC + STS diagnostic suites** | Every unit that touches search or eval. Pure-tooling refactors that the deterministic `bench` proves neutral are exempt. | RUN ALONE per `bench/epd-suites.md` §"Methodology rule"; WAC then STS, never in parallel. |
+| **SPRT vs current baseline tag (mixed TC)** | Every unit that claims a strength delta or touches search/eval where neutrality isn't trivially testable. Refactors that the deterministic `bench` proves byte-neutral are exempt (see "SPRT methodology — baselines from historical commits, not feature flags" above for the refactor-exemption rule). | After WAC+STS. Single SPRT match at a time per machine. |
+| **Elo calibration vs Stockfish (mixed TC)** | At every milestone close (M1 / M2 / M3 / …). Also at intra-milestone phases that meaningfully change strength (judgment call — typically any phase where the SPRT signal exceeds ~+30 Elo, or where the Elo curve has plausibly inflected). | After SPRT. Single rating-estimate run at a time. |
+| **Extended perft** | Movegen-adjacent units — see "Extended perft for movegen-adjacent units" above. This gate is step 8 (correctness), not step 12 (strength); listed here for completeness as the fourth pre-commit gate. | Before step 9 mechanical checks. Not CPU-contention-sensitive (deterministic test). |
+
+### WAC + STS — commands and methodology
+
+WAC (300 tactical positions, single-`bm`) and STS (1500 strategic positions across 15 themes, weighted `c0`) are scored by `src/bin/epd-suite.rs` via `scripts/epd-suite.sh`:
+
+```sh
+scripts/epd-suite.sh run wac    # ~5 min at default movetime=1000ms
+scripts/epd-suite.sh run sts    # ~15 min at default movetime=1000ms
+```
+
+Baseline backfill table at `bench/epd-suites.md`; each unit's retrospective compares WAC + STS against the predecessor baseline tag's score. Noise band at the default 1000ms wallclock budget: **±2 WAC positions, ±68 STS credit**. Movement inside the band is not signal; movement outside is.
+
+**RUN ALONE rule (load-bearing — see `bench/epd-suites.md` §"Methodology rule — RUN ALONE").** EPD suites at fixed `--movetime` are CPU-contention-sensitive: under contention the engine reaches lower depths within the budget and the numbers come back depressed in ways that look like real regressions but are pure measurement noise. The M5.F initial run hit −13 / −292 vs the clean re-run; M5.G's initial run was invalid. **Never run WAC and STS in parallel; never run either alongside SPRT, rating-estimate, `cargo mutants`, or a parallel-coding-agent's `cargo test`.** See "Resource contention discipline" below.
+
+**Per-theme STS as a secondary gate from M6 onward.** Each M6 phase identifies the STS theme group(s) it expects to move and records the per-theme delta in its retrospective; a strong-negative move on a theme the phase claims to lift is a `should-fix` before close. Per-phase same-campaign re-baseline is required per `docs/roadmap.md` §M6 — measure the predecessor baseline tag in the *same* STS run as the post-phase HEAD, under the RUN-ALONE rule.
+
+### SPRT vs current baseline tag, mixed TC
+
+Drives via `scripts/sprt.sh sprt <baseline-tag>` (uses the in-process `elo-iterate` harness per ADR-0022). Default 4-bucket mixed-TC sample `10+0.1:1,20+0.2:1,40+0.4:1,60+0.6:1` (ELOH.D) catches depth-amplifying mechanisms whose fast-TC SPRT is inconclusive — see "Mixed-TC SPRT (ELOH.D)" above for the rationale and full invocation.
+
+```sh
+scripts/sprt.sh sprt M5.H1     # current baseline tag; HEAD vs that tag
+```
+
+The baseline-tag argument is the **current production HEAD tag** (the most recent landed phase), not the tag the new unit will replace. See "Baseline tag naming convention" above for the tag list.
+
+Accept/reject per the GSPRT verdict + post-hoc Δ Elo CI in `target/matches/sprt/<TS>-<baseline-slug>-sprt/summary.txt`. The unit's retrospective records the verdict, the Δ Elo CI, the per-TC breakdown, and the pentanomial. Land/no-land decision per the plan's exit criteria.
+
+### Elo calibration vs Stockfish, mixed TC
+
+Drives via `scripts/sprt.sh rating-estimate` against Stockfish at a fixed `UCI_Elo` (default 1320; override via `STOCKFISH_ELO` env var). Fixed-game-count match (default 200 games), fixed-anchor measurement (frozen-K + disabled-σ via `--k0 0 --target-sigma 0`):
+
+```sh
+scripts/sprt.sh rating-estimate
+```
+
+Output at `target/matches/sprt/<TS>-...-rating-estimate/summary.txt`. Logged at each milestone close in the retrospective and (when meaningful) in `docs/roadmap.md`. **Caveat:** Stockfish's `UCI_Elo` is calibrated by Stockfish at slow TC (typically 60+0.6 or 120+1.2); the mixed-TC sample's faster buckets shift the calibration. The number is comparable across our own runs at the same `STOCKFISH_ELO` and the same `--tc-sample`, not directly comparable to Stockfish's published Elo.
+
+### Sequencing on a milestone landing
+
+```
+extended perft (if movegen-adjacent)  →  step 8, before step 9 mechanical checks
+WAC                                    →  step 12, RUN ALONE
+STS                                    →  step 12, RUN ALONE (after WAC)
+SPRT vs current baseline tag           →  step 12, after WAC+STS
+Elo calibration vs Stockfish           →  step 12, at milestone close, after SPRT
+```
+
+Total wallclock for the step-12 block at a milestone close is several hours; the gates do not parallelize. Running them in parallel saves no clock time once the contaminated runs are re-done.
+
+## Resource contention discipline
+
+**Background-load-sensitive workloads run strictly sequentially on this machine, never in parallel — with each other or with any other CPU-heavy job.** The rule is load-bearing for both **measurement validity** (CPU contention depresses fixed-`movetime` metrics in ways that mimic real regressions) and **OOM safety** (running SPRT alongside `cargo mutants` has hit memory pressure on the dev machine in the past — `cargo mutants` spawns N parallel test workers, each of which builds and links the crate, and stacks badly with `elo-iterate`'s N concurrent engine subprocesses).
+
+**The contention-sensitive workloads:**
+
+- **EPD suites** (`scripts/epd-suite.sh run wac` / `run sts` / `backfill`) — fixed `--movetime` budget per position; contention depresses solve rates. ±2 WAC / ±68 STS noise band assumes RUN ALONE.
+- **SPRT match** (`scripts/sprt.sh sprt <tag>`) — concurrent engine pairs; contention slows both sides equally so the Δ Elo verdict is *less* sensitive than EPD, but per-game time controls degrade and OOM risk is real.
+- **Rating estimate vs Stockfish** (`scripts/sprt.sh rating-estimate` / `scripts/elo-iterate.sh`) — same shape as SPRT plus a third engine binary.
+- **`cargo mutants`** (full-suite or `--in-diff` at scale) — N parallel test workers, each a full crate build + link + test run.
+- **Parallel-coding-agent `cargo test`** — when a worktree-isolated coding subagent is in flight, its `cargo test` saturates the box.
+
+**Forbidden combinations** (any pair below produces invalid measurement, OOM risk, or both):
+
+| | EPD | SPRT | Elo-iterate | mutants | parallel `cargo test` |
+|---|---|---|---|---|---|
+| **EPD** | ✗ (WAC+STS parallel) | ✗ | ✗ | ✗ | ✗ |
+| **SPRT** | ✗ | ✗ | ✗ | **✗ OOM** | ✗ |
+| **Elo-iterate** | ✗ | ✗ | ✗ | **✗ OOM** | ✗ |
+| **mutants** | ✗ | **✗ OOM** | **✗ OOM** | ✗ | ✗ |
+| **parallel `cargo test`** | ✗ | ✗ | ✗ | ✗ | (orchestrator's own discipline) |
+
+**Operational rule:** at any given time on the dev machine, **at most one of the above is running**. The agent serialises step-12 strength-validation gates and the step-9 `cargo mutants` run accordingly — never starts a second contention-sensitive job until the first one's process group has exited.
+
+**Parallel coding agents are fine** as long as their work stays in distinct worktrees and none of them is in the middle of running a contention-sensitive workload. The orchestrator coordinates step-12 gates centrally rather than letting per-unit subagents fire them concurrently.
 
 ## Model assignment
 
