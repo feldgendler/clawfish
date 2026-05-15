@@ -1,6 +1,6 @@
 # ADR-0014 — Evaluation v1: material + PeSTO middlegame PST
 
-**Status:** Accepted (lands with M3.A).
+**Status:** Accepted (lands with M3.A). **§1 (single-phase MG-only composition) and §5 (insufficient-material set) SUPERSEDED by [ADR-0031](0031-tapered-eval.md) at M6.A (2026-05-15)** — eval is now tapered MG/EG, and the insufficient-material set extends to KBvKB-same-color. The incremental-update-site hook (§6) and NNUE-readiness (§7) decisions remain in force; ADR-0031 extends rather than replaces them.
 
 **Context:** The engine needs an evaluation function for the first time. M3.A is the first phase that *evaluates* — the depth-1 `GreedyMover` consumes it; M3.C alpha-beta will too.
 

@@ -1116,13 +1116,13 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
         "E51: bench node counts must match across two runs in the same session \
          with qsearch-in-TT active; got {nodes1} vs {nodes2}"
     );
-    // M5.F depth-4 bench-signature pin. Recorded from the production binary
-    // after M5.F qsearch TT probe+store landed. M5.D pin was 120_856;
-    // M5.F reduces depth-4 nodes by ~26% due to qsearch TT cutoffs.
-    const M5F_DEPTH4_BENCH_NODES: u64 = 89_080;
+    // M6.A depth-4 bench-signature pin. Re-pinned after M6.A tapered eval
+    // (MG/EG blend) landed; different eval scores change alpha-beta pruning
+    // behavior, shifting node counts. M5.F pin was 89_080.
+    const M6A_DEPTH4_BENCH_NODES: u64 = 94_501;
     assert_eq!(
-        nodes1, M5F_DEPTH4_BENCH_NODES,
-        "E51: bench node count changed from M5.F pin ({M5F_DEPTH4_BENCH_NODES} at depth=4); \
+        nodes1, M6A_DEPTH4_BENCH_NODES,
+        "E51: bench node count changed from M6.A pin ({M6A_DEPTH4_BENCH_NODES} at depth=4); \
          re-pin if intentional; got {nodes1}"
     );
 }

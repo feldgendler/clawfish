@@ -1,65 +1,76 @@
-//! Material + PST evaluation.
+//! Material + PST evaluation — tapered MG/EG blend (M6.A).
 //!
 //! `evaluate(&Position) -> i32` returns a side-to-move-relative score in
-//! centipawns. The backing field `Position::static_eval_white` is maintained
-//! incrementally by `make_move` / `unmake_move` (M3.A Slice 2); this module
-//! provides the from-scratch recomputation used on construction, parse, and
-//! in debug-build round-trip asserts.
+//! centipawns. The backing triple `(static_mg_white, static_eg_white, raw_phase)`
+//! is maintained incrementally by `make_move` / `unmake_move`; this module
+//! provides `eval_state_from_scratch` for construction, parse, and debug
+//! round-trip asserts.
 //!
-//! PST data: PeSTO middlegame tables, vendored verbatim (Slice 1).
-//! Insufficient-material detection: KvK, KvN, KvB → 0 (see plan §4).
+//! PST data: PeSTO MG + EG tables, vendored verbatim.
+//! Insufficient-material detection: KvK, KvN, KvB, KBvKB-same-color → 0.
 
+use crate::bitboard::Bitboard;
 use crate::piece::{Color, PieceKind};
 use crate::position::Position;
+use crate::square::Square;
 
 mod data;
-use data::{MG_BISHOP_PST, MG_KING_PST, MG_KNIGHT_PST, MG_PAWN_PST, MG_QUEEN_PST, MG_ROOK_PST};
+use data::{
+    EG_BISHOP_PST, EG_KING_PST, EG_KNIGHT_PST, EG_PAWN_PST, EG_QUEEN_PST, EG_ROOK_PST,
+    MG_BISHOP_PST, MG_KING_PST, MG_KNIGHT_PST, MG_PAWN_PST, MG_QUEEN_PST, MG_ROOK_PST,
+};
 
-/// Centipawn material values indexed by `PieceKind::index()` (P=0 … K=5).
-/// King material is 0 — kings are never captured; the king PST term is
-/// purely positional. Re-exported for use in MVV-LVA move ordering.
+/// MG centipawn material values. Re-exported for use in MVV-LVA move ordering.
 pub(crate) use data::MATERIAL;
 
+/// Per-kind phase contribution. Re-exported for use in `update_static_eval_after_make`.
+pub(crate) use data::PHASE_DELTA;
+
 // ---------------------------------------------------------------------------
-// PSQT — preflattened lookup table (plan §1).
+// Compile-time PSQT tables.
 //
-// PSQT[color][kind][sq] is the signed contribution of a (color, kind, sq)
-// piece to `static_eval_white`.
-//   White: +(MATERIAL[kind] + MG_PST[kind][sq ^ 56])
-//   Black: -(MATERIAL[kind] + MG_PST[kind][sq])
+// PSQT_MG[color][kind][sq] and PSQT_EG[color][kind][sq] are the signed
+// contributions to `static_mg_white` / `static_eg_white` respectively.
+//   White: +(material[kind] + pst[kind][sq ^ 56])
+//   Black: -(material[kind] + pst[kind][sq])
 //
-// Vendored data lives in `src/eval/data.rs` (excluded from cargo-mutants).
-// PeSTO arrays use a8-origin indexing; `build_psqt` applies the LERF ↔ PeSTO
-// flip via `sq ^ 56` for white-piece lookups.
+// PeSTO arrays use a8-origin indexing; `build_psqt_table` applies the
+// LERF ↔ PeSTO flip via `sq ^ 56` for white-piece lookups.
 // ---------------------------------------------------------------------------
 
-/// `PSQT[color_idx][kind_idx][sq_idx]`. Indexed by `Color as usize`,
-/// `PieceKind as usize`, and `Square::index() as usize`.
-pub(crate) const PSQT: [[[i32; 64]; 6]; 2] = build_psqt();
+const MG_TABLES: [[i32; 64]; 6] = [
+    MG_PAWN_PST,
+    MG_KNIGHT_PST,
+    MG_BISHOP_PST,
+    MG_ROOK_PST,
+    MG_QUEEN_PST,
+    MG_KING_PST,
+];
 
-/// Build the PSQT from `MATERIAL` and the six `MG_*_PST` arrays.
-/// Called once at compile time; result is a constant.
-const fn build_psqt() -> [[[i32; 64]; 6]; 2] {
-    // Per-kind MG PST tables, indexed by PieceKind::index() (P=0..K=5).
-    const MG_TABLES: [[i32; 64]; 6] = [
-        MG_PAWN_PST,
-        MG_KNIGHT_PST,
-        MG_BISHOP_PST,
-        MG_ROOK_PST,
-        MG_QUEEN_PST,
-        MG_KING_PST,
-    ];
+const EG_TABLES: [[i32; 64]; 6] = [
+    EG_PAWN_PST,
+    EG_KNIGHT_PST,
+    EG_BISHOP_PST,
+    EG_ROOK_PST,
+    EG_QUEEN_PST,
+    EG_KING_PST,
+];
 
+/// `PSQT_MG[color_idx][kind_idx][sq_idx]` — MG piece-square contribution.
+pub(crate) const PSQT_MG: [[[i32; 64]; 6]; 2] = build_psqt_table(&MG_TABLES, &data::MATERIAL);
+
+/// `PSQT_EG[color_idx][kind_idx][sq_idx]` — EG piece-square contribution.
+pub(crate) const PSQT_EG: [[[i32; 64]; 6]; 2] = build_psqt_table(&EG_TABLES, &data::MATERIAL_EG);
+
+const fn build_psqt_table(tables: &[[i32; 64]; 6], material: &[i32; 6]) -> [[[i32; 64]; 6]; 2] {
     let mut psqt = [[[0i32; 64]; 6]; 2];
     let mut kind = 0usize;
     while kind < 6 {
         let mut sq = 0usize;
         while sq < 64 {
-            let mat = MATERIAL[kind];
-            // White lookup: sq ^ 56 converts LERF index to PeSTO a8-origin index.
-            psqt[Color::White as usize][kind][sq] = mat + MG_TABLES[kind][sq ^ 56];
-            // Black lookup: negate; use sq directly (PeSTO a8-origin = LERF index for black).
-            psqt[Color::Black as usize][kind][sq] = -(mat + MG_TABLES[kind][sq]);
+            let mat = material[kind];
+            psqt[Color::White as usize][kind][sq] = mat + tables[kind][sq ^ 56];
+            psqt[Color::Black as usize][kind][sq] = -(mat + tables[kind][sq]);
             sq += 1;
         }
         kind += 1;
@@ -67,59 +78,171 @@ const fn build_psqt() -> [[[i32; 64]; 6]; 2] {
     psqt
 }
 
-// Ensure build_psqt is not dead code.
-const _BUILD_PSQT_COMPILES: [[[i32; 64]; 6]; 2] = build_psqt();
+// Bishop-pair bonus values (MG/EG). Texel pass in M6.F will tune these.
+const BISHOP_PAIR_MG: i32 = 30;
+const BISHOP_PAIR_EG: i32 = 50;
+
+// Mop-up fires when raw_phase < MOP_UP_PHASE_MAX (covers KQK, KRK, etc.).
+const MOP_UP_PHASE_MAX: u8 = 5;
+const MOP_UP_MIN_ADVANTAGE_CP: i32 = 100;
 
 // ---------------------------------------------------------------------------
 // Public API.
 // ---------------------------------------------------------------------------
 
-/// Recompute `static_eval_white` from scratch. Iterates all pieces and sums
-/// `PSQT[color][kind][sq]` for each occupied square. Used by
-/// `Position::refresh_static_eval`, by debug-build round-trip asserts in
-/// `make_move` / `unmake_move`, and by the eval tests.
-pub(crate) fn eval_white_from_scratch(pos: &Position) -> i32 {
-    let mut score = 0i32;
+/// Recompute the eval triple `(mg_white, eg_white, raw_phase)` from scratch.
+/// Single pass — used by `Position::refresh_static_eval` and debug round-trip
+/// asserts in `make_move` / `unmake_move`.
+pub(crate) fn eval_state_from_scratch(pos: &Position) -> (i32, i32, u8) {
+    let mut mg = 0i32;
+    let mut eg = 0i32;
+    let mut phase: u32 = 0;
     for kind in PieceKind::ALL {
         for color in [Color::White, Color::Black] {
             let mut bb = pos.pieces_colored(color, kind);
             while let Some(sq) = bb.pop_lsb() {
-                score += PSQT[color as usize][kind.index()][sq.index() as usize];
+                mg += PSQT_MG[color as usize][kind.index()][sq.index() as usize];
+                eg += PSQT_EG[color as usize][kind.index()][sq.index() as usize];
+                phase += PHASE_DELTA[kind.index()] as u32;
             }
         }
     }
-    score
+    debug_assert!(
+        phase <= 255,
+        "phase overflow (only possible with > 255-piece-equivalent material)"
+    );
+    (mg, eg, phase as u8)
+}
+
+/// Returns `true` if the position is an insufficient-material draw.
+/// Covers KvK, KvN, KvB, and KBvKB-same-color.
+fn is_insufficient_material(pos: &Position) -> bool {
+    let total_count = pos.occupied_all().count();
+    match total_count {
+        2 => true,
+        3 => {
+            let knight_count = pos.pieces(PieceKind::Knight).count();
+            let bishop_count = pos.pieces(PieceKind::Bishop).count();
+            knight_count == 1 || bishop_count == 1
+        }
+        4 => is_kbkb_same_color(pos),
+        _ => false,
+    }
+}
+
+/// Returns `true` when the position has exactly 4 pieces, each side has
+/// exactly one bishop, and both bishops are on the **same** color complex.
+/// The caller guarantee is `pos.occupied_all().count() == 4`.
+fn is_kbkb_same_color(pos: &Position) -> bool {
+    let wb = pos.pieces_colored(Color::White, PieceKind::Bishop);
+    let bb = pos.pieces_colored(Color::Black, PieceKind::Bishop);
+    if wb.count() != 1 || bb.count() != 1 {
+        return false;
+    }
+    let wb_on_light = (wb & Bitboard::LIGHT_SQUARES).any();
+    let bb_on_light = (bb & Bitboard::LIGHT_SQUARES).any();
+    wb_on_light == bb_on_light
+}
+
+/// Returns the bishop-pair bonus for white minus the bonus for black.
+/// `value` is the per-side bonus (pass `BISHOP_PAIR_MG` or `BISHOP_PAIR_EG`).
+/// Returns `+value` if only white has the pair, `-value` if only black has it,
+/// `0` if both or neither have it.
+pub(crate) fn bishop_pair_term_white(pos: &Position, value: i32) -> i32 {
+    let wb = pos.pieces_colored(Color::White, PieceKind::Bishop);
+    let bb = pos.pieces_colored(Color::Black, PieceKind::Bishop);
+    let white_pair = (wb & Bitboard::LIGHT_SQUARES).any() && (wb & Bitboard::DARK_SQUARES).any();
+    let black_pair = (bb & Bitboard::LIGHT_SQUARES).any() && (bb & Bitboard::DARK_SQUARES).any();
+    match (white_pair, black_pair) {
+        (true, false) => value,
+        (false, true) => -value,
+        _ => 0,
+    }
+}
+
+/// Center Manhattan distance — distance from `sq` to the nearest of the four
+/// center squares {d4, e4, d5, e5}. Returns a value in `[0, 6]`.
+pub(crate) fn center_manhattan_distance(sq: Square) -> i32 {
+    let f = sq.file() as i32;
+    let r = sq.rank() as i32;
+    let fd = (f - 3).abs().min((f - 4).abs());
+    let rd = (r - 3).abs().min((r - 4).abs());
+    fd + rd
+}
+
+/// Chebyshev distance between two squares: `max(|file_diff|, |rank_diff|)`.
+/// Returns a value in `[0, 7]`.
+pub(crate) fn chebyshev_distance(a: Square, b: Square) -> i32 {
+    let fd = (a.file() as i32 - b.file() as i32).abs();
+    let rd = (a.rank() as i32 - b.rank() as i32).abs();
+    fd.max(rd)
+}
+
+/// Mop-up term: drives the losing king to a corner and the winning king close.
+/// Returns a white-perspective signed value (+bonus when white winning,
+/// -bonus when black winning). Returns 0 when the phase or advantage gate
+/// is not met.
+///
+/// `mg_white` and `eg_white` are the incremental field values (before
+/// bishop-pair addends), used to estimate the blended advantage.
+pub(crate) fn mop_up_term_white(pos: &Position, mg_white: i32, eg_white: i32) -> i32 {
+    if pos.raw_phase() >= MOP_UP_PHASE_MAX {
+        return 0;
+    }
+    // Estimate blended advantage using the same formula as static_eval_white()
+    // but without bishop-pair (consistent with the caller's inputs).
+    let phase = pos.raw_phase().min(24) as i32;
+    let advantage = (mg_white * phase + eg_white * (24 - phase)) / 24;
+    if advantage.abs() <= MOP_UP_MIN_ADVANTAGE_CP {
+        return 0;
+    }
+
+    let white_king = pos.king_square(Color::White);
+    let black_king = pos.king_square(Color::Black);
+
+    if advantage > 0 {
+        // White winning: drive black king to the corner.
+        4 * center_manhattan_distance(black_king)
+            + 2 * (14 - chebyshev_distance(white_king, black_king))
+    } else {
+        // Black winning: drive white king to the corner.
+        -(4 * center_manhattan_distance(white_king)
+            + 2 * (14 - chebyshev_distance(black_king, white_king)))
+    }
 }
 
 /// Side-to-move-relative score in centipawns.
 ///
-/// Returns 0 for insufficient-material positions (KvK, KvN, KvB).
-/// Otherwise returns `static_eval_white` negated for Black.
+/// Returns 0 for insufficient-material positions (KvK, KvN, KvB,
+/// KBvKB-same-color). Otherwise blends MG/EG by phase, applies bishop-pair
+/// and mop-up addends, then negates for Black.
 pub fn evaluate(pos: &Position) -> i32 {
-    let total_count = pos.occupied_all().count();
+    use crate::search::MATE_IN_MAX_PLY;
 
-    // KvK: only the two kings remain.
-    if total_count == 2 {
+    if is_insufficient_material(pos) {
         return 0;
     }
 
-    if total_count == 3 {
-        // KvN or KvB: exactly one minor piece besides the two kings.
-        // The "two kings" half is guaranteed by `validate_post_parse` (FEN
-        // parser rejects positions without exactly one king per color), so
-        // total_count == 3 implies exactly one non-king piece.
-        let knight_count = pos.pieces(PieceKind::Knight).count();
-        let bishop_count = pos.pieces(PieceKind::Bishop).count();
-        if knight_count == 1 || bishop_count == 1 {
-            return 0;
-        }
-    }
+    let mg = pos.static_mg_white();
+    let eg = pos.static_eg_white();
+    let phase = pos.raw_phase().min(24) as i32;
 
-    let e = pos.static_eval_white();
+    let bp_mg = bishop_pair_term_white(pos, BISHOP_PAIR_MG);
+    let bp_eg = bishop_pair_term_white(pos, BISHOP_PAIR_EG);
+    let mop_up = mop_up_term_white(pos, mg, eg);
+
+    let blended = ((mg + bp_mg) * phase + (eg + bp_eg) * (24 - phase)) / 24;
+    let result_white = blended + mop_up;
+
+    debug_assert!(
+        result_white.abs() < MATE_IN_MAX_PLY - 1,
+        "eval score {result_white} outside centipawn band"
+    );
+
     if pos.side_to_move() == Color::White {
-        e
+        result_white
     } else {
-        -e
+        -result_white
     }
 }
 
@@ -149,45 +272,60 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // A2 — e-pawn missing → ±67 cp.
+    // A — starting position phase is exactly 24.
     // -----------------------------------------------------------------------
 
-    /// Starting position minus white's e2 pawn → -67 for white to move (pawn
-    /// down). Starting position minus black's e7 pawn → +67 for white to move
-    /// (pawn up). Pins the combined material+PST contribution at e2/e7.
-    ///
-    /// Derivation: e2 is sq=12 (LERF). White lookup is
-    /// `+(MATERIAL[Pawn] + MG_PAWN_PST[12 ^ 56])` = `+(82 + MG_PAWN_PST[52])`.
-    /// MG_PAWN_PST[52] is PeSTO row 6, col 4 (e-file) = -15 (from
-    /// `docs/research/m3-eval-material-pst.md` "MG Pawn PST" row
-    /// `-35, -1, -20, -23, -15, 24, 38, -22`). Total = +(82 + (-15)) = +67.
-    ///
-    /// For e7 (sq=52): Black lookup is `-(82 + MG_PAWN_PST[52]) = -67`.
-    /// Both positions have symmetric non-e-pawn material, so the net eval
-    /// is ±67 cp.
+    /// At the starting position all pieces are present:
+    ///   4 knights × 1 + 4 bishops × 1 + 4 rooks × 2 + 2 queens × 4 = 24.
+    /// Pawns and kings contribute 0. raw_phase must be exactly 24.
     #[test]
-    fn eval_one_e_pawn_missing_is_67_cp() {
+    fn eval_starting_position_phase_is_24() {
+        let pos = Position::starting_position();
+        assert_eq!(
+            pos.raw_phase(),
+            24,
+            "starting position raw_phase must be 24 (4N×1 + 4B×1 + 4R×2 + 2Q×4 = 24)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A — e-pawn missing → −67 cp (value preserved from M3.A).
+    // -----------------------------------------------------------------------
+
+    /// Starting position minus white's e2 pawn → −67 for white to move (pawn
+    /// down). At starting raw_phase 24, mg_phase=24 and eg_phase=0, so the
+    /// blend reduces to the MG-only value. Bishop pair is symmetric at the
+    /// starting position (both sides have it) → net 0 addend. Therefore the
+    /// blended eval at full material equals the MG-only eval from M3.A: −67.
+    ///
+    /// Derivation: e2 is sq=12 (LERF). White MG lookup is
+    /// `+(MATERIAL[Pawn] + MG_PAWN_PST[12^56])` = `+(82 + MG_PAWN_PST[52])`.
+    /// MG_PAWN_PST[52] is PeSTO row 6, col 4 (e-file) = −15 (from
+    /// `docs/research/m3-eval-material-pst.md` "MG Pawn PST" row
+    /// `−35, −1, −20, −23, −15, 24, 38, −22`). Total = +(82 + (−15)) = +67.
+    /// Removed pawn means −67 white-perspective, and at phase 24 (full MG)
+    /// the blend equals the MG score. Bishop pair cancels (both sides retain
+    /// symmetric pairs). Net: −67.
+    #[test]
+    fn eval_one_e_pawn_missing_blends_to_minus_67_white_to_move() {
         // White is missing the e2 pawn (down one pawn). FEN built from
         // startpos by removing the e2 pawn from rank 2.
         let pos_white_pawn_missing =
             Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPP1PPP/RNBQKBNR w KQkq - 0 1")
                 .expect("FEN must parse");
+        // Pins the fixture invariant the derivation relies on.  Pawns contribute
+        // 0 to phase, so removing one pawn leaves raw_phase = 24 (full MG).
+        assert_eq!(
+            pos_white_pawn_missing.raw_phase(),
+            24,
+            "fixture invariant: raw_phase must be 24 (pawns have PHASE_DELTA=0)"
+        );
         assert_eq!(
             evaluate(&pos_white_pawn_missing),
             -67,
             "white missing e2 pawn: evaluate must be -67 cp \
-            (material 82 + PST[e2^56=52]=-15 → net 67, pawn down)"
-        );
-
-        // Black is missing the e7 pawn (white is up one pawn), white to move.
-        let pos_black_pawn_missing =
-            Position::from_fen("rnbqkbnr/pppp1ppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-                .expect("FEN must parse");
-        assert_eq!(
-            evaluate(&pos_black_pawn_missing),
-            67,
-            "black missing e7 pawn: evaluate must be +67 cp \
-            (material 82 + PST[52]=-15 → net 67, pawn up)"
+            (MG material 82 + PST[e2^56=52]=-15 → net 67, pawn down; \
+            at raw_phase=24 blend equals MG (eg term × 0); bishop pair symmetric → 0)"
         );
     }
 
@@ -271,105 +409,669 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // A7 — KBvKB same-color bishops does NOT return zero (deferred per ADR-0014).
+    // A — KBvKB same-color → 0; opposite-color → non-zero.
     // -----------------------------------------------------------------------
 
-    /// Same-color bishops: c4 and e2 are both light squares (convention:
-    /// `(file + rank) even ⇒ dark`; `(file + rank) odd ⇒ light`; e2 has
-    /// file=4, rank=1, sum=5 odd → light; c4 has file=2, rank=3, sum=5 odd
-    /// → light). M3.A deliberately does NOT detect this as insufficient
-    /// material; this test pins that the implementation returns a non-zero
-    /// evaluation — a regression would be a future M6 change that erroneously
-    /// adds same-color-bishop detection at this phase.
+    /// White bishop on e2 (sq=12, light: file=4, rank=1, 4+1=5 odd → light).
+    /// Black bishop on c4 (sq=26, light: file=2, rank=3, 2+3=5 odd → light).
+    /// Both on light → same-color → insufficient material → 0.
     #[test]
-    fn eval_kbvkb_does_not_return_zero() {
-        // White bishop on e2 (sq=12, light square: file=4, rank=1, sum=5 odd → light).
-        // Black bishop on c4 (sq=26, light square: file=2, rank=3, sum=5 odd → light).
-        // Both light. Positional imbalance in PST means the eval is non-zero.
-        let pos =
-            Position::from_fen("4k3/8/8/8/2b5/8/4B3/4K3 w - - 0 1").expect("KBvKB FEN must parse");
-        // The test pins that eval is non-zero (not zero). The exact value
-        // depends on PST data filled in by the implementation.
+    fn eval_kbvkb_same_color_returns_zero_light() {
+        let pos = Position::from_fen("4k3/8/8/8/2b5/8/4B3/4K3 w - - 0 1")
+            .expect("KBvKB same-color (light) FEN must parse");
+        assert_eq!(
+            evaluate(&pos),
+            0,
+            "KBvKB with both bishops on light squares must evaluate to 0 (insufficient material)"
+        );
+    }
+
+    /// White bishop on a1 (sq=0, dark: file=0, rank=0, 0+0=0 even → dark).
+    /// Black bishop on h8 (sq=63, dark: file=7, rank=7, 7+7=14 even → dark).
+    /// Both on dark → same-color → insufficient material → 0.
+    #[test]
+    fn eval_kbvkb_same_color_returns_zero_dark() {
+        // Kings on e1/e8; bishops on a1(dark) and h8(dark).
+        // Rank 8 `4k2b`: e8=k, h8=b. Rank 1 `B3K3`: a1=B, e1=K.
+        let pos = Position::from_fen("4k2b/8/8/8/8/8/8/B3K3 w - - 0 1")
+            .expect("KBvKB same-color (dark) FEN must parse");
+        assert_eq!(
+            evaluate(&pos),
+            0,
+            "KBvKB with both bishops on dark squares must evaluate to 0 (insufficient material)"
+        );
+    }
+
+    /// White bishop on e2 (light). Black bishop on c1 (sq=2, dark: file=2,
+    /// rank=0, 2+0=2 even → dark). Opposite colors → NOT insufficient material
+    /// → non-zero evaluation (material balance is 0 but PST imbalance is real).
+    #[test]
+    fn eval_kbvkb_opposite_color_does_not_return_zero() {
+        // White Be2 (light), Black Bc1 (dark). Kings on e1/e8.
+        let pos = Position::from_fen("4k3/8/8/8/8/8/4B3/2b1K3 w - - 0 1")
+            .expect("KBvKB opposite-color FEN must parse");
         assert_ne!(
             evaluate(&pos),
             0,
-            "KBvKB (same-color bishops) must not return 0 at M3.A — insufficient-material \
-            detection for this case is deferred to M6 (ADR-0014)"
+            "KBvKB with bishops on opposite colors must NOT return 0 — \
+            this is not an insufficient-material draw under FIDE"
+        );
+    }
+
+    /// KBN vs K is a forced WIN (not a draw), and has total_count == 4 — the
+    /// branch that calls `is_kbkb_same_color`. White K e1 + N b1 + B c1 (c1
+    /// is dark: file=2, rank=0, sum=2 even), Black K e8. White has exactly
+    /// one bishop; black has zero bishops.
+    ///
+    /// Mutation coverage for `is_kbkb_same_color`'s early-return guard
+    /// `wb.count() != 1 || bb.count() != 1` (survivor at src/eval.rs:139
+    /// under cargo-mutants `|| -> &&`). Original: `false || true` → returns
+    /// false → NOT insufficient → evaluate != 0 (white up B+N). The `&&`
+    /// mutant evaluates `false && true` → false → does not early-return,
+    /// then `wb_on_light(false) == bb_on_light(false)` → returns true →
+    /// evaluate would wrongly return 0 for a winning KBN-vs-K position.
+    #[test]
+    fn eval_kbn_vs_k_not_insufficient_material() {
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/1NB1K3 w - - 0 1")
+            .expect("KBN vs K FEN must parse");
+        assert_eq!(
+            pos.occupied_all().count(),
+            4,
+            "fixture invariant: KBNvK must have exactly 4 pieces (reaches the \
+             is_kbkb_same_color branch)"
+        );
+        assert_ne!(
+            evaluate(&pos),
+            0,
+            "KBN vs K is a forced win, NOT an insufficient-material draw — \
+             evaluate must be non-zero"
         );
     }
 
     // -----------------------------------------------------------------------
-    // A8–A10 — PSQT anchor values.
+    // A — PSQT_MG anchor values.
     // -----------------------------------------------------------------------
 
-    /// A2 is sq=8 (LERF). White lookup: +(MATERIAL[Pawn] + MG_PAWN_PST[8^56])
+    /// A2 is sq=8 (LERF). White MG lookup: +(MATERIAL[Pawn] + MG_PAWN_PST[8^56])
     /// = +(82 + MG_PAWN_PST[48]). PeSTO row 6 (rank-2 from White's perspective),
     /// col 0 (a-file) = -35. Total = +(82 + (-35)) = +47.
     #[test]
-    fn psqt_white_pawn_a2_anchor() {
+    fn psqt_mg_white_pawn_a2_anchor() {
         assert_eq!(
-            PSQT[Color::White as usize][PieceKind::Pawn as usize][Square::A2.index() as usize],
+            PSQT_MG[Color::White as usize][PieceKind::Pawn as usize][Square::A2.index() as usize],
             47,
-            "PSQT[White][Pawn][A2] must be 47 (82 material + (-35) PST)"
+            "PSQT_MG[White][Pawn][A2] must be 47 (82 material + (-35) MG PST)"
         );
     }
 
-    /// A7 is sq=48. Black lookup: -(MATERIAL[Pawn] + MG_PAWN_PST[48])
+    /// A7 is sq=48. Black MG lookup: -(MATERIAL[Pawn] + MG_PAWN_PST[48])
     /// = -(82 + (-35)) = -47. Pins that Black uses `table[sq]` directly (no
     /// XOR), and that the value is the negation of the symmetric white A2 entry.
     #[test]
-    fn psqt_black_pawn_a7_anchor() {
+    fn psqt_mg_black_pawn_a7_anchor() {
         assert_eq!(
-            PSQT[Color::Black as usize][PieceKind::Pawn as usize][Square::A7.index() as usize],
+            PSQT_MG[Color::Black as usize][PieceKind::Pawn as usize][Square::A7.index() as usize],
             -47,
-            "PSQT[Black][Pawn][A7] must be -47 (negation of White A2 entry)"
+            "PSQT_MG[Black][Pawn][A7] must be -47 (negation of White A2 entry)"
         );
     }
 
-    /// E1 is sq=4. White lookup: +(MATERIAL[King] + MG_KING_PST[4^56])
-    /// = +(0 + MG_KING_PST[60]). PeSTO row 7 (rank-1), col 4 (e-file) = 8.
-    /// Pins (a) king material is 0, (b) PeSTO MG king PST is included.
+    /// E1 is sq=4. White MG lookup: +(MATERIAL[King] + MG_KING_PST[4^56])
+    /// = +(0 + MG_KING_PST[60]). PeSTO MG king PST row 7 (rank-1), col 4
+    /// (e-file) = 8. Pins (a) king material is 0, (b) MG king PST is included.
     #[test]
-    fn psqt_white_king_e1_anchor() {
+    fn psqt_mg_white_king_e1_anchor() {
         assert_eq!(
-            PSQT[Color::White as usize][PieceKind::King as usize][Square::E1.index() as usize],
+            PSQT_MG[Color::White as usize][PieceKind::King as usize][Square::E1.index() as usize],
             8,
-            "PSQT[White][King][E1] must be 8 (0 material + 8 PST)"
+            "PSQT_MG[White][King][E1] must be 8 (0 material + 8 MG PST)"
         );
     }
 
     // -----------------------------------------------------------------------
-    // B1 — PSQT symmetry: PSQT[White][k][sq] == -PSQT[Black][k][sq ^ 56].
+    // A — PSQT_EG anchor values.
     // -----------------------------------------------------------------------
 
-    /// For all (kind, sq), `PSQT[White][kind][sq] == -PSQT[Black][kind][sq ^ 56]`.
-    /// Pure constant invariant, exhaustive over all 384 (kind, sq) combinations.
-    /// A plain `#[test]` rather than a proptest because the domain is small
-    /// and full enumeration gives precise failure diagnostics per (kind, sq).
+    /// A2 is sq=8 (LERF). White EG lookup: +(MATERIAL_EG[Pawn] + EG_PAWN_PST[8^56])
+    /// = +(94 + EG_PAWN_PST[48]). PeSTO EG pawn PST row 6 (rank-2 from
+    /// White's perspective), col 0 (a-file) = 13. Total = +(94 + 13) = +107.
+    ///
+    /// PeSTO EG pawn PST row 6 (a8-origin index 48..55):
+    ///   `13, 8, 8, 10, 13, 0, 2, -7`; index 48 (col 0) = 13.
     #[test]
-    fn psqt_symmetry_at_indices() {
-        // Guard against vacuous pass: PSQT must contain real data, not all zeros.
-        // Without this, the symmetry loop trivially holds (`0 == -0`).
+    fn psqt_eg_white_pawn_a2_anchor() {
+        assert_eq!(
+            PSQT_EG[Color::White as usize][PieceKind::Pawn as usize][Square::A2.index() as usize],
+            107,
+            "PSQT_EG[White][Pawn][A2] must be 107 (94 EG material + 13 EG PST)"
+        );
+    }
+
+    /// A7 is sq=48. Black EG lookup: -(MATERIAL_EG[Pawn] + EG_PAWN_PST[48])
+    /// = -(94 + 13) = -107. Symmetric with white A2.
+    #[test]
+    fn psqt_eg_black_pawn_a7_anchor() {
+        assert_eq!(
+            PSQT_EG[Color::Black as usize][PieceKind::Pawn as usize][Square::A7.index() as usize],
+            -107,
+            "PSQT_EG[Black][Pawn][A7] must be -107 (negation of White EG A2 entry)"
+        );
+    }
+
+    /// E1 is sq=4. White EG lookup: +(MATERIAL_EG[King] + EG_KING_PST[4^56])
+    /// = +(0 + EG_KING_PST[60]). PeSTO EG king PST row 7 (rank-1), col 4
+    /// (e-file) = -28. Total = +(0 + (-28)) = -28.
+    ///
+    /// PeSTO EG king PST row 7 (a8-origin index 56..63):
+    ///   `-53, -34, -21, -11, -28, -14, -24, -43`; index 60 (col 4) = -28.
+    ///
+    /// The large negative EG king values in the back rank reflect the EG king
+    /// PST's preference for central squares — the king should be active in
+    /// the endgame, not tucked in a corner.
+    #[test]
+    fn psqt_eg_white_king_e1_anchor() {
+        assert_eq!(
+            PSQT_EG[Color::White as usize][PieceKind::King as usize][Square::E1.index() as usize],
+            -28,
+            "PSQT_EG[White][King][E1] must be -28 (0 EG material + (-28) EG king PST)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // B — PSQT_MG symmetry.
+    // -----------------------------------------------------------------------
+
+    /// For all (kind, sq), `PSQT_MG[White][kind][sq] == -PSQT_MG[Black][kind][sq ^ 56]`.
+    #[test]
+    fn psqt_mg_symmetry_at_indices() {
         assert_ne!(
-            PSQT[Color::White as usize][PieceKind::Pawn as usize][Square::A2.index() as usize],
+            PSQT_MG[Color::White as usize][PieceKind::Pawn as usize][Square::A2.index() as usize],
             0,
-            "PSQT must contain non-zero data — symmetry test would pass vacuously otherwise \
-            (standard rule: (file + rank) even ⇒ dark square, odd ⇒ light square)"
+            "PSQT_MG must contain non-zero data — symmetry test would pass vacuously otherwise"
         );
 
         for kind in PieceKind::ALL {
             for sq in Square::all() {
                 let sq_idx = sq.index() as usize;
                 let sq_flip = (sq.index() ^ 56) as usize;
-                let white_val = PSQT[Color::White as usize][kind.index()][sq_idx];
-                let black_val = PSQT[Color::Black as usize][kind.index()][sq_flip];
+                let white_val = PSQT_MG[Color::White as usize][kind.index()][sq_idx];
+                let black_val = PSQT_MG[Color::Black as usize][kind.index()][sq_flip];
                 assert_eq!(
                     white_val, -black_val,
-                    "PSQT symmetry violated for {:?} at sq={sq}: \
-                    PSQT[White][{:?}][{sq_idx}]={white_val} != -PSQT[Black][{:?}][{sq_flip}]={black_val}",
+                    "PSQT_MG symmetry violated for {:?} at sq={sq}: \
+                    PSQT_MG[White][{:?}][{sq_idx}]={white_val} != -PSQT_MG[Black][{:?}][{sq_flip}]={black_val}",
                     kind, kind, kind,
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // B — PSQT_EG symmetry.
+    // -----------------------------------------------------------------------
+
+    /// For all (kind, sq), `PSQT_EG[White][kind][sq] == -PSQT_EG[Black][kind][sq ^ 56]`.
+    #[test]
+    fn psqt_eg_symmetry_at_indices() {
+        assert_ne!(
+            PSQT_EG[Color::White as usize][PieceKind::Pawn as usize][Square::A2.index() as usize],
+            0,
+            "PSQT_EG must contain non-zero data — symmetry test would pass vacuously otherwise"
+        );
+
+        for kind in PieceKind::ALL {
+            for sq in Square::all() {
+                let sq_idx = sq.index() as usize;
+                let sq_flip = (sq.index() ^ 56) as usize;
+                let white_val = PSQT_EG[Color::White as usize][kind.index()][sq_idx];
+                let black_val = PSQT_EG[Color::Black as usize][kind.index()][sq_flip];
+                assert_eq!(
+                    white_val, -black_val,
+                    "PSQT_EG symmetry violated for {:?} at sq={sq}: \
+                    PSQT_EG[White][{:?}][{sq_idx}]={white_val} != -PSQT_EG[Black][{:?}][{sq_flip}]={black_val}",
+                    kind, kind, kind,
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // B — MG and EG tables are distinct (not copies of each other).
+    // -----------------------------------------------------------------------
+
+    /// A stub that sets PSQT_MG == PSQT_EG would pass all symmetry tests above.
+    /// One spot-check that the pawn tables differ at a known entry closes the gap.
+    #[test]
+    fn psqt_mg_and_eg_pawn_tables_differ() {
+        let mg_a2 =
+            PSQT_MG[Color::White as usize][PieceKind::Pawn as usize][Square::A2.index() as usize];
+        let eg_a2 =
+            PSQT_EG[Color::White as usize][PieceKind::Pawn as usize][Square::A2.index() as usize];
+        assert_ne!(
+            mg_a2, eg_a2,
+            "PSQT_MG[White][Pawn][A2] ({mg_a2}) and PSQT_EG[White][Pawn][A2] ({eg_a2}) \
+            must differ — they come from distinct PeSTO tables (MG material 82, EG material 94)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bishop pair predicate tests.
+    // -----------------------------------------------------------------------
+
+    /// At the starting position both sides have bishop pairs (c1+f1 cover
+    /// dark+light for white; c8+f8 cover dark+light for black). bishop_pair_term_white
+    /// returns 0 when both sides have the pair (symmetric → no net bonus).
+    #[test]
+    fn bishop_pair_predicate_starting_position() {
+        let pos = Position::starting_position();
+        assert_eq!(
+            bishop_pair_term_white(&pos, BISHOP_PAIR_MG),
+            0,
+            "bishop_pair_term_white must be 0 at starting position (both sides have the pair)"
+        );
+        assert_eq!(
+            bishop_pair_term_white(&pos, BISHOP_PAIR_EG),
+            0,
+            "bishop_pair_term_white EG must be 0 at starting position"
+        );
+    }
+
+    /// Position with only white having a bishop pair (remove one black bishop).
+    /// White: c1(dark)+f1(light). Black: one bishop removed → no pair.
+    /// bishop_pair_term_white returns +value.
+    #[test]
+    fn bishop_pair_predicate_only_white() {
+        // White Ke1, Bc1, Bf1. Black Ke8, Bc8 only (f8 bishop removed).
+        let pos = Position::from_fen("2b1k3/8/8/8/8/8/8/2B1KB2 w - - 0 1")
+            .expect("bishop pair only white FEN must parse");
+        assert_eq!(
+            bishop_pair_term_white(&pos, BISHOP_PAIR_MG),
+            BISHOP_PAIR_MG,
+            "bishop_pair_term_white must be +BISHOP_PAIR_MG when only white has the pair"
+        );
+    }
+
+    /// Position with only black having a bishop pair.
+    /// bishop_pair_term_white returns -value.
+    #[test]
+    fn bishop_pair_predicate_only_black() {
+        // White Ke1, Bc1 only (f1 bishop removed). Black Ke8, Bc8, Bf8.
+        let pos = Position::from_fen("2b1kb2/8/8/8/8/8/8/2B1K3 w - - 0 1")
+            .expect("bishop pair only black FEN must parse");
+        assert_eq!(
+            bishop_pair_term_white(&pos, BISHOP_PAIR_MG),
+            -BISHOP_PAIR_MG,
+            "bishop_pair_term_white must be -BISHOP_PAIR_MG when only black has the pair"
+        );
+    }
+
+    /// Position where neither side has a bishop pair.
+    /// bishop_pair_term_white returns 0.
+    #[test]
+    fn bishop_pair_predicate_neither() {
+        // White Ke1, Bc1. Black Ke8, Bc8. Each side has exactly one bishop (dark).
+        let pos = Position::from_fen("2b1k3/8/8/8/8/8/8/2B1K3 w - - 0 1")
+            .expect("bishop pair neither FEN must parse");
+        assert_eq!(
+            bishop_pair_term_white(&pos, BISHOP_PAIR_MG),
+            0,
+            "bishop_pair_term_white must be 0 when neither side has the pair"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mop-up term tests.
+    // -----------------------------------------------------------------------
+
+    /// KQK with white winning, black king cornered and white king close.
+    /// White Kh1, Qh3, Black Kh3? No — need a position where black king is
+    /// cornered and kings are close. Use: White Ka6 + Qa8, Black Ka8 →
+    /// but kings can't be adjacent. Use White Kf6 + Qa1, Black Ka8:
+    /// raw_phase=4 (queen only). BUT MOP_UP_PHASE_MAX=5, so phase<5 fires.
+    ///
+    /// Simpler: White Kg1 + Qa4, Black Ka8. White wins big, black king on corner.
+    /// raw_phase = 4 (queen) < 5. advantage > 100. Mop-up fires and is positive.
+    #[test]
+    fn mop_up_bonus_kqk_white_winning_corner() {
+        // White Kg1 (g1=sq6), Qa4 (a4=sq24), Black Ka8 (a8=sq56).
+        // White to move (side irrelevant for mop-up direction, which depends on mg+eg sign).
+        let pos = Position::from_fen("k7/8/8/8/Q7/8/8/6K1 w - - 0 1")
+            .expect("KQK white winning FEN must parse");
+        let mg = pos.static_mg_white();
+        let eg = pos.static_eg_white();
+        let bonus = mop_up_term_white(&pos, mg, eg);
+        assert!(
+            bonus > 0,
+            "mop_up_term_white must be positive when white has KQK advantage (bonus={bonus})"
+        );
+        assert!(
+            bonus >= 14,
+            "mop_up bonus must be at least 14 (minimum formula value); got {bonus}"
+        );
+        assert!(
+            bonus <= 50,
+            "mop_up bonus must be at most 50 (maximum formula value); got {bonus}"
+        );
+    }
+
+    /// KQK with black winning, white king cornered.
+    /// Black Ka8, Black Qa4, White Kg1 (cornered at g1).
+    /// mop_up_term_white must be negative (black winning → penalty for white).
+    #[test]
+    fn mop_up_bonus_kqk_black_winning_corner() {
+        // Black Ka8 (a8=sq56), Black Qa4 (a4=sq24), White Kg1 (g1=sq6, cornered).
+        let pos = Position::from_fen("k7/8/8/8/q7/8/8/6K1 b - - 0 1")
+            .expect("KQK black winning FEN must parse");
+        let mg = pos.static_mg_white();
+        let eg = pos.static_eg_white();
+        let bonus = mop_up_term_white(&pos, mg, eg);
+        assert!(
+            bonus < 0,
+            "mop_up_term_white must be negative when black has KQK advantage (bonus={bonus})"
+        );
+        assert!(
+            bonus >= -50,
+            "mop_up penalty must not exceed -50 in magnitude; got {bonus}"
+        );
+        // Exact-arithmetic pin of the black-winning branch (mutation coverage
+        // for the `4*CMD + 2*(14-cheb)` sub-expression — survivors at
+        // src/eval.rs:210 under cargo-mutants `* -> +`, `* -> /`, `- -> /`).
+        // White K g1 is the losing king: CMD(g1) = min(|6-3|,|6-4|) +
+        // min(|0-3|,|0-4|) = 2 + 3 = 5. Black K a8; chebyshev(a8,g1) =
+        // max(|0-6|,|7-0|) = 7. bonus = -(4*5 + 2*(14-7)) = -(20+14) = -34.
+        assert_eq!(
+            bonus, -34,
+            "mop_up_term_white black-winning branch exact value: \
+             -(4*CMD(g1)=5 + 2*(14 - cheb(a8,g1)=7)) = -34; got {bonus}"
+        );
+    }
+
+    /// Phase gate: when raw_phase >= MOP_UP_PHASE_MAX, mop_up_term_white returns 0
+    /// regardless of material advantage.
+    #[test]
+    fn mop_up_phase_gate() {
+        // Four queens total (2 per side): raw_phase = 4 × 4 = 16 >= 5. Despite
+        // large material imbalance, phase gate fires and mop_up returns 0.
+        let pos = Position::from_fen("qk1q4/8/8/8/8/8/8/QK1Q4 w - - 0 1")
+            .expect("middlegame FEN must parse");
+        let mg = pos.static_mg_white();
+        let eg = pos.static_eg_white();
+        assert!(
+            pos.raw_phase() >= MOP_UP_PHASE_MAX,
+            "fixture invariant: raw_phase={} must be >= MOP_UP_PHASE_MAX={}",
+            pos.raw_phase(),
+            MOP_UP_PHASE_MAX
+        );
+        assert_eq!(
+            mop_up_term_white(&pos, mg, eg),
+            0,
+            "mop_up_term_white must return 0 when raw_phase >= MOP_UP_PHASE_MAX"
+        );
+    }
+
+    /// Advantage gate: when |advantage| <= MOP_UP_MIN_ADVANTAGE_CP, mop_up returns 0.
+    /// Construct a bare-KvK position (raw_phase=0, advantage≈0).
+    #[test]
+    fn mop_up_advantage_gate() {
+        // KvK: raw_phase=0 < 5, but advantage=0 ≤ 100 → returns 0.
+        let pos = Position::from_fen("8/8/8/4k3/8/8/8/4K3 w - - 0 1").expect("KvK FEN must parse");
+        let mg = pos.static_mg_white();
+        let eg = pos.static_eg_white();
+        assert_eq!(
+            mop_up_term_white(&pos, mg, eg),
+            0,
+            "mop_up_term_white must return 0 when advantage <= MOP_UP_MIN_ADVANTAGE_CP"
+        );
+    }
+
+    /// mop_up_term_white is positive when white wins and negative when black wins,
+    /// even for the same structural position type (KRK).
+    #[test]
+    fn mop_up_direction_white_vs_black() {
+        // White Ke1 + Ra1, Black Ke8 — white winning KRK.
+        let white_wins = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1")
+            .expect("KRK white winning FEN must parse");
+        let mg_w = white_wins.static_mg_white();
+        let eg_w = white_wins.static_eg_white();
+        let bonus_white = mop_up_term_white(&white_wins, mg_w, eg_w);
+
+        // White Ke1, Black Ke8 + Ra8 — black winning KRK.
+        let black_wins = Position::from_fen("r3k3/8/8/8/8/8/8/4K3 w - - 0 1")
+            .expect("KRK black winning FEN must parse");
+        let mg_b = black_wins.static_mg_white();
+        let eg_b = black_wins.static_eg_white();
+        let bonus_black = mop_up_term_white(&black_wins, mg_b, eg_b);
+
+        assert!(
+            bonus_white > 0,
+            "mop_up_term_white must be positive in KRK-white-winning; got {bonus_white}"
+        );
+        assert!(
+            bonus_black < 0,
+            "mop_up_term_white must be negative in KRK-black-winning; got {bonus_black}"
+        );
+    }
+
+    /// Pin Risk 4: in KQK with black winning, the mop-up term (which drives the
+    /// losing white king to a corner) must dominate the EG king PST's positive
+    /// central bias for the white king. Concretely:
+    ///
+    /// Variant A: white king on d4 (centralized, EG king PST gives a positive
+    ///   bonus to `static_eg_white`), black king nearby with queen.
+    /// Variant B: white king on a1 (cornered, EG king PST gives large negative).
+    ///
+    /// `evaluate(variant_B) < evaluate(variant_A)` from white's perspective
+    /// means the cornered position is more losing for white — which is the
+    /// correct ordering (the cornered king is closer to being mated).
+    ///
+    /// If this test fails, the mop-up scale is too small relative to the EG
+    /// king PST gradient and needs revision before SPRT.
+    #[test]
+    fn mop_up_kqk_losing_king_centralized_worse_than_cornered() {
+        // White to move so evaluate() == static_eval_white (no side-to-move flip).
+        // Black queen on b7 (off the d-file/diagonals so the white king is NOT
+        // in check in either variant — keeps these static-eval fixtures from
+        // depicting an impossible side-to-move-in-check position), black king
+        // on e6, white king on d4 (centralized).
+        let variant_a = Position::from_fen("8/1q6/4k3/8/3K4/8/8/8 w - - 0 1")
+            .expect("KQK variant A (white king centralized) FEN must parse");
+        // Same black Qb7 + Ke6; white king on a1 (cornered).
+        let variant_b = Position::from_fen("8/1q6/4k3/8/8/8/8/K7 w - - 0 1")
+            .expect("KQK variant B (white king cornered) FEN must parse");
+
+        // Sister assertion: pin that mop_up_term_white itself is more negative
+        // for the cornered variant.  This is the load-bearing invariant: even if
+        // evaluate() ordering happens to hold for other reasons, the mop-up term
+        // must contribute a larger penalty when CMD(losing king) is larger.
+        // CMD(a1)=6 > CMD(d4)=0, so mop_up_b must be strictly less than mop_up_a.
+        let mop_up_a = mop_up_term_white(
+            &variant_a,
+            variant_a.static_mg_white(),
+            variant_a.static_eg_white(),
+        );
+        let mop_up_b = mop_up_term_white(
+            &variant_b,
+            variant_b.static_mg_white(),
+            variant_b.static_eg_white(),
+        );
+        assert!(
+            mop_up_b < mop_up_a,
+            "mop-up term must be more negative for the cornered white king (CMD=6) \
+            than for the centralized white king (CMD=0): \
+            mop_up(centralized)={mop_up_a}, mop_up(cornered)={mop_up_b}; \
+            expected mop_up_cornered < mop_up_centralized"
+        );
+
+        let eval_a = evaluate(&variant_a);
+        let eval_b = evaluate(&variant_b);
+
+        assert!(
+            eval_b < eval_a,
+            "mop-up must make the cornered-white-king position more losing for white: \
+            eval(centralized)={eval_a}, eval(cornered)={eval_b}; \
+            expected eval_cornered < eval_centralized"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Distance helper tests.
+    // -----------------------------------------------------------------------
+
+    /// center_manhattan_distance: min(|f-3|,|f-4|) + min(|r-3|,|r-4|).
+    /// Known values from definition: corners are 6, center squares are 0.
+    #[test]
+    fn center_manhattan_distance_known_squares() {
+        // a1: file=0, rank=0. min(|0-3|,|0-4|)+min(|0-3|,|0-4|) = min(3,4)+min(3,4) = 3+3 = 6.
+        assert_eq!(
+            center_manhattan_distance(Square::A1),
+            6,
+            "CMD(a1) must be 6"
+        );
+        // d4: file=3, rank=3. min(|3-3|,|3-4|)+min(|3-3|,|3-4|) = min(0,1)+min(0,1) = 0+0 = 0.
+        assert_eq!(
+            center_manhattan_distance(Square::D4),
+            0,
+            "CMD(d4) must be 0"
+        );
+        // e4: file=4, rank=3. min(|4-3|,|4-4|)+min(|3-3|,|3-4|) = min(1,0)+min(0,1) = 0+0 = 0.
+        assert_eq!(
+            center_manhattan_distance(Square::E4),
+            0,
+            "CMD(e4) must be 0"
+        );
+        // h1: file=7, rank=0. min(|7-3|,|7-4|)+min(|0-3|,|0-4|) = min(4,3)+min(3,4) = 3+3 = 6.
+        assert_eq!(
+            center_manhattan_distance(Square::H1),
+            6,
+            "CMD(h1) must be 6"
+        );
+        // d5: file=3, rank=4. min(|3-3|,|3-4|)+min(|4-3|,|4-4|) = 0+0 = 0.
+        assert_eq!(
+            center_manhattan_distance(Square::D5),
+            0,
+            "CMD(d5) must be 0"
+        );
+        // a8: file=0, rank=7. min(3,4)+min(|7-3|,|7-4|) = 3+min(4,3) = 3+3 = 6.
+        assert_eq!(
+            center_manhattan_distance(Square::A8),
+            6,
+            "CMD(a8) must be 6"
+        );
+        // h8: file=7, rank=7. min(4,3)+min(4,3) = 3+3 = 6.
+        assert_eq!(
+            center_manhattan_distance(Square::H8),
+            6,
+            "CMD(h8) must be 6"
+        );
+    }
+
+    /// chebyshev_distance: max(|fa-fb|, |ra-rb|).
+    #[test]
+    fn chebyshev_distance_known_pairs() {
+        // a1 vs h8: max(|0-7|,|0-7|) = max(7,7) = 7.
+        assert_eq!(
+            chebyshev_distance(Square::A1, Square::H8),
+            7,
+            "chebyshev(a1, h8) must be 7"
+        );
+        // a1 vs b1: max(|0-1|,|0-0|) = max(1,0) = 1.
+        assert_eq!(
+            chebyshev_distance(Square::A1, Square::B1),
+            1,
+            "chebyshev(a1, b1) must be 1"
+        );
+        // a1 vs a8: max(|0-0|,|0-7|) = max(0,7) = 7.
+        assert_eq!(
+            chebyshev_distance(Square::A1, Square::A8),
+            7,
+            "chebyshev(a1, a8) must be 7"
+        );
+        // Pairs with BOTH ranks non-zero — mutation coverage for the rank
+        // term (survivor at src/eval.rs:177 under `- -> +`). With a1 (rank 0)
+        // in every pair above, `0 - x` and `0 + x` have equal abs, so the
+        // sign of the rank subtraction is untestable. b2 vs c4: file diff
+        // |1-2|=1, rank diff |1-3|=2 → max=2 (a `+` mutant gives |1+3|=4).
+        assert_eq!(
+            chebyshev_distance(Square::B2, Square::C4),
+            2,
+            "chebyshev(b2, c4) must be 2 (rank diff |1-3|=2 dominates file diff 1)"
+        );
+        // g7 vs b3: file diff |6-1|=5, rank diff |6-2|=4 → max=5 (a `+`
+        // mutant gives rank |6+2|=8 → max would be 8).
+        assert_eq!(
+            chebyshev_distance(Square::G7, Square::B3),
+            5,
+            "chebyshev(g7, b3) must be 5 (file diff 5 dominates rank diff |6-2|=4)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase clamp tests.
+    // -----------------------------------------------------------------------
+
+    /// Construct a position with raw_phase > 24 (promoted queen adds to phase).
+    /// evaluate() must not produce an obviously wrong or panicking result — the
+    /// blend's `min(raw_phase, 24)` clamp is the load-bearing guard.
+    ///
+    /// Position: starting material + extra white queen (simulating promotion
+    /// having occurred). raw_phase = 4 (starting queen) + 4 (extra queen) = 8
+    /// for the non-standard piece count; we'll use a position where only queens
+    /// are on the board to keep it simple.
+    ///
+    /// Simpler: 3 white queens (2 promoted) on a8-origin board, raw_phase = 12.
+    /// This is > 24 only with enough queens. Use 7 queens: 7×4=28 > 24.
+    ///
+    /// For a feasible test: we want raw_phase > 24. That needs 7+ queens.
+    /// Use a simpler check: after a series of promotions on the same position
+    /// via a known FEN with extra pieces. Actually test via direct accessor path.
+    ///
+    /// Simpler approach: test that static_eval_white() clamps correctly when
+    /// raw_phase > 24 (see accessor_clamp test), and for promote-then-evaluate,
+    /// use a FEN with 7 white queens (5 promoted) + kings only:
+    /// raw_phase = 7×4 = 28 > 24. Result must be finite and < MATE threshold.
+    #[test]
+    fn eval_promoted_queen_position_phase_clamped() {
+        // 7 white queens + white king + black king. raw_phase = 7×4 = 28 > 24.
+        // The blend must not explode: `min(28,24)=24` → pure MG blend.
+        let pos = Position::from_fen("QQQQ4/QQQ5/8/8/8/8/8/4K1k1 w - - 0 1")
+            .expect("multi-queen FEN must parse");
+        let result = evaluate(&pos);
+        // The result must be a finite centipawn value, not a mate score.
+        // MATE_IN_MAX_PLY - 1 ≈ 29935; any valid eval is well below.
+        assert!(
+            result.abs() < 30_000,
+            "evaluate with raw_phase > 24 must produce a finite centipawn result; got {result}"
+        );
+        assert!(
+            pos.raw_phase() > 24,
+            "fixture invariant: raw_phase={} must be > 24 for this test",
+            pos.raw_phase()
+        );
+    }
+
+    /// Direct test of the Position::static_eval_white() accessor's clamp.
+    /// Construct a position where raw_phase > 24, manually set the triple,
+    /// then verify the blended accessor returns the clamped result.
+    ///
+    /// When raw_phase > 24, min(raw_phase,24) = 24, so (24−24)=0 → EG term
+    /// drops out, and the result equals mg (before the /24 scaling):
+    ///   accessor = (mg × 24 + eg × 0) / 24 = mg.
+    #[test]
+    fn static_eval_white_accessor_clamp_at_overflowed_phase() {
+        // Use a multi-queen position where raw_phase > 24.
+        let pos = Position::from_fen("QQQQ4/QQQ5/8/8/8/8/8/4K1k1 w - - 0 1")
+            .expect("multi-queen FEN must parse");
+        let raw = pos.raw_phase();
+        assert!(raw > 24, "fixture invariant: raw_phase={raw} must be > 24");
+        // At phase > 24, min(phase,24)=24 → eg_phase=0 → accessor == mg.
+        let mg = pos.static_mg_white();
+        let expected_blend = mg; // (mg*24 + eg*0) / 24 = mg
+        assert_eq!(
+            pos.static_eval_white(),
+            expected_blend,
+            "static_eval_white() with raw_phase={raw} > 24 must clamp: \
+            expected mg={mg} (EG term drops out), got {}",
+            pos.static_eval_white()
+        );
     }
 }

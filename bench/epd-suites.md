@@ -38,9 +38,20 @@ Run config: `--movetime 500 --concurrency 6 --hash 16`. Apple M4 P-cores. All 11
 | M5.D (+FFP) | `m5d-ffp` | 263 | 87.7% | 8773 | 58.5% | 2360 |
 | M5.E (qsearch correctness) | `m5e-qsearch-correctness` | 263 | 87.7% | 8764 | 58.4% | 2356 |
 | M5.F (qsearch-in-TT) | `m5f-qsearch-in-tt` | 267 | 89.0% | 8822 | 58.8% | 2376 |
-| M5.G (singular extensions, v2) | HEAD | **278** | **92.7%** | **9239** | **61.6%** | **2499** |
+| M5.G (singular extensions, v2) | `M5.G` | 278 | 92.7% | 9239 | 61.6% | 2499 |
 
-**Bold** marks per-suite peak. M5.E HEAD-run delta vs tag was +2 WAC / +68 STS (wallclock-budget noise; engine code byte-identical from tag onward). M5.F HEAD-run vs M5.E HEAD-run: +2 WAC, −10 STS — both well within wallclock noise. Statistically flat. **M5.G HEAD-run vs M5.F: +11 WAC (well above ±2 noise band) and +417 STS credit (well above ±68 noise band) — decisive tactical+strategic positive**, validating the SE extension's contribution in fixed-`movetime` mode. Initial measurement (WAC 268 / STS 9036) was depressed by CPU contention from concurrent SPRT + parallel EPD suites; the clean re-run above is the load-bearing measurement (see "Methodology rule — RUN ALONE" below — a rule the M5.G campaign forced into the project conventions after a repeat M5.F-style mistake).
+### M6.A same-campaign re-baseline — 2026-05-15
+
+Per roadmap §"Same-campaign re-baseline required", M6 per-phase secondary gates re-measure the predecessor baseline tag and HEAD in the **same** RUN-ALONE campaign; the 2026-05-09 snapshot above (and its M5.H1-implied figures) is **stale and not a valid gate** at the ±2 WAC / ±68 STS noise band. Run config identical (`--movetime 500 --concurrency 6 --hash 16`, Apple M4).
+
+| Milestone | Baseline tag | WAC (solved/300) | WAC % | STS (credit/15000) | STS % | STS-Elo est. |
+|---|---|---:|---:|---:|---:|---:|
+| M5.H1 (re-baseline) | `M5.H1` | 270 | 90.0% | 8786 | 58.6% | 2365 |
+| M6.A (tapered eval foundation) | HEAD | **271** | **90.3%** | **9620** | **64.1%** | **2613** |
+
+M6.A vs M5.H1 (same campaign): WAC **+1** (within ±2 noise — flat). STS **+834 credit / +248 STS-Elo** (≫ ±68 noise — decisive). Per-piggyback sub-gates (plan §13.3): theme #11 "King Activity" 404→499 = **+95** (mop-up, gate ≥+30 — PASS); theme #5 "Bishop vs Knight" 698→688 = **−10** (bishop-pair, flat/within-noise, above the ≤−20 should-fix floor, no targeted lift — Texel-calibrated in M6.F). Largest movers: Center Control +137, Open Files +116. The 2026-05-09 snapshot's M5.H1-era weakest themes (King Activity 42.3%, AKPC 46.2%) both lifted materially (49.9%, 50.7% at M6.A).
+
+**Bold** marks per-suite peak in the legacy 2026-05-09 table only. M5.E HEAD-run delta vs tag was +2 WAC / +68 STS (wallclock-budget noise; engine code byte-identical from tag onward). M5.F HEAD-run vs M5.E HEAD-run: +2 WAC, −10 STS — both well within wallclock noise. Statistically flat. **M5.G HEAD-run vs M5.F: +11 WAC (well above ±2 noise band) and +417 STS credit (well above ±68 noise band) — decisive tactical+strategic positive**, validating the SE extension's contribution in fixed-`movetime` mode. Initial measurement (WAC 268 / STS 9036) was depressed by CPU contention from concurrent SPRT + parallel EPD suites; the clean re-run above is the load-bearing measurement (see "Methodology rule — RUN ALONE" below — a rule the M5.G campaign forced into the project conventions after a repeat M5.F-style mistake).
 
 ### M5.F observation (2026-05-09)
 

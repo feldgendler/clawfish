@@ -122,11 +122,17 @@ pub struct Position {
     /// XOR updates inside `make_move` / `unmake_move`. Private — cross-module
     /// mutation goes through `refresh_zobrist`. See ADR-0009.
     zobrist: u64,
-    /// Combined material + PST score from White's perspective (always
-    /// positive = White advantage). Maintained incrementally by
-    /// `make_move` / `unmake_move` (M3.A Slice 2). Populated from scratch
-    /// by `refresh_static_eval` after construction and FEN parse.
-    static_eval_white: i32,
+    /// MG component of static eval, white-perspective. Maintained
+    /// incrementally by make/unmake. Populated from-scratch by
+    /// `refresh_static_eval`.
+    static_mg_white: i32,
+    /// EG component of static eval, white-perspective. Maintained
+    /// incrementally by make/unmake.
+    static_eg_white: i32,
+    /// Raw phase tag, sum of `PHASE_DELTA[kind]` over all pieces. May
+    /// exceed 24 in queened-pawn positions; clamp to 24 at blend time only.
+    /// Maintained incrementally by make/unmake.
+    raw_phase: u8,
 }
 
 impl Position {
@@ -151,7 +157,9 @@ impl Position {
             halfmove_clock: 0,
             fullmove_number: 1,
             zobrist: 0,
-            static_eval_white: 0,
+            static_mg_white: 0,
+            static_eg_white: 0,
+            raw_phase: 0,
         }
     }
 
@@ -231,7 +239,9 @@ impl Position {
             halfmove_clock: 0,
             fullmove_number: 1,
             zobrist: 0,
-            static_eval_white: 0,
+            static_mg_white: 0,
+            static_eg_white: 0,
+            raw_phase: 0,
         };
         p.refresh_zobrist();
         p.refresh_static_eval();
@@ -498,22 +508,45 @@ impl Position {
         self.zobrist = value;
     }
 
-    /// Combined material + PST score from White's perspective, maintained
-    /// incrementally by `make_move` / `unmake_move`. Populated from scratch
-    /// by `refresh_static_eval` after construction and FEN parse.
+    /// MG component of the static eval, white-perspective.
+    pub(crate) fn static_mg_white(&self) -> i32 {
+        self.static_mg_white
+    }
+
+    /// EG component of the static eval, white-perspective.
+    pub(crate) fn static_eg_white(&self) -> i32 {
+        self.static_eg_white
+    }
+
+    /// Raw phase tag. May exceed 24 in queened-pawn positions; clamp to 24
+    /// at blend time only.
+    pub(crate) fn raw_phase(&self) -> u8 {
+        self.raw_phase
+    }
+
+    /// Blended white-perspective static eval (MG/EG by phase). The blend
+    /// matches the formula in `evaluate(&Position)` minus the
+    /// insufficient-material check, mop-up addend, and bishop-pair addend.
+    /// Used by RFP / NMP / FFP for cheap stand-pat reads.
     pub(crate) fn static_eval_white(&self) -> i32 {
-        self.static_eval_white
+        let phase = self.raw_phase.min(24) as i32;
+        (self.static_mg_white * phase + self.static_eg_white * (24 - phase)) / 24
     }
 
-    /// Recompute `static_eval_white` from scratch via `eval::eval_white_from_scratch`.
+    /// Recompute the eval triple from scratch via `eval::eval_state_from_scratch`.
     pub(crate) fn refresh_static_eval(&mut self) {
-        self.static_eval_white = crate::eval::eval_white_from_scratch(self);
+        let (mg, eg, raw_phase) = crate::eval::eval_state_from_scratch(self);
+        self.static_mg_white = mg;
+        self.static_eg_white = eg;
+        self.raw_phase = raw_phase;
     }
 
-    /// Write `value` into `static_eval_white` directly, bypassing
-    /// from-scratch recomputation. Used by `make_move` / `unmake_move`.
-    pub(crate) fn refresh_static_eval_from(&mut self, value: i32) {
-        self.static_eval_white = value;
+    /// Write the eval triple directly, bypassing from-scratch recomputation.
+    /// Used by `make_move` / `unmake_move`.
+    pub(crate) fn refresh_static_eval_from_triple(&mut self, mg: i32, eg: i32, raw_phase: u8) {
+        self.static_mg_white = mg;
+        self.static_eg_white = eg;
+        self.raw_phase = raw_phase;
     }
 
     /// Apply `mv` to `self`, returning an [`Undo`](crate::mov::Undo) token
@@ -1205,6 +1238,68 @@ mod tests {
         assert!(
             matches!(r, Err(FenError::TooManyKings(Color::Black))),
             "two black kings must yield TooManyKings(Black), got {r:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M6.A §10.4 — Position triple field tests.
+    // -----------------------------------------------------------------------
+
+    /// After constructing the starting position, raw_phase must be 24.
+    /// Pins the field-initialization in `Position::starting_position` and
+    /// `Position::from_fen` (which calls `refresh_static_eval` after parse).
+    ///
+    /// Phase derivation: 4N×1 + 4B×1 + 4R×2 + 2Q×4 = 4+4+8+8 = 24.
+    /// Pawns contribute 0; kings contribute 0.
+    #[test]
+    fn starting_position_initial_raw_phase_24() {
+        let pos = Position::starting_position();
+        assert_eq!(
+            pos.raw_phase(),
+            24,
+            "starting position raw_phase must be 24 (4N+4B+4R×2+2Q×4)"
+        );
+        // Also verify via FEN parse path.
+        let pos_fen =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+                .expect("starting FEN must parse");
+        assert_eq!(
+            pos_fen.raw_phase(),
+            24,
+            "FEN-parsed starting position raw_phase must be 24"
+        );
+    }
+
+    /// After calling `refresh_static_eval`, all three fields are populated
+    /// consistently with the position's piece layout.
+    ///
+    /// Cross-check: `eval_state_from_scratch` returns the same triple as
+    /// the fields after refresh.
+    #[test]
+    fn refresh_static_eval_populates_all_three_fields() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("Kiwipete FEN must parse");
+
+        // `from_fen` already calls `refresh_static_eval` internally.
+        // `eval_state_from_scratch` returns the ground-truth triple.
+        let (mg_scratch, eg_scratch, phase_scratch) = crate::eval::eval_state_from_scratch(&pos);
+
+        assert_eq!(
+            pos.static_mg_white(),
+            mg_scratch,
+            "static_mg_white() must match eval_state_from_scratch after refresh"
+        );
+        assert_eq!(
+            pos.static_eg_white(),
+            eg_scratch,
+            "static_eg_white() must match eval_state_from_scratch after refresh"
+        );
+        assert_eq!(
+            pos.raw_phase(),
+            phase_scratch,
+            "raw_phase() must match eval_state_from_scratch after refresh"
         );
     }
 

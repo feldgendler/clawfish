@@ -49,6 +49,16 @@ impl Bitboard {
     /// All 8 squares on rank 8 (Black's back rank).
     pub const RANK_8: Bitboard = Bitboard(0xFF00_0000_0000_0000);
 
+    /// Light squares in LERF (a1=0). a1 is dark by chess convention, so the
+    /// light squares are those where `(file + rank) % 2 == 1` — bits {1, 3,
+    /// 5, 7, 8, 10, 12, 14, …}. The rank-1 byte is `0b10101010 = 0xAA`
+    /// (b1, d1, f1, h1 light); rank-2 byte is `0b01010101 = 0x55` (a2, c2,
+    /// e2, g2 light); the pattern alternates byte-by-byte up the board.
+    pub const LIGHT_SQUARES: Bitboard = Bitboard(0x55AA_55AA_55AA_55AA);
+    /// Dark squares: complement of `LIGHT_SQUARES`. a1, c1, e1, g1, b2, …
+    /// are dark.
+    pub const DARK_SQUARES: Bitboard = Bitboard(0xAA55_AA55_AA55_AA55);
+
     /// Return a bitboard with only `sq` set.
     #[must_use]
     #[inline]
@@ -864,5 +874,84 @@ mod tests {
             }
             prop_assert_eq!(by_iter, by_pop);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // M6.A §10.2 — LIGHT_SQUARES / DARK_SQUARES constants.
+    // -----------------------------------------------------------------------
+
+    /// Light and dark squares together cover the full board with no overlap.
+    ///
+    /// Pins the exact constant values against the LERF layout (a1=dark):
+    ///   `LIGHT_SQUARES = 0x55AA_55AA_55AA_55AA`
+    ///   `DARK_SQUARES  = 0xAA55_AA55_AA55_AA55`
+    #[test]
+    fn light_dark_squares_partition_full_board() {
+        assert_eq!(
+            Bitboard::LIGHT_SQUARES.0,
+            0x55AA_55AA_55AA_55AA,
+            "LIGHT_SQUARES constant must equal 0x55AA_55AA_55AA_55AA"
+        );
+        assert_eq!(
+            Bitboard::LIGHT_SQUARES | Bitboard::DARK_SQUARES,
+            Bitboard::FULL,
+            "LIGHT_SQUARES | DARK_SQUARES must equal FULL"
+        );
+        assert_eq!(
+            Bitboard::LIGHT_SQUARES & Bitboard::DARK_SQUARES,
+            Bitboard::EMPTY,
+            "LIGHT_SQUARES & DARK_SQUARES must equal EMPTY (no square is both)"
+        );
+    }
+
+    /// a1 is a dark square by chess convention.
+    ///
+    /// LERF bit 0 (a1) must be in DARK_SQUARES and absent from LIGHT_SQUARES.
+    /// This pins that the masks are not accidentally swapped.
+    #[test]
+    fn a1_is_dark_square() {
+        let a1 = Bitboard::from_square(Square::A1);
+        assert!(
+            (Bitboard::DARK_SQUARES & a1).any(),
+            "a1 must be a dark square (LERF bit 0 in DARK_SQUARES)"
+        );
+        assert!(
+            !(Bitboard::LIGHT_SQUARES & a1).any(),
+            "a1 must not be in LIGHT_SQUARES"
+        );
+    }
+
+    /// a2 is a light square (file=0, rank=1, sum=1 odd → light).
+    ///
+    /// LERF bit 8 (a2) must be in LIGHT_SQUARES. Pins rank-2 byte pattern
+    /// `0x55` (a2, c2, e2, g2 light).
+    #[test]
+    fn a2_is_light_square() {
+        let a2 = Bitboard::from_square(Square::A2);
+        assert!(
+            (Bitboard::LIGHT_SQUARES & a2).any(),
+            "a2 must be a light square (file=0, rank=1, sum=1 odd → light)"
+        );
+        assert!(
+            !(Bitboard::DARK_SQUARES & a2).any(),
+            "a2 must not be in DARK_SQUARES"
+        );
+    }
+
+    /// h1 is a light square (file=7, rank=0, sum=7 odd → light).
+    ///
+    /// LERF bit 7 (h1) must be in LIGHT_SQUARES. Pins rank-1 byte pattern
+    /// `0xAA` (b1, d1, f1, h1 light).
+    #[test]
+    fn h1_is_light_square() {
+        let h1 = Bitboard::from_square(Square::H1);
+        assert!(
+            (Bitboard::LIGHT_SQUARES & h1).any(),
+            "h1 must be a light square (file=7, rank=0, sum=7 odd → light)"
+        );
+        assert!(
+            !(Bitboard::DARK_SQUARES & h1).any(),
+            "h1 must not be in DARK_SQUARES"
+        );
     }
 }

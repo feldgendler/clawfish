@@ -36,12 +36,12 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 
 | Area | One-line shape | See |
 |---|---|---|
-| Position layout | 6+2 bitboards + mailbox + cached king squares + aux + Polyglot Zobrist + `static_eval_white` | "Position layout" below; ADR-0009, ADR-0014 |
+| Position layout | 6+2 bitboards + mailbox + cached king squares + aux + Polyglot Zobrist + tapered eval triple `(static_mg_white, static_eg_white, raw_phase)` | "Position layout" below; ADR-0009, ADR-0031 |
 | FEN parsing | Strict per Edwards 1994 §16.1 (single-space separator, strict-decimal integers, structural sanity); phantom-EP sanitized to `None` per ADR-0015 | `docs/plans/m1.b.md`; ADR-0015 (phantom-EP only) |
 | Move encoding | 16-bit `Move(u16)`: from(6) / to(6) / flag-nibble(4); 14 valid flag codes | `docs/research/m1-engine-architecture.md` §2 |
 | Sliding-piece attacks | Fancy magic bitboards, variable shift (~840 KiB) | "Sliding-piece attack lookup" below; ADR-0008 |
 | Position hashing | Polyglot 781-key Zobrist; pseudo-legal-only EP rule; incremental in `make_move` | "Position hashing" below; ADR-0009 |
-| Make/unmake | Free fns + `Position::*` delegates; incremental Zobrist + `static_eval` with debug round-trip | "Make / unmake" below; ADR-0004, ADR-0014 |
+| Make/unmake | Free fns + `Position::*` delegates; incremental Zobrist + tapered `(mg, eg, raw_phase)` with debug round-trip | "Make / unmake" below; ADR-0004, ADR-0031 |
 | Move generation | Legal-direct, mask-based, with check-evasion specialization | ADR-0007 |
 | Perft validation | `perft` / `perft_bulk` / `divide` / `perft_categorized` against Stockfish 18 fixtures | "Perft validation" below; ADR-0006 |
 | UCI move encoding | `Move::to_uci` / `Move::from_uci`; generate-and-match parsing | `docs/plans/m2.a.md` |
@@ -49,7 +49,7 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 | UCI engine I/O loop | Reader thread → mpsc → orchestrator + per-`go` worker; `Arc<AtomicBool>` cancellation | ADR-0011 |
 | Search trait | `Search` trait + `SearchContext` + `SearchLimits` + `SearchResult` (unchanged since M2.C) | ADR-0011; "Search v1" below |
 | UCI options | `Random_Seed` (M2.D), `MoveOverhead` (M3.E), `Hash` (M4.A) | `docs/plans/m2.d.md`, ADR-0017, ADR-0018 |
-| Evaluation v1 | PeSTO MG material + PST in a precomputed `PSQT[color][kind][square]` const table | "Evaluation v1" below; ADR-0014 |
+| Evaluation v2 | Tapered PeSTO MG+EG material+PST (`PSQT_MG`/`PSQT_EG` const tables) blended by phase + bishop pair + KBvKB-same-color + mop-up | "Evaluation v2 — tapered" below; ADR-0031 (supersedes ADR-0014 §1/§5) |
 | Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D + M5.E refinements + M5.F TT participation) + ID + caps (M3.E) + TT (M4.A + M5.F qsearch tier) + killers (M4.B) + history (M4.C) + aspiration (M4.D) + NMP (M5.A) + RFP (M5.B) + LMR (M5.C) + FFP (M5.D) + SE (M5.G) + staged movegen (M5.H1 architecture, eager generation; M5.H2 will enable lazy generation); `bench` regression baseline (M3.F) | "Search v1" below; ADR-0016, ADR-0017, ADR-0018, ADR-0019, ADR-0023, ADR-0024, ADR-0025, ADR-0026, ADR-0027, ADR-0028, ADR-0029, ADR-0030 |
 | Transposition table (M4.A + M5.F) | `TranspositionTable` in `src/tt.rs`: `UnsafeCell<Vec<TtEntry>>` + `AtomicUsize` mask + `AtomicU8` generation; depth-preferred + age-bias replacement; full 64-bit Zobrist key; mate-score depth-adjustment; bound-aware probe with cutoffs at non-PV nodes (negamax) and unconditionally (qsearch); `Hash` UCI option (default 16 MiB, range 1–4096). M5.F: qsearch participates with `depth = 0` entries; `is_empty()` discriminator changes to `key == 0`; non-terminal qsearch stores only Lower/Upper (no Exact, per Stockfish 45e5e65). | "Transposition table" below; ADR-0018, ADR-0028 |
 | Game history + draw helpers | `Engine::game_history: Vec<u64>` + `is_repetition` + `is_fifty_move_draw` | "Game history and draw-detection helpers" below |
@@ -70,7 +70,7 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 - Cached king squares for both colors.
 - Aux state: side-to-move, castling rights (4-bit `KQkq`), EP target (`Option<Square>`), halfmove clock, fullmove number.
 - `zobrist: u64` — Polyglot hash, maintained incrementally by `make_move` / `unmake_move` (ADR-0009).
-- `static_eval_white: i32` — combined material + PST score from White's perspective, maintained incrementally (ADR-0014).
+- Tapered eval triple `(static_mg_white: i32, static_eg_white: i32, raw_phase: u8)` — white-perspective MG/EG material+PST plus the material phase tag, maintained incrementally; blended at `evaluate()` time (ADR-0031, supersedes ADR-0014).
 
 **Phantom-EP sanitization (Stockfish-compatible).** Per ADR-0015: the EP target field is set iff a pseudo-legal en passant capture actually exists. Both `from_fen` and `make_move` apply the same `fen::ep_capturer_exists` predicate, so `Position::ep_target` and `zobrist::ep_file_to_hash` agree by construction.
 
@@ -103,36 +103,35 @@ See `decisions/0008-magic-bitboards-fancy-variable-shift.md`.
 
 See `decisions/0009-polyglot-zobrist.md`.
 
-## Evaluation v1
+## Evaluation v2 — tapered (M6.A; ADR-0031, supersedes ADR-0014 §1/§5)
 
 **Public API.** The `eval` module exposes:
 
-- `evaluate(&Position) -> i32` — side-to-move-relative centipawn score. Insufficient-material override returns 0 for KvK / KvN / KvB; otherwise reads `Position::static_eval_white()` and flips for Black.
-- `eval_white_from_scratch(&Position) -> i32` — `pub(crate)` from-scratch recomputation. Used by `Position::refresh_static_eval()` after FEN parse / construction, and by debug-build round-trip asserts inside `make_move` / `unmake_move`.
+- `evaluate(&Position) -> i32` — side-to-move-relative centipawn score. Extended insufficient-material override returns 0 for KvK / KvN / KvB / **KBvKB-same-color**; otherwise blends MG/EG by phase, adds bishop-pair + mop-up addends, flips for Black. Debug-only mate-band assert `result.abs() < MATE_IN_MAX_PLY - 1`.
+- `eval_state_from_scratch(&Position) -> (i32, i32, u8)` — `pub(crate)` single-pass from-scratch recomputation returning `(mg_white, eg_white, raw_phase)`. Used by `Position::refresh_static_eval()` and the debug round-trip asserts in `make_move` / `unmake_move`.
+- `pub(crate)` helpers `bishop_pair_term_white`, `center_manhattan_distance`, `chebyshev_distance`, `mop_up_term_white` (the last three test-visible for mutation coverage).
 
-**PSQT lookup.** `pub(crate) const PSQT: [[[i32; 64]; 6]; 2]` — compile-time table. `PSQT[color][kind][sq]` is the signed contribution of a (color, kind, sq) piece to `static_eval_white`:
+**Tapered representation.** `Position` carries the triple `(static_mg_white: i32, static_eg_white: i32, raw_phase: u8)` (replaces M3.A's single `static_eval_white: i32`). `raw_phase` accumulates `PHASE_DELTA[kind]` (`[P=0, N=1, B=1, R=2, Q=4, K=0]`, sums to 24 at the start); promoted-queen positions may exceed 24 — **clamp `min(24)` only at blend time**, never during accumulation. The blend: `((mg + bp_mg) * p + (eg + bp_eg) * (24 - p)) / 24 + mop_up` with `p = raw_phase.min(24)`, Rust truncation. A blended `Position::static_eval_white()` accessor (same signature as M3.A's) returns the phase-blended white-perspective score sans bishop-pair/mop-up — consumed transparently by RFP/NMP/FFP in `negamax`.
 
-- White lookup: `+(MATERIAL[kind] + MG_PST[kind][sq ^ 56])`.
-- Black lookup: `-(MATERIAL[kind] + MG_PST[kind][sq])`.
+**PSQT lookups.** Two compile-time tables `pub(crate) const PSQT_MG / PSQT_EG: [[[i32; 64]; 6]; 2]`, both built by `const fn build_psqt_table(tables, material)`. White lookup `+(material[kind] + pst[kind][sq ^ 56])`; Black `-(...)`. The `s ^ 56` flip converts LERF (a1=0) to PeSTO a8-origin.
 
-The `s ^ 56` flip converts our internal LERF index (a1 = 0) to the PeSTO array's a8-origin layout (a8 = 0). Built at compile time by `const fn build_psqt()` in `src/eval.rs`.
+**Vendored data (`src/eval/data.rs`, `cargo mutants`-excluded — vendored, not logic):**
 
-**Vendored data.** `src/eval/data.rs` carries:
+- `MATERIAL` = `[82, 337, 365, 477, 1025, 0]` (MG), `MATERIAL_EG` = `[94, 281, 297, 512, 936, 0]` — PeSTO; king material 0.
+- Six `MG_*_PST` + six `EG_*_PST` `[i32; 64]` arrays — PeSTO MG+EG tables, vendored verbatim from Ronald Friederich's CPW post.
+- `PHASE_DELTA: [u8; 6]`.
 
-- `MATERIAL: [i32; 6]` = `[82, 337, 365, 477, 1025, 0]` — PeSTO MG values; king material 0 (kings are never captured).
-- Six `MG_*_PST: [i32; 64]` arrays — PeSTO MG piece-square tables, vendored verbatim from Ronald Friederich's CPW post.
+**Piggyback terms (at the `evaluate()` boundary, not incrementally tracked):**
 
-The split file is `cargo mutants`-excluded at file level via `.cargo/mutants.toml`. Same precedent as `src/magic/constants.rs` — vendored data, not logic.
+- **Bishop pair** — `+30 MG / +50 EG` when a side covers *both* colour complexes (a light-square AND a dark-square bishop). Literature defaults; Texel-calibrated in M6.F.
+- **KBvKB-same-color** — `is_kbkb_same_color`: total_count==4, each side exactly one bishop, both on the *same* complex → 0. The *logical opposite* of the bishop-pair predicate (distinct named functions to prevent the inversion bug).
+- **Mop-up** — `4·CMD(losing_king) + 2·(14 − chebyshev(kings))`, signed for the winning side, gated `raw_phase < MOP_UP_PHASE_MAX = 5` ∧ `|blended advantage| > 100 cp`. `MOP_UP_PHASE_MAX = 5` (not 4) is load-bearing — KQK has `raw_phase = 4` (lone queen); a `< 4` gate would exclude the canonical KQK conversion case.
 
-**Insufficient-material draws.**
+**Insufficient-material draws.** `total==2`→KvK; `total==3 ∧ (#N==1 ∨ #B==1)`→KvN/KvB; `total==4 ∧ is_kbkb_same_color`→KBvKB-same-color. All before the blend (a `phase`-gated path must not pre-empt these).
 
-- `total_count == 2` → KvK → 0.
-- `total_count == 3` AND (`knight_count == 1` OR `bishop_count == 1`) → KvN / KvB → 0.
-- KBvKB same-color bishops deliberately not detected at M3 (deferred to M6 alongside the bishop-pair term).
+**Incremental update site.** The triple is maintained by `update_static_eval_after_make` in `src/mov.rs` — each M3.A PSQT line splits into an MG line + an EG line; per-arm `raw_phase` delta (EP arm contributes literal `0`, not a `-= PHASE_DELTA[Pawn]` no-op). `Undo` carries `prior_static_mg / prior_static_eg / prior_raw_phase`; `unmake_move` restores via `refresh_static_eval_from_triple`. Round-trip debug asserts compare the triple against `eval_state_from_scratch`. The always-on `make_move_no_from_scratch_in_release` perf sentinel guards against accidental from-scratch reintroduction of either zobrist or eval on the hot path.
 
-**Incremental update site.** `Position::static_eval_white: i32` is maintained by `make_move` / `unmake_move` via the `update_static_eval_after_make` private helper in `src/mov.rs`. Six flag-arm deltas (one per MoveFlag category); the helper takes `mover: Piece` by value and uses `mover.color`, making it order-agnostic at the call boundary (mirrors `update_zobrist_after_make` discipline). `Undo::prior_static_eval` is captured pre-mutation; `unmake_move` restores via `refresh_static_eval_from`.
-
-**NNUE-readiness (ADR-0004 extension).** When NNUE arrives at M10, the PSQT-based incremental update slots out for the accumulator update; `make_move` / `unmake_move` signatures stay. Exactly the discrete-function shape ADR-0004 designed for.
+**NNUE-readiness (ADR-0004 extension).** When NNUE arrives at M10, the tapered incremental update slots out for the accumulator update; `make_move` / `unmake_move` signatures stay. Exactly the discrete-function shape ADR-0004 designed for.
 
 See `decisions/0014-eval-material-pst.md` and `docs/research/m3-eval-material-pst.md`.
 

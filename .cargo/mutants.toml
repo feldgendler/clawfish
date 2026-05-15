@@ -669,4 +669,23 @@ exclude_re = [
     # the `*` between `ln(depth)` and `ln(quiet_index)`.
     "replace \\* with \\+ in late_move_reduction",
     "replace \\* with / in late_move_reduction",
+
+    # ---- M6.A: mop_up_term_white advantage-sign guard `> → >=` — equivalent ----
+    #
+    # `mop_up_term_white` has an early guard:
+    #   if advantage.abs() <= MOP_UP_MIN_ADVANTAGE_CP { return 0; }   // == 100
+    # followed later by the winning-side branch:
+    #   if advantage > 0 { ...white winning... } else { ...black winning... }
+    # The guard guarantees that any execution reaching the `advantage > 0`
+    # branch has `advantage.abs() > 100`, i.e. `advantage <= -101` OR
+    # `advantage >= 101` — `advantage == 0` is impossible at this point.
+    # `>` and `>=` differ ONLY at `advantage == 0`, which is unreachable here.
+    # So no test input distinguishes the two operators. Provably equivalent.
+    #
+    # **EQUIVALENCE DEPENDS ON: the `advantage.abs() <= MOP_UP_MIN_ADVANTAGE_CP`
+    # guard preceding the sign branch, with MOP_UP_MIN_ADVANTAGE_CP > 0.** If
+    # the guard is removed or its constant set to 0, `advantage == 0` becomes
+    # reachable and the mutants diverge — re-evaluate this exclusion then.
+    # Function-anchored (there is exactly one `>` comparison in this helper).
+    "replace > with >= in mop_up_term_white",
 ]

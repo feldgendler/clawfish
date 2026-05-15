@@ -6,9 +6,9 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**M5 milestone closed 2026-05-11 at M5.H1.** Production HEAD = `M5.H1`. M5.H2 (lazy quiet sort) and M5.I (third aspiration tier) both attempted and DEFERRED at the milestone close — see their retrospectives for revisit conditions.
+**M6.A landed 2026-05-15.** Production HEAD = `M6.A` (tapered eval foundation + bishop pair + KBvKB-same-color + mop-up). Mixed-TC SPRT vs `M5.H1`: **H1-accept, Δ Elo +250.57 [+197, +317]** (the gain is outsized because `M5.H1` is MG-only with no EG king PST — M6.A fixes the ADR-0014-flagged bare-king-endgame weakness wholesale; downstream M6.B–F deltas vs M6.A will be back in the literature range). M5 closed 2026-05-11 at M5.H1; M5.H2/M5.I deferred.
 
-**Next phase: M6 (eval improvements)** — tapered eval, pawn structure, king safety, mobility, passed pawns. Per-theme STS validation available via `src/bin/epd-suite.rs`; M5.H1 baseline at HEAD is 8822/15000 (58.9%) total credit. See [`docs/roadmap.md`](docs/roadmap.md) for the forward plan and [`docs/milestones/`](docs/milestones/) for per-phase retrospectives.
+**Next phase: M6.B (pawn structure + pawn hash)** — see [`docs/roadmap.md`](docs/roadmap.md) §M6 for the forward plan, [`docs/milestones/m6.a.md`](docs/milestones/m6.a.md) for the M6.A retrospective, and [`bench/m6.md`](bench/m6.md) for per-phase verification numbers. Per-theme STS via `src/bin/epd-suite.rs`; M6.A same-campaign STS = 9620/15000 (64.1%).
 
 ## How to pick up a new session
 
