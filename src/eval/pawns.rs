@@ -1,0 +1,1430 @@
+//! Pawn-structure evaluation + search-owned pawn hash table (M6.B).
+//!
+//! `pawn_eval(&Position) -> PawnEval` is the single source of truth for the
+//! white-perspective pawn-structure MG/EG contribution and the passed-pawn
+//! detection bitboards (cached for M6.C). `PawnHashTable` is a fixed 4 MiB
+//! always-replace accelerator keyed by the pawn-only Zobrist substream
+//! (ADR-0032).
+
+use crate::bitboard::{self, Bitboard};
+use crate::eval::data::{BWD_EG, BWD_MG, CONN_EG, CONN_MG, DBL_EG, DBL_MG, ISO_EG, ISO_MG};
+use crate::piece::{Color, PieceKind};
+use crate::position::Position;
+
+/// White-perspective pawn-structure eval + cached detection bitboards.
+///
+/// `#[allow(dead_code)]`: the test-first gate lays this type + the term
+/// helpers + `pawn_eval`/`get` down as `unimplemented!()` stubs. Their
+/// non-test consumers (`eval::evaluate_core`, qsearch via `evaluate_cached`)
+/// land in Slices C–E; until then production builds see them unused. The
+/// in-module tests do exercise them. Mirrors the plan-mandated
+/// `#[allow(dead_code)]` on `AlphaBetaMover::pawn_hash`.
+#[allow(dead_code)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PawnEval {
+    /// White-perspective pawn-structure MG contribution.
+    pub mg: i32,
+    /// White-perspective pawn-structure EG contribution.
+    pub eg: i32,
+    /// `passed[White]`, `passed[Black]` passed-pawn bitboards (M6.C reads).
+    pub passed: [Bitboard; 2],
+}
+
+/// Compute pawn-structure eval from scratch (no cache). Single source of
+/// truth for both `evaluate` and `evaluate_cached` (via the hash table).
+#[allow(dead_code)] // Slice C impl; non-test consumer is evaluate_core (Slice D).
+pub(crate) fn pawn_eval(pos: &Position) -> PawnEval {
+    let wp = pos.pieces_colored(Color::White, PieceKind::Pawn);
+    let bp = pos.pieces_colored(Color::Black, PieceKind::Pawn);
+
+    let mut mg = 0i32;
+    let mut eg = 0i32;
+    let mut passed = [Bitboard::EMPTY; 2];
+
+    for (side, own, enemy, sign) in [(Color::White, wp, bp, 1i32), (Color::Black, bp, wp, -1i32)] {
+        let iso = isolated_pawns(own);
+        let dbl = doubled_pawns(own);
+        let bwd = backward_pawns(own, enemy, side);
+        let con = connected_pawns(own, side);
+
+        // Isolated / doubled / backward STACK — no if-else / cross-term
+        // suppression (ADR-0032 §6: "Isolated/doubled/backward stack (no
+        // if-else suppression)"). A pawn that is isolated AND backward
+        // incurs both penalties; isolated AND doubled likewise. Texel
+        // reconciles any double-counting in M6.F.
+        let iso_count = iso.count() as i32;
+        let bwd_count = bwd.count() as i32;
+
+        let mut conn_mg = 0i32;
+        let mut conn_eg = 0i32;
+        let mut remaining = con;
+        while let Some(sq) = remaining.pop_lsb() {
+            let rel_rank = match side {
+                Color::White => sq.rank() as usize,
+                Color::Black => 7 - sq.rank() as usize,
+            };
+            conn_mg += CONN_MG[rel_rank];
+            conn_eg += CONN_EG[rel_rank];
+        }
+
+        mg += sign
+            * (ISO_MG * iso_count + DBL_MG * dbl.count() as i32 + BWD_MG * bwd_count + conn_mg);
+        eg += sign
+            * (ISO_EG * iso_count + DBL_EG * dbl.count() as i32 + BWD_EG * bwd_count + conn_eg);
+
+        passed[side.index()] = passed_pawns(own, enemy, side);
+    }
+
+    PawnEval { mg, eg, passed }
+}
+
+const PAWN_HASH_MIB: usize = 4;
+const PAWN_HASH_ENTRIES: usize = PAWN_HASH_MIB * 1024 * 1024 / 32; // 2^17
+// Pin the literal entry count: the `& (PAWN_HASH_ENTRIES - 1)` index mask
+// requires a power of two, and a `/`→`*` (or arithmetic) mutation on the
+// line above would silently produce a ~4 GiB allocation that only manifests
+// as a test timeout. This compile-time assert turns any such mutation into
+// an UNVIABLE (build-caught) result instead. 4 MiB / 32 B = 131072 = 2^17.
+const _: () = assert!(PAWN_HASH_ENTRIES == 131072 && PAWN_HASH_ENTRIES.is_power_of_two());
+
+/// One pawn-hash slot. `key == 0` doubles as the zeroed-slot sentinel and a
+/// reachable real value; ADR-0032 §2 — such positions are never cached.
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct PawnHashEntry {
+    key: u64,
+    mg: i16,
+    eg: i16,
+    passed: [Bitboard; 2],
+}
+
+// Pin the 4-MiB/entry-count arithmetic against a future field reorder.
+const _: () = assert!(core::mem::size_of::<PawnHashEntry>() == 32);
+
+/// Search-owned, fixed 4 MiB, always-replace pawn hash table (ADR-0032 §2).
+pub(crate) struct PawnHashTable {
+    entries: Box<[PawnHashEntry]>,
+}
+
+impl PawnHashTable {
+    /// Allocate a zeroed table. `key == 0` is the empty-slot sentinel.
+    pub(crate) fn new() -> Self {
+        let entries = vec![
+            PawnHashEntry {
+                key: 0,
+                mg: 0,
+                eg: 0,
+                passed: [Bitboard::EMPTY; 2],
+            };
+            PAWN_HASH_ENTRIES
+        ]
+        .into_boxed_slice();
+        Self { entries }
+    }
+
+    /// Zero every slot (fired on `ucinewgame` + per bench position via
+    /// `Search::reset`).
+    pub(crate) fn clear(&mut self) {
+        for e in self.entries.iter_mut() {
+            *e = PawnHashEntry {
+                key: 0,
+                mg: 0,
+                eg: 0,
+                passed: [Bitboard::EMPTY; 2],
+            };
+        }
+    }
+
+    /// Probe-or-compute: returns `PawnEval`; on miss computes via `pawn_eval`
+    /// and stores. `key == 0` recomputes without probe or store (ADR-0032 §2).
+    #[allow(dead_code)] // Slice C impl; non-test consumer is evaluate_cached (Slice E).
+    pub(crate) fn get(&mut self, pos: &Position) -> PawnEval {
+        let key = pos.pawn_zobrist();
+
+        // key==0 is both the empty-slot sentinel and a reachable real value
+        // (no-pawn position, some symmetric structures). Never cache it.
+        if key == 0 {
+            return pawn_eval(pos);
+        }
+
+        let idx = (key as usize) & (PAWN_HASH_ENTRIES - 1);
+        if self.entries[idx].key == key {
+            // Cache hit: reconstruct PawnEval from stored i16 fields.
+            let e = &self.entries[idx];
+            return PawnEval {
+                mg: e.mg as i32,
+                eg: e.eg as i32,
+                passed: e.passed,
+            };
+        }
+
+        // Cache miss: compute, store (always-replace), return.
+        let pe = pawn_eval(pos);
+        debug_assert!(
+            pe.mg >= i16::MIN as i32 && pe.mg <= i16::MAX as i32,
+            "pawn eval mg out of i16 range: {}",
+            pe.mg
+        );
+        debug_assert!(
+            pe.eg >= i16::MIN as i32 && pe.eg <= i16::MAX as i32,
+            "pawn eval eg out of i16 range: {}",
+            pe.eg
+        );
+        self.entries[idx] = PawnHashEntry {
+            key,
+            mg: pe.mg as i16,
+            eg: pe.eg as i16,
+            passed: pe.passed,
+        };
+        pe
+    }
+
+    /// Test-only: `true` iff every slot key is the empty-sentinel 0.
+    /// Mirrors the `history_table` test-accessor precedent — lets the
+    /// search-wiring tests observe `Search::reset`'s clear without exposing
+    /// the slot array. Production never calls this.
+    #[cfg(test)]
+    pub(crate) fn all_slots_empty_for_test(&self) -> bool {
+        self.entries.iter().all(|e| e.key == 0)
+    }
+
+    /// Test-only: forcibly dirty one slot so a subsequent `clear()` /
+    /// `Search::reset()` is observably effective.
+    #[cfg(test)]
+    pub(crate) fn dirty_one_slot_for_test(&mut self) {
+        self.entries[0].key = 0xC0FF_EE00_DEAD_BEEF;
+        self.entries[0].mg = 77;
+        self.entries[0].eg = -33;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-term predicate helpers (white-relative; black via symmetry in
+// pawn_eval). Each returns a bitboard of the pawns satisfying the predicate.
+// ---------------------------------------------------------------------------
+
+/// Pawns of `own` with no friendly pawn on either adjacent file.
+#[allow(dead_code)]
+pub(crate) fn isolated_pawns(own: Bitboard) -> Bitboard {
+    // A pawn is isolated if no friendly pawn exists on either adjacent file.
+    // Neighbor files: east and west of all files containing own pawns.
+    let pawn_files = bitboard::file_fill(own);
+    let neighbor_files = pawn_files.shift_east() | pawn_files.shift_west();
+    own & !neighbor_files
+}
+
+/// The per-extra-pawn doubled set: on any file with N≥2 friendly pawns this
+/// returns N−1 of them, so `count()` == Σ(pawns_on_file − 1) regardless of
+/// color (the only quantity `pawn_eval` consumes — the DBL penalty). Note the
+/// *specific* pawn marked is color-relative: the south-based formula marks the
+/// northernmost-but-one toward rank 8 (the rear pawn for White, the
+/// least-advanced for Black). Since only the popcount is consumed and it is
+/// color-correct, the per-color square identity is immaterial here.
+#[allow(dead_code)]
+pub(crate) fn doubled_pawns(own: Bitboard) -> Bitboard {
+    // South-fill of the full own-pawn set: a pawn is in it iff another own
+    // pawn sits north of it on the same file (count = pawns_on_file − 1).
+    own & bitboard::black_front_spans(own)
+}
+
+/// CPW-simple backward pawns of `own` (white-relative when `side` is White):
+/// stop square attacked by an enemy pawn and not covered by own attack-front
+/// spans.
+#[allow(dead_code)]
+pub(crate) fn backward_pawns(own: Bitboard, enemy: Bitboard, side: Color) -> Bitboard {
+    match side {
+        Color::White => {
+            // stops = one square ahead of each own pawn (toward rank 8).
+            let stops = own.shift_north();
+            // Enemy pawn attacks on those stop squares.
+            let enemy_attacks = enemy.shift_south_east() | enemy.shift_south_west();
+            // Diagonal attack-front spans of own pawns (without own file).
+            let own_attack_spans = bitboard::white_front_spans(own).shift_east()
+                | bitboard::white_front_spans(own).shift_west();
+            // Backward = stop attacked by enemy and not covered by own spans,
+            // shifted back to the pawn's square.
+            (stops & enemy_attacks & !own_attack_spans).shift_south()
+        }
+        Color::Black => {
+            // Direction-reversed formula: black advances toward rank 1.
+            let stops = own.shift_south();
+            let enemy_attacks = enemy.shift_north_east() | enemy.shift_north_west();
+            let own_attack_spans = bitboard::black_front_spans(own).shift_east()
+                | bitboard::black_front_spans(own).shift_west();
+            (stops & enemy_attacks & !own_attack_spans).shift_north()
+        }
+    }
+}
+
+/// Connected pawns of `own` (`phalanx | defended`), white-relative when
+/// `side` is White. A pawn is connected iff it is in a phalanx with an
+/// adjacent same-rank friendly pawn OR it is defended by another friendly
+/// pawn's attack. A bare defender (c3 defends d4) is NOT itself connected
+/// unless it is also phalanx or itself defended.
+#[allow(dead_code)]
+pub(crate) fn connected_pawns(own: Bitboard, side: Color) -> Bitboard {
+    // Phalanx: same-rank, adjacent-file friendly pawn (direction-independent).
+    let phalanx = own & (own.shift_east() | own.shift_west());
+
+    // Defended: own pawn attacked from below by another own pawn.
+    // White pawns attack north-east/north-west, so a defended white pawn
+    // has another white pawn to its south-east or south-west.
+    let defended = match side {
+        Color::White => own & (own.shift_north_east() | own.shift_north_west()),
+        Color::Black => own & (own.shift_south_east() | own.shift_south_west()),
+    };
+
+    phalanx | defended
+}
+
+/// Passed pawns of `own`: no `enemy` pawn on the file or either adjacent file
+/// strictly ahead. White-relative when `side` is White.
+#[allow(dead_code)]
+pub(crate) fn passed_pawns(own: Bitboard, enemy: Bitboard, side: Color) -> Bitboard {
+    // Enemy coverage toward own's promotion rank, widened by adjacent files.
+    let enemy_front = match side {
+        Color::White => {
+            let ef = bitboard::black_front_spans(enemy);
+            ef | ef.shift_east() | ef.shift_west()
+        }
+        Color::Black => {
+            let ef = bitboard::white_front_spans(enemy);
+            ef | ef.shift_east() | ef.shift_west()
+        }
+    };
+    own & !enemy_front
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bitboard::Bitboard;
+    use crate::eval::data::{BWD_EG, BWD_MG, CONN_EG, CONN_MG, DBL_EG, DBL_MG, ISO_EG, ISO_MG};
+    use crate::piece::Color;
+    use crate::position::Position;
+    use crate::square::Square;
+
+    // Centre-of-literature default weights (research §6). These mirror the
+    // values the implementation will place in `eval::data`; the per-term
+    // tests below assert on popcounts/bitboards (definitional, weight-free)
+    // so they survive any later Texel re-tune. `pawn_eval` component tests
+    // assert sign/relative-magnitude, not exact cp, for the same reason —
+    // except the explicitly weight-pinned stacking + rank-scaling fixtures
+    // which document the literature default in their derivation.
+
+    /// Helper: white+black pawn bitboards from a FEN fixture.
+    fn pawns_of(fen: &str) -> (Bitboard, Bitboard) {
+        let pos = Position::from_fen(fen).expect("fixture FEN must parse");
+        (
+            pos.pieces_colored(Color::White, crate::piece::PieceKind::Pawn),
+            pos.pieces_colored(Color::Black, crate::piece::PieceKind::Pawn),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Isolated pawns.
+    // -----------------------------------------------------------------------
+
+    /// a-file isolani: white pawns a4 and c2. The a4 pawn has no friendly
+    /// pawn on the b-file (its only adjacent file) → isolated. The c2 pawn
+    /// has no friendly pawn on b- or d-file → also isolated. Expected set =
+    /// {a4, c2}, popcount 2.
+    ///
+    /// Hand-derivation: white pawns = {a4, c2}. Adjacent files of a4: only
+    /// b. No white pawn on b → a4 isolated. Adjacent files of c2: b, d. No
+    /// white pawn on b or d → c2 isolated.
+    #[test]
+    fn isolated_a_file_and_center_isolani() {
+        let (wp, _bp) = pawns_of("4k3/8/8/8/P7/8/2P5/4K3 w - - 0 1");
+        let iso = isolated_pawns(wp);
+        assert_eq!(
+            iso,
+            Bitboard::from_square(Square::A4) | Bitboard::from_square(Square::C2),
+            "isolated set must be exactly {{a4, c2}}"
+        );
+        assert_eq!(iso.count(), 2, "two isolated pawns");
+    }
+
+    /// Non-isolated control: connected white pawns b2 and c2 share adjacent
+    /// files (b is adjacent to c and vice versa) → neither isolated.
+    /// Expected isolated set = empty.
+    #[test]
+    fn isolated_excludes_pawns_with_adjacent_file_neighbor() {
+        let (wp, _bp) = pawns_of("4k3/8/8/8/8/8/1PP5/4K3 w - - 0 1");
+        let iso = isolated_pawns(wp);
+        assert_eq!(
+            iso,
+            Bitboard::EMPTY,
+            "b2 and c2 each have a neighbor on the other's file → none isolated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Doubled pawns (per *extra* pawn on a file).
+    // -----------------------------------------------------------------------
+
+    /// Doubled pair on the d-file (d2, d4) → 1 extra pawn. The doubled set
+    /// (CPW: rear-span members = not front-most) is the rear pawn {d2}.
+    /// popcount = 1 = popcount_on_file − 1.
+    ///
+    /// Hand-derivation: d-file white pawns {d2, d4}. Front-most (toward rank
+    /// 8) for white = d4. Rear = d2. doubled = {d2}, count 1.
+    #[test]
+    fn doubled_pair_counts_one_extra() {
+        let (wp, _bp) = pawns_of("4k3/8/8/8/3P4/8/3P4/4K3 w - - 0 1");
+        let dbl = doubled_pawns(wp);
+        assert_eq!(dbl.count(), 1, "doubled pair → exactly 1 extra pawn");
+        assert_eq!(
+            dbl,
+            Bitboard::from_square(Square::D2),
+            "the rear pawn (d2) is the doubled member; d4 is front-most"
+        );
+    }
+
+    /// Tripled file (e2, e4, e6) → 2 extra pawns. doubled set = the two
+    /// non-front-most pawns {e2, e4}; e6 is front-most for white. popcount 2.
+    #[test]
+    fn tripled_file_counts_two_extra() {
+        let (wp, _bp) = pawns_of("4k3/8/4P3/8/4P3/8/4P3/4K3 w - - 0 1");
+        let dbl = doubled_pawns(wp);
+        assert_eq!(dbl.count(), 2, "tripled file → 2 extra pawns");
+        assert_eq!(
+            dbl,
+            Bitboard::from_square(Square::E2) | Bitboard::from_square(Square::E4),
+            "the two rear pawns (e2, e4) are doubled members; e6 is front-most"
+        );
+    }
+
+    /// No doubling: one pawn per occupied file → empty doubled set.
+    #[test]
+    fn no_doubled_when_one_per_file() {
+        let (wp, _bp) = pawns_of("4k3/8/8/8/8/8/PP6/4K3 w - - 0 1");
+        assert_eq!(
+            doubled_pawns(wp),
+            Bitboard::EMPTY,
+            "a2,b2 single-occupancy files → no doubled pawns"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Backward pawns (CPW-simple).
+    // -----------------------------------------------------------------------
+
+    /// CPW-simple positive: white pawn c3, friendly d-file pawn pushed to d4
+    /// (so it cannot defend c3's stop square c4), and a black pawn on b5 and
+    /// d5 that attack c4. c3's stop square is c4. c4 is attacked by an enemy
+    /// pawn (b5 attacks c4, d5 attacks c4) AND c4 is NOT in white's
+    /// attack-front-spans (no white pawn can ever defend c4 here: the b-file
+    /// has no white pawn, and d4 is level with — not behind — c4 so its
+    /// attack-front-span starts at d5/b5, not c4). → c3 is backward.
+    ///
+    /// Hand-derivation:
+    ///   white pawns: c3 (sq 18), d4 (sq 27)
+    ///   black pawns: b5 (sq 33), d5 (sq 35)
+    ///   stops(white) = white_pawns << 8 → c4 (26), d5 (35)
+    ///   black pawn attacks = b5→{a4,c4}, d5→{c4,e4}  ⇒ includes c4
+    ///   white attack-front-spans: from c3 the OWN spans don't cover c4
+    ///     (a pawn's own forward-attack span starts one rank ahead and
+    ///     diagonally — c3 covers b4/d4 upward, never c4 itself); d4 covers
+    ///     c5/e5 upward, never c4. So c4 ∉ white attack spans.
+    ///   backward = (stops & blackAttacks & ~whiteAttackSpans) >> 8
+    ///            = ({c4} & {a4,c4,e4} & ~{...}) >> 8 = {c4} >> 8 = {c3}
+    /// Expected backward set = {c3}, popcount 1.
+    #[test]
+    fn backward_cpw_simple_positive() {
+        let (wp, bp) = pawns_of("4k3/8/8/1p1p4/3P4/2P5/8/4K3 w - - 0 1");
+        let bwd = backward_pawns(wp, bp, Color::White);
+        assert_eq!(
+            bwd,
+            Bitboard::from_square(Square::C3),
+            "c3 is backward (stop c4 enemy-attacked, not in white attack-spans)"
+        );
+        assert_eq!(bwd.count(), 1, "exactly one backward pawn");
+    }
+
+    /// Near-miss: same white c3 pawn, but the stop square c4 is NOT attacked
+    /// by any enemy pawn (black pawns moved to a7/h7, far away). CPW-simple
+    /// requires the stop square be enemy-pawn-attacked → c3 is NOT backward.
+    /// Expected backward set = empty.
+    ///
+    /// Hand-derivation: black pawns a7,h7 attack b6 and g6 only — never c4.
+    /// stops(white) ∩ blackAttacks = ∅ → backward = ∅.
+    #[test]
+    fn backward_near_miss_stop_not_enemy_attacked() {
+        let (wp, bp) = pawns_of("4k3/p6p/8/8/8/2P5/8/4K3 w - - 0 1");
+        assert_eq!(
+            backward_pawns(wp, bp, Color::White),
+            Bitboard::EMPTY,
+            "c3 stop (c4) not enemy-attacked → not backward (CPW-simple)"
+        );
+    }
+
+    /// Defended stop square is NOT backward: white c3 with a friendly b2
+    /// pawn whose attack-front-span covers c3..c8 diagonals including c4.
+    /// Even though black b5/d5 attack c4, c4 ∈ white attack-front-spans (b2
+    /// attacks c3 and the front-span continues up the c-diagonal). → not
+    /// backward.
+    ///
+    /// Hand-derivation: b2 white pawn → east attack-front-span covers
+    /// c3,c4,c5,... So c4 ∈ whiteAttackSpans ⇒ masked out ⇒ backward = ∅.
+    #[test]
+    fn backward_excluded_when_stop_in_own_attack_spans() {
+        let (wp, bp) = pawns_of("4k3/8/8/1p1p4/8/2P5/1P6/4K3 w - - 0 1");
+        assert_eq!(
+            backward_pawns(wp, bp, Color::White),
+            Bitboard::EMPTY,
+            "c4 is covered by b2's attack-front-span → c3 not backward"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Connected pawns (connected = phalanx | defended).
+    // -----------------------------------------------------------------------
+
+    /// Chain-defended (tightened definition `connected = phalanx | defended`):
+    /// white pawn d4 defended by c3 (c3 attacks d4). d4 is defended →
+    /// d4 is connected. c3 defends d4 but c3 is NOT itself defended (no
+    /// friendly pawn attacks c3) and is NOT in a phalanx → c3 is NOT
+    /// connected under the tightened predicate.
+    ///
+    /// Hand-derivation:
+    ///   phalanx: no same-rank adjacent pairs → ∅
+    ///   defended(d4): c3 attacks d4 → d4 ∈ defended
+    ///   defended(c3): no white pawn attacks c3 → c3 ∉ defended
+    ///   connected = phalanx | defended = {d4}
+    #[test]
+    fn connected_chain_defended() {
+        let (wp, _bp) = pawns_of("4k3/8/8/8/3P4/2P5/8/4K3 w - - 0 1");
+        let con = connected_pawns(wp, Color::White);
+        assert_eq!(
+            con,
+            Bitboard::from_square(Square::D4),
+            "tightened connected = phalanx|defended: d4 is defended by c3, \
+             but c3 is not itself defended or in a phalanx → only d4"
+        );
+    }
+
+    /// Phalanx: both same-rank-adjacent members are phalanx → both connected.
+    /// d4/e4 are adjacent on rank 4 — each is phalanx of the other. Under
+    /// `connected = phalanx | defended`, both appear regardless of whether
+    /// either defends the other.
+    ///
+    /// Hand-derivation:
+    ///   phalanx: d4 adjacent to e4 on same rank → {d4, e4}
+    ///   connected = {d4, e4}
+    #[test]
+    fn connected_phalanx_both_members() {
+        let (wp, _bp) = pawns_of("4k3/8/8/8/3PP3/8/8/4K3 w - - 0 1");
+        let con = connected_pawns(wp, Color::White);
+        assert_eq!(
+            con,
+            Bitboard::from_square(Square::D4) | Bitboard::from_square(Square::E4),
+            "d4/e4 phalanx → both connected (same-rank-adjacent)"
+        );
+    }
+
+    /// Isolated lone pawn is NOT connected (no phalanx partner, defends or
+    /// is defended by nothing). Expected connected set = empty.
+    #[test]
+    fn connected_excludes_lone_pawn() {
+        let (wp, _bp) = pawns_of("4k3/8/8/8/4P3/8/8/4K3 w - - 0 1");
+        assert_eq!(
+            connected_pawns(wp, Color::White),
+            Bitboard::EMPTY,
+            "lone e4 pawn → not connected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Passed pawns (detection; bonus is M6.C).
+    // -----------------------------------------------------------------------
+
+    /// Clear passer: white e5, no black pawn on d/e/f files anywhere ahead
+    /// (rank > 5). Black pawn parked on a7 (far file) → e5 is a passer.
+    /// Expected white-passers = {e5}.
+    ///
+    /// Hand-derivation: enemyFront = black front-spans of {a7} = a-file
+    /// below a7 ⇒ {a1..a6}; widen by east/west ⇒ a/b files ranks 1..6.
+    /// e5 ∉ that → e5 passer.
+    #[test]
+    fn passed_clear_passer() {
+        let (wp, bp) = pawns_of("4k3/p7/8/4P3/8/8/8/4K3 w - - 0 1");
+        let passers = passed_pawns(wp, bp, Color::White);
+        assert_eq!(
+            passers,
+            Bitboard::from_square(Square::E5),
+            "e5 has no enemy pawn on d/e/f ahead → passer"
+        );
+    }
+
+    /// Blocked-by-adjacent-enemy: white e5 with a black pawn on d6 (adjacent
+    /// file, strictly ahead). d6 is on an adjacent file ahead of e5 → e5 is
+    /// NOT a passer. Expected white-passers = empty.
+    ///
+    /// Hand-derivation: black d6 front-span (downward for black is
+    /// irrelevant; for passer detection we widen enemy *front-spans toward
+    /// their promotion*, i.e. black pawns' coverage toward rank 1) — the
+    /// CPW formula: enemyFront = bFrontSpans(bpawns) widened by E/W. Black
+    /// d6 front-span (toward rank 1) = d5,d4,...,d1; widen E/W ⇒ c,d,e files
+    /// at those ranks; that does NOT include e5 (e5 is rank 5 = same rank as
+    /// d6−1? d6 is rank 6; d6 front-span starts d5). e5 is rank 5, e-file —
+    /// included via the east-widen of d5 ⇒ e5 ∈ enemyFront ⇒ e5 NOT a
+    /// passer.
+    #[test]
+    fn passed_blocked_by_adjacent_enemy_not_passer() {
+        let (wp, bp) = pawns_of("4k3/8/3p4/4P3/8/8/8/4K3 w - - 0 1");
+        assert_eq!(
+            passed_pawns(wp, bp, Color::White),
+            Bitboard::EMPTY,
+            "black d6 (adjacent file, ahead) stops e5 being a passer"
+        );
+    }
+
+    /// Doubled rear pawn is automatically NOT a passer: white e4 and e5
+    /// (e5 front of e4). e4's own front-span is occupied by e5 — but the
+    /// CPW formula keys off *enemy* pawns only. The intended invariant
+    /// (research §1.5): a doubled rear pawn is not a passer because the
+    /// front friendly pawn blocks it; here we instead pin the enemy-side
+    /// definition with a black e7 pawn: e7 is on the e-file ahead of both
+    /// e4 and e5 → NEITHER is a passer. Expected = empty.
+    ///
+    /// Hand-derivation: black e7 front-span (toward rank 1) = e6..e1;
+    /// widen E/W ⇒ d,e,f files ranks 1..6. e4 and e5 both ∈ that set ⇒
+    /// neither is a passer.
+    #[test]
+    fn passed_enemy_on_file_ahead_blocks_both_doubled() {
+        let (wp, bp) = pawns_of("4k3/4p3/8/4P3/4P3/8/8/4K3 w - - 0 1");
+        assert_eq!(
+            passed_pawns(wp, bp, Color::White),
+            Bitboard::EMPTY,
+            "black e7 on the file ahead → neither doubled white pawn is a passer"
+        );
+    }
+
+    /// Black-side passer (symmetry of formula, not a mirrored Position):
+    /// black d4 with no white pawn on c/d/e ahead (toward rank 1). White
+    /// pawn parked h2 (far). Expected black-passers = {d4}.
+    ///
+    /// Hand-derivation: white front-span of {h2} = h3..h8; widen E/W ⇒ g/h
+    /// files ranks 3..8. d4 ∉ that → d4 is a black passer.
+    #[test]
+    fn passed_black_side_passer() {
+        let (wp, bp) = pawns_of("4k3/8/8/8/3p4/8/7P/4K3 w - - 0 1");
+        let passers = passed_pawns(bp, wp, Color::Black);
+        assert_eq!(
+            passers,
+            Bitboard::from_square(Square::D4),
+            "black d4 has no white pawn on c/d/e ahead → black passer"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Overlapping-operand union tests for `passed_pawns` (M6.B mutant closure).
+    //
+    // The four tests below force the three union terms inside `passed_pawns`
+    // (ef | ef.shift_east() | ef.shift_west()) to overlap on at least one
+    // file, so that substituting `|` with `^` or `&` produces a different
+    // result. Each test asserts the exact empty passed-pawn set, which becomes
+    // non-empty under the targeted mutation.
+    // -----------------------------------------------------------------------
+
+    /// White branch — adjacent enemy files, first-`|` `|→^` mutant.
+    ///
+    /// Input: white pawn e3, black pawns d6 and e6.
+    ///
+    /// Enemy-front derivation (for white passers):
+    ///   ef = black_front_spans(d6|e6) = south_fill(d5|e5) = {d1..d5} ∪ {e1..e5}
+    ///   ef.shift_east()  = {e1..e5} ∪ {f1..f5}
+    ///   ef.shift_west()  = {c1..c5} ∪ {d1..d5}
+    ///   ef ∩ ef.shift_east() = {e1..e5}  (non-empty — e-file overlap)
+    ///
+    ///   Correct enemy_front = c1..c5 ∪ d1..d5 ∪ e1..e5 ∪ f1..f5
+    ///   (ranks 1–5 on c/d/e/f files — 20 squares).
+    ///
+    ///   Under `|→^` at first `|`: (ef ^ ef.shift_east()) | ef.shift_west()
+    ///     ef ^ east = (d1..d5 | e1..e5) ^ (e1..e5 | f1..f5)
+    ///               = d1..d5 | f1..f5   (e cancels)
+    ///     | west    = c1..c5 | d1..d5 | f1..f5   (e-file missing!)
+    ///   e3 ∈ e1..e5 in the correct block but absent in the mutated block
+    ///   → e3 wrongly scores as a white passer. Result becomes {e3} ≠ EMPTY.
+    ///   The test assertion fails under the mutation. ✓
+    #[test]
+    fn passed_pawns_white_adjacent_enemy_files_union_kills_first_xor() {
+        // White pawn on e3; black pawns on d6 and e6 (adjacent files).
+        let own = Bitboard::from_square(Square::E3);
+        let enemy = Bitboard::from_square(Square::D6) | Bitboard::from_square(Square::E6);
+        let result = passed_pawns(own, enemy, Color::White);
+        // e3 is on the e-file; black d6/e6 cover d/e/c/f files toward rank 1,
+        // including e3's path → e3 is NOT a white passer.
+        assert_eq!(
+            result,
+            Bitboard::EMPTY,
+            "e3 is blocked by black d6/e6 whose widened front spans cover the e-file; \
+             |→^ at the first union operator drops the e-file from enemy_front, \
+             wrongly making e3 a passer and returning a non-empty set"
+        );
+    }
+
+    /// White branch — skip-file enemy pattern, second-`|` `|→^` and `|→&` mutants.
+    ///
+    /// Input: white pawns b3 and d3, black pawns c6 and e6.
+    ///
+    /// Enemy-front derivation (for white passers):
+    ///   ef = black_front_spans(c6|e6) = south_fill(c5|e5) = {c1..c5} ∪ {e1..e5}
+    ///   ef.shift_east()  = {d1..d5} ∪ {f1..f5}
+    ///   ef.shift_west()  = {b1..b5} ∪ {d1..d5}
+    ///   ef.shift_east() ∩ ef.shift_west() = {d1..d5}  (non-empty — d not in ef!)
+    ///   ef ∩ ef.shift_east() = ∅  (c/e vs d/f — disjoint)
+    ///
+    ///   Correct enemy_front = b1..b5 ∪ c1..c5 ∪ d1..d5 ∪ e1..e5 ∪ f1..f5
+    ///   (ranks 1–5 on b/c/d/e/f files — 25 squares).
+    ///
+    ///   d3 ∈ d1..d5 → blocked. b3 ∈ b1..b5 → blocked. Expected = EMPTY.
+    ///
+    ///   Under `|→^` at second `|`: ef | (ef.shift_east() ^ ef.shift_west())
+    ///     east ^ west = (d1..d5 | f1..f5) ^ (b1..b5 | d1..d5)
+    ///                 = b1..b5 | f1..f5   (d cancels)
+    ///     ef | above  = b1..b5 ∪ c1..c5 ∪ e1..e5 ∪ f1..f5   (d-file missing!)
+    ///   d3 ∉ mutated enemy_front → d3 wrongly a passer. Result = {d3} ≠ EMPTY. ✓
+    ///
+    ///   Under `|→&` at second `|` (Rust precedence: ef | (east & west)):
+    ///     east & west = (d1..d5 | f1..f5) & (b1..b5 | d1..d5) = d1..d5
+    ///     ef | d1..d5 = c1..c5 | d1..d5 | e1..e5   (b and f files missing!)
+    ///   b3 ∉ mutated enemy_front → b3 wrongly a passer. Result = {b3, …} ≠ EMPTY. ✓
+    #[test]
+    fn passed_pawns_white_skip_enemy_files_union_kills_second_xor_and_and() {
+        // White pawns on b3 and d3; black pawns on c6 and e6 (skip the d-file).
+        let own = Bitboard::from_square(Square::B3) | Bitboard::from_square(Square::D3);
+        let enemy = Bitboard::from_square(Square::C6) | Bitboard::from_square(Square::E6);
+        let result = passed_pawns(own, enemy, Color::White);
+        // b3 is blocked by the west-widened c6 span; d3 is blocked by the
+        // overlapping east/west widening of c6 and e6 onto the d-file.
+        assert_eq!(
+            result,
+            Bitboard::EMPTY,
+            "b3 and d3 are blocked by black c6/e6 whose widened front spans cover b and d; \
+             |→^ at the second union operator drops the d-file (making d3 a passer), \
+             and |→& collapses to the d-file only (making b3 a passer)"
+        );
+    }
+
+    /// Black branch — adjacent enemy files, first-`|` `|→^` mutant.
+    ///
+    /// Input: black pawn e6, white pawns d3 and e3.
+    ///
+    /// Enemy-front derivation (for black passers):
+    ///   ef = white_front_spans(d3|e3) = north_fill(d4|e4) = {d4..d8} ∪ {e4..e8}
+    ///   ef.shift_east()  = {e4..e8} ∪ {f4..f8}
+    ///   ef.shift_west()  = {c4..c8} ∪ {d4..d8}
+    ///   ef ∩ ef.shift_east() = {e4..e8}  (non-empty — e-file overlap)
+    ///
+    ///   Correct enemy_front = c4..c8 ∪ d4..d8 ∪ e4..e8 ∪ f4..f8
+    ///   (ranks 4–8 on c/d/e/f files — 20 squares).
+    ///
+    ///   e6 ∈ e4..e8 → blocked. Expected = EMPTY.
+    ///
+    ///   Under `|→^` at first `|`: (ef ^ ef.shift_east()) | ef.shift_west()
+    ///     ef ^ east = (d4..d8 | e4..e8) ^ (e4..e8 | f4..f8)
+    ///               = d4..d8 | f4..f8   (e cancels)
+    ///     | west    = c4..c8 | d4..d8 | f4..f8   (e-file missing!)
+    ///   e6 ∉ mutated enemy_front → e6 wrongly a black passer. Result = {e6} ≠ EMPTY. ✓
+    #[test]
+    fn passed_pawns_black_adjacent_enemy_files_union_kills_first_xor() {
+        // Black pawn on e6; white pawns on d3 and e3 (adjacent files).
+        let own = Bitboard::from_square(Square::E6);
+        let enemy = Bitboard::from_square(Square::D3) | Bitboard::from_square(Square::E3);
+        let result = passed_pawns(own, enemy, Color::Black);
+        // e6 is on the e-file; white d3/e3 front spans cover d/e/c/f files
+        // toward rank 8, including e6's path → e6 is NOT a black passer.
+        assert_eq!(
+            result,
+            Bitboard::EMPTY,
+            "e6 is blocked by white d3/e3 whose widened front spans cover the e-file; \
+             |→^ at the first union operator in the black branch drops the e-file, \
+             wrongly making e6 a passer"
+        );
+    }
+
+    /// Black branch — skip-file enemy pattern, second-`|` `|→^` and `|→&` mutants.
+    ///
+    /// Input: black pawns b6 and d6, white pawns c3 and e3.
+    ///
+    /// Enemy-front derivation (for black passers):
+    ///   ef = white_front_spans(c3|e3) = north_fill(c4|e4) = {c4..c8} ∪ {e4..e8}
+    ///   ef.shift_east()  = {d4..d8} ∪ {f4..f8}
+    ///   ef.shift_west()  = {b4..b8} ∪ {d4..d8}
+    ///   ef.shift_east() ∩ ef.shift_west() = {d4..d8}  (non-empty — d not in ef!)
+    ///   ef ∩ ef.shift_east() = ∅  (c/e vs d/f — disjoint)
+    ///
+    ///   Correct enemy_front = b4..b8 ∪ c4..c8 ∪ d4..d8 ∪ e4..e8 ∪ f4..f8
+    ///   (ranks 4–8 on b/c/d/e/f files — 25 squares).
+    ///
+    ///   d6 ∈ d4..d8 → blocked. b6 ∈ b4..b8 → blocked. Expected = EMPTY.
+    ///
+    ///   Under `|→^` at second `|`: ef | (ef.shift_east() ^ ef.shift_west())
+    ///     east ^ west = (d4..d8 | f4..f8) ^ (b4..b8 | d4..d8)
+    ///                 = b4..b8 | f4..f8   (d cancels)
+    ///     ef | above  = b4..b8 ∪ c4..c8 ∪ e4..e8 ∪ f4..f8   (d-file missing!)
+    ///   d6 ∉ mutated enemy_front → d6 wrongly a passer. Result = {d6} ≠ EMPTY. ✓
+    ///
+    ///   Under `|→&` at second `|` (Rust precedence: ef | (east & west)):
+    ///     east & west = (d4..d8 | f4..f8) & (b4..b8 | d4..d8) = d4..d8
+    ///     ef | d4..d8 = c4..c8 | d4..d8 | e4..e8   (b and f files missing!)
+    ///   b6 ∉ mutated enemy_front → b6 wrongly a passer. Result = {b6, …} ≠ EMPTY. ✓
+    #[test]
+    fn passed_pawns_black_skip_enemy_files_union_kills_second_xor_and_and() {
+        // Black pawns on b6 and d6; white pawns on c3 and e3 (skip the d-file).
+        let own = Bitboard::from_square(Square::B6) | Bitboard::from_square(Square::D6);
+        let enemy = Bitboard::from_square(Square::C3) | Bitboard::from_square(Square::E3);
+        let result = passed_pawns(own, enemy, Color::Black);
+        // b6 is blocked by the west-widened c3 span; d6 is blocked by the
+        // overlapping east/west widening of c3 and e3 onto the d-file.
+        assert_eq!(
+            result,
+            Bitboard::EMPTY,
+            "b6 and d6 are blocked by white c3/e3 whose widened front spans cover b and d; \
+             |→^ at the second union operator drops the d-file (making d6 a passer), \
+             and |→& collapses to the d-file only (making b6 a passer)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Isolated + doubled stacking (pins D5: no if-else suppression).
+    // -----------------------------------------------------------------------
+
+    /// White pawns a2 and a4 only: the a-file is doubled (1 extra) AND both
+    /// a-pawns are isolated (no white pawn on the b-file). Both predicates
+    /// must fire independently — no mutual suppression.
+    ///
+    /// Hand-derivation:
+    ///   isolated(white) = {a2, a4}  (no b-file friendly pawn)  → count 2
+    ///   doubled(white)  = {a2}      (a4 front-most for white)   → count 1
+    /// The two sets are NOT disjoint by construction (a2 ∈ both); stacking
+    /// means the eval applies ISO twice (a2,a4) AND DBL once (a2) — pinned
+    /// at the `pawn_eval` level by `pawn_eval_isolated_doubled_stack`.
+    #[test]
+    fn isolated_and_doubled_stack_independently() {
+        let (wp, _bp) = pawns_of("4k3/8/8/8/P7/8/P7/4K3 w - - 0 1");
+        let iso = isolated_pawns(wp);
+        let dbl = doubled_pawns(wp);
+        assert_eq!(
+            iso,
+            Bitboard::from_square(Square::A2) | Bitboard::from_square(Square::A4),
+            "both a-file pawns are isolated"
+        );
+        assert_eq!(iso.count(), 2, "two isolated pawns");
+        assert_eq!(
+            dbl,
+            Bitboard::from_square(Square::A2),
+            "rear a2 is the doubled member"
+        );
+        assert_eq!(dbl.count(), 1, "one extra doubled pawn");
+        // Stacking precondition: the two predicates overlap (a2 ∈ both) —
+        // proving they are computed independently, not via if-else.
+        assert!(
+            (iso & dbl).any(),
+            "a2 must be in BOTH the isolated and doubled sets (no suppression)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // pawn_eval — accumulation, sign, rank-scaling, stacking.
+    // -----------------------------------------------------------------------
+
+    /// Empty-of-pawns position: pawn_eval is the identity (0,0, no passers).
+    /// Pins the no-pawn base case (also the key==0 path's correctness claim).
+    // Passes against a zero-returning stub: this documents the base case, not
+    // the pawn-structure arithmetic. Correctness of the zero return is pinned
+    // by `pawn_eval_isolated_doubled_stack` (which asserts non-zero values).
+    #[test]
+    fn pawn_eval_no_pawns_is_zero_identity() {
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").expect("KvK FEN");
+        let pe = pawn_eval(&pos);
+        assert_eq!(pe.mg, 0, "no pawns → mg 0");
+        assert_eq!(pe.eg, 0, "no pawns → eg 0");
+        assert_eq!(pe.passed[0], Bitboard::EMPTY, "no white passers");
+        assert_eq!(pe.passed[1], Bitboard::EMPTY, "no black passers");
+    }
+
+    /// Color-symmetric structure cancels to zero. Hand-mirrored FEN pair is
+    /// NOT used here — instead a single position that is itself vertically
+    /// symmetric: white isolated a2 vs black isolated a7 (each side one
+    /// isolated a-pawn, structurally identical under color swap). The
+    /// white-minus-black accumulation must cancel: mg == 0, eg == 0.
+    ///
+    /// Hand-derivation (pure-stack, ADR-0032 §6): white {a2} isolated only —
+    /// it is NOT backward (black a7's only pawn-attack is b6, never a3, so
+    /// a2's stop a3 is not enemy-attacked) and not doubled/connected.
+    /// Symmetrically black {a7} isolated only. ISO contributes sign·ISO for
+    /// each: `+1·ISO (white) + (−1)·ISO (black) = 0` for both mg and eg —
+    /// the cancellation holds *because* no confounding term fires on either
+    /// side. No passers: a7 is on the a-file ahead of a2 ⇒ a2 not a passer;
+    /// symmetrically a7 not a passer. passers both empty.
+    // Passes against a zero-returning stub: the exact cancellation expected
+    // here is zero, which any zero stub satisfies. The non-zero sign/magnitude
+    // claims are pinned by the asymmetric mirror-pair tests above.
+    #[test]
+    fn pawn_eval_symmetric_structure_cancels() {
+        let pos = Position::from_fen("4k3/p7/8/8/8/8/P7/4K3 w - - 0 1")
+            .expect("symmetric isolated-a-pawn FEN");
+        let pe = pawn_eval(&pos);
+        assert_eq!(pe.mg, 0, "symmetric isolated pawns cancel in mg");
+        assert_eq!(pe.eg, 0, "symmetric isolated pawns cancel in eg");
+        assert_eq!(pe.passed[0], Bitboard::EMPTY, "a2 blocked by a7 ahead");
+        assert_eq!(pe.passed[1], Bitboard::EMPTY, "a7 blocked by a2 ahead");
+    }
+
+    /// Sign convention: a white-only isolated pawn yields a negative MG/EG
+    /// (penalty), and the hand-mirrored black-only counterpart yields the
+    /// exact componentwise negation. The pair is two hand-written FENs
+    /// (vertical mirror + color swap), NOT a generic `mirror(pos)` helper.
+    /// Isolates the isolated term under **pure-stack semantics** (ADR-0032
+    /// §6): a lone pawn with no enemy pawns has *only* the ISO term — no
+    /// doubled (single file occupant), no backward (no enemy attacks the
+    /// stop), no connected (no friendly partner). The assertion follows
+    /// directly from the ADR-§6 weights, no term suppression involved.
+    ///
+    /// FEN A (white isolani c4, lone): "4k3/8/8/8/2P5/8/8/4K3"
+    /// FEN B (black isolani c5, the vertical-mirror+color-swap):
+    ///        "4k3/8/8/2p5/8/8/8/4K3"
+    /// c4 white ↔ c5 black under board flip (rank r ↔ 7−r: rank 3 ↔ rank 4,
+    /// i.e. c4 (rank idx 3) ↔ c5 (rank idx 4)).
+    ///
+    /// Hand-derivation: A has white {c4} isolated only ⇒ white net =
+    /// `ISO_MG·1 = −10` (mg), `ISO_EG·1 = −20` (eg) ⇒ `mg_A = −10 < 0`,
+    /// `eg_A = −20 < 0`. No black pawns ⇒ c4 is a passer ⇒
+    /// `passed[White] = {c4}`. B is the exact mirror: black {c5} isolated ⇒
+    /// `mg_B = +10 = −mg_A`, `eg_B = +20 = −eg_A`; `passed[Black] = {c5}`.
+    #[test]
+    fn pawn_eval_color_mirror_pair_negates_componentwise() {
+        let a = Position::from_fen("4k3/8/8/8/2P5/8/8/4K3 w - - 0 1").expect("mirror A");
+        let b = Position::from_fen("4k3/8/8/2p5/8/8/8/4K3 w - - 0 1").expect("mirror B");
+        let pe_a = pawn_eval(&a);
+        let pe_b = pawn_eval(&b);
+        // Composition pinned symbolically against `eval::data` (lone white
+        // isolani ⇒ white net = ISO term only). Holds at the M6.B shipped
+        // CONN-only config (ISO_MG = ISO_EG = 0) and at any M6.F re-tune.
+        assert_eq!(pe_a.mg, ISO_MG, "lone white isolani → mg = ISO_MG");
+        assert_eq!(pe_a.eg, ISO_EG, "lone white isolani → eg = ISO_EG");
+        assert!(
+            pe_a.mg <= 0,
+            "ISO is a penalty term (≤0 at any weight; 0 in M6.B CONN-only ship)"
+        );
+        assert!(pe_a.eg <= 0, "ISO eg is a penalty term (≤0 at any weight)");
+        assert_eq!(
+            pe_b.mg, -pe_a.mg,
+            "mirrored black-only isolani mg must be the negation of white's"
+        );
+        assert_eq!(
+            pe_b.eg, -pe_a.eg,
+            "mirrored black-only isolani eg must be the negation of white's"
+        );
+        // Detection-bitboard symmetry across the hand-mirror pair.
+        assert_eq!(
+            pe_a.passed[Color::White.index()],
+            Bitboard::from_square(Square::C4),
+            "A: c4 is a white passer (no black pawns)"
+        );
+        assert_eq!(
+            pe_b.passed[Color::Black.index()],
+            Bitboard::from_square(Square::C5),
+            "B: c5 is a black passer (mirror of A's white passer)"
+        );
+        // The white-term popcount on A equals the black-term popcount on B.
+        let (wa, _) = (
+            a.pieces_colored(Color::White, crate::piece::PieceKind::Pawn),
+            (),
+        );
+        let (_, bb_b) = (
+            (),
+            b.pieces_colored(Color::Black, crate::piece::PieceKind::Pawn),
+        );
+        assert_eq!(
+            isolated_pawns(wa).count(),
+            isolated_pawns(bb_b).count(),
+            "white isolated popcount on A == black isolated popcount on B"
+        );
+    }
+
+    /// Color-mirror pair for the doubled term. Isolates the doubled (+
+    /// isolated) terms under **pure-stack semantics** (ADR-0032 §6). A pure
+    /// DBL-only fixture is impossible without an adjacent friendly pawn (which
+    /// would introduce a connected term); the doubled d-file pawns are
+    /// *necessarily* isolated, so ISO and DBL both fire and stack — exactly
+    /// what pure-stack mandates. With no enemy pawns there is no backward
+    /// confound, so the full contribution is hand-derivable to an exact value.
+    ///
+    /// FEN A (white doubled d-file, d3+d4): "4k3/8/8/8/3P4/3P4/8/4K3"
+    /// FEN B (black doubled d-file, d5+d6, vertical-mirror+color-swap):
+    ///        "4k3/8/3p4/3p4/8/8/8/4K3"
+    ///
+    /// Hand-derivation (A): white {d3, d4}, no black. isolated = {d3, d4}
+    /// (no c/e-file friendly pawn) ⇒ count 2. doubled = {d3} (d4 front-most
+    /// for white) ⇒ count 1. backward = ∅ (no enemy attacks any stop).
+    /// connected = ∅ (d3/d4 not same-rank phalanx; d3 attacks c4/e4, not d4,
+    /// so d4 not defended). White net =
+    /// `2·ISO_MG + 1·DBL_MG = 2·(−10) + (−10) = −30` (mg),
+    /// `2·ISO_EG + 1·DBL_EG = 2·(−20) + (−15) = −55` (eg) ⇒ `mg_A = −30 < 0`,
+    /// `eg_A = −55 < 0` — assertion follows the math. B is the exact mirror ⇒
+    /// `mg_B = +30 = −mg_A`, `eg_B = +55 = −eg_A`. White doubled popcount on
+    /// A == black doubled popcount on B (both 1 extra).
+    #[test]
+    fn pawn_eval_doubled_color_mirror_pair_negates_componentwise() {
+        let a = Position::from_fen("4k3/8/8/8/3P4/3P4/8/4K3 w - - 0 1").expect("doubled mirror A");
+        let b = Position::from_fen("4k3/8/3p4/3p4/8/8/8/4K3 w - - 0 1").expect("doubled mirror B");
+        let pe_a = pawn_eval(&a);
+        let pe_b = pawn_eval(&b);
+        // Composition pinned symbolically (2 isolated + 1 doubled-extra,
+        // pure-stack). Holds at the M6.B CONN-only ship (all three = 0) and
+        // at any M6.F re-tune.
+        assert_eq!(
+            pe_a.mg,
+            2 * ISO_MG + DBL_MG,
+            "doubled+isolated d3/d4 → mg = 2*ISO_MG + DBL_MG"
+        );
+        assert_eq!(
+            pe_a.eg,
+            2 * ISO_EG + DBL_EG,
+            "doubled+isolated d3/d4 → eg = 2*ISO_EG + DBL_EG"
+        );
+        assert!(pe_a.mg <= 0, "ISO+DBL penalties sum ≤0 at any weight");
+        assert!(pe_a.eg <= 0, "ISO+DBL eg penalties sum ≤0 at any weight");
+        assert_eq!(pe_b.mg, -pe_a.mg, "doubled mirror: mg negated");
+        assert_eq!(pe_b.eg, -pe_a.eg, "doubled mirror: eg negated");
+        let (wa, _) = pawns_of("4k3/8/8/8/3P4/3P4/8/4K3 w - - 0 1");
+        let (_, bb_b) = pawns_of("4k3/8/3p4/3p4/8/8/8/4K3 w - - 0 1");
+        assert_eq!(
+            doubled_pawns(wa).count(),
+            doubled_pawns(bb_b).count(),
+            "white doubled popcount on A == black doubled popcount on B"
+        );
+    }
+
+    /// Color-mirror pair for the backward term. Isolates the backward term
+    /// under **pure-stack semantics** (ADR-0032 §6: ISO/DBL/BWD stack, no
+    /// if-else suppression). The prior fixture
+    /// (`4k3/8/8/1p1p4/3P4/2P5/8/4K3`) was confounded — its black b5/d5 were
+    /// *each* isolated AND backward, so under honest pure-stack accumulation
+    /// the black side's `−1·(2·ISO + 2·BWD)` swamped white's small net and the
+    /// position scored `mg = +35` (positive), violating `mg_A < 0`. The
+    /// defective Slice-C code "fixed" this by introducing ISO/BWD mutual
+    /// exclusion — contradicting the locked ADR. This redesign instead picks a
+    /// fixture whose sign is correct under honest stacking.
+    ///
+    /// FEN A: white {c3, d6}, black {b5, c5} — `4k3/8/3P4/1pp5/8/2P5/8/4K3`.
+    ///
+    /// d6 is a *structure-free* partner: its only role is to make c3
+    /// non-isolated (d-file adjacent to c). d6 is not isolated (c3 adjacent),
+    /// not doubled, not backward (stop d7 not enemy-attacked), and creates no
+    /// connected term — not in a phalanx with c3 (different ranks), does not
+    /// defend c3, not defended by c3 (c3 attacks b4/d4 not d6; d6 attacks
+    /// c7/e7 not c3).
+    ///
+    /// White backward set = {c3}: stop c4; black b5 attacks c4 (b5→c4 SE); c4
+    /// is not in white's attack-front-spans (no white pawn can ever defend c4
+    /// here) → c3 backward, and no other white term fires ⇒ white net =
+    /// `BWD_MG·1 = −8` (mg), `BWD_EG·1 = −12` (eg).
+    ///
+    /// Black {b5, c5} is a same-rank-4 phalanx: NOT isolated (b/c mutually
+    /// adjacent files), NOT doubled, NOT backward (stops b4/c4: only b4 ∈
+    /// white attacks via c3, but b4 ∈ black's own attack-front-spans through
+    /// c5 → masked out → backward(black)=∅), connected = the phalanx {b5, c5}
+    /// (count 2). Both on chess rank 5 ⇒ black relative rank `7 − 4 = 3` ⇒
+    /// black net term = `CONN_MG[3]·2 = 7·2 = 14` (mg),
+    /// `CONN_EG[3]·2 = 10·2 = 20` (eg); applied with `sign = −1`.
+    ///
+    /// Total ⇒ `mg_A = −8 + (−14) = −22 < 0`,
+    /// `eg_A = −12 + (−20) = −32 < 0`. The sign assertion follows from this
+    /// arithmetic, not vice-versa.
+    ///
+    /// M6.F maintenance note: unlike the isolated/doubled/connected mirror
+    /// fixtures (each a single weight table), these exact-value pins mix two
+    /// independent weight tables — BWD (white c3) and CONN (black b5/c5
+    /// phalanx). If BWD and CONN are independently retuned in M6.F the
+    /// `assert_eq!` pins (not the sign checks) will need re-deriving from the
+    /// new `eval::data` constants.
+    ///
+    /// FEN B = exact vertical-mirror + color-swap of A:
+    /// `4k3/8/2p5/8/1PP5/3p4/8/4K3` (white c3↔black c6, white d6↔black d3,
+    /// black b5↔white b4, black c5↔white c4). By the mirror symmetry of the
+    /// per-term formulas `pe_B = −pe_A` componentwise ⇒ `mg_B = +22`,
+    /// `eg_B = +32`. Black backward popcount on B = 1 (c6) = white backward
+    /// popcount on A.
+    #[test]
+    fn pawn_eval_backward_color_mirror_pair_negates_componentwise() {
+        let a =
+            Position::from_fen("4k3/8/3P4/1pp5/8/2P5/8/4K3 w - - 0 1").expect("backward mirror A");
+        let b =
+            Position::from_fen("4k3/8/2p5/8/1PP5/3p4/8/4K3 w - - 0 1").expect("backward mirror B");
+        let pe_a = pawn_eval(&a);
+        let pe_b = pawn_eval(&b);
+        // Composition pinned symbolically: white net = BWD term (c3); black
+        // net = CONN over the b5/c5 phalanx at black relative rank 3 (2 pawns),
+        // applied with sign −1. Holds at the M6.B CONN-only ship (BWD=0,
+        // CONN live) and at any M6.F re-tune. mg/eg are strictly negative
+        // because CONN[3] > 0 dominates the non-positive BWD term.
+        assert_eq!(
+            pe_a.mg,
+            BWD_MG - 2 * CONN_MG[3],
+            "white backward c3 + black rank-5 phalanx → mg = BWD_MG − 2·CONN_MG[3]"
+        );
+        assert_eq!(
+            pe_a.eg,
+            BWD_EG - 2 * CONN_EG[3],
+            "white backward c3 + black rank-5 phalanx → eg = BWD_EG − 2·CONN_EG[3]"
+        );
+        assert!(pe_a.mg < 0, "backward fixture → negative mg contribution");
+        assert!(pe_a.eg < 0, "backward fixture → negative eg contribution");
+        assert_eq!(pe_b.mg, -pe_a.mg, "backward mirror: mg negated");
+        assert_eq!(pe_b.eg, -pe_a.eg, "backward mirror: eg negated");
+        let (wa_all, bp_all) = pawns_of("4k3/8/3P4/1pp5/8/2P5/8/4K3 w - - 0 1");
+        let (wp_b, bb_b) = pawns_of("4k3/8/2p5/8/1PP5/3p4/8/4K3 w - - 0 1");
+        assert_eq!(
+            backward_pawns(wa_all, bp_all, Color::White).count(),
+            backward_pawns(bb_b, wp_b, Color::Black).count(),
+            "white backward popcount on A == black backward popcount on B"
+        );
+    }
+
+    /// Color-mirror pair for the connected term. Isolates the connected term
+    /// under **pure-stack semantics** (ADR-0032 §6): an adjacent-file phalanx
+    /// with no enemy pawns has *only* the connected bonus — adjacent files ⇒
+    /// not isolated, no enemy ⇒ not backward, single occupant per file ⇒ not
+    /// doubled.
+    ///
+    /// FEN A (white phalanx d4/e4): "4k3/8/8/8/3PP3/8/8/4K3"
+    /// FEN B (black phalanx d5/e5, vertical-mirror+color-swap):
+    ///        "4k3/8/8/3pp3/8/8/8/4K3"
+    ///
+    /// Hand-derivation (A): white {d4, e4}, no black. isolated = ∅ (d/e
+    /// mutually adjacent files). doubled = ∅; backward = ∅ (no enemy).
+    /// connected = phalanx {d4, e4} (same rank 4, adjacent files) ⇒ count 2;
+    /// both on chess rank 4 ⇒ white relative rank 3. White net =
+    /// `CONN_MG[3]·2 = 7·2 = 14` (mg), `CONN_EG[3]·2 = 10·2 = 20` (eg) ⇒
+    /// `mg_A = +14 > 0`, `eg_A = +20 > 0` — assertion follows the math. B is
+    /// the exact mirror ⇒ `mg_B = −14 = −mg_A`, `eg_B = −20 = −eg_A`.
+    /// White connected popcount on A == black connected popcount on B (both 2).
+    #[test]
+    fn pawn_eval_connected_color_mirror_pair_negates_componentwise() {
+        let a = Position::from_fen("4k3/8/8/8/3PP3/8/8/4K3 w - - 0 1").expect("conn mirror A");
+        let b = Position::from_fen("4k3/8/8/3pp3/8/8/8/4K3 w - - 0 1").expect("conn mirror B");
+        let pe_a = pawn_eval(&a);
+        let pe_b = pawn_eval(&b);
+        assert_eq!(pe_a.mg, 14, "rank-4 phalanx d4/e4 → mg = 2*CONN_MG[3] = 14");
+        assert_eq!(pe_a.eg, 20, "rank-4 phalanx d4/e4 → eg = 2*CONN_EG[3] = 20");
+        assert!(pe_a.mg > 0, "white phalanx d4/e4 → positive mg (bonus)");
+        assert!(
+            pe_a.eg > 0,
+            "white rank-4 phalanx → positive eg (CONN_EG[rank4] > 0)"
+        );
+        assert_eq!(pe_b.mg, -pe_a.mg, "connected mirror: mg negated");
+        assert_eq!(pe_b.eg, -pe_a.eg, "connected mirror: eg negated");
+        let (wa, _) = pawns_of("4k3/8/8/8/3PP3/8/8/4K3 w - - 0 1");
+        let (_, bb_b) = pawns_of("4k3/8/8/3pp3/8/8/8/4K3 w - - 0 1");
+        assert_eq!(
+            connected_pawns(wa, Color::White).count(),
+            connected_pawns(bb_b, Color::Black).count(),
+            "white connected popcount on A == black connected popcount on B"
+        );
+    }
+
+    /// Connected rank-scaling: the SAME phalanx shape at a more advanced
+    /// rank yields a strictly larger (more positive) white MG contribution.
+    /// Fixture 1: white phalanx b3/c3 (relative rank 2 for white). Fixture
+    /// 2: white phalanx b6/c6 (relative rank 5). With CONN positive and
+    /// rank-scaled (research §1.4 table: rank 6 entry ≫ rank 3 entry), the
+    /// rank-6 fixture's mg must exceed the rank-3 fixture's mg.
+    ///
+    /// Hand-derivation: both fixtures have ONLY the connected term active
+    /// (no isolated: b,c adjacent; no doubled; no backward — no enemy pawns;
+    /// passers present but passers add nothing to mg/eg in M6.B —
+    /// detection-only). So mg = Σ CONN_MG[rank]. CONN_MG is monotone
+    /// increasing in advancement → mg(rank6 phalanx) > mg(rank3 phalanx).
+    #[test]
+    fn pawn_eval_connected_rank_scaling_monotone() {
+        let low = Position::from_fen("4k3/8/8/8/8/1PP5/8/4K3 w - - 0 1").expect("rank-3 phalanx");
+        let high = Position::from_fen("4k3/8/1PP5/8/8/8/8/4K3 w - - 0 1").expect("rank-6 phalanx");
+        let mg_low = pawn_eval(&low).mg;
+        let mg_high = pawn_eval(&high).mg;
+        assert!(
+            mg_high > mg_low,
+            "advanced phalanx must score higher (rank-scaled CONN): \
+             mg(rank3)={mg_low}, mg(rank6)={mg_high}"
+        );
+        assert!(
+            mg_low > 0,
+            "a pure connected phalanx with no weaknesses → positive mg"
+        );
+    }
+
+    /// Stacking pinned at the pawn_eval level (D5; ADR-0032 §6: "Isolated/
+    /// doubled/backward stack (no if-else suppression)"). This test's whole
+    /// point is to keep BOTH ISO and DBL firing on the same pawn — it must
+    /// NOT isolate to a single term. White a2 and a4: each is isolated (no
+    /// b-file friendly pawn) and a2 is the rear of a doubled a-file pair.
+    /// Under **pure-stack** semantics a2 incurs ISO *and* DBL simultaneously
+    /// (proving the reverted code applies no cross-term `& !` suppression).
+    ///
+    /// Detection: isolated = {a2, a4} ⇒ count 2. doubled = {a2} ⇒ count 1
+    /// (a4 front-most for white). backward = ∅ (no enemy pawns); connected
+    /// = ∅ (a2/a4 not phalanx, a2 attacks b3 not a4, so a4 not defended).
+    ///
+    /// **The no-suppression invariant is asserted weight-free on the predicate
+    /// popcounts** (`isolated_pawns(wp).count()==2` ∧ `doubled_pawns(wp)
+    /// .count()==1`): a2 ∈ *both* sets is exactly "no if-else suppression",
+    /// and a suppressing implementation would fail those `assert_eq!`s
+    /// regardless of weights. This is the load-bearing discriminator — needed
+    /// because the M6.B shipped CONN-only config zeroes ISO/DBL/BWD, so the
+    /// weighted sum (`pe.mg == 2·ISO_MG + DBL_MG`, now `== 0`) can no longer
+    /// tell suppressed from non-suppressed code. The `pe.mg/eg` pins are kept
+    /// as a composition check, expressed symbolically over the `eval::data`
+    /// constants so they auto-revalidate against whatever values M6.F's joint
+    /// Texel pass produces. The a-pawns are passers (no black pawns) but
+    /// detection adds nothing to mg/eg.
+    #[test]
+    fn pawn_eval_isolated_doubled_stack() {
+        let pos = Position::from_fen("4k3/8/8/8/P7/8/P7/4K3 w - - 0 1").expect("a2+a4 stack FEN");
+        let pe = pawn_eval(&pos);
+        // No-suppression is a STRUCTURAL claim, asserted weight-free on the
+        // predicate popcounts (the M6.B CONN-only ship zeroes ISO/DBL weights,
+        // so the weighted sum alone cannot discriminate suppression). a2 must
+        // appear in BOTH the isolated set (a2, a4) AND the doubled set (a-file
+        // extra) — exactly what "no if-else suppression" means.
+        let (wp, _) = pawns_of("4k3/8/8/8/P7/8/P7/4K3 w - - 0 1");
+        assert_eq!(
+            isolated_pawns(wp).count(),
+            2,
+            "no suppression: a2 AND a4 both isolated"
+        );
+        assert_eq!(
+            doubled_pawns(wp).count(),
+            1,
+            "no suppression: a2 also counts as the a-file doubled extra"
+        );
+        // Composition pinned symbolically (2 isolated + 1 doubled-extra).
+        assert_eq!(
+            pe.mg,
+            2 * ISO_MG + DBL_MG,
+            "stack composition: 2*ISO_MG + DBL_MG (no if-else suppression)"
+        );
+        assert_eq!(
+            pe.eg,
+            2 * ISO_EG + DBL_EG,
+            "stack composition: 2*ISO_EG + DBL_EG"
+        );
+        // Both a-pawns are passers (no black pawns); passed[] is detection-only in M6.B.
+        assert_eq!(
+            pe.passed[Color::White.index()],
+            Bitboard::from_square(Square::A2) | Bitboard::from_square(Square::A4),
+            "a2 and a4 are both white passers (no black pawns)"
+        );
+        assert_eq!(
+            pe.passed[Color::Black.index()],
+            Bitboard::EMPTY,
+            "no black pawns → no black passers"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PawnHashTable: new/clear are real; get is stubbed.
+    // -----------------------------------------------------------------------
+
+    /// `new()` allocates the full fixed-size table without panicking and the
+    /// entry-count arithmetic resolves to 2^17.
+    #[test]
+    fn pawn_hash_new_allocates_full_table() {
+        let ph = PawnHashTable::new();
+        assert_eq!(
+            ph.entries.len(),
+            PAWN_HASH_ENTRIES,
+            "table must hold PAWN_HASH_ENTRIES slots"
+        );
+        assert_eq!(PAWN_HASH_ENTRIES, 1 << 17, "4 MiB / 32 B = 2^17 entries");
+    }
+
+    /// `new()` zeroes every slot (key 0 = empty sentinel).
+    #[test]
+    fn pawn_hash_new_is_zeroed() {
+        let ph = PawnHashTable::new();
+        assert!(
+            ph.entries.iter().all(|e| e.key == 0),
+            "every slot key must be 0 after new()"
+        );
+    }
+
+    /// `clear()` re-zeroes a table whose slots were mutated.
+    #[test]
+    fn pawn_hash_clear_zeroes_all_slots() {
+        let mut ph = PawnHashTable::new();
+        // Dirty a few slots directly (private fields visible in-module).
+        ph.entries[0].key = 0xDEAD_BEEF;
+        ph.entries[0].mg = 123;
+        ph.entries[1].key = 0x1234_5678;
+        ph.entries[PAWN_HASH_ENTRIES - 1].key = 0xFFFF;
+        ph.clear();
+        assert!(
+            ph.entries
+                .iter()
+                .all(|e| e.key == 0 && e.mg == 0 && e.eg == 0),
+            "clear() must zero every slot's key/mg/eg"
+        );
+    }
+
+    /// Direct slot-collision unit test: provably exercises the full-key
+    /// verification path in `get`. Recipe:
+    ///   (a) `get(p_a)` once → p_a's real slot is populated with p_a's data.
+    ///   (b) Compute p_a's actual slot index from `p_a.pawn_zobrist()` (same
+    ///       mask the table uses) and overwrite that slot with a different key
+    ///       (`pz ^ (1u64 << 17)` — same low-17-bit index, different full key)
+    ///       and poisoned values (999, -999).
+    ///   (c) `get(p_a)` again — it now provably probes the poisoned slot;
+    ///       the full-key check must reject the stale entry, recompute, and
+    ///       return `pawn_eval(p_a)` (not 999/-999).
+    ///
+    /// This kills a "store without key-verification on read-back" stub: such a
+    /// stub would return (999, -999) in step (c) and fail the assertions.
+    ///
+    /// Stub note: panics on `unimplemented!()` until Slice C — that is the
+    /// test-first gate; the invariant is correct against the §6 contract.
+    #[test]
+    fn pawn_hash_collision_full_key_verification() {
+        let p_a = Position::from_fen("4k3/8/8/8/P7/8/P7/4K3 w - - 0 1").expect("p_a");
+        let mut ph = PawnHashTable::new();
+
+        // (a) Populate p_a's real slot.
+        let first = ph.get(&p_a);
+
+        // (b) Overwrite that exact slot with a different key and poisoned values.
+        let pz = p_a.pawn_zobrist();
+        let slot_idx = (pz as usize) & (PAWN_HASH_ENTRIES - 1);
+        let poison_key = pz ^ (1u64 << 17); // same slot index, different full key
+        debug_assert_eq!(
+            (poison_key as usize) & (PAWN_HASH_ENTRIES - 1),
+            slot_idx,
+            "poison_key must map to the same slot as pz"
+        );
+        ph.entries[slot_idx].key = poison_key;
+        ph.entries[slot_idx].mg = 999;
+        ph.entries[slot_idx].eg = -999;
+
+        // (c) Re-probe p_a: must detect key mismatch and recompute.
+        let second = ph.get(&p_a);
+        assert_ne!(
+            (second.mg, second.eg),
+            (999, -999),
+            "full-key mismatch: poisoned slot must be rejected, not returned"
+        );
+        assert_eq!(
+            second, first,
+            "re-probe after slot collision must return the same PawnEval as the first get"
+        );
+        assert_eq!(
+            second,
+            pawn_eval(&p_a),
+            "re-probe after slot collision must equal pawn_eval(p_a)"
+        );
+    }
+
+    /// Entry layout is pinned to 32 bytes (the const-assert duplicated as a
+    /// runtime check so a reviewer sees it fail loudly, not just at compile).
+    #[test]
+    fn pawn_hash_entry_is_32_bytes() {
+        assert_eq!(
+            core::mem::size_of::<PawnHashEntry>(),
+            32,
+            "PawnHashEntry must be 32 B (4-MiB / 2^17 arithmetic depends on it)"
+        );
+    }
+
+    /// `get` miss-then-hit returns equal `PawnEval`. Uses a position with a
+    /// non-zero pawn_zobrist so the key != 0 cache path is exercised. (Stub:
+    /// fails with `unimplemented!` until Slice C — that is the test-first
+    /// gate; the assertion is correct against the §6 contract.)
+    #[test]
+    fn pawn_hash_get_miss_then_hit_equal() {
+        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+            .expect("startpos");
+        let mut ph = PawnHashTable::new();
+        let first = ph.get(&pos); // miss → compute + store
+        let second = ph.get(&pos); // hit → reconstructed
+        assert_eq!(first, second, "miss-then-hit must return the same PawnEval");
+        assert_eq!(
+            second,
+            pawn_eval(&pos),
+            "cached value must equal the uncached pawn_eval (pure accelerator)"
+        );
+    }
+
+    /// `clear` forces a subsequent `get` to recompute (miss). The recomputed
+    /// value must still equal `pawn_eval`.
+    #[test]
+    fn pawn_hash_get_after_clear_recomputes_correctly() {
+        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+            .expect("startpos");
+        let mut ph = PawnHashTable::new();
+        let _ = ph.get(&pos);
+        ph.clear();
+        let after = ph.get(&pos);
+        assert_eq!(
+            after,
+            pawn_eval(&pos),
+            "post-clear get must recompute the correct PawnEval"
+        );
+    }
+
+    /// Collision-slot correctness: two positions whose pawn_zobrist values
+    /// land in the same table index but differ must NOT alias. After storing
+    /// the first and then the second (always-replace), a re-`get` of the
+    /// first must reconstruct the FIRST's value (full-key verification
+    /// rejects the stale second-position entry → recompute, correct).
+    ///
+    /// We do not hand-pick a true index collision (pawn_zobrist is opaque);
+    /// instead we assert the weaker, sufficient invariant: `get` on two
+    /// different pawn structures returns each structure's own `pawn_eval`,
+    /// interleaved, with no cross-contamination. This kills a "store but
+    /// never verify the key" stub.
+    #[test]
+    fn pawn_hash_get_distinct_structures_no_cross_contamination() {
+        let p1 = Position::from_fen("4k3/8/8/8/P7/8/P7/4K3 w - - 0 1").expect("p1");
+        let p2 = Position::from_fen("4k3/8/8/8/3PP3/8/8/4K3 w - - 0 1").expect("p2");
+        let mut ph = PawnHashTable::new();
+        let a1 = ph.get(&p1);
+        let b2 = ph.get(&p2);
+        let a1_again = ph.get(&p1);
+        assert_eq!(a1, pawn_eval(&p1), "p1 first get must equal pawn_eval(p1)");
+        assert_eq!(b2, pawn_eval(&p2), "p2 get must equal pawn_eval(p2)");
+        assert_eq!(
+            a1_again,
+            pawn_eval(&p1),
+            "re-get of p1 must still equal pawn_eval(p1), not p2's value"
+        );
+    }
+
+    /// `get` on a no-pawn position (pawn_zobrist == 0) returns the trivial
+    /// identity and does not corrupt the table. Pins the key==0 decision
+    /// (ADR-0032 §2): never probe/store, recompute → (0,0,empty).
+    #[test]
+    fn pawn_hash_get_no_pawn_position_returns_identity() {
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").expect("KvK");
+        let mut ph = PawnHashTable::new();
+        let pe = ph.get(&pos);
+        assert_eq!(
+            pe,
+            PawnEval {
+                mg: 0,
+                eg: 0,
+                passed: [Bitboard::EMPTY; 2]
+            },
+            "no-pawn position → (0,0,empty) identity"
+        );
+        // The table must remain pristine (no store happened for key==0).
+        assert!(
+            ph.entries.iter().all(|e| e.key == 0),
+            "key==0 path must not store → table stays all-zero"
+        );
+    }
+}

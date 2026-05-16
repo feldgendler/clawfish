@@ -1018,6 +1018,11 @@ pub(crate) struct AlphaBetaMover {
     /// `go` invocations within a game. Cleared by `Search::reset()` (called
     /// from `Engine::reset_for_new_game()` on `ucinewgame` and per bench position).
     history_table: HistoryTable,
+    /// M6.B: search-owned pawn hash (ADR-0032 §2). Fixed 4 MiB, always-
+    /// replace, keyed by `Position::pawn_zobrist`. Cleared by
+    /// `Search::reset()` (same `ucinewgame`/per-bench-position discipline as
+    /// `history_table`). Read by `evaluate_cached` from qsearch (Slice E).
+    pawn_hash: crate::eval::pawns::PawnHashTable,
     /// M5.A: per-`go` count of NMP firings (number of times the null sub-search
     /// was attempted, regardless of cutoff). Test-only instrumentation for the
     /// stacked-null `negamax_passes_allow_null_false_in_null_subsearch` test;
@@ -1126,6 +1131,7 @@ impl AlphaBetaMover {
             tt: None,
             killers: [[Move::default(); 2]; MAX_PLY],
             history_table: HistoryTable::new(),
+            pawn_hash: crate::eval::pawns::PawnHashTable::new(),
             #[cfg(test)]
             nmp_firings: 0,
             #[cfg(test)]
@@ -1382,6 +1388,7 @@ impl Search for AlphaBetaMover {
         self.history.clear(); // M3.B carry-forward: game-history Zobrist Vec.
         clear_killers(&mut self.killers); // M4.B: killer table.
         self.history_table.clear(); // M4.C: butterfly history table.
+        self.pawn_hash.clear(); // M6.B: search-owned pawn hash (ADR-0032).
         // pv and nodes are reset per-go; TT lives in engine.
     }
 }
@@ -2322,6 +2329,14 @@ impl AlphaBetaMover {
         &mut self.history_table
     }
 
+    /// Test-only accessor for the M6.B search-owned pawn hash. Used by the
+    /// Slice-E wiring tests to observe `Search::reset`'s clear. Production
+    /// reads the table only via `evaluate_cached` from qsearch.
+    #[cfg(test)]
+    pub(crate) fn pawn_hash_for_test_mut(&mut self) -> &mut crate::eval::pawns::PawnHashTable {
+        &mut self.pawn_hash
+    }
+
     /// Quiescence search: extends the leaf evaluation with captures and queen
     /// promotions until the position is quiet, restoring tactical correctness
     /// past the negamax horizon. Called by negamax at `depth == 0`.
@@ -2338,7 +2353,7 @@ impl AlphaBetaMover {
         ctx: &SearchContext,
         clock: &SearchClock,
     ) -> i32 {
-        use crate::eval::evaluate;
+        use crate::eval::evaluate_cached;
         use crate::movegen::{MoveList, generate_moves, in_check};
 
         // 1. Per-frame nodes increment + cancellation poll. Negamax's depth==0
@@ -2364,7 +2379,7 @@ impl AlphaBetaMover {
         // helper gives `cargo mutants --in-diff` a unique name to mutate
         // and a unit test surface to discriminate.
         if qsearch_short_circuit_at_ply_ceiling(ply, pos) {
-            return evaluate(pos);
+            return evaluate_cached(pos, &mut self.pawn_hash);
         }
 
         // 2. Mate-distance pruning — may return mate-bound before stand-pat is
@@ -2422,7 +2437,7 @@ impl AlphaBetaMover {
         //    `best`. On the in-check branch, initialized to `-INF` so any
         //    evasion's negated child score beats the seed and propagates up.
         let best_init = if !in_chk {
-            let sp = evaluate(pos);
+            let sp = evaluate_cached(pos, &mut self.pawn_hash);
             if sp >= beta {
                 // Path A: stand-pat fail-high → Lower bound (M5.F).
                 return self.qsearch_store_and_return(pos, sp, TtBound::Lower, 0, ply);
@@ -8888,6 +8903,105 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // M6.B Slice E — pawn-hash wiring (ADR-0032 §2).
+    // -----------------------------------------------------------------------
+
+    /// `Search::reset()` clears the search-owned pawn hash (same
+    /// `ucinewgame`/per-bench-position discipline as `history_table`).
+    /// Dirty a slot, reset, assert all slots empty. Works against the stub
+    /// (`clear()` is real) — this is the wiring-presence guard.
+    #[test]
+    fn pawn_hash_cleared_on_reset() {
+        let mut ab = AlphaBetaMover::new();
+        ab.pawn_hash_for_test_mut().dirty_one_slot_for_test();
+        assert!(
+            !ab.pawn_hash_for_test_mut().all_slots_empty_for_test(),
+            "pre-condition: pawn hash must be dirty before reset"
+        );
+        <AlphaBetaMover as Search>::reset(&mut ab);
+        assert!(
+            ab.pawn_hash_for_test_mut().all_slots_empty_for_test(),
+            "Search::reset must clear the pawn hash (ADR-0032 §2)"
+        );
+    }
+
+    /// Determinism: from a fresh mover, `reset()` then `go()` to fixed depth
+    /// twice on the same position must produce an identical node count
+    /// (pins ADR-0010 / ADR-0032 §5 — the pawn hash changes speed, never
+    /// result; per-search clearing keeps reruns bit-identical). This is the
+    /// search-level analogue of the `bench` twice-at-same-HEAD invariant.
+    ///
+    /// Precondition: `evaluate_cached` must be callable without panicking
+    /// (Slice E wires it; until then this test panics on the first search
+    /// that reaches a leaf — that is the test-first gate).
+    #[test]
+    fn pawn_hash_search_is_deterministic_across_reset() {
+        use crate::eval::evaluate_cached;
+        use crate::eval::pawns::PawnHashTable;
+        // Precondition: evaluate_cached reachable on a real position without panic.
+        // Fails with `unimplemented!` until Slice C/D/E — this is the gate.
+        let probe_pos = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let mut probe_ph = PawnHashTable::new();
+        let _ = evaluate_cached(&probe_pos, &mut probe_ph);
+
+        let pos = Position::from_fen(
+            "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+        )
+        .expect("middlegame fixture");
+        let (ctx, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(5)));
+
+        let mut ab = AlphaBetaMover::new();
+        ab.reset();
+        let r1 = drive_go(&mut ab, &pos, &ctx).0;
+        ab.reset();
+        let r2 = drive_go(&mut ab, &pos, &ctx).0;
+
+        assert_eq!(
+            r1.nodes, r2.nodes,
+            "node count must be identical across reset+rerun \
+             (pawn hash must not perturb determinism): {} vs {}",
+            r1.nodes, r2.nodes
+        );
+        assert_eq!(
+            r1.bestmove, r2.bestmove,
+            "bestmove must be identical across reset+rerun"
+        );
+    }
+
+    /// Behavioral: qsearch's stand-pat leaf score on a quiet,
+    /// not-in-check, pawn-structure-rich position must equal
+    /// `evaluate_cached(pos, fresh_hash)` — i.e. qsearch sources its leaf
+    /// eval through the cached entry point (Slice E call-site swap), and the
+    /// pawn-structure term is present in that score. Fails with
+    /// `unimplemented!` until Slice C/D/E land — the test-first gate.
+    ///
+    /// Fixture: a quiet position with a clear pawn-structure imbalance
+    /// (white doubled+isolated a-pawns vs black sound pawns) and no legal
+    /// captures / checks, so qsearch returns the stand-pat immediately.
+    #[test]
+    fn qsearch_leaf_uses_evaluate_cached_with_pawn_structure() {
+        use crate::eval::evaluate_cached;
+        use crate::eval::pawns::PawnHashTable;
+
+        // White: Kg1, pawns a2,a4 (doubled + isolated). Black: Kg8, pawns
+        // f7,g7,h7 (sound). No captures available, neither side in check.
+        let pos = Position::from_fen("6k1/5ppp/8/8/P7/8/P7/6K1 w - - 0 1")
+            .expect("quiet pawn-structure fixture");
+
+        let mut ab = AlphaBetaMover::new();
+        let (ctx, _stop) = ctx_for(&pos, SearchLimits::default());
+        let qscore = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 0, &ctx);
+
+        let mut ph = PawnHashTable::new();
+        let expected = evaluate_cached(&pos, &mut ph);
+        assert_eq!(
+            qscore, expected,
+            "qsearch stand-pat must equal evaluate_cached (Slice-E call-site \
+             swap; pawn structure present in the leaf score)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // HS12 — `negamax_move_order_score` orders captures > killers > quiets
     // (history-rated and not), even when the quiet has saturated history.
     // -----------------------------------------------------------------------
@@ -9188,14 +9302,48 @@ mod tests {
     // Helpers shared across the integration tests below.
     // -----------------------------------------------------------------------
 
-    /// Reliable fail-low fixture. White to move; black queen + rook dominate
-    /// and iter-6 produces a fail-low at try 1 under the tapered evaluator:
-    /// the centered window `(prior - 50, prior + 50)` lies entirely above
-    /// depth-6's true value. At depth 6: iter-5 returned -1201; iter-6 first
-    /// try `(-1251, -1151)` returns ≤ -1251 → fail-low; re-search at
-    /// `(-INF, -1251)` succeeds with score -1250.
+    /// Reliable fail-low fixture. White to move; black queen + rook dominate.
+    /// iter-6 produces a fail-low at try 1 under the tapered evaluator: the
+    /// centered window `(prior - 50, prior + 50)` lies entirely above depth-6's
+    /// true value.
+    ///
+    /// **M6.B re-pin (ADR-0032).** The original M6.A fixture
+    /// (`1q4r1/8/8/8/8/PPP5/2K5/k7`, Kc2 vs Ka1) relied on a pawn-tactical
+    /// inflection in the a3/b3/c3 phalanx. M6.B's connected-pawn bonus
+    /// flattened the iter-5→iter-6 trajectory enough that the original fixture
+    /// no longer fails low at iter-6 try-1 (iter-5 -1226, iter-6 -1237 —
+    /// inside the ±50 window). A pawn-structure-neutral replacement preserving
+    /// the fail-low dynamic is not achievable: no-pawn endgames with comparable
+    /// material either find a forced mate before the aspiration regime (iter ≥ 6)
+    /// or have monotone-smooth trajectories with no fail-low inflection (the
+    /// inflection is intrinsically pawn-tactical). Per `docs/plans/m6.b.md` §7
+    /// step 6–7 the fixture is re-pinned: white king moves c2 → d2, the phalanx
+    /// is reduced to b3/c3, giving a different material-imbalance trajectory
+    /// that reliably fails low at iter-6 try-1.
+    ///
+    /// **Legality (M6.B defect fix).** The intermediate re-pin
+    /// (`…/2K5/3k4`) placed Kc2 and Kd1 diagonally adjacent (Chebyshev
+    /// distance 1) — an illegal position; `make_move` would generate
+    /// `c2xd1 (Capture)`, tripping `debug_assert!` at `src/mov.rs:589` in
+    /// debug builds. This fixture is explicitly legal: white Kd2 vs black Ka1,
+    /// Chebyshev distance max(|d-a|=3, |2-1|=1)=**3** — kings are not
+    /// adjacent. Neither king is in check (Qb8 and Rg8 do not attack d2; Pb3,
+    /// Pc3, and Kd2 do not attack a1).
+    ///
+    /// Empirically re-derived M6.B trajectory (deterministic, verified
+    /// with `cargo test --lib` debug asserts enabled):
+    /// - iter-1: -1167; iter-2: -1256; iter-3: -1246; iter-4: -1330.
+    /// - iter-5 returns **-1336**.
+    /// - iter-6 first try centers `(-1386, -1286)`; the true value equals
+    ///   -1386 (exactly at the fail-low boundary → returned ≤ prev_alpha).
+    ///   `widen_after_fail` re-searches `(-INF, -1386)`, which succeeds with
+    ///   score **-1386** (exactly one re-search at depth 6, alpha=-INF).
+    /// - At depth 7: same iter-6 fail-low (exactly one `depth=6` re-search
+    ///   line); iter-7 succeeds window-contained at **-1411** (no depth-7
+    ///   re-search). Killer-persistence and PV-legality properties hold at
+    ///   both depth caps.
     fn fail_low_fixture() -> Position {
-        Position::from_fen("1q4r1/8/8/8/8/PPP5/2K5/k7 w - - 0 1")
+        Position::from_fen("1q4r1/8/8/8/8/1PP5/3K4/k7 w - - 0 1")
             .expect("fail-low fixture FEN must parse")
     }
 
@@ -9536,7 +9684,8 @@ mod tests {
             "fail-low re-search beta must be a finite proved bound, not INF; got {beta}"
         );
         // Beta must NOT be 0 (which would suggest the proved bound was lost).
-        // The fixture's iter-6 returned score is ≤ -935 cp (queen-down regime).
+        // The M6.B re-pinned fixture's iter-6 try-1 returned score is -1386
+        // (deep queen-down regime; see fail_low_fixture docstring).
         assert!(
             beta < -100,
             "beta must be the iter's try-1 returned score (deeply negative on this fixture); got {beta}"

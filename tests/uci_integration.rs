@@ -1116,13 +1116,23 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
         "E51: bench node counts must match across two runs in the same session \
          with qsearch-in-TT active; got {nodes1} vs {nodes2}"
     );
-    // M6.A depth-4 bench-signature pin. Re-pinned after M6.A tapered eval
-    // (MG/EG blend) landed; different eval scores change alpha-beta pruning
-    // behavior, shifting node counts. M5.F pin was 89_080.
-    const M6A_DEPTH4_BENCH_NODES: u64 = 94_501;
+    // M6.B depth-4 bench-signature pin. M6.B ships the pawn-structure eval
+    // with the **connected-pawn term only** active (`PAWN_STRUCTURE_IN_EVAL
+    // = true`; ISO/DBL/BWD weights zeroed in `eval::data` — a per-term SPRT
+    // screen + confirmation vs `M6.A` showed every multi-term subset
+    // collapses via a connectivity-axis double-count while CONN-only is a
+    // decisive +103.1 Elo; ADR-0032 §7, docs/milestones/m6.b.md). The live
+    // CONN term changes leaf scores ⇒ root-move ordering ⇒ node count, so
+    // the depth-4 bench moves off M6.A's `94_501` to the CONN-only `90_591`
+    // (the score-neutral M6.B and Slice-E weighted values no longer apply).
+    // Per the roadmap bench-node-count policy this number is a determinism
+    // anchor, not a no-regression signal. M6.F re-introduces ISO/DBL/BWD via
+    // joint Texel; the bench will move again then.
+    // Score-neutral M6.B / M6.A pin was 94_501; M5.F pin was 89_080.
+    const M6B_DEPTH4_BENCH_NODES: u64 = 90_591;
     assert_eq!(
-        nodes1, M6A_DEPTH4_BENCH_NODES,
-        "E51: bench node count changed from M6.A pin ({M6A_DEPTH4_BENCH_NODES} at depth=4); \
+        nodes1, M6B_DEPTH4_BENCH_NODES,
+        "E51: bench node count changed from M6.B pin ({M6B_DEPTH4_BENCH_NODES} at depth=4); \
          re-pin if intentional; got {nodes1}"
     );
 }

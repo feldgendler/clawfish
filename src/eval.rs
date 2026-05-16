@@ -14,6 +14,8 @@ use crate::piece::{Color, PieceKind};
 use crate::position::Position;
 use crate::square::Square;
 
+pub(crate) mod pawns;
+
 mod data;
 use data::{
     EG_BISHOP_PST, EG_KING_PST, EG_KNIGHT_PST, EG_PAWN_PST, EG_QUEEN_PST, EG_ROOK_PST,
@@ -211,12 +213,14 @@ pub(crate) fn mop_up_term_white(pos: &Position, mg_white: i32, eg_white: i32) ->
     }
 }
 
-/// Side-to-move-relative score in centipawns.
+/// Shared blend: PST + bishop-pair + pawn-structure + mop-up, white-perspective,
+/// then STM flip. Pawn structure enters only here (ADR-0032 §4), not in the
+/// incremental accessor or the mop-up estimate.
 ///
-/// Returns 0 for insufficient-material positions (KvK, KvN, KvB,
-/// KBvKB-same-color). Otherwise blends MG/EG by phase, applies bishop-pair
-/// and mop-up addends, then negates for Black.
-pub fn evaluate(pos: &Position) -> i32 {
+/// Mop-up uses PST-only `(mg, eg)` inputs — bishop-pair and pawn structure are
+/// deliberately excluded from the mop-up advantage estimate (ADR-0031 / ADR-0032
+/// §4). This is the M6.A precedent preserved verbatim.
+fn evaluate_core(pos: &Position, pe: pawns::PawnEval) -> i32 {
     use crate::search::MATE_IN_MAX_PLY;
 
     if is_insufficient_material(pos) {
@@ -229,9 +233,34 @@ pub fn evaluate(pos: &Position) -> i32 {
 
     let bp_mg = bishop_pair_term_white(pos, BISHOP_PAIR_MG);
     let bp_eg = bishop_pair_term_white(pos, BISHOP_PAIR_EG);
+    // Mop-up takes PST-only (mg, eg) — no bishop-pair, no pawn structure
+    // (ADR-0032 §4; M6.A precedent). The mop_up_addend_excludes_pawn_structure
+    // regression test pins this call site.
     let mop_up = mop_up_term_white(pos, mg, eg);
 
-    let blended = ((mg + bp_mg) * phase + (eg + bp_eg) * (24 - phase)) / 24;
+    // M6.B ships the pawn-structure eval with the **connected-pawn term only**
+    // active: ISO/DBL/BWD weights are zeroed in `eval::data` (kept as named
+    // M6.F-tunable constants), CONN keeps its literature-default table. A
+    // per-term SPRT screen + confirmation vs `M6.A` (single-TC 10+0.1; see
+    // docs/milestones/m6.b.md + ADR-0032 §7) showed each term individually
+    // positive-to-neutral (ISO +82.7, DBL +31.4, BWD −7.5, CONN +103.1) but
+    // every multi-term subset collapses via a connectivity-axis double-count
+    // (ISO×CONN −197.9 H0; all-four −99.9; ISO+DBL+CONN +9.9 neutral) —
+    // ISO and CONN are opposite-signed measurements of the same axis with
+    // mismatched scale, coherent only after the joint Texel co-calibration
+    // that ADR-0032 §6 always assigned to M6.F. CONN-only is the largest
+    // confirmed gain *and* structurally interaction-immune (one term). `pe`
+    // still computes ISO/DBL/BWD (× zero weight) so the structure is
+    // M6.F-ready, and caches `pe.passed` for M6.C. **M6.F**: re-introduce
+    // ISO/DBL/BWD via joint Texel against the CONN-only baseline.
+    const PAWN_STRUCTURE_IN_EVAL: bool = true;
+    let (pe_mg, pe_eg) = if PAWN_STRUCTURE_IN_EVAL {
+        (pe.mg, pe.eg)
+    } else {
+        (0, 0)
+    };
+
+    let blended = ((mg + bp_mg + pe_mg) * phase + (eg + bp_eg + pe_eg) * (24 - phase)) / 24;
     let result_white = blended + mop_up;
 
     debug_assert!(
@@ -244,6 +273,29 @@ pub fn evaluate(pos: &Position) -> i32 {
     } else {
         -result_white
     }
+}
+
+/// Side-to-move-relative score in centipawns.
+///
+/// Returns 0 for insufficient-material positions (KvK, KvN, KvB,
+/// KBvKB-same-color). Otherwise blends MG/EG by phase, applies bishop-pair,
+/// pawn-structure, and mop-up addends, then negates for Black.
+///
+/// Pawn structure is recomputed from scratch on every call. For the hot search
+/// path use [`evaluate_cached`].
+pub fn evaluate(pos: &Position) -> i32 {
+    evaluate_core(pos, pawns::pawn_eval(pos))
+}
+
+/// Hot-path eval: same result as [`evaluate`] but with pawn structure served
+/// from the search-owned pawn hash. Pure accelerator — `evaluate_cached(p,
+/// h) == evaluate(p)` for all `p` and any hash state (ADR-0032 §5).
+///
+/// `pub(crate)` rather than `pub` because `PawnHashTable` is crate-private
+/// (search-owned, not public API) — a `pub fn` taking a `pub(crate)` type is
+/// a privacy-leak lint error. No external consumer exists (only qsearch).
+pub(crate) fn evaluate_cached(pos: &Position, ph: &mut pawns::PawnHashTable) -> i32 {
+    evaluate_core(pos, ph.get(pos))
 }
 
 // ===========================================================================
@@ -1072,6 +1124,159 @@ mod tests {
             "static_eval_white() with raw_phase={raw} > 24 must clamp: \
             expected mg={mg} (EG term drops out), got {}",
             pos.static_eval_white()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M6.B Slice D — eval integration (evaluate_cached purity, regressions).
+    // -----------------------------------------------------------------------
+
+    use crate::eval::pawns::PawnHashTable;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Random-position × random-hash-state determinism (pins ADR-0032
+        /// §5 / plan D6): `evaluate_cached(p, h) == evaluate(p)` for any `p`
+        /// and any hash population. The hash is pre-warmed by probing along
+        /// a short pseudo-random legal walk so the property exercises hit,
+        /// miss, and collision-eviction states — not just a cold table.
+        /// Stub: fails with `unimplemented!` until Slice D — correct
+        /// against the contract, the test-first gate.
+        #[test]
+        fn evaluate_cached_equals_evaluate(seed in 0u64..u64::MAX) {
+            const SEED_FENS: &[&str] = &[
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+                "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+                "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+                "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+            ];
+            let fen_idx = (seed as usize) % SEED_FENS.len();
+            let mut pos = Position::from_fen(SEED_FENS[fen_idx]).expect("seed FEN");
+
+            let mut ph = PawnHashTable::new();
+            // Randomly decide whether to pre-warm or leave the hash cold.
+            if seed & 1 == 0 {
+                let _ = crate::eval::evaluate_cached(&pos, &mut ph);
+            }
+
+            // Walk a few plies, asserting equality at every node + clearing
+            // the hash mid-walk on some seeds (covers cleared-then-reused).
+            let mut state = seed;
+            for ply in 0..4u32 {
+                prop_assert_eq!(
+                    crate::eval::evaluate_cached(&pos, &mut ph),
+                    crate::eval::evaluate(&pos),
+                    "evaluate_cached must equal evaluate at ply {}", ply
+                );
+                if (seed >> 3) & 1 == 1 && ply == 1 {
+                    ph.clear();
+                }
+                let mut ml = crate::movegen::MoveList::new();
+                crate::movegen::generate_moves(&pos, &mut ml);
+                if ml.is_empty() {
+                    break;
+                }
+                state = state.wrapping_add(0x9E3779B97F4A7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z ^= z >> 31;
+                let mv = ml.as_slice()[(z as usize) % ml.len()];
+                pos.make_move(mv);
+            }
+        }
+    }
+
+    /// `evaluate` is unchanged on a pawn-free position (regression guard
+    /// against accidental non-pawn-core drift in the Slice-D refactor). A
+    /// pawn-free position has no pawn-structure contribution by definition,
+    /// so the M6.B `evaluate` value must equal what the non-pawn core
+    /// alone produces. KRvK with white winning has a known non-zero value
+    /// driven by material/PST/mop-up; we pin it to the value `evaluate`
+    /// returns *today* (pre-M6.B) — recorded here as the M6.A baseline.
+    ///
+    /// Hand-derivation of the invariant (not the literal): pawn-free →
+    /// pawn_eval == (0,0,empty) → evaluate_core(pos, (0,0,empty)) must
+    /// equal the M6.A `evaluate(pos)` exactly. The literal value below is
+    /// captured from the M6.A HEAD `evaluate` and is the regression anchor.
+    #[test]
+    fn eval_pawn_free_position_unchanged_vs_m6a() {
+        // White Ke1 + Ra1, Black Ke8 — KRK, white winning. Pawn-free.
+        let pos =
+            Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").expect("KRK white winning FEN");
+        // M6.A baseline value of evaluate() on this exact fixture. If the
+        // Slice-D non-pawn core refactor drifts, this fails. (The number is
+        // the regression anchor; recomputed from M6.A HEAD.)
+        const M6A_BASELINE: i32 = 525;
+        assert_eq!(
+            evaluate(&pos),
+            M6A_BASELINE,
+            "pawn-free evaluate() must be unchanged from the M6.A baseline \
+             (pawn structure cannot contribute on a pawn-free board)"
+        );
+    }
+
+    /// Startpos evaluates to 0 (symmetric pawn structure cancels in the
+    /// white-minus-black pawn accumulation, on top of the already-symmetric
+    /// material/PST). Distinct from `eval_starting_position_is_zero` above
+    /// in that it is the post-M6.B contract: even WITH the pawn-structure
+    /// term added, the perfectly symmetric start must still be exactly 0.
+    #[test]
+    fn eval_startpos_zero_with_pawn_structure() {
+        let pos = Position::starting_position();
+        assert_eq!(
+            evaluate(&pos),
+            0,
+            "startpos must still be exactly 0 once pawn structure is added \
+             (white and black pawn structure are mirror-identical)"
+        );
+    }
+
+    /// Insufficient-material short-circuit still returns 0 even though the
+    /// position (KvK) has no pawns and pawn structure would be (0,0) anyway
+    /// — pins that the `is_insufficient_material` early return is preserved
+    /// by the Slice-D refactor and not bypassed by a pawn-eval path.
+    #[test]
+    fn eval_insufficient_material_still_zero_post_m6b() {
+        let pos = Position::from_fen("8/8/8/4k3/8/8/8/4K3 w - - 0 1").expect("KvK FEN");
+        assert_eq!(
+            evaluate(&pos),
+            0,
+            "KvK must still short-circuit to 0 after the M6.B refactor"
+        );
+    }
+
+    /// Mop-up addend regression (pins §6 / ADR-0032 §4): pawn structure must
+    /// NOT enter the mop-up advantage estimate. On a mop-up-eligible fixture
+    /// that *also* has pawns, `mop_up_term_white(pos, static_mg_white,
+    /// static_eg_white)` (PST-only inputs) must be byte-identical to its
+    /// M6.A value. We assert it directly on a KQ-vs-K+pawn fixture by
+    /// recomputing the term with the PST-only triple and comparing to the
+    /// hand-derived M6.A formula value — independent of any pawn-eval code.
+    ///
+    /// Fixture: White Kg1 + Qa4, Black Ka8 + black pawn h7 (so the position
+    /// has a pawn, exercising the "pawn structure must be excluded" path).
+    /// raw_phase: queen 4 + pawn 0 = 4 < MOP_UP_PHASE_MAX(5) → mop-up eligible.
+    /// The mop-up estimate uses static_mg_white/static_eg_white (PST-only,
+    /// no pawn-structure addend). White winning (Q vs lone K + 1 pawn) →
+    /// mop_up > 0, computed as 4·CMD(losing king a8)=4·6=24 + 2·(14 −
+    /// cheb(g1,a8)=7) = 24 + 14 = 38.
+    ///
+    /// CMD(a8) = min(|0-3|,|0-4|) + min(|7-3|,|7-4|) = 3 + 3 = 6.
+    /// cheb(g1,a8) = max(|6-0|,|0-7|) = 7.  bonus = 4·6 + 2·(14−7) = 38.
+    #[test]
+    fn mop_up_addend_excludes_pawn_structure_vs_m6a() {
+        let pos = Position::from_fen("k7/7p/8/8/Q7/8/8/6K1 w - - 0 1")
+            .expect("KQ vs K+pawn mop-up fixture");
+        let mg = pos.static_mg_white();
+        let eg = pos.static_eg_white();
+        let bonus = mop_up_term_white(&pos, mg, eg);
+        assert_eq!(
+            bonus, 38,
+            "mop-up addend must equal its M6.A formula value \
+             (4·CMD(a8)=24 + 2·(14−cheb(g1,a8)=7)=14 → 38); pawn structure \
+             must be excluded from the mop-up advantage estimate"
         );
     }
 }

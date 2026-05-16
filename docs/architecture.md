@@ -50,6 +50,7 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 | Search trait | `Search` trait + `SearchContext` + `SearchLimits` + `SearchResult` (unchanged since M2.C) | ADR-0011; "Search v1" below |
 | UCI options | `Random_Seed` (M2.D), `MoveOverhead` (M3.E), `Hash` (M4.A) | `docs/plans/m2.d.md`, ADR-0017, ADR-0018 |
 | Evaluation v2 | Tapered PeSTO MG+EG material+PST (`PSQT_MG`/`PSQT_EG` const tables) blended by phase + bishop pair + KBvKB-same-color + mop-up | "Evaluation v2 — tapered" below; ADR-0031 (supersedes ADR-0014 §1/§5) |
+| Pawn-structure infra (M6.B) | Pawn-only Zobrist substream `Position::pawn_zobrist` (structural 3-XOR, Polyglot pawn keys); 4 MiB search-owned always-replace `PawnHashTable` on `AlphaBetaMover` (cleared in `Search::reset`); isolated/doubled/backward/connected predicates + passed detection; `evaluate_core`/`evaluate`/`evaluate_cached` (pure accelerator, D6). **Shipped config: `PAWN_STRUCTURE_IN_EVAL = true`, CONN-only — `ISO/DBL/BWD` weights zeroed in `eval::data` (every multi-term subset collapses via an ISO×CONN connectivity double-count; CONN-only Δ Elo +45.42 vs `M6.A`). M6.F re-introduces ISO/DBL/BWD via joint Texel + rescales CONN.** | "Pawn-structure infra" below; ADR-0032 (§7) |
 | Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D + M5.E refinements + M5.F TT participation) + ID + caps (M3.E) + TT (M4.A + M5.F qsearch tier) + killers (M4.B) + history (M4.C) + aspiration (M4.D) + NMP (M5.A) + RFP (M5.B) + LMR (M5.C) + FFP (M5.D) + SE (M5.G) + staged movegen (M5.H1 architecture, eager generation; M5.H2 will enable lazy generation); `bench` regression baseline (M3.F) | "Search v1" below; ADR-0016, ADR-0017, ADR-0018, ADR-0019, ADR-0023, ADR-0024, ADR-0025, ADR-0026, ADR-0027, ADR-0028, ADR-0029, ADR-0030 |
 | Transposition table (M4.A + M5.F) | `TranspositionTable` in `src/tt.rs`: `UnsafeCell<Vec<TtEntry>>` + `AtomicUsize` mask + `AtomicU8` generation; depth-preferred + age-bias replacement; full 64-bit Zobrist key; mate-score depth-adjustment; bound-aware probe with cutoffs at non-PV nodes (negamax) and unconditionally (qsearch); `Hash` UCI option (default 16 MiB, range 1–4096). M5.F: qsearch participates with `depth = 0` entries; `is_empty()` discriminator changes to `key == 0`; non-terminal qsearch stores only Lower/Upper (no Exact, per Stockfish 45e5e65). | "Transposition table" below; ADR-0018, ADR-0028 |
 | Game history + draw helpers | `Engine::game_history: Vec<u64>` + `is_repetition` + `is_fifty_move_draw` | "Game history and draw-detection helpers" below |
@@ -134,6 +135,45 @@ See `decisions/0009-polyglot-zobrist.md`.
 **NNUE-readiness (ADR-0004 extension).** When NNUE arrives at M10, the tapered incremental update slots out for the accumulator update; `make_move` / `unmake_move` signatures stay. Exactly the discrete-function shape ADR-0004 designed for.
 
 See `decisions/0014-eval-material-pst.md` and `docs/research/m3-eval-material-pst.md`.
+
+## Pawn-structure infra (M6.B; ADR-0032)
+
+**Pawn-only Zobrist substream.** `Position::pawn_zobrist: u64` = XOR of
+`zobrist::piece_key(pawn, sq)` over all pawns, side-to-move excluded.
+Maintained by the **structural three-XOR form** in `update_zobrist_after_make`
+(pawn-mover out@`from`; pawn-non-promo in@`to`; pawn-victim out@`capture_sq`) —
+no per-`MoveFlag` match; EP's two-pawn delta + all promo arms correct by
+construction (a promo-capture victim is never a pawn — back-rank geometry).
+`Undo.prior_pawn_zobrist`; from-scratch round-trip `debug_assert` in
+make/unmake/make_null_move; FEN-parse path refreshes it adjacent to every
+`refresh_zobrist`.
+
+**Pawn hash.** `PawnHashTable` — fixed 4 MiB (`#[repr(C)]` 32-byte entries,
+2¹⁷, `const`-size-pinned), always-replace, owned by `AlphaBetaMover`, cleared
+in `Search::reset()` (ucinewgame + per bench position). `key == 0` never
+cached. `evaluate_cached(pos, &mut PawnHashTable)` (qsearch hot path) is a
+**pure accelerator**: `evaluate_cached == evaluate` for all positions / any
+hash state (D6 proptest).
+
+**Shipped config — CONN-only.** `const PAWN_STRUCTURE_IN_EVAL: bool` in
+`eval::evaluate_core` gates the `(pe.mg, pe.eg)` fold into the blended score;
+**M6.B ships it `true`** with `ISO_MG=ISO_EG=DBL_MG=DBL_EG=BWD_MG=BWD_EG = 0`
+in `eval::data` (CONN keeps its literature-default table). The all-four
+literature-default SPRT vs `M6.A` was H0 / −99.88; a per-term screen +
+confirmation showed every term individually positive-to-neutral but every
+multi-term subset collapses via a **catastrophic ISO×CONN double-count of the
+connectivity axis** (ISO+CONN alone = −197.94). CONN-only is the largest
+confirmed gain and structurally interaction-immune; landing-gate mixed-TC
+SPRT vs `M6.A` (elo0=0/elo1=5, seed `…014`) = `continue@400-cap`, **Δ Elo
++45.42 [+19.68, +71.67]**, lands by the M5.F/M5.G-v2 outcome-ladder
+precedent (ADR-0032 §7). bench `1213649` / depth-4 `90591`. Caveat: per-TC
+depth reversal (fast-TC strong+, 60+0.6 negative) — M6.F watch-item. The
+zeroed ISO/DBL/BWD constants + term math stay (M6.F-ready); `pe.passed` is
+cached for M6.C. **M6.F re-introduces ISO/DBL/BWD via joint Texel against the
+CONN-only baseline and rescales CONN** (the gate is already live).
+
+See `decisions/0032-pawn-structure-and-pawn-hash.md` and
+`docs/research/m6-pawn-structure.md`.
 
 ## Search v1 (production: alpha-beta)
 

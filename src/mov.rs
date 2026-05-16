@@ -465,6 +465,9 @@ pub struct Undo {
     pub prior_halfmove: u8,
     /// Polyglot Zobrist hash of the position before this move.
     pub prior_zobrist: u64,
+    /// Pawn-only Zobrist substream (ADR-0032) before this move; restored
+    /// structurally by `unmake_move` (Slice B impl).
+    pub prior_pawn_zobrist: u64,
     /// MG eval component, white-perspective, before `make_move`.
     pub prior_static_mg: i32,
     /// EG eval component, white-perspective, before `make_move`.
@@ -604,6 +607,7 @@ pub fn make_move(pos: &mut Position, mv: Move) -> Undo {
         prior_ep: pos.ep_target(),
         prior_halfmove: pos.halfmove_clock(),
         prior_zobrist: pos.zobrist(),
+        prior_pawn_zobrist: pos.pawn_zobrist(),
         prior_static_mg: pos.static_mg_white(),
         prior_static_eg: pos.static_eg_white(),
         prior_raw_phase: pos.raw_phase(),
@@ -740,6 +744,11 @@ pub fn make_move(pos: &mut Position, mv: Move) -> Undo {
             "incremental zobrist diverged after make_move {mv:?}",
         );
         debug_assert_eq!(
+            pos.pawn_zobrist(),
+            zobrist::pawn_zobrist_from_scratch(pos),
+            "incremental pawn_zobrist diverged after make/unmake {mv:?}",
+        );
+        debug_assert_eq!(
             (
                 pos.static_mg_white(),
                 pos.static_eg_white(),
@@ -853,6 +862,10 @@ pub fn unmake_move(pos: &mut Position, mv: Move, undo: Undo) {
     // is structural: we wrote prior_zobrist into Undo at make-time.
     pos.refresh_zobrist_from(undo.prior_zobrist);
 
+    // Restore the pawn-only Zobrist substream the same way (ADR-0032 §1):
+    // structural restore from the make-time snapshot, not a reverse delta.
+    pos.refresh_pawn_zobrist_from(undo.prior_pawn_zobrist);
+
     // Restore eval triple directly from undo (same structural guarantee).
     pos.refresh_static_eval_from_triple(
         undo.prior_static_mg,
@@ -867,6 +880,11 @@ pub fn unmake_move(pos: &mut Position, mv: Move, undo: Undo) {
             pos.zobrist(),
             zobrist::from_scratch(pos),
             "unmake restored zobrist disagrees with from_scratch",
+        );
+        debug_assert_eq!(
+            pos.pawn_zobrist(),
+            zobrist::pawn_zobrist_from_scratch(pos),
+            "incremental pawn_zobrist diverged after make/unmake {mv:?}",
         );
         debug_assert_eq!(
             (
@@ -932,11 +950,18 @@ pub fn make_null_move(pos: &mut Position) -> NullUndo {
     pos.refresh_zobrist_from(new_zobrist);
 
     #[cfg(debug_assertions)]
-    debug_assert_eq!(
-        pos.zobrist(),
-        zobrist::from_scratch(pos),
-        "make_null_move incremental zobrist disagrees with from_scratch",
-    );
+    {
+        debug_assert_eq!(
+            pos.zobrist(),
+            zobrist::from_scratch(pos),
+            "make_null_move incremental zobrist disagrees with from_scratch",
+        );
+        debug_assert_eq!(
+            pos.pawn_zobrist(),
+            zobrist::pawn_zobrist_from_scratch(pos),
+            "make_null_move pawn_zobrist disagrees with from_scratch",
+        );
+    }
 
     NullUndo {
         prior_ep,
@@ -1068,6 +1093,36 @@ fn update_zobrist_after_make(
     z ^= zobrist::turn_key();
 
     pos.refresh_zobrist_from(z);
+
+    // ----- Pawn-only Zobrist substream (ADR-0032 §1) -----
+    // The same unified structural shape as the main zobrist, restricted to
+    // pawn keys: three conditional XOR sites, NO per-MoveFlag match. EP's
+    // three-square delta and the promotion/promo-capture arms are correct by
+    // construction (they fall out of the upstream-computed `capture_sq` and
+    // `mv.promotion_kind()`, exactly as the main zobrist relies on them).
+    // `us`/`them` derive from the by-value `mover` param — no mutable `pos`
+    // read, matching this helper's order-agnostic discipline.
+    let them = us.flip();
+    let pk = |c: Color, sq: Square| zobrist::piece_key(Piece::new(c, PieceKind::Pawn), sq);
+    let is_pawn_mover = mover.kind == PieceKind::Pawn;
+    let mut pz = undo.prior_pawn_zobrist;
+    // (a) Mover pawn leaves `from` (always, when a pawn moves at all).
+    if is_pawn_mover {
+        pz ^= pk(us, from);
+    }
+    // (b) A pawn lands on `to` only for a non-promoting pawn move
+    //     (promotions: the pawn leaves, a non-pawn arrives → no pawn in).
+    if is_pawn_mover && mv.promotion_kind().is_none() {
+        pz ^= pk(us, to);
+    }
+    // (c) A captured pawn leaves its actual square (`capture_sq` == `to`
+    //     except for EP, where it is the three-square-delta source).
+    if let Some(victim) = captured
+        && victim.kind == PieceKind::Pawn
+    {
+        pz ^= pk(them, capture_sq);
+    }
+    pos.refresh_pawn_zobrist_from(pz);
 }
 
 /// Apply the incremental eval-triple delta after `make_move` has completed
@@ -3534,6 +3589,495 @@ mod tests {
                     incremental,
                     from_scratch,
                     depth,
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // M6.B Slice B — pawn-Zobrist substream round-trip (ADR-0032).
+    //
+    // The correctness core. These exercise the structural three-XOR delta
+    // (plan §5) across every pawn-touching MoveFlag arm via make/unmake
+    // round-trips and the from-scratch cross-check. They fail with
+    // `unimplemented!` until Slice B (pawn_zobrist plumbing + the
+    // update_zobrist_after_make pawn delta) — the test-first gate.
+    //
+    // Reuses the curated `CASES` corpus + the C4 random-walk proptest infra.
+    // -----------------------------------------------------------------------
+
+    /// Startpos pawn_zobrist is non-zero and equals the from-scratch value.
+    /// (16 pawns of two colors; the XOR of 16 distinct Polyglot pawn keys is
+    /// overwhelmingly non-zero — and is exactly `pawn_zobrist_from_scratch`.)
+    #[test]
+    fn pawn_zobrist_startpos_nonzero_and_from_scratch_matches() {
+        let pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        assert_ne!(
+            pos.pawn_zobrist(),
+            0,
+            "startpos pawn_zobrist must be non-zero (16 pawn keys XORed)"
+        );
+        assert_eq!(
+            pos.pawn_zobrist(),
+            crate::zobrist::pawn_zobrist_from_scratch(&pos),
+            "startpos pawn_zobrist must equal pawn_zobrist_from_scratch"
+        );
+    }
+
+    /// A constructed no-pawn position (KvK): pawn_zobrist == 0. Pins the
+    /// "key==0 is reachable" decision (ADR-0032 §2). No-pawn XOR-fold is the
+    /// empty XOR = 0, and that must equal the from-scratch value.
+    #[test]
+    fn pawn_zobrist_zero_on_no_pawn_position() {
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            pos.pawn_zobrist(),
+            0,
+            "no-pawn position pawn_zobrist must be 0 (empty XOR-fold)"
+        );
+        assert_eq!(
+            pos.pawn_zobrist(),
+            crate::zobrist::pawn_zobrist_from_scratch(&pos),
+            "no-pawn pawn_zobrist must equal pawn_zobrist_from_scratch (both 0)"
+        );
+    }
+
+    /// Generic per-arm round-trip helper: make then unmake on a `CASES`
+    /// entry, asserting (1) prior pawn_zobrist restored byte-exact and
+    /// (2) post-make pawn_zobrist equals the from-scratch value (catches an
+    /// EP/promo desync that the round-trip alone would mask).
+    fn assert_pawn_zobrist_round_trips(label: &str) {
+        let c = case(label);
+        let mut pos = Position::from_fen(c.before)
+            .unwrap_or_else(|e| panic!("pawn-zobrist fixture '{label}' FEN: {e:?}"));
+        let prior = pos.pawn_zobrist();
+        let undo = make_move(&mut pos, c.mv);
+        assert_eq!(
+            pos.pawn_zobrist(),
+            crate::zobrist::pawn_zobrist_from_scratch(&pos),
+            "'{label}': post-make pawn_zobrist diverged from from-scratch"
+        );
+        unmake_move(&mut pos, c.mv, undo);
+        assert_eq!(
+            pos.pawn_zobrist(),
+            prior,
+            "'{label}': pawn_zobrist not restored after unmake"
+        );
+        assert_eq!(
+            pos.pawn_zobrist(),
+            crate::zobrist::pawn_zobrist_from_scratch(&pos),
+            "'{label}': restored pawn_zobrist diverged from from-scratch"
+        );
+    }
+
+    #[test]
+    fn quiet_pawn_pawn_zobrist_roundtrip() {
+        assert_pawn_zobrist_round_trips("quiet_pawn_single_push_white");
+    }
+
+    #[test]
+    fn double_push_pawn_zobrist_roundtrip() {
+        assert_pawn_zobrist_round_trips("double_push_white_sets_ep_e3");
+    }
+
+    /// True pawn×pawn capture: white pawn e4 captures black pawn d5
+    /// (Capture flag, `capture_sq == to == d5`). All three pawn-key sites
+    /// fire: (a) WP out@e4, (b) WP in@d5, (c) BP out@d5. Pins that the
+    /// three-XOR form handles the mover-is-pawn + victim-is-pawn case
+    /// without double-counting.
+    ///
+    /// Expected delta: `prior ^ WP@e4 ^ WP@d5 ^ BP@d5`
+    #[test]
+    fn pawn_capture_pawn_zobrist_roundtrip() {
+        let mut pos = Position::from_fen("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1").unwrap();
+        let prior = pos.pawn_zobrist();
+        let mv = Move::capture(Square::E4, Square::D5);
+        let wp = |sq| crate::zobrist::piece_key(Piece::new(Color::White, PieceKind::Pawn), sq);
+        let bp = |sq| crate::zobrist::piece_key(Piece::new(Color::Black, PieceKind::Pawn), sq);
+        let expected = prior ^ wp(Square::E4) ^ wp(Square::D5) ^ bp(Square::D5);
+        let undo = make_move(&mut pos, mv);
+        assert_eq!(
+            pos.pawn_zobrist(),
+            expected,
+            "pawn×pawn capture: WP out@e4, WP in@d5, BP out@d5"
+        );
+        assert_eq!(
+            pos.pawn_zobrist(),
+            crate::zobrist::pawn_zobrist_from_scratch(&pos),
+            "post-make == from-scratch"
+        );
+        unmake_move(&mut pos, mv, undo);
+        assert_eq!(pos.pawn_zobrist(), prior, "unmake restores");
+    }
+
+    /// Capture of a pawn by a piece (knight×pawn): exercised by the existing
+    /// CASES entry; the dedicated XOR-delta check is in
+    /// `capture_of_pawn_by_piece_pawn_zobrist_roundtrip` below.
+    #[test]
+    fn piece_capture_pawn_zobrist_roundtrip() {
+        assert_pawn_zobrist_round_trips("capture_basic_knight_takes_pawn");
+    }
+
+    /// Capture of a pawn by a piece: knight on f3 takes the e5 pawn. The
+    /// pawn substream loses exactly the black e5 pawn key (mover is not a
+    /// pawn → no (a)/(b) pawn term; victim is a pawn → (c) fires at e5).
+    #[test]
+    fn capture_of_pawn_by_piece_pawn_zobrist_roundtrip() {
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppp1ppp/8/4p3/8/5N2/PPPPPPPP/RNBQKB1R w KQkq - 0 2")
+                .unwrap();
+        let prior = pos.pawn_zobrist();
+        let prior_scratch = crate::zobrist::pawn_zobrist_from_scratch(&pos);
+        let mv = Move::capture(Square::F3, Square::E5);
+        let undo = make_move(&mut pos, mv);
+        // Exactly the e5 black-pawn key toggled out.
+        let bp_e5 =
+            crate::zobrist::piece_key(Piece::new(Color::Black, PieceKind::Pawn), Square::E5);
+        assert_eq!(
+            pos.pawn_zobrist(),
+            prior ^ bp_e5,
+            "capture-of-pawn-by-piece must XOR out exactly the e5 black-pawn key"
+        );
+        assert_eq!(
+            pos.pawn_zobrist(),
+            crate::zobrist::pawn_zobrist_from_scratch(&pos),
+            "post-make pawn_zobrist must equal from-scratch"
+        );
+        unmake_move(&mut pos, mv, undo);
+        assert_eq!(pos.pawn_zobrist(), prior, "pawn_zobrist restored");
+        assert_eq!(
+            crate::zobrist::pawn_zobrist_from_scratch(&pos),
+            prior_scratch,
+            "from-scratch restored"
+        );
+    }
+
+    /// EN PASSANT — the silent-corruption flagship test (research §3.2).
+    /// Asserts the three-square delta: capturer leaves `from`, capturer
+    /// lands on `to`, victim leaves `capture_sq` (which is NOT `to`).
+    ///
+    /// Fixture (white EP): "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", e5xd6 EP.
+    ///   from = e5, to = d6, capture_sq = d5 (NOT d6 — the EP victim is on
+    ///   d5, one rank behind d6).
+    /// Expected post-make pawn_zobrist =
+    ///   prior  ^ WP@e5  ^ WP@d6  ^ BP@d5    (three distinct pawn keys)
+    /// A `capture_sq → to` mutant would XOR BP@d6 instead of BP@d5 — caught
+    /// here AND by the from-scratch cross-check.
+    #[test]
+    fn en_passant_pawn_zobrist_roundtrip() {
+        let mut pos = Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1").unwrap();
+        let prior = pos.pawn_zobrist();
+        let mv = Move::new(Square::E5, Square::D6, MoveFlag::EnPassant);
+        let wp = |sq| crate::zobrist::piece_key(Piece::new(Color::White, PieceKind::Pawn), sq);
+        let bp = |sq| crate::zobrist::piece_key(Piece::new(Color::Black, PieceKind::Pawn), sq);
+        let expected = prior ^ wp(Square::E5) ^ wp(Square::D6) ^ bp(Square::D5);
+        let undo = make_move(&mut pos, mv);
+        assert_eq!(
+            pos.pawn_zobrist(),
+            expected,
+            "EP three-square delta: out WP@e5, in WP@d6, out BP@d5 (NOT d6)"
+        );
+        assert_eq!(
+            pos.pawn_zobrist(),
+            crate::zobrist::pawn_zobrist_from_scratch(&pos),
+            "EP post-make pawn_zobrist must equal from-scratch (kills capture_sq→to)"
+        );
+        unmake_move(&mut pos, mv, undo);
+        assert_eq!(
+            pos.pawn_zobrist(),
+            prior,
+            "EP unmake must restore the prior pawn_zobrist (three-square reverse)"
+        );
+    }
+
+    /// Black EP mirror (the other EP arm): "4k3/8/8/8/3pP3/8/8/4K3 b - e3
+    /// 0 1", d4xe3 EP. capture_sq = e4 (NOT e3).
+    #[test]
+    fn en_passant_black_pawn_zobrist_roundtrip() {
+        let mut pos = Position::from_fen("4k3/8/8/8/3pP3/8/8/4K3 b - e3 0 1").unwrap();
+        let prior = pos.pawn_zobrist();
+        let mv = Move::new(Square::D4, Square::E3, MoveFlag::EnPassant);
+        let wp = |sq| crate::zobrist::piece_key(Piece::new(Color::White, PieceKind::Pawn), sq);
+        let bp = |sq| crate::zobrist::piece_key(Piece::new(Color::Black, PieceKind::Pawn), sq);
+        let expected = prior ^ bp(Square::D4) ^ bp(Square::E3) ^ wp(Square::E4);
+        let undo = make_move(&mut pos, mv);
+        assert_eq!(
+            pos.pawn_zobrist(),
+            expected,
+            "black EP: out BP@d4, in BP@e3, out WP@e4 (NOT e3)"
+        );
+        assert_eq!(
+            pos.pawn_zobrist(),
+            crate::zobrist::pawn_zobrist_from_scratch(&pos),
+            "black EP post-make must equal from-scratch"
+        );
+        unmake_move(&mut pos, mv, undo);
+        assert_eq!(pos.pawn_zobrist(), prior, "black EP unmake restores");
+    }
+
+    /// Each of the 4 promotions (no capture): pawn leaves `from`, NO pawn
+    /// lands on `to` (a non-pawn arrives). Post-make pawn_zobrist =
+    /// prior ^ WP@e7  (one term only).
+    #[test]
+    fn each_promo_pawn_zobrist_roundtrip() {
+        for flag in [
+            MoveFlag::QueenPromo,
+            MoveFlag::RookPromo,
+            MoveFlag::BishopPromo,
+            MoveFlag::KnightPromo,
+        ] {
+            let mut pos = Position::from_fen("5k2/4P3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+            let prior = pos.pawn_zobrist();
+            let mv = Move::new(Square::E7, Square::E8, flag);
+            let wp_e7 =
+                crate::zobrist::piece_key(Piece::new(Color::White, PieceKind::Pawn), Square::E7);
+            let undo = make_move(&mut pos, mv);
+            assert_eq!(
+                pos.pawn_zobrist(),
+                prior ^ wp_e7,
+                "{flag:?}: promotion removes WP@e7 and adds NO pawn at e8"
+            );
+            assert_eq!(
+                pos.pawn_zobrist(),
+                crate::zobrist::pawn_zobrist_from_scratch(&pos),
+                "{flag:?}: post-make must equal from-scratch"
+            );
+            unmake_move(&mut pos, mv, undo);
+            assert_eq!(
+                pos.pawn_zobrist(),
+                prior,
+                "{flag:?}: unmake restores pawn_zobrist"
+            );
+        }
+    }
+
+    /// Each of the 4 promo-captures with a NON-pawn victim (knight on f8):
+    /// pawn leaves `from`, no pawn lands on `to`, victim is not a pawn so
+    /// (c) does not fire. Post-make pawn_zobrist = prior ^ WP@e7.
+    #[test]
+    fn each_promo_capture_nonpawn_victim_pawn_zobrist_roundtrip() {
+        for flag in [
+            MoveFlag::QueenPromoCapture,
+            MoveFlag::RookPromoCapture,
+            MoveFlag::BishopPromoCapture,
+            MoveFlag::KnightPromoCapture,
+        ] {
+            let mut pos = Position::from_fen("4kn2/4P3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+            let prior = pos.pawn_zobrist();
+            let mv = Move::new(Square::E7, Square::F8, flag);
+            let wp_e7 =
+                crate::zobrist::piece_key(Piece::new(Color::White, PieceKind::Pawn), Square::E7);
+            let undo = make_move(&mut pos, mv);
+            assert_eq!(
+                pos.pawn_zobrist(),
+                prior ^ wp_e7,
+                "{flag:?} (knight victim): only WP@e7 toggled (no pawn victim)"
+            );
+            assert_eq!(
+                pos.pawn_zobrist(),
+                crate::zobrist::pawn_zobrist_from_scratch(&pos),
+                "{flag:?}: post-make must equal from-scratch"
+            );
+            unmake_move(&mut pos, mv, undo);
+            assert_eq!(pos.pawn_zobrist(), prior, "{flag:?}: unmake restores");
+        }
+    }
+
+    /// Underpromotion-capture of a PAWN by a pawn (the second silent-
+    /// corruption flagship, research §3.2): black pawn on g2 captures the
+    /// white pawn... we need a pawn diagonally promotable onto a pawn. Build
+    /// it by hand: black pawn b2, white pawn a1 is impossible (rank 1). Use
+    /// a white pawn capturing a black pawn on promotion: white b7 pawn
+    /// captures a BLACK PAWN on a8?? pawns cannot be on rank 8. So the
+    /// promo-capture victim pawn must be on rank 7 for a black promo-capture
+    /// to rank... no — pawns never sit on rank 1 or 8.
+    ///
+    /// The genuine pawn×pawn promo-capture: a white pawn on b7 promo-
+    /// captures a piece on a8; the *victim* is whatever stands on a8. A
+    /// pawn cannot be on a8. Therefore a pawn-victim promo-capture is
+    /// geometrically impossible in standard chess — the victim of a
+    /// promo-capture is always on the back rank, where pawns cannot stand.
+    ///
+    /// Plan §9 nonetheless names `underpromo_capture_of_pawn_pawn_zobrist_
+    /// roundtrip` ("pawn×pawn promo-cap, two pawn removals"). The closest
+    /// REACHABLE two-pawn-removal arm is an EN PASSANT capture (capturer
+    /// pawn + victim pawn, two pawn keys toggled out plus one in). That is
+    /// already covered by `en_passant_pawn_zobrist_roundtrip`. To honor the
+    /// plan's intent (a promo-capture whose structural (a)+(c) BOTH fire on
+    /// pawn keys) we instead pin the structural property directly: a
+    /// promo-capture's (b) is suppressed and (a) toggles the pawn; combined
+    /// with an EP-style two-pawn case this covers the "two pawn removals"
+    /// failure mode. We assert the (a)-only promo-capture pawn term here on
+    /// the reachable knight-victim arm and document the geometric
+    /// impossibility — a broken impl that mishandles a hypothetical pawn
+    /// victim cannot be exercised because the position is illegal.
+    ///
+    /// PLAN AMBIGUITY (noted, defensible reading chosen): the named
+    /// `underpromo_capture_of_pawn` fixture describes a geometrically
+    /// impossible position (promo-capture victims sit on the back rank;
+    /// pawns never do). The two-pawn-removal failure mode it targets is
+    /// fully covered by the EP round-trip (capturer + victim, both pawns).
+    /// This test pins the promo-capture structural shape on the reachable
+    /// arm and records the impossibility rather than committing an
+    /// un-constructible fixture.
+    #[test]
+    fn underpromo_capture_two_pawn_removal_failure_mode_covered() {
+        // Reachable surrogate for "two pawn keys removed in one move": EP.
+        // (Capturer pawn leaves `from`, victim pawn leaves `capture_sq`.)
+        let mut pos = Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1").unwrap();
+        let prior = pos.pawn_zobrist();
+        let mv = Move::new(Square::E5, Square::D6, MoveFlag::EnPassant);
+        let wp = |sq| crate::zobrist::piece_key(Piece::new(Color::White, PieceKind::Pawn), sq);
+        let bp = |sq| crate::zobrist::piece_key(Piece::new(Color::Black, PieceKind::Pawn), sq);
+        let undo = make_move(&mut pos, mv);
+        // Two pawn removals (e5 capturer out of `from`, d5 victim out of
+        // capture_sq) plus the one in at d6 — exactly three pawn-key XORs.
+        assert_eq!(
+            pos.pawn_zobrist(),
+            prior ^ wp(Square::E5) ^ wp(Square::D6) ^ bp(Square::D5),
+            "two-pawn-removal arm: capturer + victim pawn keys both toggled"
+        );
+        unmake_move(&mut pos, mv, undo);
+        assert_eq!(
+            pos.pawn_zobrist(),
+            prior,
+            "two-pawn-removal unmake restores"
+        );
+
+        // Reachable promo-capture (knight victim): (a) toggles the pawn,
+        // (b) suppressed (non-pawn promoted), (c) no pawn victim. Confirms
+        // the promo-capture pawn term is the (a)-only single XOR.
+        let mut pos2 = Position::from_fen("4kn2/4P3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let prior2 = pos2.pawn_zobrist();
+        let mv2 = Move::new(Square::E7, Square::F8, MoveFlag::KnightPromoCapture);
+        let undo2 = make_move(&mut pos2, mv2);
+        assert_eq!(
+            pos2.pawn_zobrist(),
+            prior2 ^ wp(Square::E7),
+            "promo-capture pawn term is (a)-only (single XOR; (b) suppressed)"
+        );
+        unmake_move(&mut pos2, mv2, undo2);
+        assert_eq!(pos2.pawn_zobrist(), prior2, "promo-capture unmake restores");
+    }
+
+    /// Non-pawn quiet move: knight g1→f3. Pawn substream delta is 0.
+    #[test]
+    fn pawn_zobrist_unchanged_on_non_pawn_quiet() {
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let prior = pos.pawn_zobrist();
+        let mv = Move::quiet(Square::G1, Square::F3);
+        let undo = make_move(&mut pos, mv);
+        assert_eq!(
+            pos.pawn_zobrist(),
+            prior,
+            "knight move must not change pawn_zobrist (delta 0)"
+        );
+        assert_eq!(
+            pos.pawn_zobrist(),
+            crate::zobrist::pawn_zobrist_from_scratch(&pos),
+            "post-make pawn_zobrist must still equal from-scratch"
+        );
+        unmake_move(&mut pos, mv, undo);
+        assert_eq!(pos.pawn_zobrist(), prior, "unmake restores (unchanged)");
+    }
+
+    /// Castling never moves a pawn → pawn_zobrist unchanged.
+    #[test]
+    fn pawn_zobrist_unchanged_on_castling() {
+        let mut pos = Position::from_fen("4k3/8/8/8/8/8/8/4K2R w K - 0 1").unwrap();
+        let prior = pos.pawn_zobrist();
+        let mv = Move::new(Square::E1, Square::G1, MoveFlag::KingCastle);
+        let undo = make_move(&mut pos, mv);
+        assert_eq!(
+            pos.pawn_zobrist(),
+            prior,
+            "castling must not change pawn_zobrist"
+        );
+        assert_eq!(
+            pos.pawn_zobrist(),
+            crate::zobrist::pawn_zobrist_from_scratch(&pos),
+            "post-castle pawn_zobrist must equal from-scratch"
+        );
+        unmake_move(&mut pos, mv, undo);
+        assert_eq!(pos.pawn_zobrist(), prior, "castle unmake restores");
+    }
+
+    /// Null move never moves a pawn → pawn_zobrist untouched (plan §5).
+    #[test]
+    fn pawn_zobrist_unchanged_on_null_move() {
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let prior = pos.pawn_zobrist();
+        let undo = make_null_move(&mut pos);
+        assert_eq!(
+            pos.pawn_zobrist(),
+            prior,
+            "null move must not change pawn_zobrist"
+        );
+        assert_eq!(
+            pos.pawn_zobrist(),
+            crate::zobrist::pawn_zobrist_from_scratch(&pos),
+            "post-null pawn_zobrist must equal from-scratch"
+        );
+        unmake_null_move(&mut pos, undo);
+        assert_eq!(pos.pawn_zobrist(), prior, "null unmake restores");
+    }
+
+    proptest! {
+        /// Property: a random legal-move walk keeps `pos.pawn_zobrist()`
+        /// equal to `pawn_zobrist_from_scratch(pos)` at EVERY ply (reuses
+        /// the C4 random-walk infra). The always-on incremental-vs-scratch
+        /// guarantee for the pawn substream.
+        #[test]
+        fn prop_pawn_zobrist_matches_from_scratch_random_walk(seed in 0u64..u64::MAX) {
+            const UCI_SEED_FENS: &[&str] = &[
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+                "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+                "r2q1rk1/pP1p2pp/Q4n2/bbp1p3/Np6/1B3NBn/pPPP1PPP/R3K2R b KQ - 0 1",
+                "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+                "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+            ];
+            let fen_idx = (seed as usize) % UCI_SEED_FENS.len();
+            let mut pos = Position::from_fen(UCI_SEED_FENS[fen_idx]).unwrap();
+
+            // Pre-walk consistency.
+            prop_assert_eq!(
+                pos.pawn_zobrist(),
+                crate::zobrist::pawn_zobrist_from_scratch(&pos),
+                "pawn_zobrist diverged at ply 0",
+            );
+
+            let mut state = seed;
+            let mut stack: Vec<(Move, Undo)> = Vec::with_capacity(4);
+            for _ in 0..4 {
+                let mut ml = crate::movegen::MoveList::new();
+                crate::movegen::generate_moves(&pos, &mut ml);
+                if ml.is_empty() {
+                    break;
+                }
+                state = state.wrapping_add(0x9E3779B97F4A7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z ^= z >> 31;
+                let mv = ml.as_slice()[(z as usize) % ml.len()];
+                let undo = make_move(&mut pos, mv);
+                stack.push((mv, undo));
+                prop_assert_eq!(
+                    pos.pawn_zobrist(),
+                    crate::zobrist::pawn_zobrist_from_scratch(&pos),
+                    "pawn_zobrist diverged after make at ply {}", stack.len(),
+                );
+            }
+            while let Some((mv, undo)) = stack.pop() {
+                unmake_move(&mut pos, mv, undo);
+                prop_assert_eq!(
+                    pos.pawn_zobrist(),
+                    crate::zobrist::pawn_zobrist_from_scratch(&pos),
+                    "pawn_zobrist diverged after unmake",
                 );
             }
         }

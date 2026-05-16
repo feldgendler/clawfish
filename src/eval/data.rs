@@ -14,6 +14,57 @@
 //! a8, index 63 = h1). The `build_psqt` function in the parent module
 //! applies the LERF ↔ PeSTO flip via `sq ^ 56` before populating `PSQT`.
 
+// ---------------------------------------------------------------------------
+// M6.B pawn-structure weight constants. Source: docs/research/m6-pawn-
+// structure.md §6 (literature defaults).
+//
+// **Shipped config: connected-pawn term only.** ISO/DBL/BWD weights are
+// **zeroed** — a per-term SPRT screen + confirmation vs `M6.A` proved each
+// term individually positive-to-neutral (ISO +82.7, DBL +31.4, BWD −7.5,
+// CONN +103.1) yet every multi-term subset collapses via a connectivity-axis
+// double-count (ISO×CONN −197.9; all-four −99.9). CONN-only is the largest
+// confirmed gain (+103.1 [+65.5, +143.1] H1) and is interaction-immune.
+// ISO/DBL/BWD are kept as named tunable constants (the term math in
+// `pawns::pawn_eval` still references them at zero weight, M6.F-ready);
+// **M6.F re-introduces them via joint Texel** against the CONN-only baseline.
+// ADR-0032 §7; docs/milestones/m6.b.md.
+//
+// These are data constants, not logic. They are excluded from `cargo mutants`
+// per `.cargo/mutants.toml` alongside the PST arrays.
+// ---------------------------------------------------------------------------
+
+/// Isolated pawn penalty, middlegame (per pawn). Negative = penalty.
+/// Zeroed in the shipped CONN-only config (M6.F re-tunes); see block comment.
+pub(crate) const ISO_MG: i32 = 0;
+/// Isolated pawn penalty, endgame (per pawn). Zeroed — see `ISO_MG`.
+pub(crate) const ISO_EG: i32 = 0;
+
+/// Doubled pawn penalty, middlegame (per *extra* pawn on a file).
+/// Zeroed in the shipped CONN-only config (M6.F re-tunes); see block comment.
+pub(crate) const DBL_MG: i32 = 0;
+/// Doubled pawn penalty, endgame. Zeroed — see `DBL_MG`.
+pub(crate) const DBL_EG: i32 = 0;
+
+/// Backward pawn penalty, middlegame (CPW-simple predicate).
+/// Zeroed in the shipped CONN-only config (M6.F re-tunes); see block comment.
+pub(crate) const BWD_MG: i32 = 0;
+/// Backward pawn penalty, endgame. Zeroed — see `BWD_MG`.
+pub(crate) const BWD_EG: i32 = 0;
+
+/// Connected pawn bonus table, middlegame. Indexed by relative rank (0..7).
+/// Relative rank = `sq.rank()` for white; `7 - sq.rank()` for black.
+/// Indices 0 and 1 are 0: rank-0 is the back rank (unreachable for a pawn),
+/// rank-1 is the starting rank (no advancement bonus). Indices 2..7 hold the
+/// literature-default rank-scaled bonuses from research §1.4 (chess ranks 3–8
+/// / relative ranks 2–7). Index 7 = promotion rank, kept in the table for
+/// completeness but never hit mid-search.
+#[rustfmt::skip]
+pub(crate) const CONN_MG: [i32; 8] = [0, 0, 3, 7, 13, 22, 40, 70];
+
+/// Connected pawn bonus table, endgame. Same indexing as `CONN_MG`.
+#[rustfmt::skip]
+pub(crate) const CONN_EG: [i32; 8] = [0, 0, 5, 10, 18, 30, 55, 95];
+
 /// Centipawn material values indexed by `PieceKind::index()` (P=0 … K=5).
 /// King material is 0 — kings are never captured; the king PST term is
 /// purely positional.

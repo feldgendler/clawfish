@@ -189,6 +189,72 @@ impl Bitboard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fill / front-span primitives (M6.B, ADR-0032). General-purpose: also used
+// by M6.C/M6.E. Stubbed for the test-first gate — Slice A implements.
+//
+// `#[allow(dead_code)]` per fn: the non-test consumers (`eval::pawns` term
+// helpers) land in Slice C; the in-module tests exercise them now. Same
+// rationale as the plan-mandated allow on `AlphaBetaMover::pawn_hash`.
+// ---------------------------------------------------------------------------
+
+/// Northward (toward rank 8) flood fill: every square at or above an input
+/// square's rank, on that square's file.
+#[allow(dead_code)]
+pub(crate) const fn north_fill(bb: Bitboard) -> Bitboard {
+    // Kogge-Stone fill: 7 shifts cover all 8 ranks.
+    let bb = Bitboard(bb.0 | (bb.0 << 8));
+    let bb = Bitboard(bb.0 | (bb.0 << 16));
+    Bitboard(bb.0 | (bb.0 << 32))
+}
+
+/// Southward (toward rank 1) flood fill.
+#[allow(dead_code)]
+pub(crate) const fn south_fill(bb: Bitboard) -> Bitboard {
+    let bb = Bitboard(bb.0 | (bb.0 >> 8));
+    let bb = Bitboard(bb.0 | (bb.0 >> 16));
+    Bitboard(bb.0 | (bb.0 >> 32))
+}
+
+/// Full-file fill: every square on any file occupied by an input square
+/// (`north_fill | south_fill`). Idempotent.
+#[allow(dead_code)]
+pub(crate) const fn file_fill(bb: Bitboard) -> Bitboard {
+    Bitboard(north_fill(bb).0 | south_fill(bb).0)
+}
+
+/// White front spans: squares strictly ahead (toward rank 8) of each input
+/// pawn on its own file. **Excludes** the pawn's own square (off-by-one
+/// guard — e5 → {e6,e7,e8}).
+#[allow(dead_code)]
+pub(crate) const fn white_front_spans(bb: Bitboard) -> Bitboard {
+    // Shift one step north first so the pawn's own square is excluded.
+    north_fill(bb.shift_north())
+}
+
+/// Black front spans: squares strictly ahead (toward rank 1) of each input
+/// pawn on its own file. Excludes the pawn's own square.
+#[allow(dead_code)]
+pub(crate) const fn black_front_spans(bb: Bitboard) -> Bitboard {
+    south_fill(bb.shift_south())
+}
+
+/// White attack-front spans: the white front spans widened east and west
+/// (the diagonal capture files ahead of each pawn).
+#[allow(dead_code)]
+pub(crate) const fn white_attack_front_spans(bb: Bitboard) -> Bitboard {
+    let spans = white_front_spans(bb);
+    // shift_east/west already mask FILE_H/FILE_A — no wrap.
+    Bitboard(spans.0 | spans.shift_east().0 | spans.shift_west().0)
+}
+
+/// Black attack-front spans: black front spans widened east and west.
+#[allow(dead_code)]
+pub(crate) const fn black_attack_front_spans(bb: Bitboard) -> Bitboard {
+    let spans = black_front_spans(bb);
+    Bitboard(spans.0 | spans.shift_east().0 | spans.shift_west().0)
+}
+
 impl ops::BitAnd for Bitboard {
     type Output = Bitboard;
     #[inline]
@@ -952,6 +1018,654 @@ mod tests {
         assert!(
             !(Bitboard::DARK_SQUARES & h1).any(),
             "h1 must not be in DARK_SQUARES"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M6.B Slice A — fill / front-span primitives (ADR-0032).
+    //
+    // Hand-derived expected sets in every comment. These fail with
+    // `unimplemented!` until Slice A — the test-first gate; assertions are
+    // correct against the research-note definitions.
+    // -----------------------------------------------------------------------
+
+    use super::{
+        black_attack_front_spans, black_front_spans, file_fill, north_fill, south_fill,
+        white_attack_front_spans, white_front_spans,
+    };
+
+    /// north_fill of a single square fills that square and every square
+    /// above it on the same file. e4 (rank idx 3, e-file) → {e4,e5,e6,e7,e8}.
+    #[test]
+    fn north_fill_single_square() {
+        let got = north_fill(Bitboard::from_square(Square::E4));
+        let want = Bitboard::from_square(Square::E4)
+            | Bitboard::from_square(Square::E5)
+            | Bitboard::from_square(Square::E6)
+            | Bitboard::from_square(Square::E7)
+            | Bitboard::from_square(Square::E8);
+        assert_eq!(got, want, "north_fill(e4) = {{e4..e8}}");
+    }
+
+    /// south_fill of a single square fills that square and every square
+    /// below it. e4 → {e1,e2,e3,e4}.
+    #[test]
+    fn south_fill_single_square() {
+        let got = south_fill(Bitboard::from_square(Square::E4));
+        let want = Bitboard::from_square(Square::E1)
+            | Bitboard::from_square(Square::E2)
+            | Bitboard::from_square(Square::E3)
+            | Bitboard::from_square(Square::E4);
+        assert_eq!(got, want, "south_fill(e4) = {{e1..e4}}");
+    }
+
+    /// file_fill of a single square fills the entire file. e4 → FILE_E.
+    #[test]
+    fn file_fill_single_square_fills_whole_file() {
+        assert_eq!(
+            file_fill(Bitboard::from_square(Square::E4)),
+            Bitboard::FILE_E,
+            "file_fill(e4) = FILE_E (whole e-file)"
+        );
+    }
+
+    /// Fills of the empty set are empty.
+    #[test]
+    fn fills_of_empty_are_empty() {
+        assert_eq!(north_fill(Bitboard::EMPTY), Bitboard::EMPTY);
+        assert_eq!(south_fill(Bitboard::EMPTY), Bitboard::EMPTY);
+        assert_eq!(file_fill(Bitboard::EMPTY), Bitboard::EMPTY);
+    }
+
+    /// north_fill of a full file is that full file (already saturated).
+    #[test]
+    fn north_fill_full_file_is_idempotent_set() {
+        assert_eq!(
+            north_fill(Bitboard::FILE_A),
+            Bitboard::FILE_A,
+            "north_fill(FILE_A) = FILE_A"
+        );
+        assert_eq!(
+            south_fill(Bitboard::FILE_H),
+            Bitboard::FILE_H,
+            "south_fill(FILE_H) = FILE_H"
+        );
+    }
+
+    /// file_fill is idempotent: file_fill(file_fill(x)) == file_fill(x).
+    /// Property over random u64 bit patterns.
+    #[test]
+    fn file_fill_idempotent_property() {
+        use proptest::prelude::*;
+        proptest!(|(bits in any::<u64>())| {
+            let x = Bitboard(bits);
+            let once = file_fill(x);
+            prop_assert_eq!(file_fill(once), once, "file_fill must be idempotent");
+        });
+    }
+
+    /// white_front_spans EXCLUDES the pawn's own square (off-by-one guard).
+    /// White e5 → {e6,e7,e8} — NOT e5.
+    #[test]
+    fn white_front_spans_excludes_own_square() {
+        let got = white_front_spans(Bitboard::from_square(Square::E5));
+        let want = Bitboard::from_square(Square::E6)
+            | Bitboard::from_square(Square::E7)
+            | Bitboard::from_square(Square::E8);
+        assert_eq!(
+            got, want,
+            "white_front_spans(e5) = {{e6,e7,e8}} (excludes e5)"
+        );
+        assert!(
+            !got.contains(Square::E5),
+            "white front span must NOT include the pawn's own square"
+        );
+    }
+
+    /// black_front_spans excludes own square; ahead for black is toward
+    /// rank 1. Black e5 → {e4,e3,e2,e1} — NOT e5.
+    #[test]
+    fn black_front_spans_excludes_own_square() {
+        let got = black_front_spans(Bitboard::from_square(Square::E5));
+        let want = Bitboard::from_square(Square::E4)
+            | Bitboard::from_square(Square::E3)
+            | Bitboard::from_square(Square::E2)
+            | Bitboard::from_square(Square::E1);
+        assert_eq!(
+            got, want,
+            "black_front_spans(e5) = {{e4,e3,e2,e1}} (excludes e5)"
+        );
+        assert!(
+            !got.contains(Square::E5),
+            "black front span must NOT include the pawn's own square"
+        );
+    }
+
+    /// white front span of a pawn already on rank 8 is empty (nothing ahead).
+    #[test]
+    fn white_front_span_rank8_empty() {
+        assert_eq!(
+            white_front_spans(Bitboard::from_square(Square::E8)),
+            Bitboard::EMPTY,
+            "no squares ahead of a rank-8 white pawn"
+        );
+    }
+
+    /// black front span of a pawn on rank 1 is empty.
+    #[test]
+    fn black_front_span_rank1_empty() {
+        assert_eq!(
+            black_front_spans(Bitboard::from_square(Square::E1)),
+            Bitboard::EMPTY,
+            "no squares ahead of a rank-1 black pawn"
+        );
+    }
+
+    /// white_attack_front_spans = white front spans widened E/W (the
+    /// diagonal capture files ahead). White d4 → front span {d5,d6,d7,d8},
+    /// widened east/west ⇒ also the c- and e-file squares at ranks 5..8.
+    /// Expected = {c,d,e files} × {ranks 5..8}.
+    #[test]
+    fn white_attack_front_spans_cover_diagonal_files() {
+        let got = white_attack_front_spans(Bitboard::from_square(Square::D4));
+        let mut want = Bitboard::EMPTY;
+        for sq in [
+            // d-file ahead
+            Square::D5,
+            Square::D6,
+            Square::D7,
+            Square::D8,
+            // c-file (west widen)
+            Square::C5,
+            Square::C6,
+            Square::C7,
+            Square::C8,
+            // e-file (east widen)
+            Square::E5,
+            Square::E6,
+            Square::E7,
+            Square::E8,
+        ] {
+            want |= Bitboard::from_square(sq);
+        }
+        assert_eq!(
+            got, want,
+            "white_attack_front_spans(d4) = c/d/e files at ranks 5..8"
+        );
+    }
+
+    /// black_attack_front_spans = black front spans widened E/W. Black d5 →
+    /// front span {d4,d3,d2,d1}, widen E/W ⇒ also c- and e-file at ranks
+    /// 1..4. Expected = {c,d,e files} × {ranks 1..4}.
+    #[test]
+    fn black_attack_front_spans_cover_diagonal_files() {
+        let got = black_attack_front_spans(Bitboard::from_square(Square::D5));
+        let mut want = Bitboard::EMPTY;
+        for sq in [
+            Square::D4,
+            Square::D3,
+            Square::D2,
+            Square::D1,
+            Square::C4,
+            Square::C3,
+            Square::C2,
+            Square::C1,
+            Square::E4,
+            Square::E3,
+            Square::E2,
+            Square::E1,
+        ] {
+            want |= Bitboard::from_square(sq);
+        }
+        assert_eq!(
+            got, want,
+            "black_attack_front_spans(d5) = c/d/e files at ranks 1..4"
+        );
+    }
+
+    /// a-file edge: white_attack_front_spans must not wrap to the h-file.
+    /// White a4 → front span {a5..a8}, east-widen ⇒ b-file {b5..b8}; the
+    /// west-widen off the a-file is discarded (no wrap). Expected = a/b
+    /// files ranks 5..8 only.
+    #[test]
+    fn white_attack_front_spans_a_file_no_wrap() {
+        let got = white_attack_front_spans(Bitboard::from_square(Square::A4));
+        let mut want = Bitboard::EMPTY;
+        for sq in [
+            Square::A5,
+            Square::A6,
+            Square::A7,
+            Square::A8,
+            Square::B5,
+            Square::B6,
+            Square::B7,
+            Square::B8,
+        ] {
+            want |= Bitboard::from_square(sq);
+        }
+        assert_eq!(
+            got, want,
+            "a-file attack-front-span must not wrap onto the h-file"
+        );
+    }
+
+    /// h-file edge: white_attack_front_spans must not wrap to the a-file.
+    /// White h4 → front span {h5..h8}, west-widen ⇒ g-file {g5..g8}; the
+    /// east-widen off the h-file is discarded (no wrap). Expected = g/h
+    /// files ranks 5..8 only.
+    #[test]
+    fn white_attack_front_spans_h_file_no_wrap() {
+        let got = white_attack_front_spans(Bitboard::from_square(Square::H4));
+        let mut want = Bitboard::EMPTY;
+        for sq in [
+            Square::G5,
+            Square::G6,
+            Square::G7,
+            Square::G8,
+            Square::H5,
+            Square::H6,
+            Square::H7,
+            Square::H8,
+        ] {
+            want |= Bitboard::from_square(sq);
+        }
+        assert_eq!(
+            got, want,
+            "h-file attack-front-span must not wrap onto the a-file"
+        );
+    }
+
+    /// a-file edge: black_attack_front_spans must not wrap to the h-file.
+    /// Black a5 → front span (toward rank 1) {a4..a1}, east-widen ⇒
+    /// b-file {b4..b1}; west-widen off a-file discarded. Expected = a/b
+    /// files ranks 1..4 only.
+    #[test]
+    fn black_attack_front_spans_a_file_no_wrap() {
+        let got = black_attack_front_spans(Bitboard::from_square(Square::A5));
+        let mut want = Bitboard::EMPTY;
+        for sq in [
+            Square::A1,
+            Square::A2,
+            Square::A3,
+            Square::A4,
+            Square::B1,
+            Square::B2,
+            Square::B3,
+            Square::B4,
+        ] {
+            want |= Bitboard::from_square(sq);
+        }
+        assert_eq!(
+            got, want,
+            "a-file black attack-front-span must not wrap onto the h-file"
+        );
+    }
+
+    /// h-file edge: black_attack_front_spans must not wrap to the a-file.
+    /// Black h5 → front span {h4..h1}, west-widen ⇒ g-file {g4..g1}; the
+    /// east-widen off the h-file is discarded (no wrap). Expected = g/h
+    /// files ranks 1..4 only.
+    #[test]
+    fn black_attack_front_spans_h_file_no_wrap() {
+        let got = black_attack_front_spans(Bitboard::from_square(Square::H5));
+        let mut want = Bitboard::EMPTY;
+        for sq in [
+            Square::G1,
+            Square::G2,
+            Square::G3,
+            Square::G4,
+            Square::H1,
+            Square::H2,
+            Square::H3,
+            Square::H4,
+        ] {
+            want |= Bitboard::from_square(sq);
+        }
+        assert_eq!(
+            got, want,
+            "h-file black attack-front-span must not wrap onto the a-file"
+        );
+    }
+
+    /// Overlapping-operand union for `white_attack_front_spans` — adjacent
+    /// input files force the three union terms to overlap on shared squares,
+    /// exposing any `|→^` substitution.
+    ///
+    /// Input: white pawns c2 and d2.
+    ///
+    /// Step-by-step derivation:
+    ///   white_front_spans(c2|d2) = north_fill(c3|d3) = {c3..c8} | {d3..d8}.
+    ///   Let `spans` = c3..c8 ∪ d3..d8.
+    ///   spans.shift_east()  = d3..d8 ∪ e3..e8   (c→d, d→e)
+    ///   spans.shift_west()  = b3..b8 ∪ c3..c8   (c→b, d→c)
+    ///
+    ///   spans ∩ spans.shift_east()  = d3..d8  (non-empty — d-file overlap)
+    ///   spans ∩ spans.shift_west()  = c3..c8  (non-empty — c-file overlap)
+    ///
+    ///   Correct union ( | ): b3..b8 ∪ c3..c8 ∪ d3..d8 ∪ e3..e8  (24 squares)
+    ///   Under `|→^` at first  `|`: (spans ^ east) | west
+    ///     spans ^ east = c3..c8 ∪ e3..e8  (d cancels) → | west = b3..b8 ∪ c3..c8 ∪ e3..e8
+    ///     (d-file absent — 6 squares dropped)
+    ///   Under `|→^` at second `|`: spans | (east ^ west)
+    ///     east ^ west = b3..b8 ∪ e3..e8  (c,d cancel? No — c is in west only
+    ///     [from d→c], d is in east only [from c→d]; e is in east only; b is in
+    ///     west only → east ^ west = b3..b8 ∪ d3..d8 ∪ e3..e8)
+    ///     wait: east = d3..d8 | e3..e8; west = b3..b8 | c3..c8 → no overlap
+    ///     east ^ west = b3..b8 | c3..c8 | d3..d8 | e3..e8. Then spans | above
+    ///     = correct. (The second `^` mutant is invisible here — this fixture
+    ///     is designed to kill only the first-`|` mutants; the exact-equality
+    ///     assertion still pins the full 24-square result against any accidental
+    ///     output change.)
+    ///
+    ///   LERF hex: b/c/d/e files on ranks 3–8 each contribute 0x1E in their
+    ///   rank byte (b=bit1, c=bit2, d=bit3, e=bit4 within the byte → 0b0001_1110).
+    ///   Bytes 0–1 (ranks 1–2) = 0x00; bytes 2–7 (ranks 3–8) = 0x1E each.
+    ///   Expected = 0x1E1E_1E1E_1E1E_0000.
+    #[test]
+    fn white_attack_front_spans_adjacent_files_union_not_xor() {
+        let input = Bitboard::from_square(Square::C2) | Bitboard::from_square(Square::D2);
+        let got = white_attack_front_spans(input);
+
+        // Hand-enumerated expected set: b/c/d/e files, ranks 3–8.
+        let mut want = Bitboard::EMPTY;
+        for sq in [
+            // b-file ranks 3–8
+            Square::B3,
+            Square::B4,
+            Square::B5,
+            Square::B6,
+            Square::B7,
+            Square::B8,
+            // c-file ranks 3–8
+            Square::C3,
+            Square::C4,
+            Square::C5,
+            Square::C6,
+            Square::C7,
+            Square::C8,
+            // d-file ranks 3–8
+            Square::D3,
+            Square::D4,
+            Square::D5,
+            Square::D6,
+            Square::D7,
+            Square::D8,
+            // e-file ranks 3–8
+            Square::E3,
+            Square::E4,
+            Square::E5,
+            Square::E6,
+            Square::E7,
+            Square::E8,
+        ] {
+            want |= Bitboard::from_square(sq);
+        }
+        // LERF hex: 0x1E1E_1E1E_1E1E_0000 (b/c/d/e bits set in each rank byte
+        // for ranks 3–8; ranks 1–2 zero).
+        assert_eq!(
+            want,
+            Bitboard(0x1E1E_1E1E_1E1E_0000),
+            "hand-derived hex sanity check"
+        );
+        assert_eq!(
+            got, want,
+            "white_attack_front_spans(c2|d2): spans and east-shift overlap on the \
+             d-file, west-shift overlaps on the c-file; correct | keeps all 24 squares, \
+             |→^ drops the 6 d-file squares (first mutant) or 6 c-file squares (second)"
+        );
+    }
+
+    /// Overlapping-operand union for `black_attack_front_spans` — adjacent
+    /// input files force all three union terms to share squares.
+    ///
+    /// Input: black pawns c7 and d7.
+    ///
+    /// Step-by-step derivation:
+    ///   black_front_spans(c7|d7) = south_fill(c6|d6) = {c1..c6} | {d1..d6}.
+    ///   Let `spans` = c1..c6 ∪ d1..d6.
+    ///   spans.shift_east()  = d1..d6 ∪ e1..e6   (c→d, d→e)
+    ///   spans.shift_west()  = b1..b6 ∪ c1..c6   (c→b, d→c)
+    ///
+    ///   spans ∩ spans.shift_east()  = d1..d6  (d-file overlap, non-empty)
+    ///   spans ∩ spans.shift_west()  = c1..c6  (c-file overlap, non-empty)
+    ///
+    ///   Correct union ( | ): b1..b6 ∪ c1..c6 ∪ d1..d6 ∪ e1..e6  (24 squares)
+    ///   Under `|→^` at first  `|`: (spans ^ east) | west
+    ///     spans ^ east = c1..c6 ∪ e1..e6  (d cancels) → | west = b1..b6 ∪ c1..c6 ∪ e1..e6
+    ///     (d-file missing — 6 squares dropped)
+    ///   Under `|→^` at second `|`: spans | (east ^ west)
+    ///     east = d1..d6 | e1..e6; west = b1..b6 | c1..c6 — no overlap
+    ///     east ^ west = east | west → spans | above = correct. (Same argument
+    ///     as white case: second `^` is invisible here; exact-equality still
+    ///     guards the full 24-square result.)
+    ///
+    ///   LERF hex: b/c/d/e files on ranks 1–6 each contribute 0x1E in their
+    ///   rank byte. Bytes 0–5 (ranks 1–6) = 0x1E; bytes 6–7 (ranks 7–8) = 0x00.
+    ///   Expected = 0x0000_1E1E_1E1E_1E1E.
+    #[test]
+    fn black_attack_front_spans_adjacent_files_union_not_xor() {
+        let input = Bitboard::from_square(Square::C7) | Bitboard::from_square(Square::D7);
+        let got = black_attack_front_spans(input);
+
+        // Hand-enumerated expected set: b/c/d/e files, ranks 1–6.
+        let mut want = Bitboard::EMPTY;
+        for sq in [
+            // b-file ranks 1–6
+            Square::B1,
+            Square::B2,
+            Square::B3,
+            Square::B4,
+            Square::B5,
+            Square::B6,
+            // c-file ranks 1–6
+            Square::C1,
+            Square::C2,
+            Square::C3,
+            Square::C4,
+            Square::C5,
+            Square::C6,
+            // d-file ranks 1–6
+            Square::D1,
+            Square::D2,
+            Square::D3,
+            Square::D4,
+            Square::D5,
+            Square::D6,
+            // e-file ranks 1–6
+            Square::E1,
+            Square::E2,
+            Square::E3,
+            Square::E4,
+            Square::E5,
+            Square::E6,
+        ] {
+            want |= Bitboard::from_square(sq);
+        }
+        // LERF hex: 0x0000_1E1E_1E1E_1E1E (b/c/d/e bits set in rank bytes 1–6;
+        // ranks 7–8 zero).
+        assert_eq!(
+            want,
+            Bitboard(0x0000_1E1E_1E1E_1E1E),
+            "hand-derived hex sanity check"
+        );
+        assert_eq!(
+            got, want,
+            "black_attack_front_spans(c7|d7): spans and east-shift overlap on the \
+             d-file, west-shift overlaps on the c-file; correct | keeps all 24 squares, \
+             |→^ drops the 6 d-file squares"
+        );
+    }
+
+    /// Skip-file union for `white_attack_front_spans` — non-adjacent input
+    /// files force the east-shift and west-shift to overlap on an intermediate
+    /// file that is absent from `spans`, exposing `|→^` at the second `|`.
+    ///
+    /// Input: white pawns b2 and d2 (skipping the c-file).
+    ///
+    /// Step-by-step derivation:
+    ///   white_front_spans(b2|d2) = north_fill(b3|d3) = {b3..b8} | {d3..d8}.
+    ///   Let `spans` = b3..b8 ∪ d3..d8  (c-file absent from spans).
+    ///   spans.shift_east()  = c3..c8 ∪ e3..e8   (b→c, d→e)
+    ///   spans.shift_west()  = a3..a8 ∪ c3..c8   (b→a, d→c)
+    ///
+    ///   spans ∩ spans.shift_east()  = ∅  (b,d vs c,e — disjoint)
+    ///   east  ∩ west                = c3..c8  (non-empty; c NOT in spans!)
+    ///
+    ///   Correct union ( | ): a3..a8 ∪ b3..b8 ∪ c3..c8 ∪ d3..d8 ∪ e3..e8  (30 squares)
+    ///   Under `|→^` at second `|`: spans | (east ^ west)
+    ///     east ^ west = (c3..c8 | e3..e8) ^ (a3..a8 | c3..c8)
+    ///                 = a3..a8 | e3..e8  (c cancels!)
+    ///     spans | above = b3..b8 | d3..d8 | a3..a8 | e3..e8  (c-file missing!)
+    ///   Under `|→^` at first  `|`: (spans ^ east) | west
+    ///     spans ^ east = b3..b8 | c3..c8 | d3..d8 | e3..e8  (no overlap → ^ = |)
+    ///     | west       = a3..a8 | b3..b8 | c3..c8 | d3..d8 | e3..e8  (= correct)
+    ///     So this fixture is invisible to the first-`|` mutant — see the
+    ///     adjacent-files test for that coverage.
+    ///
+    ///   LERF hex: a/b/c/d/e files on ranks 3–8 each contribute 0x1F in their
+    ///   rank byte (a=bit0, b=bit1, c=bit2, d=bit3, e=bit4 → 0b0001_1111 = 0x1F).
+    ///   Bytes 0–1 (ranks 1–2) = 0x00; bytes 2–7 (ranks 3–8) = 0x1F each.
+    ///   Expected = 0x1F1F_1F1F_1F1F_0000.
+    #[test]
+    fn white_attack_front_spans_skip_files_second_union_not_xor() {
+        let input = Bitboard::from_square(Square::B2) | Bitboard::from_square(Square::D2);
+        let got = white_attack_front_spans(input);
+
+        // Hand-enumerated expected set: a/b/c/d/e files, ranks 3–8.
+        let mut want = Bitboard::EMPTY;
+        for sq in [
+            // a-file ranks 3–8
+            Square::A3,
+            Square::A4,
+            Square::A5,
+            Square::A6,
+            Square::A7,
+            Square::A8,
+            // b-file ranks 3–8
+            Square::B3,
+            Square::B4,
+            Square::B5,
+            Square::B6,
+            Square::B7,
+            Square::B8,
+            // c-file ranks 3–8 (present in east∩west but not in spans — drops under ^)
+            Square::C3,
+            Square::C4,
+            Square::C5,
+            Square::C6,
+            Square::C7,
+            Square::C8,
+            // d-file ranks 3–8
+            Square::D3,
+            Square::D4,
+            Square::D5,
+            Square::D6,
+            Square::D7,
+            Square::D8,
+            // e-file ranks 3–8
+            Square::E3,
+            Square::E4,
+            Square::E5,
+            Square::E6,
+            Square::E7,
+            Square::E8,
+        ] {
+            want |= Bitboard::from_square(sq);
+        }
+        // LERF hex: 0x1F1F_1F1F_1F1F_0000 (a/b/c/d/e bits in rank bytes 3–8).
+        assert_eq!(
+            want,
+            Bitboard(0x1F1F_1F1F_1F1F_0000),
+            "hand-derived hex sanity check"
+        );
+        assert_eq!(
+            got, want,
+            "white_attack_front_spans(b2|d2): east and west shifts both land on the \
+             c-file (absent from spans); correct | keeps c-file squares, |→^ at the \
+             second operator cancels them"
+        );
+    }
+
+    /// Skip-file union for `black_attack_front_spans` — non-adjacent input
+    /// files expose `|→^` at the second `|` via an intermediate-file overlap.
+    ///
+    /// Input: black pawns b7 and d7 (skipping the c-file).
+    ///
+    /// Step-by-step derivation:
+    ///   black_front_spans(b7|d7) = south_fill(b6|d6) = {b1..b6} | {d1..d6}.
+    ///   Let `spans` = b1..b6 ∪ d1..d6  (c-file absent from spans).
+    ///   spans.shift_east()  = c1..c6 ∪ e1..e6   (b→c, d→e)
+    ///   spans.shift_west()  = a1..a6 ∪ c1..c6   (b→a, d→c)
+    ///
+    ///   spans ∩ spans.shift_east()  = ∅  (b,d vs c,e — disjoint)
+    ///   east  ∩ west                = c1..c6  (non-empty; c NOT in spans!)
+    ///
+    ///   Correct union ( | ): a1..a6 ∪ b1..b6 ∪ c1..c6 ∪ d1..d6 ∪ e1..e6  (30 squares)
+    ///   Under `|→^` at second `|`: spans | (east ^ west)
+    ///     east ^ west = a1..a6 | e1..e6  (c cancels!)
+    ///     spans | above = a1..a6 | b1..b6 | d1..d6 | e1..e6  (c-file missing!)
+    ///   Under `|→^` at first `|`: result equals correct (no spans∩east overlap).
+    ///
+    ///   LERF hex: a/b/c/d/e files on ranks 1–6 each contribute 0x1F in their
+    ///   rank byte. Bytes 0–5 (ranks 1–6) = 0x1F; bytes 6–7 = 0x00.
+    ///   Expected = 0x0000_1F1F_1F1F_1F1F.
+    #[test]
+    fn black_attack_front_spans_skip_files_second_union_not_xor() {
+        let input = Bitboard::from_square(Square::B7) | Bitboard::from_square(Square::D7);
+        let got = black_attack_front_spans(input);
+
+        // Hand-enumerated expected set: a/b/c/d/e files, ranks 1–6.
+        let mut want = Bitboard::EMPTY;
+        for sq in [
+            // a-file ranks 1–6
+            Square::A1,
+            Square::A2,
+            Square::A3,
+            Square::A4,
+            Square::A5,
+            Square::A6,
+            // b-file ranks 1–6
+            Square::B1,
+            Square::B2,
+            Square::B3,
+            Square::B4,
+            Square::B5,
+            Square::B6,
+            // c-file ranks 1–6 (east∩west but not spans — drops under ^)
+            Square::C1,
+            Square::C2,
+            Square::C3,
+            Square::C4,
+            Square::C5,
+            Square::C6,
+            // d-file ranks 1–6
+            Square::D1,
+            Square::D2,
+            Square::D3,
+            Square::D4,
+            Square::D5,
+            Square::D6,
+            // e-file ranks 1–6
+            Square::E1,
+            Square::E2,
+            Square::E3,
+            Square::E4,
+            Square::E5,
+            Square::E6,
+        ] {
+            want |= Bitboard::from_square(sq);
+        }
+        // LERF hex: 0x0000_1F1F_1F1F_1F1F (a/b/c/d/e bits in rank bytes 1–6).
+        assert_eq!(
+            want,
+            Bitboard(0x0000_1F1F_1F1F_1F1F),
+            "hand-derived hex sanity check"
+        );
+        assert_eq!(
+            got, want,
+            "black_attack_front_spans(b7|d7): east and west shifts both land on the \
+             c-file (absent from spans); correct | keeps c-file squares, |→^ at the \
+             second operator cancels them"
         );
     }
 }

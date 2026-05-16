@@ -157,6 +157,7 @@ pub(crate) fn parse(s: &str) -> Result<Position, FenError> {
     //     M1.E will switch to incremental updates inside make/unmake; the
     //     parser path stays at from-scratch.
     p.refresh_zobrist();
+    p.refresh_pawn_zobrist();
 
     // 12. Compute the combined material + PST score from scratch (M3.A).
     p.refresh_static_eval();
@@ -1482,6 +1483,7 @@ mod tests {
             // fields; do both once at the end so structural equality with the
             // FEN-roundtripped position (whose parser refreshes both) holds.
             p.refresh_zobrist();
+            p.refresh_pawn_zobrist();
             p.refresh_static_eval();
 
             let s = p.to_fen();

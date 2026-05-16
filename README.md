@@ -3,7 +3,7 @@
 A Rust chess engine, written from scratch and grown incrementally toward
 GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 
-> **Status: M6 in progress (M6.A landed 2026-05-15).** Fail-soft
+> **Status: M6 in progress (M6.B landed 2026-05-16, CONN-only, +45 Elo vs `M6.A`).** Fail-soft
 > alpha-beta with quiescence search, iterative deepening, transposition
 > table (Zobrist-keyed, 16 MiB default; qsearch participates per ADR-0028),
 > killer-aware move ordering (TT move + MVV-LVA captures + 2 killer slots
@@ -25,26 +25,41 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > **tapered PeSTO MG+EG piece-square evaluation** blended by a material
 > phase tag, with a **bishop-pair** term, **KBvKB-same-color**
 > insufficient-material detection, and a **KQK/KRK mop-up**
-> corner-attractor (M6.A; ADR-0031, supersedes ADR-0014 §1/§5), and
+> corner-attractor (M6.A; ADR-0031, supersedes ADR-0014 §1/§5),
+> the **pawn-structure infrastructure** — 4 MiB search-owned pawn hash,
+> pawn-only Zobrist substream, isolated/doubled/backward/connected
+> predicates, passed-pawn detection — shipping the **connected-pawn
+> term only** (`PAWN_STRUCTURE_IN_EVAL=true`; ISO/DBL/BWD weights zeroed
+> in `eval::data`; M6.B; ADR-0032 §7: the all-four literature defaults
+> SPRT-regressed −100 vs `M6.A`, a per-term subset screen exposed a
+> catastrophic ISO×CONN connectivity-axis double-count, CONN-only is
+> the largest interaction-immune gain at **+45 Elo**; M6.F re-introduces
+> ISO/DBL/BWD via joint Texel + rescales CONN), and
 > `compute_caps`-driven time management. `bench` UCI command for
 > deterministic node-count regression baselines. The remaining strength
 > path (pawn structure, mobility, king safety, Texel tuning across M6.B–F;
 > then NNUE) is tracked in [`docs/roadmap.md`](docs/roadmap.md).
 >
-> **Current strength: ~2678 Elo on the Stockfish 18 UCI_LimitStrength
-> scale at uniform mixed TC** (M6.A, 2026-05-15; 200-game rating estimate
-> Δ Elo **+36.62 [−2.43, +76.61]** vs the long-standing 2641 anchor —
-> the first phase to break above the statistically-flat M5.D-v2 → M5.G
-> ~2622–2639 plateau, though the CI lower bound just grazes it). The
-> in-engine mixed-TC SPRT — the actual landing gate — measured M6.A
-> **+250.57 [+197.15, +316.66] Elo vs `M5.H1`** (H1-accept at 136 games).
-> The two figures are consistent: `UCI_LimitStrength` is a non-linear
-> scale at 2200–2700, so chained clawfish-vs-clawfish logistic-Elo gains
-> compress heavily into UCI_Elo space and do **not** transfer 1:1. The
-> +250 is outsized because `M5.H1` was MG-only with no endgame king PST —
-> M6.A fixes a known, ADR-0014-documented bare-king-endgame weakness
-> wholesale; downstream M6.B–F deltas vs M6.A will be back in the
-> literature range.
+> **Current strength: ~2648 Elo on the Stockfish 18 UCI_LimitStrength
+> scale at uniform mixed TC** (M6.B CONN-only, measured 2026-05-16,
+> 200-game rating estimate Δ Elo **+6.95 [−39.89, +54.05]** vs the
+> long-standing 2641 anchor → ≈ **2648 [2601, 2695]**; statistically
+> **flat within noise** vs M6.A's ≈2678 [2639, 2718] — the two are
+> independent HEAD-vs-Stockfish estimates with heavily overlapping CIs,
+> a ~30-pt point-estimate move well inside ±50 noise, **not** a
+> regression). The in-engine mixed-TC SPRT — the actual landing gate and
+> the authoritative *relative* measure — measured M6.B CONN-only
+> **+45.42 [+19.68, +71.67] Elo vs `M6.A`**
+> (`continue`@400-cap; lands by the M5.F/M5.G-v2 positive-CI
+> outcome-ladder precedent — see ADR-0032 §7), itself stacked on M6.A's
+> **+250.57 [+197.15, +316.66] vs `M5.H1`** (H1-accept). `UCI_LimitStrength`
+> is a non-linear scale at 2200–2700, so chained clawfish-vs-clawfish
+> logistic-Elo gains compress heavily into UCI_Elo space and do **not**
+> transfer 1:1; the M6.A +250 was outsized because `M5.H1` was MG-only
+> with no endgame king PST. Caveat: CONN-only's gain is fast-TC-concentrated
+> and reverses at `60+0.6` (the literature CONN table is over-scaled for
+> deep search) — an M6.F joint-Texel watch-item; the aggregate mixed-TC
+> game (the actual gate object) is firmly positive.
 >
 > **Per-phase SPRT chain, bench history, and diagnostic-suite numbers**
 > for every milestone live in the milestone docs — they are no longer
@@ -54,8 +69,10 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > [`bench/sprt/`](bench/sprt/). Apple M4 P-cores, single thread, no
 > pondering, virtual clock on clawfish.
 >
-> **Current bench:** `bench: 1093365 nodes <NPS> nps` at default depth 7
-> (M6.A end). Node count is deterministic; NPS is wallclock-dependent.
+> **Current bench:** `bench: 1213649 nodes <NPS> nps` at default depth 7
+> (M6.B end — CONN-only; the live connected-pawn term reshuffles root-move
+> ordering, +11% node count vs M6.A's `1093365`; depth-4 `90591`). Node
+> count is deterministic; NPS is wallclock-dependent.
 > From M6.A onward the bench *number* is no longer a no-regression signal
 > (tapered leaf scores reshuffle root-move ordering) — but it stays stable
 > across reruns at each HEAD and anchors the next phase

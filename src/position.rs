@@ -133,6 +133,12 @@ pub struct Position {
     /// exceed 24 in queened-pawn positions; clamp to 24 at blend time only.
     /// Maintained incrementally by make/unmake.
     raw_phase: u8,
+    /// Pawn-only Zobrist substream (ADR-0032): XOR of
+    /// `zobrist::piece_key(pawn, sq)` over every pawn of both colors,
+    /// side-to-move excluded. Keys the search-owned pawn hash. Maintained
+    /// incrementally by make/unmake (Slice B impl); from-scratch via
+    /// `refresh_pawn_zobrist`.
+    pawn_zobrist: u64,
 }
 
 impl Position {
@@ -160,6 +166,7 @@ impl Position {
             static_mg_white: 0,
             static_eg_white: 0,
             raw_phase: 0,
+            pawn_zobrist: 0,
         }
     }
 
@@ -242,9 +249,11 @@ impl Position {
             static_mg_white: 0,
             static_eg_white: 0,
             raw_phase: 0,
+            pawn_zobrist: 0,
         };
         p.refresh_zobrist();
         p.refresh_static_eval();
+        p.refresh_pawn_zobrist();
         p
     }
 
@@ -547,6 +556,28 @@ impl Position {
         self.static_mg_white = mg;
         self.static_eg_white = eg;
         self.raw_phase = raw_phase;
+    }
+
+    /// Pawn-only Zobrist substream (ADR-0032). Keys the search-owned pawn
+    /// hash. Maintained incrementally by `make_move` / `unmake_move`
+    /// (Slice B impl); `refresh_pawn_zobrist` recomputes from scratch.
+    pub(crate) fn pawn_zobrist(&self) -> u64 {
+        self.pawn_zobrist
+    }
+
+    /// Recompute `pawn_zobrist` from scratch via
+    /// `crate::zobrist::pawn_zobrist_from_scratch`. Called adjacent to every
+    /// `refresh_zobrist` site (constructors + the FEN parser).
+    pub(crate) fn refresh_pawn_zobrist(&mut self) {
+        self.pawn_zobrist = crate::zobrist::pawn_zobrist_from_scratch(self);
+    }
+
+    /// Write `value` into the `pawn_zobrist` field directly, bypassing the
+    /// from-scratch recomputation. Used by `mov::make_move` to install an
+    /// incrementally-computed substream and by `mov::unmake_move` to restore
+    /// the pre-make value from `Undo`. Mirrors `refresh_zobrist_from`.
+    pub(crate) fn refresh_pawn_zobrist_from(&mut self, value: u64) {
+        self.pawn_zobrist = value;
     }
 
     /// Apply `mv` to `self`, returning an [`Undo`](crate::mov::Undo) token
@@ -1061,6 +1092,7 @@ mod tests {
         // position (whose parser refreshes both) holds.
         p.refresh_zobrist();
         p.refresh_static_eval();
+        p.refresh_pawn_zobrist();
 
         let formatted = format!("{}", p);
         let parsed = Position::from_fen(&formatted).expect("formatted FEN must parse");
@@ -1097,6 +1129,7 @@ mod tests {
         // holds.
         p.refresh_zobrist();
         p.refresh_static_eval();
+        p.refresh_pawn_zobrist();
 
         let formatted = format!("{}", p);
         let parsed = Position::from_fen(&formatted).expect("formatted castle/EP FEN must parse");

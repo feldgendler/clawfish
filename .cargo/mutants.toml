@@ -688,4 +688,33 @@ exclude_re = [
     # reachable and the mutants diverge — re-evaluate this exclusion then.
     # Function-anchored (there is exactly one `>` comparison in this helper).
     "replace > with >= in mop_up_term_white",
+
+    # ---- M6.B: PawnHashTable::get key==0 guard `== → !=` — equivalent --------
+    #
+    # `get` opens with `if key == 0 { return pawn_eval(pos); }` — the
+    # never-cache guard for the key==0 sentinel/reachable-value (ADR-0032 §2).
+    # The pawn hash is a **pure accelerator** (ADR-0032 §5 / plan D6:
+    # `evaluate_cached(p,h) == evaluate(p)` for all p, any h). Mutating `==`
+    # to `!=` only changes *whether* a value is cached, never the value
+    # returned:
+    #   - key != 0 (common): mutant returns `pawn_eval(pos)` directly
+    #     (correct value, just uncached). Original returns the same value
+    #     (cached or freshly computed — equal by the pure-accelerator
+    #     invariant). Identical observable result.
+    #   - key == 0: only realistically reachable as the no-pawn position
+    #     (Polyglot pawn keys do not XOR-cancel for mirrored/symmetric
+    #     structures — distinct random 64-bit keys). The mutant falls through
+    #     to slot 0, whose cleared entry is `(0,0,empty)` — exactly
+    #     `pawn_eval` of a no-pawn position. Identical observable result.
+    # No input observably distinguishes the two operators. Verified
+    # empirically: hand-applying the mutation leaves all 46 pawn-hash /
+    # evaluate_cached / pawns:: tests green. Provably equivalent under the
+    # pure-accelerator design. Function-anchored (one `==` in this helper's
+    # guard; the slot-key `==` at the probe is a separate, caught mutant).
+    #
+    # **EQUIVALENCE DEPENDS ON: the pawn hash remaining a pure accelerator
+    # (get's only effect being a possibly-cached return of pawn_eval) AND the
+    # key==0 slot staying the zeroed (0,0,empty) sentinel.** If get ever gains
+    # an observable side effect, or key==0 becomes cacheable, re-evaluate.
+    "replace == with != in PawnHashTable::get",
 ]

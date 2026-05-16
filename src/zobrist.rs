@@ -202,6 +202,28 @@ pub fn from_scratch(pos: &Position) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Pawn-only Zobrist substream (ADR-0032).
+// ---------------------------------------------------------------------------
+
+/// XOR of `piece_key(pawn, sq)` over both pawn bitboards (side-to-move
+/// excluded). Keys the search-owned pawn hash; used to initialize
+/// `Position::pawn_zobrist` after parse/construction and by the debug-build
+/// round-trip assert after every `make_move` / `unmake_move`.
+///
+/// The no-pawns position folds to the empty XOR, `0` — a reachable real
+/// value that the pawn hash treats as its empty-slot sentinel (ADR-0032 §2).
+pub fn pawn_zobrist_from_scratch(pos: &Position) -> u64 {
+    let mut pz: u64 = 0;
+    for color in [Color::White, Color::Black] {
+        let pawn = Piece::new(color, PieceKind::Pawn);
+        for sq in pos.pieces_colored(color, PieceKind::Pawn).iter() {
+            pz ^= piece_key(pawn, sq);
+        }
+    }
+    pz
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
