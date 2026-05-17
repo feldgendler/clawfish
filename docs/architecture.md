@@ -52,6 +52,7 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 | Evaluation v2 | Tapered PeSTO MG+EG material+PST (`PSQT_MG`/`PSQT_EG` const tables) blended by phase + bishop pair + KBvKB-same-color + mop-up | "Evaluation v2 — tapered" below; ADR-0031 (supersedes ADR-0014 §1/§5) |
 | Pawn-structure infra (M6.B) | Pawn-only Zobrist substream `Position::pawn_zobrist` (structural 3-XOR, Polyglot pawn keys); 4 MiB search-owned always-replace `PawnHashTable` on `AlphaBetaMover` (cleared in `Search::reset`); isolated/doubled/backward/connected predicates + passed detection; `evaluate_core`/`evaluate`/`evaluate_cached` (pure accelerator, D6). **Shipped config: `PAWN_STRUCTURE_IN_EVAL = true`, CONN-only — `ISO/DBL/BWD` weights zeroed in `eval::data` (every multi-term subset collapses via an ISO×CONN connectivity double-count; CONN-only Δ Elo +45.42 vs `M6.A`). M6.F re-introduces ISO/DBL/BWD via joint Texel + rescales CONN.** | "Pawn-structure infra" below; ADR-0032 (§7) |
 | Passed-pawn term (M6.C) | `pawns::passed_pawn_term_white` (rank bonus + EG three-state path + EG king-tropism), reads M6.B's cached `passed[2]`, **computed live in `evaluate_core` — never cached** (king-distance/path are not pawn-only, ADR-0032 §3); blend-numerator only, not `static_eval_white`/mop-up (§4). **Shipped score-neutral: every passed weight zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.B`** (a three-config screen ladder proved the literature defaults a scale-invariant structural mismatch; whole weight set → M6.F). Term math live at zero weight, M6.F-ready. | "Passed-pawn term" below; ADR-0032 (§8) |
+| Piece-mobility term (M6.D) | `eval::mobility::mobility_term_white(pos) -> (i32, i32)` — N/B/R/Q `popcount(piece_attacks(sq, occ_all) ∩ area)`, `area = !(own_occupied ∪ enemy_pawn_attacked)`, per-kind MG/EG tables; **computed live in `evaluate_core` — never cached** (not pawn-only, the ADR-0032 §3 class); blend-numerator only, not `static_eval_white`/mop-up (the ADR-0032 §4 boundary class). Sliders use full `occ_all` (enemy-non-pawn first-blocker counted); pins scored **pseudolegally**; **no x-ray** — deliberate roadmap-committed deferrals. King/pawn excluded. **Shipped score-neutral: all 8 `*_MOBILITY_*` weights zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.C`** (the landing-gate + full §11 per-kind screen proved the Stockfish-HCE literature defaults a scale-invariant structural mismatch with our PeSTO PSTs — co-scale ×0.5 *worsened* to −220; whole weight set → M6.F per-kind reshape). `MOBILITY_IN_EVAL=true`, term math live at zero weight, M6.F-ready. **No ADR** — roadmap M6.D row + `docs/milestones/m6.d.md` commit the semantic (ADR-0032 is pawn-structure-scoped). | "Piece-mobility term" below; roadmap §M6 / m6.d.md |
 | Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D + M5.E refinements + M5.F TT participation) + ID + caps (M3.E) + TT (M4.A + M5.F qsearch tier) + killers (M4.B) + history (M4.C) + aspiration (M4.D) + NMP (M5.A) + RFP (M5.B) + LMR (M5.C) + FFP (M5.D) + SE (M5.G) + staged movegen (M5.H1 architecture, eager generation; M5.H2 will enable lazy generation); `bench` regression baseline (M3.F) | "Search v1" below; ADR-0016, ADR-0017, ADR-0018, ADR-0019, ADR-0023, ADR-0024, ADR-0025, ADR-0026, ADR-0027, ADR-0028, ADR-0029, ADR-0030 |
 | Transposition table (M4.A + M5.F) | `TranspositionTable` in `src/tt.rs`: `UnsafeCell<Vec<TtEntry>>` + `AtomicUsize` mask + `AtomicU8` generation; depth-preferred + age-bias replacement; full 64-bit Zobrist key; mate-score depth-adjustment; bound-aware probe with cutoffs at non-PV nodes (negamax) and unconditionally (qsearch); `Hash` UCI option (default 16 MiB, range 1–4096). M5.F: qsearch participates with `depth = 0` entries; `is_empty()` discriminator changes to `key == 0`; non-terminal qsearch stores only Lower/Upper (no Exact, per Stockfish 45e5e65). | "Transposition table" below; ADR-0018, ADR-0028 |
 | Game history + draw helpers | `Engine::game_history: Vec<u64>` + `is_repetition` + `is_fifty_move_draw` | "Game history and draw-detection helpers" below |
@@ -200,6 +201,45 @@ the ISO/DBL/BWD + CONN obligation.**
 See `decisions/0032-pawn-structure-and-pawn-hash.md` (§7 CONN-only, §8
 passed-pawn score-neutral) and `docs/research/m6-pawn-structure.md` +
 `docs/research/m6-passed-pawns.md`.
+
+**Piece-mobility term (M6.D; no ADR — roadmap-committed) — shipped
+score-neutral.** `eval::mobility::mobility_term_white(pos) -> (i32, i32)`
+adds a white-perspective N/B/R/Q mobility term: per piece,
+`popcount(piece_attacks(sq, occ_all) ∩ area)` indexes a per-kind MG/EG
+table; `area = !(own_occupied ∪ enemy_pawn_attacked)` (friendly-occupied and
+enemy-pawn-attacked squares excluded; friendly-pawn-attacked-empty and
+enemy-non-pawn-occupied squares kept — captures count as mobility). Sliders
+use full `occ_all` (the first enemy non-pawn blocker is counted). King and
+pawn mobility excluded. Pins scored **pseudolegally** and **no x-ray**
+through friendly sliders — deliberate roadmap-committed deferrals (the eval
+leaf has no movegen context; M6.F absorbs the average over-credit). The
+index-bound invariant (empty-board geometric maxima 8/13/14/27 = table top
+indices; `occ_all`/`& area` only reduce) is a `debug_assert!`, not a clamp
+(the M6.A trust-the-invariant-in-release discipline). The term is **not
+pawn-only** ⇒ never cached / never in `PawnEval`/the pawn hash (the
+ADR-0032 §3 class). It enters the blend numerator only (gated by
+`const MOBILITY_IN_EVAL: bool`, shipped `true`) — never `static_eval_white()`
+(the RFP/NMP/FFP pruning input) nor the mop-up estimate (the ADR-0032 §4
+boundary class; pinned by `static_accessor_excludes_mobility` +
+`mop_up_addend_excludes_mobility_vs_m6c`). **Shipped config: all 8
+`KNIGHT/BISHOP/ROOK/QUEEN_MOBILITY_{MG,EG}` arrays zeroed in `eval::data` ⇒
+the term ≡ `(0,0)` ⇒ `evaluate` byte-identical to `M6.C`** (the landing-gate
++ the full pre-committed §11 per-kind screen vs `M6.C` proved the
+Stockfish-HCE literature defaults a scale-invariant structural mismatch with
+our PeSTO PSTs: all-four −131.62 H0; per-kind all non-positive; ×0.5
+co-scale −220.18 *worsened*; no positive interaction-immune subset). Term
+math live at zero weight (M6.F-ready, the M6.B/M6.C `*_IN_EVAL` precedent).
+**M6.F re-derives the entire N/B/R/Q mobility weight set against our PeSTO
+PSTs (per-kind reshape, not a global rescale — the co-scale-worsens
+verdict), jointly with the M6.B ISO/DBL/BWD + CONN and the M6.C passed-pawn
+obligations (one joint pass).** The dominant offender was the slider EG
+*magnitude* (`ROOK_EG`→169/`QUEEN_EG`→199 vs Stockfish's flatter PSTs), not
+the research-predicted N/B PST double-count.
+
+See the roadmap M6.D row + `docs/milestones/m6.d.md` (semantic + screen
+ledger + the M6.F reshape brief) and `docs/research/m6-mobility.md`. **No
+separate ADR** — ADR-0032 is pawn-structure-scoped; mobility is a distinct
+roadmap-committed concern.
 
 ## Search v1 (production: alpha-beta)
 

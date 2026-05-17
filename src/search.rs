@@ -1602,6 +1602,29 @@ impl AlphaBetaMover {
         //    bound at the current depth in the TT. The step-8 RFP block above
         //    has its own independent `static_eval` read (lazy-dup by design —
         //    ADR-0024); this NMP block's read is preserved verbatim.
+        // Test-only stacked-null reachability witness (same `#[cfg(test)]`
+        // instrumentation class as `nmp_firings`/`rfp_firings`; compiled out
+        // of release). Counts `allow_null == false` nodes (NMP children) where
+        // every *other* NMP gate holds — provably 0 under the zero-window
+        // null search; the load-bearing assertion in
+        // `negamax_passes_allow_null_false_in_null_subsearch`. ADR-0023 §5.
+        #[cfg(test)]
+        {
+            if ply > 0 && !allow_null && !is_pv && depth >= NMP_MIN_DEPTH && !in_check(pos) {
+                let stm = pos.side_to_move();
+                if has_non_pawn_material(pos, stm) {
+                    let se = if stm == Color::White {
+                        pos.static_eval_white()
+                    } else {
+                        -pos.static_eval_white()
+                    };
+                    if se >= beta {
+                        STACKED_NULL_GATE_REACHABLE
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
         if ply > 0 && allow_null && !is_pv && depth >= NMP_MIN_DEPTH && !in_check(pos) {
             let stm = pos.side_to_move();
             if has_non_pawn_material(pos, stm) {
@@ -3460,26 +3483,75 @@ fn history_sort_in_place(quiets: &mut [Move], pos: &Position, history: &HistoryT
 
 // ---------------------------------------------------------------------------
 
-/// Pinned NMP firings count for the
-/// `negamax_passes_allow_null_false_in_null_subsearch` test (M5.A).
-/// Empirically observed at impl time on the chosen fixture
+/// Drift anchor (NOT the discriminator) for
+/// `negamax_passes_allow_null_false_in_null_subsearch`. The total NMP firing
+/// count across the search subtree on the test fixture
 /// (`r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9` at
-/// depth 8, ply 1, beta = `static_eval - 100`). The value is the number of
-/// NMP firings observed across the entire search subtree under stacked-null
-/// prevention; mutating the inner null-search's `allow_null = false` to
-/// `true` would let nested nulls fire and inflate this count.
+/// depth 8, ply 1, beta = `static_eval - 100`). Re-pinned on every search
+/// reshaping (M5.B, M5.C) — the absolute count is sensitive to pruning/eval
+/// changes and carries no anti-regression power on its own.
 ///
-/// M5.B re-pin: K is unchanged from M5.A's value of 34. RFP is gated by
-/// `depth <= RFP_MAX_DEPTH = 6`, so the test's depth-8 root frame trivially
-/// fails the RFP depth predicate before any margin computation. The pin's
-/// load-bearing claim — that across the entire search subtree no descendant
-/// frame at `depth <= 6` satisfies the RFP gate's structural cheap-gates AND
-/// `static_eval - margin*d >= beta_at_that_node` AT a frame where M5.A's NMP
-/// would otherwise have fired — is empirical, verified by the test passing
-/// at impl time. M5.C's LMR may reshape the descendant set; if K drifts on
-/// a future phase's run, re-pin to the new observed value.
+/// **M6.D lands at the score-neutral floor → anchor stays 2 (== M6.C).**
+/// M6.D ships piece-mobility infrastructure with every `*_MOBILITY_*` weight
+/// zeroed in `eval::data` (the §11.4 score-neutral floor — a per-kind SPRT
+/// screen ladder proved the literature-default weights have a scale-invariant
+/// structural mismatch; M6.F joint Texel reshapes the whole set). With all
+/// mobility weights zeroed the term is behaviorally inert and `evaluate` is
+/// byte-identical to `M6.C`, so the search tree is byte-identical to M6.C and
+/// this firing count reverts to M6.C's value `2`. The pin is a pure
+/// regression *anchor* (catches gross unintended tree-shape changes), **not**
+/// the stacked-null-prevention discriminator (that is the eval-independent
+/// `STACKED_NULL_GATE_REACHABLE == 0` reachability invariant below).
+///
+/// **Why the count is not the discriminator (M6.D finding).** Flipping the
+/// NMP null-search's `allow_null = false` → `true` is *provably and
+/// empirically inert* w.r.t. this count: the null search uses the zero-width
+/// window `(-beta, -beta + 1)` and `make_null_move` leaves the board (hence
+/// `static_eval_white`) unchanged, so a node reached with `allow_null ==
+/// false` has `child_static_eval = -parent_static_eval` and `child_beta =
+/// -parent_beta + 1`; the parent fired NMP (`parent_static_eval >=
+/// parent_beta`), making the child's `static_eval >= child_beta` gate
+/// `parent_static_eval <= parent_beta - 1` — a contradiction. The immediate
+/// stacked null is mathematically unreachable; verified empirically as
+/// `STACKED_NULL_GATE_REACHABLE == 0` across 27 fixture/depth combinations
+/// (incl. depth-12, ~15k firings) — the mutant firing count equals the
+/// correct count on every one. The load-bearing anti-regression assertion is
+/// therefore the `STACKED_NULL_GATE_REACHABLE == 0` *reachability invariant*
+/// (see that static's doc), which is the exact provable statement of
+/// stacked-null prevention and would flip non-zero under a real regression
+/// (e.g. a non-zero-window null search combined with the flag flip).
 #[cfg(test)]
 const NMP_FIRINGS_PINNED: u32 = 2;
+
+/// Test-only instrumentation for `negamax_passes_allow_null_false_in_null_subsearch`.
+///
+/// Counts negamax nodes that are reached with `allow_null == false` (i.e., the
+/// immediate child of an NMP null-move search — the ONLY place line ~1628
+/// passes `allow_null = false`) AND that simultaneously satisfy *every other*
+/// NMP gate (`ply > 0`, `!is_pv`, `depth >= NMP_MIN_DEPTH`, `!in_check`,
+/// `has_non_pawn_material`, `static_eval >= beta`). At such a node the
+/// `allow_null` flag is the SOLE predicate suppressing a (stacked) NMP fire —
+/// exactly what flipping line ~1628 `false → true` would unblock.
+///
+/// **Provably always 0 under the current zero-window NMP design.** The NMP
+/// null-search recurses with the zero-width window `(-beta, -beta + 1)`, so a
+/// node reached with `allow_null == false` has `child_beta = -parent_beta + 1`
+/// and (because `make_null_move` only flips the side — the board, hence
+/// `static_eval_white`, is unchanged) `child_static_eval = -parent_static_eval`.
+/// The parent fired NMP, so `parent_static_eval >= parent_beta`; the child's
+/// `static_eval >= child_beta` gate is `-parent_static_eval >= -parent_beta + 1`
+/// ⟺ `parent_static_eval <= parent_beta - 1` — contradicting the parent's
+/// firing condition. Hence the immediate stacked null is mathematically
+/// unreachable and this counter is identically 0 (empirically confirmed across
+/// 27 fixture/depth combinations incl. depth-12 with ~15k firings). The
+/// `allow_null = false` at line ~1628 is therefore *defense-in-depth*
+/// (ADR-0023 §5) for a hypothetical future non-zero-window null search, not a
+/// currently-firing-count-observable guard — which is precisely why the
+/// firing-count pin alone CANNOT discriminate the mutation, and this
+/// reachability invariant is the load-bearing anti-regression assertion.
+#[cfg(test)]
+static STACKED_NULL_GATE_REACHABLE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 
 #[cfg(test)]
 mod tests {
@@ -11086,10 +11158,57 @@ mod tests {
     }
 
     /// Stacked-null prevention: the NMP null-search recursive call passes
-    /// `allow_null = false`. Direct kill via the `nmp_firings` counter:
-    /// if the `false` were a `true`, stacked nulls would fire more times.
-    /// The pinned K (= 12 at impl time) is the empirical firings count for
-    /// the chosen fixture+depth; mutating to `true` increases this to >= 13.
+    /// `allow_null = false` (line ~1628, ADR-0023 §5).
+    ///
+    /// **M6.D finding — the literal `false → true` flip is provably
+    /// behaviorally inert; no runtime observable can discriminate it.**
+    /// `allow_null` gates exactly one thing: a node's own NMP block (the
+    /// step-9 `if ply > 0 && allow_null && …`). The NMP null-search recurses
+    /// with the zero-width window `(-beta, -beta + 1)`, and `make_null_move`
+    /// leaves the board (hence `static_eval_white`) unchanged, so a node
+    /// reached with `allow_null == false` (always an NMP child) has
+    /// `child_beta = -parent_beta + 1` and `child_static_eval =
+    /// -parent_static_eval`. The parent fired NMP (`parent_static_eval >=
+    /// parent_beta`), so the child's `static_eval >= child_beta` gate reduces
+    /// to `parent_static_eval <= parent_beta - 1` — a contradiction. The
+    /// child therefore cannot fire NMP whether `allow_null` is `false` OR
+    /// `true`; its subtree (and `nmp_firings`) is byte-identical either way.
+    /// Verified empirically: mutant firing count == correct count on all 27
+    /// fixture/depth combinations (incl. depth-12, ~15k firings), and
+    /// `STACKED_NULL_GATE_REACHABLE == 0` on every one. The `allow_null =
+    /// false` at line ~1628 is *defense-in-depth* (ADR-0023 §5) for a
+    /// hypothetical future non-zero-window null search — it does no
+    /// firing-count-observable work today. A firing-count pin therefore
+    /// CANNOT discriminate the flip; re-pinning it as the discriminator
+    /// would be the forbidden coverage gap (so it is demoted to a drift
+    /// anchor — see `NMP_FIRINGS_PINNED`). **This impossibility is a
+    /// structural property, not fixture drift; surfaced to the orchestrator
+    /// in the M6.D recalibration report.**
+    ///
+    /// **Load-bearing assertion: the reachability invariant** —
+    /// `STACKED_NULL_GATE_REACHABLE == 0`: zero nodes reached with
+    /// `allow_null == false` satisfy *every other* NMP gate (`ply > 0`,
+    /// `!is_pv`, `depth >= NMP_MIN_DEPTH`, `!in_check`,
+    /// `has_non_pawn_material`, `static_eval >= beta`). This is the exact
+    /// *provable* statement that stacked-null prevention holds (the zero
+    /// window genuinely makes the stacked-null gate unreachable at every
+    /// `allow_null == false` node). It is a genuine correctness witness +
+    /// canary: a realistic future regression — switching the null search to
+    /// a non-zero window (e.g. a PVS refactor) — would make the gate
+    /// reachable at an `allow_null == false` node, flipping this counter
+    /// non-zero and *failing this test*, which is the precise signal that
+    /// the `allow_null = false` has become load-bearing and must be verified
+    /// (and that flipping it would then truly regress search). It does NOT
+    /// claim to kill the source-literal flip itself (provably impossible per
+    /// the finding above).
+    ///
+    /// The `nmp_firings == NMP_FIRINGS_PINNED` check is a secondary
+    /// regression *anchor* only (gross tree-shape drift). M6.D lands at the
+    /// score-neutral floor (all mobility weights zeroed ⇒ `evaluate`
+    /// byte-identical to `M6.C` ⇒ search tree byte-identical ⇒ this firing
+    /// count == M6.C's value), so K reverts to **2**; explicitly NOT the
+    /// discriminator (the eval-independent `STACKED_NULL_GATE_REACHABLE == 0`
+    /// reachability invariant is — see `NMP_FIRINGS_PINNED` doc).
     #[test]
     fn negamax_passes_allow_null_false_in_null_subsearch() {
         let pos =
@@ -11100,23 +11219,39 @@ mod tests {
         let beta = static_eval - 100;
         let alpha = -INF;
 
+        STACKED_NULL_GATE_REACHABLE.store(0, std::sync::atomic::Ordering::Relaxed);
         let mut ab = AlphaBetaMover::new();
         let _ = ab.negamax_for_test(&mut pos.clone(), 8, 1, alpha, beta, false, true, None, &ctx);
         let firings = ab.nmp_firings_for_test();
+        let stacked_reachable =
+            STACKED_NULL_GATE_REACHABLE.load(std::sync::atomic::Ordering::Relaxed);
 
-        // The pinned firings count is observed at impl time; the assertion
-        // is `firings == K`, where K is the stable count for this fixture
-        // under stacked-null prevention. Mutating the inner null-search's
-        // `allow_null = false` to `true` would let inner NMPs fire,
-        // increasing the count past K.
+        // LOAD-BEARING (correctness witness + non-zero-window canary; see fn
+        // doc): no node reached with allow_null==false may satisfy every other
+        // NMP gate. Provably 0 under the current zero-window NMP design; a
+        // future non-zero-window null search would resurrect reachability and
+        // flip this non-zero, signalling allow_null=false has become
+        // load-bearing.
+        assert_eq!(
+            stacked_reachable, 0,
+            "stacked-null reachability invariant violated: {stacked_reachable} node(s) \
+             reached with allow_null==false satisfied every other NMP gate \
+             (static_eval>=beta included) — `allow_null` is now the sole suppressor \
+             of a stacked NMP fire. Provably 0 under the zero-window null search; \
+             non-zero means the null-search window changed and stacked-null \
+             prevention must be re-verified (ADR-0023 §5)."
+        );
+
+        // Secondary anchor (NOT the discriminator — see fn doc): gross
+        // tree-shape drift. K == 2 at the M6.D score-neutral floor (eval
+        // byte-identical to M6.C ⇒ M6.C firing count).
         const PINNED_FIRINGS: u32 = NMP_FIRINGS_PINNED;
-
         assert_eq!(
             firings, PINNED_FIRINGS,
-            "NMP firings count must match pinned K={PINNED_FIRINGS}; got {firings}. \
-             A larger value indicates stacked-null prevention has regressed \
-             (the inner null-search recursive call's `allow_null = false` \
-             may have been changed to `true`)."
+            "NMP firing-count drift anchor: expected pinned K={PINNED_FIRINGS}, got \
+             {firings}. This is a regression *anchor* for gross tree-shape change \
+             (re-pinned per search reshaping), NOT the stacked-null discriminator — \
+             that is the STACKED_NULL_GATE_REACHABLE assertion above."
         );
     }
 

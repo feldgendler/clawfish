@@ -148,6 +148,73 @@ pub(crate) const PASSED_KDIST_ENEMY_PER_STEP: i32 = 0;
 /// constant even though inert at the zeroed coeffs (see block comment).
 pub(crate) const PASSED_KDIST_CAP: i32 = 5;
 
+// ---------------------------------------------------------------------------
+// M6.D piece-mobility weight constants. Source: Stockfish classical-HCE
+// MobilityBonus (TalkChess quote — docs/research/m6-mobility.md §6;
+// ADR-0003-clean, not engine source). Single co-calibrated Texel set,
+// index = popcount(piece_attacks ∩ mobility_area).
+//
+// **Shipped config: ALL mobility weights zeroed (score-neutral landing).**
+// A §11 per-kind env-mask screen ladder vs `M6.C` (single-TC 10+0.1,
+// elo0=0/elo1=10, RUN ALONE) proved the literature defaults have a
+// *scale-invariant structural mismatch* with this engine's PeSTO PSTs —
+// no global scalar recovers Elo:
+//   - all-four literature default: Δ Elo **−131.62** [−165, −100] H0.
+//   - per-kind: {R} −77.60 H0 / {Q} −55.88 H0 / {N} −10.43 (≈flat,
+//     CI [−36,+15]) / {B} −136.30 H0 — **no positive interaction-immune
+//     subset** (contrast M6.B's clean CONN-only +103). The slider EG tables
+//     (ROOK→169, QUEEN→199 ≈1.7–2 pawns) dominate the over-magnitude; the
+//     bishop table triple-counts against PeSTO's bishop PST + bishop-pair.
+//   - uniform ×0.5 co-scale probe (the M6.B `(ISO+CONN)/2` / M6.C
+//     `{RANK+PATH}/2` discriminator): Δ Elo **−220.18** — *worsened*, not
+//     rescued. A global multiplier cannot make a wrong-shaped term
+//     non-negative; the failure is scale-invariant and structural.
+//
+// Conclusion (the M6.C disposition reproduced for mobility): the literature
+// tables are mis-*shaped* for this engine, not mis-*scaled*. **M6.F joint
+// Texel re-derives and reshapes the entire mobility weight set** against our
+// PeSTO PSTs jointly with the M6.B ISO/DBL/BWD + CONN rescale and the M6.C
+// passed-pawn reshape. The constants stay named and referenced —
+// `mobility::mobility_term_white` exercises the full term math at zero weight
+// (M6.F-ready), the M6.B/M6.C `*_IN_EVAL` precedent. **No separate ADR** —
+// the mobility-area semantic + the score-neutral disposition are committed in
+// the roadmap M6.D row + docs/milestones/m6.d.md (ADR-0032 is
+// pawn-structure-scoped; mobility is a distinct concern, roadmap-committed).
+//
+// The pre-zero literature defaults (the M6.F starting point) were:
+//   KNIGHT_MG = [-75,-56,-9,-2,6,15,22,30,36]
+//   KNIGHT_EG = [-76,-54,-26,-10,5,11,26,28,29]
+//   BISHOP_MG = [-48,-21,16,26,37,51,54,63,65,71,79,81,92,97]
+//   BISHOP_EG = [-58,-19,-2,12,22,42,54,58,63,70,74,86,90,94]
+//   ROOK_MG   = [-56,-25,-11,-5,-4,-1,8,14,21,23,31,32,43,49,59]
+//   ROOK_EG   = [-78,-18,26,55,70,81,109,120,128,143,154,160,165,168,169]
+//   QUEEN_MG  = [-40,-25,2,4,14,24,25,40,43,47,54,56,60,70,72,73,75,77,
+//                85,94,99,108,112,113,118,119,123,128]
+//   QUEEN_EG  = [-35,-12,7,19,37,55,62,76,79,87,94,102,111,116,118,122,
+//                128,130,133,136,140,157,158,161,174,177,191,199]
+//
+// Data, not logic — excluded from cargo mutants per .cargo/mutants.toml.
+#[rustfmt::skip]
+pub(crate) const KNIGHT_MOBILITY_MG: [i32; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+#[rustfmt::skip]
+pub(crate) const KNIGHT_MOBILITY_EG: [i32; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+#[rustfmt::skip]
+pub(crate) const BISHOP_MOBILITY_MG: [i32; 14] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+#[rustfmt::skip]
+pub(crate) const BISHOP_MOBILITY_EG: [i32; 14] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+#[rustfmt::skip]
+pub(crate) const ROOK_MOBILITY_MG: [i32; 15] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+#[rustfmt::skip]
+pub(crate) const ROOK_MOBILITY_EG: [i32; 15] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+#[rustfmt::skip]
+pub(crate) const QUEEN_MOBILITY_MG: [i32; 28] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+#[rustfmt::skip]
+pub(crate) const QUEEN_MOBILITY_EG: [i32; 28] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
 /// Centipawn material values indexed by `PieceKind::index()` (P=0 … K=5).
 /// King material is 0 — kings are never captured; the king PST term is
 /// purely positional.

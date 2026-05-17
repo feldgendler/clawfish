@@ -14,6 +14,7 @@ use crate::piece::{Color, PieceKind};
 use crate::position::Position;
 use crate::square::Square;
 
+pub(crate) mod mobility;
 pub(crate) mod pawns;
 
 mod data;
@@ -283,8 +284,24 @@ fn evaluate_core(pos: &Position, pe: pawns::PawnEval) -> i32 {
         (0, 0)
     };
 
-    let blended =
-        ((mg + bp_mg + pe_mg + pp_mg) * phase + (eg + bp_eg + pe_eg + pp_eg) * (24 - phase)) / 24;
+    // M6.D piece mobility (N/B/R/Q attack-count ∩ mobility area, per-kind
+    // MG/EG tables). Live literature defaults (Stockfish HCE) pending the
+    // landing-gate SPRT vs `M6.C` (plan §10/§11). Computed live (not pawn-only
+    // ⇒ never cached). Enters the blend numerator ONLY — never
+    // `static_eval_white()` (the RFP/NMP/FFP pruning input) nor the mop-up
+    // estimate (ADR-0032 §4; pinned by `static_accessor_excludes_mobility` +
+    // `mop_up_addend_excludes_mobility_vs_m6c`). Term math stays live; the §11
+    // contingency zeros per-kind `eval::data` arrays, not this flag (M6.B/C).
+    const MOBILITY_IN_EVAL: bool = true;
+    let (mob_mg, mob_eg) = if MOBILITY_IN_EVAL {
+        mobility::mobility_term_white(pos)
+    } else {
+        (0, 0)
+    };
+
+    let blended = ((mg + bp_mg + pe_mg + pp_mg + mob_mg) * phase
+        + (eg + bp_eg + pe_eg + pp_eg + mob_eg) * (24 - phase))
+        / 24;
     let result_white = blended + mop_up;
 
     debug_assert!(
@@ -1438,6 +1455,109 @@ mod tests {
              (4·CMD(a8)=24 + 2·(14−cheb(g1,a8)=7)=14 → 38); the live \
              passed-pawn term must be excluded from the mop-up advantage \
              estimate (PST-only inputs)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M6.D boundary regression tests (ADR-0032 §4).
+    // -----------------------------------------------------------------------
+
+    /// Regression pin: the `static_mg_white()` / `static_eg_white()` PST-only
+    /// accessors used by RFP/NMP/FFP must NOT include the mobility term.
+    ///
+    /// On a midgame fixture with N/B/R/Q on the board the mobility term is
+    /// non-zero. We assert that `pos.static_mg_white()` and `pos.static_eg_white()`
+    /// equal `eval_state_from_scratch(&pos)`'s `(mg, eg)` — the PST-only triple —
+    /// regardless of the mobility term. This is a regression pin, not a TDD-red
+    /// test: the accessor is PST-only by construction and must remain so.
+    ///
+    /// TDD state: GREEN now (accessor is PST-only by construction) and stays
+    /// green after the impl (mobility enters only the blend numerator, not the
+    /// accessor — ADR-0032 §4). Weight-free.
+    ///
+    /// The fixture invariant is a weight-free *structural* presence check
+    /// (mobile pieces are on the board): the non-zero/value discriminator is
+    /// **M6.F-dormant** at the score-neutral zeroed mobility weights and
+    /// auto-revalidates when M6.F re-introduces non-zero weights (the M6.C
+    /// per-test-docstring convention).
+    #[test]
+    fn static_accessor_excludes_mobility() {
+        // Midgame position with N/B/R/Q for both sides (mobility≠0 fixture).
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("midgame fixture must parse");
+        // Weight-free structural fixture invariant: the fixture must contain
+        // at least one mobile white piece (N/B/R/Q) — the boundary the test
+        // pins. The non-zero-value discriminator is M6.F-dormant at the
+        // score-neutral zeroed mobility weights (mirrors
+        // `mop_up_addend_excludes_passed_pawns_vs_m6b`'s structural precedent).
+        assert!(
+            pos.pieces_colored(Color::White, PieceKind::Knight).any()
+                || pos.pieces_colored(Color::White, PieceKind::Bishop).any()
+                || pos.pieces_colored(Color::White, PieceKind::Rook).any()
+                || pos.pieces_colored(Color::White, PieceKind::Queen).any(),
+            "fixture invariant: ≥1 mobile white piece (N/B/R/Q) must be present \
+             (the boundary the test pins; value discriminator is M6.F-dormant \
+             at the score-neutral zeroed weights)"
+        );
+        let (from_scratch_mg, from_scratch_eg, _) = eval_state_from_scratch(&pos);
+        assert_eq!(
+            pos.static_mg_white(),
+            from_scratch_mg,
+            "static_mg_white() must equal the PST-only from-scratch mg \
+             (mobility must NOT enter this accessor)"
+        );
+        assert_eq!(
+            pos.static_eg_white(),
+            from_scratch_eg,
+            "static_eg_white() must equal the PST-only from-scratch eg \
+             (mobility must NOT enter this accessor)"
+        );
+    }
+
+    /// Mop-up addend regression — pins ADR-0032 §4 for M6.D: the mobility
+    /// term must NOT enter the mop-up advantage estimate. Mirrors
+    /// `mop_up_addend_excludes_passed_pawns_vs_m6b` verbatim in shape.
+    ///
+    /// Fixture: White Kg1 + Qa4 (raw_phase = queen 4 < MOP_UP_PHASE_MAX 5 →
+    /// mop-up eligible), Black Ka8. No pawns. KQ-vs-K.
+    ///
+    /// Fixture invariant assertion FIRST: a mobile white queen is structurally
+    /// present (the boundary the test pins). The non-zero-value discriminator
+    /// is **M6.F-dormant** at the score-neutral zeroed mobility weights and
+    /// auto-revalidates when M6.F re-introduces non-zero weights (the M6.C
+    /// per-test-docstring convention).
+    ///
+    /// mop_up uses PST-only `(mg, eg)` inputs. Hand-derived longhand:
+    ///   White winning: drive black king to corner (black king on a8, white on g1).
+    ///   CMD(a8) = min(|0−3|,|0−4|) + min(|7−3|,|7−4|) = 3 + 3 = 6.
+    ///   cheb(g1,a8) = max(|6−0|,|0−7|) = 7.
+    ///   bonus = 4·CMD(a8) + 2·(14 − cheb(g1,a8)) = 4·6 + 2·(14−7)
+    ///         = 24 + 14 = 38.
+    #[test]
+    fn mop_up_addend_excludes_mobility_vs_m6c() {
+        let pos =
+            Position::from_fen("k7/8/8/8/Q7/8/8/6K1 w - - 0 1").expect("KQ vs K mop-up fixture");
+        // Weight-free structural fixture invariant: a mobile white queen must
+        // be present (the boundary the test pins; value discriminator is
+        // M6.F-dormant at the score-neutral zeroed mobility weights). Mirrors
+        // `mop_up_addend_excludes_passed_pawns_vs_m6b`'s structural precedent.
+        assert!(
+            pos.pieces_colored(Color::White, PieceKind::Queen).any(),
+            "fixture invariant: a mobile white queen must be present (the \
+             boundary the test pins; value discriminator is M6.F-dormant at \
+             the score-neutral zeroed weights)"
+        );
+        let mg = pos.static_mg_white();
+        let eg = pos.static_eg_white();
+        let bonus = mop_up_term_white(&pos, mg, eg);
+        assert_eq!(
+            bonus, 38,
+            "mop-up addend must equal its hand-derived formula value \
+             (4·CMD(a8)=24 + 2·(14−cheb(g1,a8)=7)=14 → 38); the mobility \
+             term must be excluded from the mop-up advantage estimate \
+             (PST-only inputs)"
         );
     }
 }

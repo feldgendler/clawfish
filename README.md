@@ -3,9 +3,9 @@
 A Rust chess engine, written from scratch and grown incrementally toward
 GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 
-> **Status: M6 in progress (M6.C landed 2026-05-17 — passed-pawn infra,
-> score-neutral; all passed weights deferred to M6.F. Production HEAD = `M6.C`,
-> strength unchanged vs `M6.B` by construction).** Fail-soft
+> **Status: M6 in progress (M6.D landed 2026-05-17 — piece-mobility infra,
+> score-neutral; all mobility weights deferred to M6.F. Production HEAD = `M6.D`,
+> eval byte-identical to `M6.C` / `M6.B`, strength unchanged by construction).** Fail-soft
 > alpha-beta with quiescence search, iterative deepening, transposition
 > table (Zobrist-keyed, 16 MiB default; qsearch participates per ADR-0028),
 > killer-aware move ordering (TT move + MVV-LVA captures + 2 killer slots
@@ -43,6 +43,14 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > defaults a scale-invariant structural mismatch with this engine, so
 > every passed weight is zeroed and the whole set defers to M6.F's
 > reshape; the term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.B`),
+> the **piece-mobility term** — N/B/R/Q pseudolegal-attack count ∩
+> mobility area, per-kind MG/EG tables, computed live, never cached —
+> also shipped **score-neutral** (M6.D; no ADR, roadmap-committed: the
+> landing-gate + a full per-kind screen proved the Stockfish-HCE
+> literature defaults a scale-invariant structural mismatch with our
+> PeSTO PSTs — all-four −131.62, ×0.5 co-scale −220.18 *worsened*; every
+> mobility weight zeroed, whole set defers to M6.F's per-kind reshape;
+> the term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.C`),
 > and `compute_caps`-driven time management. `bench` UCI command for
 > deterministic node-count regression baselines. The remaining strength
 > path (pawn structure, mobility, king safety, Texel tuning across M6.B–F;
