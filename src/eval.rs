@@ -260,7 +260,31 @@ fn evaluate_core(pos: &Position, pe: pawns::PawnEval) -> i32 {
         (0, 0)
     };
 
-    let blended = ((mg + bp_mg + pe_mg) * phase + (eg + bp_eg + pe_eg) * (24 - phase)) / 24;
+    // M6.C ships the passed-pawn term (rank bonus + EG path discriminator +
+    // EG king-tropism) **wired but with all weights zeroed** in `eval::data`
+    // — the score-neutral landing. The three-screen mixed-TC SPRT ladder vs
+    // `M6.B` proved the literature defaults have a scale-invariant structural
+    // mismatch with this engine (all-three Δ −21.74 / 60+0.6 KDIST collapse;
+    // {RANK+PATH} fast-TC over-magnitude; {RANK+PATH}/2 plateau migrating the
+    // failure — the M6.B `(ISO+CONN)/2` signature); the entire passed-pawn
+    // weight set defers to the M6.F joint Texel reshape (ADR-0032 §7; see the
+    // authoritative provenance block in `eval::data` + docs/milestones/m6.c.md).
+    // Computed **live** from `pe.passed` (M6.B cache): king-distance/path
+    // depend on non-pawn state, so the term is not pawn-only and is never
+    // cached (ADR-0032 §3). It enters the blend numerator only — never
+    // `static_eval_white()` nor the mop-up estimate (D7 / ADR-0032 §4). The
+    // term math stays live at zero weight (M6.F-ready); the screen zeroed the
+    // data constants, not this flag (the M6.B `PAWN_STRUCTURE_IN_EVAL`
+    // precedent).
+    const PASSED_PAWNS_IN_EVAL: bool = true;
+    let (pp_mg, pp_eg) = if PASSED_PAWNS_IN_EVAL {
+        pawns::passed_pawn_term_white(pos, &pe.passed)
+    } else {
+        (0, 0)
+    };
+
+    let blended =
+        ((mg + bp_mg + pe_mg + pp_mg) * phase + (eg + bp_eg + pe_eg + pp_eg) * (24 - phase)) / 24;
     let result_white = blended + mop_up;
 
     debug_assert!(
@@ -1134,6 +1158,46 @@ mod tests {
     use crate::eval::pawns::PawnHashTable;
     use proptest::prelude::*;
 
+    /// D6 proptest corpus (single source of truth — referenced by both the
+    /// `evaluate_cached_equals_evaluate` proptest and the corpus-invariant
+    /// guard below). Hoisted to module scope so a future FEN edit cannot
+    /// silently leave the proptest passer-free without the guard test failing.
+    const SEED_FENS: &[&str] = &[
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+    ];
+
+    /// Corpus-invariant guard (test-suite-review should-fix #1): the D6
+    /// argument for the live passed-pawn term is structural (pure fn of
+    /// `pos`+`pe.passed`, identical `evaluate_core` call site in both
+    /// `evaluate` and `evaluate_cached`), so it does not *depend* on a
+    /// passer being present — but the proptest should still exercise a
+    /// non-empty passed set at a walked node for defense-in-depth. The plan's
+    /// example claim that `SEED_FENS[2]` has a "b5 passer" is wrong (b5 is
+    /// blocked by black c7 on the adjacent file); coverage actually comes
+    /// from `SEED_FENS[3]`'s genuine white d7 passer. Pin it so a corpus
+    /// edit that removes all passers fails loudly here.
+    #[test]
+    fn d6_proptest_corpus_exercises_a_passer() {
+        let any_passer = SEED_FENS.iter().any(|fen| {
+            let pos = Position::from_fen(fen).expect("seed FEN parses");
+            let pe = crate::eval::pawns::pawn_eval(&pos);
+            !pe.passed[Color::White.index()].is_empty()
+                || !pe.passed[Color::Black.index()].is_empty()
+        });
+        assert!(
+            any_passer,
+            "the evaluate_cached_equals_evaluate proptest corpus must contain \
+             at least one position with a passed pawn (SEED_FENS[3] = the \
+             rnbq1k1r/pp1Pbppp/... white d7 passer); a corpus edit that \
+             removed every passer would silently un-exercise the live \
+             passed-pawn term in the D6 property"
+        );
+    }
+
     proptest! {
         /// Random-position × random-hash-state determinism (pins ADR-0032
         /// §5 / plan D6): `evaluate_cached(p, h) == evaluate(p)` for any `p`
@@ -1144,13 +1208,8 @@ mod tests {
         /// against the contract, the test-first gate.
         #[test]
         fn evaluate_cached_equals_evaluate(seed in 0u64..u64::MAX) {
-            const SEED_FENS: &[&str] = &[
-                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-                "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
-                "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
-                "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
-            ];
+            // SEED_FENS is the module-scope const (single source of truth;
+            // pinned non-empty-of-passers by `d6_proptest_corpus_exercises_a_passer`).
             let fen_idx = (seed as usize) % SEED_FENS.len();
             let mut pos = Position::from_fen(SEED_FENS[fen_idx]).expect("seed FEN");
 
@@ -1277,6 +1336,108 @@ mod tests {
             "mop-up addend must equal its M6.A formula value \
              (4·CMD(a8)=24 + 2·(14−cheb(g1,a8)=7)=14 → 38); pawn structure \
              must be excluded from the mop-up advantage estimate"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M6.C — passed-pawn integration.
+    //
+    // These run against CURRENT behaviour: `passed_pawn_term_white` is NOT
+    // yet wired into `evaluate_core` (Slice B does that). They are GREEN now
+    // and must STAY green after the impl phase — they pin the no-passer
+    // baseline, the insufficient-material short-circuit, the D6 cached==
+    // uncached invariant (structurally, via the existing proptest), the
+    // extreme-passers mate-band, and the D7 mop-up exclusion.
+    // -----------------------------------------------------------------------
+
+    /// Startpos has no passers (every pawn is blocked by an opposing pawn on
+    /// its own or an adjacent file) and is colour-symmetric, so `evaluate`
+    /// must still be exactly 0 once the passed-pawn term is added — the
+    /// passed term must not perturb the no-passer baseline. Green now (term
+    /// not yet wired) and green after (no passers ⇒ term is (0,0); symmetry
+    /// otherwise unchanged).
+    #[test]
+    fn evaluate_startpos_zero_with_passed_term() {
+        let pos = Position::starting_position();
+        assert_eq!(
+            evaluate(&pos),
+            0,
+            "startpos must still be exactly 0 with the passed-pawn term \
+             (no passers, white/black structure mirror-identical)"
+        );
+    }
+
+    /// The `is_insufficient_material` short-circuit precedes any passed-pawn
+    /// computation (it returns before `evaluate_core`'s blend). KvK → 0,
+    /// unaffected by the passed term in any phase.
+    #[test]
+    fn evaluate_insufficient_material_still_zero() {
+        let pos = Position::from_fen("8/8/8/4k3/8/8/8/4K3 w - - 0 1").expect("KvK FEN");
+        assert_eq!(
+            evaluate(&pos),
+            0,
+            "KvK insufficient-material short-circuit precedes the passed-pawn term"
+        );
+    }
+
+    /// Adversarial many-passer band check (pins the plan §5 derived
+    /// worst-case bound). 8 white passers on rank 7 (rel-rank 6) with no
+    /// black pawns: `evaluate` must not trip the `evaluate_core` mate-band
+    /// `debug_assert!` and must land within `±(MATE_IN_MAX_PLY−1)`. Green
+    /// now (term not wired) and green after: §5 bounds `|Σ pp_eg| ≤ 8·426 =
+    /// 3408`, an order of magnitude below the band, stacked on a
+    /// material/PST sum the M6.B core already keeps well inside it.
+    #[test]
+    fn passed_pawn_term_extreme_passers_in_band() {
+        use crate::search::MATE_IN_MAX_PLY;
+        let pos = Position::from_fen("4k3/PPPPPPPP/8/8/8/8/8/4K3 w - - 0 1")
+            .expect("8 white passers, no black pawns");
+        let score = evaluate(&pos);
+        assert!(
+            score.abs() < MATE_IN_MAX_PLY - 1,
+            "8-passer extreme position must stay within the centipawn band; got {score}"
+        );
+    }
+
+    /// Mop-up addend regression — pins D7 / ADR-0032 §4: the live
+    /// passed-pawn term must NOT enter the mop-up advantage estimate. This
+    /// reproduces the `mop_up_addend_excludes_pawn_structure_vs_m6a`
+    /// pinned-literal discipline (the M6.B precedent at the top of this
+    /// section) with the `_vs_m6b` suffix — M6.C's baseline is `M6.B`.
+    ///
+    /// Fixture: White Kg1 + Qa4 + Pb5, Black Ka8. The white b5 pawn is a
+    /// passer (no black pawns) — so the position exercises the "the passed
+    /// term must be excluded from mop-up" path. raw_phase = queen 4 + pawn 0
+    /// = 4 < MOP_UP_PHASE_MAX(5) → mop-up eligible; White Q+P vs lone K →
+    /// advantage ≫ 100, White winning → mop_up > 0.
+    ///
+    /// mop_up uses `mop_up_term_white(pos, static_mg_white, static_eg_white)`
+    /// — PST-only inputs, so the live passed-pawn term provably cannot
+    /// perturb the addend. Hand-derived longhand (king geometry identical to
+    /// the M6.A precedent, so the literal is the same 38):
+    ///   CMD(a8) = min(|0−3|,|0−4|) + min(|7−3|,|7−4|) = 3 + 3 = 6.
+    ///   cheb(g1,a8) = max(|6−0|,|0−7|) = 7.
+    ///   bonus = 4·CMD(a8) + 2·(14 − cheb(g1,a8)) = 4·6 + 2·(14−7)
+    ///         = 24 + 14 = 38.
+    #[test]
+    fn mop_up_addend_excludes_passed_pawns_vs_m6b() {
+        let pos = Position::from_fen("k7/8/8/1P6/Q7/8/8/6K1 w - - 0 1")
+            .expect("KQ+P vs K mop-up fixture with a white passer");
+        // Fixture invariant: the white b5 pawn is a passer (no black pawns) —
+        // this is what makes the test exercise the passed-term exclusion.
+        assert!(
+            !crate::eval::pawns::pawn_eval(&pos).passed[Color::White.index()].is_empty(),
+            "fixture invariant: white must have a passer (b5) present"
+        );
+        let mg = pos.static_mg_white();
+        let eg = pos.static_eg_white();
+        let bonus = mop_up_term_white(&pos, mg, eg);
+        assert_eq!(
+            bonus, 38,
+            "mop-up addend must equal its hand-derived formula value \
+             (4·CMD(a8)=24 + 2·(14−cheb(g1,a8)=7)=14 → 38); the live \
+             passed-pawn term must be excluded from the mop-up advantage \
+             estimate (PST-only inputs)"
         );
     }
 }

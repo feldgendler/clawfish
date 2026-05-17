@@ -65,6 +65,89 @@ pub(crate) const CONN_MG: [i32; 8] = [0, 0, 3, 7, 13, 22, 40, 70];
 #[rustfmt::skip]
 pub(crate) const CONN_EG: [i32; 8] = [0, 0, 5, 10, 18, 30, 55, 95];
 
+// ---------------------------------------------------------------------------
+// M6.C passed-pawn weight constants. Source: docs/research/m6-passed-pawns.md
+// §8 (literature defaults — MadChess 3.0 Beta Build 103 rank+path, placeholder
+// king-distance).
+//
+// **Shipped config: all passed-pawn weights zeroed (score-neutral landing).**
+// A three-screen SPRT vs `M6.B` (env-mask subset filter, no value tuning —
+// the M6.B "Subset rework" method) proved the literature-default passed-pawn
+// weights have a *scale-invariant structural* mismatch with this engine, with
+// no global scalar that recovers Elo:
+//   - **all-three** literature default: Δ Elo **−21.74** — the 60+0.6 bucket
+//     collapsed W15-L57 (KDIST slow-TC-toxic: distance-proportional, rank-
+//     scaled placeholder coeffs over-help shallow ordering and reverse with
+//     depth — plan §9 R2 / ADR-0032 §7 pattern).
+//   - **{RANK+PATH}** (KDIST out): Δ Elo **+4.34 [−22.33, +31.07]** — flat;
+//     a fast-TC W30-L59 over-magnitude vs the PeSTO EG pawn PST (R1: MadChess
+//     was Texel-tuned against a different PST).
+//   - **{RANK+PATH}/2** (uniform ½-co-scale, the M6.B `(ISO+CONN)/2` probe):
+//     Δ Elo **−0.87 [−23.68, +21.94]** — the scale-invariant plateau
+//     signature; halving did not recover Elo, it merely migrated the failure
+//     to the 20+0.2 bucket. No global multiplier fixes a wrong-*shape* set.
+//
+// Conclusion: the failure is scale-invariant and structural, not a magnitude
+// knob → a joint *reshape* (not a rescale) is required. **M6.F joint Texel
+// re-introduces and reshapes the entire passed-pawn weight set** against the
+// shipped (CONN-only, passed-zeroed) baseline. The constants stay named and
+// referenced — `pawns::passed_pawn_term_white` exercises the full term math at
+// zero weight (M6.F-ready), the M6.B ISO/DBL/BWD `pawn_eval` precedent.
+// ADR-0032 §7; docs/milestones/m6.c.md.
+//
+// `PASSED_KDIST_CAP` is a **structural clamp, not a weight** (it bounds the
+// Chebyshev distance regardless of coefficient magnitude); it is inert at zero
+// coeffs but kept as the named M6.F-tunable structural constant, mirroring how
+// M6.B kept its term math live.
+//
+// Index convention matches `CONN_*`: relative rank 0..7 (`sq.rank()` for
+// white, `7 - sq.rank()` for black). Indices 0/1 are 0 (back rank / starting
+// rank — unreachable for a passer). The rank-7 MG entry is 0 (the passer
+// bonus is EG-dominant — research §1.2/§7 "rank-7 MG non-zero" pitfall; D6).
+// The pre-zero literature defaults (M6.F starting point) were:
+//   PASSED_MG            = [0, 0,  3,  8, 15, 24,  34,   0]
+//   PASSED_EG            = [0, 0,  4, 18, 42, 75, 118, 170]
+//   PASSED_FREE_EG_DELTA = [0, 0,  4, 16, 35, 63,  98, 141]
+//   PASSED_KDIST_OWN_PER_STEP = 5   PASSED_KDIST_ENEMY_PER_STEP = 7
+//
+// These are data constants, not logic — excluded from `cargo mutants` per
+// `.cargo/mutants.toml` alongside the PST/CONN arrays.
+// ---------------------------------------------------------------------------
+
+/// Passed pawn rank bonus, middlegame. Indexed by relative rank (0..7).
+/// Zeroed in the shipped score-neutral config (M6.F re-tunes); see block
+/// comment.
+#[rustfmt::skip]
+pub(crate) const PASSED_MG: [i32; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+
+/// Passed pawn rank bonus, endgame. Same indexing as `PASSED_MG`.
+/// Zeroed — see `PASSED_MG`.
+#[rustfmt::skip]
+pub(crate) const PASSED_EG: [i32; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+
+/// EG-only path-clear delta (MadChess free-path minus base EG). `+` when the
+/// front-span is empty of all pieces, `−` when an enemy piece is on it, `0`
+/// when only a friendly piece is on it (three-state — research §3 / ADR-0032
+/// §6). Same indexing as `PASSED_MG`. Zeroed — see block comment.
+#[rustfmt::skip]
+pub(crate) const PASSED_FREE_EG_DELTA: [i32; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+
+/// EG-only king-tropism: cp per Chebyshev step the **own** king is closer to
+/// the passer's promotion square (rank-scaled by relative rank). Zeroed in the
+/// shipped score-neutral config (M6.F re-tunes); see block comment.
+pub(crate) const PASSED_KDIST_OWN_PER_STEP: i32 = 0;
+
+/// EG-only king-tropism: cp per Chebyshev step the **enemy** king is closer
+/// to the promotion square (rank-scaled; a near enemy king is a penalty).
+/// Zeroed — see `PASSED_KDIST_OWN_PER_STEP`.
+pub(crate) const PASSED_KDIST_ENEMY_PER_STEP: i32 = 0;
+
+/// Chebyshev-distance clamp for the king-tropism term: beyond 5 steps king
+/// intervention is too slow to matter at shallow depth (research §2.2). A
+/// **structural clamp, not a weight** — kept as the named M6.F-tunable
+/// constant even though inert at the zeroed coeffs (see block comment).
+pub(crate) const PASSED_KDIST_CAP: i32 = 5;
+
 /// Centipawn material values indexed by `PieceKind::index()` (P=0 … K=5).
 /// King material is 0 — kings are never captured; the king PST term is
 /// purely positional.

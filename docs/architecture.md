@@ -51,6 +51,7 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 | UCI options | `Random_Seed` (M2.D), `MoveOverhead` (M3.E), `Hash` (M4.A) | `docs/plans/m2.d.md`, ADR-0017, ADR-0018 |
 | Evaluation v2 | Tapered PeSTO MG+EG material+PST (`PSQT_MG`/`PSQT_EG` const tables) blended by phase + bishop pair + KBvKB-same-color + mop-up | "Evaluation v2 — tapered" below; ADR-0031 (supersedes ADR-0014 §1/§5) |
 | Pawn-structure infra (M6.B) | Pawn-only Zobrist substream `Position::pawn_zobrist` (structural 3-XOR, Polyglot pawn keys); 4 MiB search-owned always-replace `PawnHashTable` on `AlphaBetaMover` (cleared in `Search::reset`); isolated/doubled/backward/connected predicates + passed detection; `evaluate_core`/`evaluate`/`evaluate_cached` (pure accelerator, D6). **Shipped config: `PAWN_STRUCTURE_IN_EVAL = true`, CONN-only — `ISO/DBL/BWD` weights zeroed in `eval::data` (every multi-term subset collapses via an ISO×CONN connectivity double-count; CONN-only Δ Elo +45.42 vs `M6.A`). M6.F re-introduces ISO/DBL/BWD via joint Texel + rescales CONN.** | "Pawn-structure infra" below; ADR-0032 (§7) |
+| Passed-pawn term (M6.C) | `pawns::passed_pawn_term_white` (rank bonus + EG three-state path + EG king-tropism), reads M6.B's cached `passed[2]`, **computed live in `evaluate_core` — never cached** (king-distance/path are not pawn-only, ADR-0032 §3); blend-numerator only, not `static_eval_white`/mop-up (§4). **Shipped score-neutral: every passed weight zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.B`** (a three-config screen ladder proved the literature defaults a scale-invariant structural mismatch; whole weight set → M6.F). Term math live at zero weight, M6.F-ready. | "Passed-pawn term" below; ADR-0032 (§8) |
 | Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D + M5.E refinements + M5.F TT participation) + ID + caps (M3.E) + TT (M4.A + M5.F qsearch tier) + killers (M4.B) + history (M4.C) + aspiration (M4.D) + NMP (M5.A) + RFP (M5.B) + LMR (M5.C) + FFP (M5.D) + SE (M5.G) + staged movegen (M5.H1 architecture, eager generation; M5.H2 will enable lazy generation); `bench` regression baseline (M3.F) | "Search v1" below; ADR-0016, ADR-0017, ADR-0018, ADR-0019, ADR-0023, ADR-0024, ADR-0025, ADR-0026, ADR-0027, ADR-0028, ADR-0029, ADR-0030 |
 | Transposition table (M4.A + M5.F) | `TranspositionTable` in `src/tt.rs`: `UnsafeCell<Vec<TtEntry>>` + `AtomicUsize` mask + `AtomicU8` generation; depth-preferred + age-bias replacement; full 64-bit Zobrist key; mate-score depth-adjustment; bound-aware probe with cutoffs at non-PV nodes (negamax) and unconditionally (qsearch); `Hash` UCI option (default 16 MiB, range 1–4096). M5.F: qsearch participates with `depth = 0` entries; `is_empty()` discriminator changes to `key == 0`; non-terminal qsearch stores only Lower/Upper (no Exact, per Stockfish 45e5e65). | "Transposition table" below; ADR-0018, ADR-0028 |
 | Game history + draw helpers | `Engine::game_history: Vec<u64>` + `is_repetition` + `is_fifty_move_draw` | "Game history and draw-detection helpers" below |
@@ -172,8 +173,33 @@ zeroed ISO/DBL/BWD constants + term math stay (M6.F-ready); `pe.passed` is
 cached for M6.C. **M6.F re-introduces ISO/DBL/BWD via joint Texel against the
 CONN-only baseline and rescales CONN** (the gate is already live).
 
-See `decisions/0032-pawn-structure-and-pawn-hash.md` and
-`docs/research/m6-pawn-structure.md`.
+**Passed-pawn term (M6.C; ADR-0032 §8) — shipped score-neutral.**
+`pawns::passed_pawn_term_white(pos, &pe.passed) -> (i32, i32)` adds a
+per-passer rank bonus + EG three-state path discriminator (front-span empty
+of all pieces → +Δ, enemy piece on it → −Δ, friendly-only → 0) + EG
+king-tropism (rank-scaled Chebyshev to the promotion square, clamped at
+`PASSED_KDIST_CAP=5`). **Invariant: computed live in `evaluate_core`, never
+cached** — king-distance and path depend on non-pawn state, so the term is
+*not* pawn-only and must not enter `PawnEval`/the pawn hash (ADR-0032 §3). It
+enters the blend numerator only (gated by `const PASSED_PAWNS_IN_EVAL: bool`,
+shipped `true`) — never `static_eval_white()` (the pruning input) nor the
+mop-up estimate (ADR-0032 §4 / D7). **Shipped config: every passed weight
+zeroed** (`PASSED_MG=PASSED_EG=PASSED_FREE_EG_DELTA=PASSED_KDIST_OWN_PER_STEP=
+PASSED_KDIST_ENEMY_PER_STEP = 0`; `PASSED_KDIST_CAP=5` kept as the named
+structural clamp) ⇒ the term ≡ `(0,0)` ⇒ `evaluate` byte-identical to `M6.B`
+(the score-neutral landing gate — provably inert, no confirmation SPRT, the
+M6.B precedent). A three-config screen ladder proved the literature defaults
+have a scale-invariant structural mismatch with this engine (KDIST
+slow-TC-toxic; RANK+PATH fast-TC over-magnitude vs the PeSTO EG pawn PST;
+`{RANK+PATH}/2` co-scale migrates the failure — the M6.B `(ISO+CONN)/2`
+plateau). Term math live at zero weight (M6.F-ready, the
+`PAWN_STRUCTURE_IN_EVAL` precedent). **M6.F re-derives the rank table against
+our PeSTO EG pawn PST and reshapes (not rescales) king-distance, jointly with
+the ISO/DBL/BWD + CONN obligation.**
+
+See `decisions/0032-pawn-structure-and-pawn-hash.md` (§7 CONN-only, §8
+passed-pawn score-neutral) and `docs/research/m6-pawn-structure.md` +
+`docs/research/m6-passed-pawns.md`.
 
 ## Search v1 (production: alpha-beta)
 

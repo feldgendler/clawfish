@@ -51,6 +51,17 @@ Per roadmap §"Same-campaign re-baseline required", M6 per-phase secondary gates
 
 M6.A vs M5.H1 (same campaign): WAC **+1** (within ±2 noise — flat). STS **+834 credit / +248 STS-Elo** (≫ ±68 noise — decisive). Per-piggyback sub-gates (plan §13.3): theme #11 "King Activity" 404→499 = **+95** (mop-up, gate ≥+30 — PASS); theme #5 "Bishop vs Knight" 698→688 = **−10** (bishop-pair, flat/within-noise, above the ≤−20 should-fix floor, no targeted lift — Texel-calibrated in M6.F). Largest movers: Center Control +137, Open Files +116. The 2026-05-09 snapshot's M5.H1-era weakest themes (King Activity 42.3%, AKPC 46.2%) both lifted materially (49.9%, 50.7% at M6.A).
 
+### M6.C same-campaign re-baseline — 2026-05-17 (rejected-config diagnostic)
+
+Per roadmap §"Same-campaign re-baseline required" (RUN ALONE, sandbox-disabled, `--movetime 1000 --concurrency 4`, Apple M4). **Caveat:** this campaign measured the **live-term (rejected) M6.C config**, not the shipped artifact — M6.C ships **score-neutral** (all passed weights zeroed; `evaluate` byte-identical to `M6.B`), so the shipped build's WAC/STS == `M6.B`'s by construction and there is no per-theme delta to gate (the M6.B "rejected-config EPD no longer applies to the shipped build" precedent). Retained as a diagnostic of the rejected literature-default build + to discharge the M6.B WAC/STS watch-item.
+
+| Milestone | Baseline tag | WAC (solved/300) | WAC % | STS (credit/15000) | STS % |
+|---|---|---:|---:|---:|---:|
+| M6.B (re-baseline, same campaign) | `M6.B` | 271 | 90.3% | 9640 | 64.3% |
+| M6.C **live-term, rejected** (not shipped) | HEAD-live | 269 | 89.7% | 9791 | 65.3% |
+
+Live-term vs `M6.B` (same campaign): WAC **−2** (flat, ±2 band). STS **+151 credit** (≫ ±68 — real). Per-theme (claimed pawn-advancement group): #9 "Advancement of a/b/c pawns" 542→600 = **+58**; #13 "Pawn Play in the Center" 639→645 +6; #8 "AKPC" 536→525 −11 (within per-theme noise); #11 "King Activity" 526→601 = **+75** (the king-tropism sub-term's direct target). Only notable negative #10 "Simplification" 710→648 −62 (not a claimed theme; within per-theme noise; aggregate +151 dwarfs it). **Diagnostic conclusion: the literature passed-pawn term is directionally correct — it lifts exactly the themes it claims — but mis-*scaled* not mis-*designed* (it SPRT-regressed via TC-localized over-magnitude; ADR-0032 §8). This is the M6.F "reshape, don't delete" corroboration.** Discharges the M6.B watch-item (2): M6.B's same-campaign 271 WAC / 9640 STS is now on record.
+
 **Bold** marks per-suite peak in the legacy 2026-05-09 table only. M5.E HEAD-run delta vs tag was +2 WAC / +68 STS (wallclock-budget noise; engine code byte-identical from tag onward). M5.F HEAD-run vs M5.E HEAD-run: +2 WAC, −10 STS — both well within wallclock noise. Statistically flat. **M5.G HEAD-run vs M5.F: +11 WAC (well above ±2 noise band) and +417 STS credit (well above ±68 noise band) — decisive tactical+strategic positive**, validating the SE extension's contribution in fixed-`movetime` mode. Initial measurement (WAC 268 / STS 9036) was depressed by CPU contention from concurrent SPRT + parallel EPD suites; the clean re-run above is the load-bearing measurement (see "Methodology rule — RUN ALONE" below — a rule the M5.G campaign forced into the project conventions after a repeat M5.F-style mistake).
 
 ### M5.F observation (2026-05-09)

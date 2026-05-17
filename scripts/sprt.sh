@@ -49,13 +49,14 @@ BASELINE_TAG="${2:-}"
 usage() {
     echo "Usage: scripts/sprt.sh <sprt|match|rating-estimate> [baseline-tag]"
     echo ""
-    echo "  sprt <tag>           SPRT match (elo0=0, elo1=10, alpha=0.05, beta=0.05; up to 400 games)"
+    echo "  sprt <tag>           SPRT match (elo0=0, elo1=\$SPRT_ELO1 [def 10], alpha=0.05, beta=0.05; up to 400 games)"
     echo "  match <tag>          fixed-game-count match (200 games default)"
     echo "  rating-estimate      fixed-game-count match HEAD vs Stockfish UCI_Elo=\$STOCKFISH_ELO (200 games)"
     echo ""
     echo "Env vars:"
     echo "  STOCKFISH_ELO        default 1320; rating-estimate cross-validation knob"
     echo "  SPRT_GAMES           default sprt=400, match=200, rating-estimate=200"
+    echo "  SPRT_ELO1            H1 bound; default 10, set 5 for marginal/eval-term (M6 phases)"
     echo "  SPRT_TC              default '10+0.1'"
     echo "  SPRT_CONCURRENCY     default '6'"
     echo "  SPRT_REBUILD=1       force rebuild of cached baseline worktree"
@@ -158,6 +159,9 @@ TC="${SPRT_TC:-10+0.1}"
 TC_SAMPLE="${SPRT_TC_SAMPLE:-}"
 CONCURRENCY="${SPRT_CONCURRENCY:-6}"
 SEED_ARG="${SPRT_SEED:-}"
+# H1 bound. Default 10 (standard); tighten to 5 for marginal/eval-term changes
+# per docs/workflow.md §SPRT + the M6-phase exit criteria (roadmap §M6).
+SPRT_ELO1="${SPRT_ELO1:-10}"
 
 # `--tc-sample` (mixed-TC per-pair sampling, ELOH.D) is mutually exclusive
 # with `--tc`. Pick one based on whether SPRT_TC_SAMPLE is set.
@@ -203,13 +207,13 @@ fi
 case "$SUBCMD" in
     sprt)
         GAMES="${SPRT_GAMES:-400}"
-        echo "Running SPRT (in-process harness): $TC_LABEL, up to $GAMES games, elo0=0 elo1=10 alpha=0.05 beta=0.05"
+        echo "Running SPRT (in-process harness): $TC_LABEL, up to $GAMES games, elo0=0 elo1=$SPRT_ELO1 alpha=0.05 beta=0.05"
         echo "  HEAD vs $BASELINE_LABEL"
         cargo run --release --bin elo-iterate --manifest-path "$REPO_ROOT/Cargo.toml" --quiet -- \
             "${COMMON_HARNESS_ARGS[@]}" \
             --max-games "$GAMES" \
             --initial-elo 0 \
-            --sprt-elo0 0 --sprt-elo1 10 --sprt-alpha 0.05 --sprt-beta 0.05
+            --sprt-elo0 0 --sprt-elo1 "$SPRT_ELO1" --sprt-alpha 0.05 --sprt-beta 0.05
         ;;
     match)
         GAMES="${SPRT_GAMES:-200}"

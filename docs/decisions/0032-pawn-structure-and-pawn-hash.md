@@ -1,7 +1,10 @@
 # ADR-0032 — Pawn structure evaluation + pawn hash + pawn-Zobrist substream
 
 **Status:** Accepted (M6.B ships the **connected-pawn term only**; ISO/DBL/BWD
-zeroed pending M6.F joint Texel — see Decision §7. Δ Elo +45.42 vs `M6.A`).
+zeroed pending M6.F joint Texel — see Decision §7. Δ Elo +45.42 vs `M6.A`.
+**M6.C** adds the passed-pawn term **wired but all weights zeroed** — score-
+neutral vs `M6.B`, entire weight set deferred to the M6.F joint-Texel reshape;
+see Decision §8.).
 
 ## Context
 
@@ -225,6 +228,53 @@ phalanx/supported/opposed modulation context (the de-modulated-fragment
 provenance), (b) decorrelate the ISO/CONN connectivity axis, and (c) fix the
 slow-TC CONN over-scaling — jointly, not by scalar tuning. Precedent for the
 landing shape: M5.F / M5.G-v2 `continue@cap` positive-CI lands.
+
+### 8. M6.C ships the passed-pawn term **wired, all weights zeroed**
+
+M6.C adds `passed_pawn_term_white` (per-passer rank bonus + EG three-state
+path discriminator + EG king-tropism, reading M6.B's cached `passed[2]`,
+computed live in `evaluate_core` — never cached, king-distance/path are not
+pawn-only, §3). It is no separate ADR (the roadmap M6.C row commits the
+path-blocked semantic); this is its addendum.
+
+**Three-config screen ladder vs `M6.B`** (canonical mixed-TC 4-bucket,
+elo0=0/elo1=5, RUN ALONE; `bench/sprt/2026-05-17-m6.c-screen-ladder-vs-m6b-mixed-tc.md`):
+
+| config | Δ Elo vs `M6.B` | failure |
+|---|---|---|
+| all-three (literature default) | **−21.74** [−49.60, +5.84] | 60+0.6 W15-L57 — KDIST slow-TC collapse |
+| {RANK+PATH} (KDIST off) | +4.34 [−22.33, +31.07] | 10+0.1 W30-L59 — RANK+PATH fast-TC over-magnitude |
+| {RANK+PATH}/2 (co-scale) | −0.87 [−23.68, +21.94] | 20+0.2 W15-L42 — failure migrates; scale-invariant |
+
+**Decision.** The literature-default passed-pawn weights have a
+**scale-invariant structural mismatch** with this engine: KDIST is an
+independently-sourced, not-co-calibrated, rank-scaled term (the §7
+de-modulated-fragment + standalone-coefficient pastiche pattern) that is
+slow-TC-toxic; the MadChess RANK+PATH pair was Texel-tuned against a
+*different* EG pawn PST and is fast-TC over-magnitude on our PeSTO EG pawn
+PST; the `{RANK+PATH}/2` co-scale probe reproduces the §7 `(ISO+CONN)/2`
+plateau — a uniform multiplier merely migrates the over-magnitude across TC
+buckets, it cannot make a wrong-shaped term non-negative across the profile.
+No positive interaction-immune subset exists (contrast M6.B's clean CONN-only
++103 H1). M6.C therefore ships **`PASSED_MG=PASSED_EG=PASSED_FREE_EG_DELTA=
+PASSED_KDIST_OWN_PER_STEP=PASSED_KDIST_ENEMY_PER_STEP = 0`** in `eval::data`
+(`PASSED_KDIST_CAP=5` kept as the named structural clamp); the term math
+stays live at zero weight (M6.F-ready) — the §7 / M6.B
+`PAWN_STRUCTURE_IN_EVAL` precedent verbatim.
+
+**Landing gate.** Zeroed weights ⇒ `passed_pawn_term_white` ≡ `(0,0)` ⇒
+`evaluate` byte-identical to `M6.B` ⇒ `bench 1213649` byte-for-byte ⇒
+provably behaviorally inert ⇒ M6.C lands **without a confirmation SPRT** (the
+§7 / M6.B inert-landing disposition). The live-term same-campaign WAC/STS
+(+151 STS, #9 "Advancement a/b/c" +58) is a *rejected-config* diagnostic —
+the term is directionally correct, mis-scaled not mis-designed; the shipped
+build's WAC/STS == `M6.B`'s by construction.
+
+**M6.F obligation (extended).** The M6.F joint-Texel pass now also
+**re-derives the passed-pawn rank table against our PeSTO EG pawn PST and
+reshapes (not rescales) king-distance** — jointly with the §7 ISO/DBL/BWD
+re-introduction + CONN rescale. One joint pass; until then the passed term
+is inert by design.
 
 ## Consequences
 

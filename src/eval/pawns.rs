@@ -6,10 +6,16 @@
 //! always-replace accelerator keyed by the pawn-only Zobrist substream
 //! (ADR-0032).
 
+use super::chebyshev_distance;
 use crate::bitboard::{self, Bitboard};
-use crate::eval::data::{BWD_EG, BWD_MG, CONN_EG, CONN_MG, DBL_EG, DBL_MG, ISO_EG, ISO_MG};
+use crate::eval::data::{
+    BWD_EG, BWD_MG, CONN_EG, CONN_MG, DBL_EG, DBL_MG, ISO_EG, ISO_MG, PASSED_EG,
+    PASSED_FREE_EG_DELTA, PASSED_KDIST_CAP, PASSED_KDIST_ENEMY_PER_STEP, PASSED_KDIST_OWN_PER_STEP,
+    PASSED_MG,
+};
 use crate::piece::{Color, PieceKind};
 use crate::position::Position;
+use crate::square::Square;
 
 /// White-perspective pawn-structure eval + cached detection bitboards.
 ///
@@ -295,6 +301,72 @@ pub(crate) fn passed_pawns(own: Bitboard, enemy: Bitboard, side: Color) -> Bitbo
     own & !enemy_front
 }
 
+/// White-perspective passed-pawn eval (rank bonus + EG path discriminator +
+/// EG king-tropism). Reads the M6.B-cached `passed[White|Black]`; computed
+/// **live** (king-distance/path are not pawn-only — ADR-0032 §3). Returns
+/// `(mg, eg)` white-perspective; black passers subtract symmetrically.
+///
+/// **Shipped score-neutral (M6.C):** all `PASSED_*` weights are zeroed in
+/// `eval::data` (the §11-step-3 / ADR-0032 §7 outcome — see `data.rs`), so this
+/// term currently contributes `(0, 0)` for every position. The term math stays
+/// live and referenced at zero weight so M6.F's joint Texel re-introduces and
+/// reshapes the passed-pawn weight set with no code change (the M6.B
+/// ISO/DBL/BWD `pawn_eval` precedent).
+pub(crate) fn passed_pawn_term_white(pos: &Position, passed: &[Bitboard; 2]) -> (i32, i32) {
+    let occ_all = pos.occupied_all();
+    let mut mg = 0i32;
+    let mut eg = 0i32;
+
+    for (side, sign) in [(Color::White, 1i32), (Color::Black, -1i32)] {
+        let enemy = side.flip();
+        let enemy_occ = pos.occupied(enemy);
+
+        for sq in passed[side.index()].iter() {
+            // Relative rank: white counts from rank 1 up, black mirrors.
+            let rel = match side {
+                Color::White => sq.rank(),
+                Color::Black => 7 - sq.rank(),
+            } as usize;
+
+            mg += sign * PASSED_MG[rel];
+            eg += sign * PASSED_EG[rel];
+
+            // Front-span path (excludes the pawn's own square, includes the
+            // promotion square). Three-state EG discriminator: empty of ALL
+            // pieces → +Δ; an enemy piece on it → −Δ; friendly-only → 0.
+            let pawn_bb = Bitboard::from_square(sq);
+            let path = match side {
+                Color::White => bitboard::white_front_spans(pawn_bb),
+                Color::Black => bitboard::black_front_spans(pawn_bb),
+            };
+            if (path & occ_all).is_empty() {
+                eg += sign * PASSED_FREE_EG_DELTA[rel];
+            } else if (path & enemy_occ).any() {
+                eg -= sign * PASSED_FREE_EG_DELTA[rel];
+            }
+
+            // King-tropism (EG-only, rank-scaled, measured to the promotion
+            // square: rank 7 for white, rank 0 for black — research §7). Own
+            // king near promo → bonus; enemy king near promo → penalty.
+            let own_king = pos.king_square(side);
+            let enemy_king = pos.king_square(enemy);
+            let promo_rank = match side {
+                Color::White => 7,
+                Color::Black => 0,
+            };
+            let promo = Square::from_file_rank(sq.file(), promo_rank)
+                .expect("file 0..7 and rank 0/7 are always in range");
+            let own_d = chebyshev_distance(own_king, promo).min(PASSED_KDIST_CAP);
+            let enemy_d = chebyshev_distance(enemy_king, promo).min(PASSED_KDIST_CAP);
+            let rel_scale = rel as i32;
+            eg += sign * rel_scale * PASSED_KDIST_OWN_PER_STEP * (PASSED_KDIST_CAP - own_d);
+            eg += sign * rel_scale * PASSED_KDIST_ENEMY_PER_STEP * (enemy_d - PASSED_KDIST_CAP);
+        }
+    }
+
+    (mg, eg)
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -303,7 +375,11 @@ pub(crate) fn passed_pawns(own: Bitboard, enemy: Bitboard, side: Color) -> Bitbo
 mod tests {
     use super::*;
     use crate::bitboard::Bitboard;
-    use crate::eval::data::{BWD_EG, BWD_MG, CONN_EG, CONN_MG, DBL_EG, DBL_MG, ISO_EG, ISO_MG};
+    use crate::eval::data::{
+        BWD_EG, BWD_MG, CONN_EG, CONN_MG, DBL_EG, DBL_MG, ISO_EG, ISO_MG, PASSED_EG,
+        PASSED_FREE_EG_DELTA, PASSED_KDIST_CAP, PASSED_KDIST_ENEMY_PER_STEP,
+        PASSED_KDIST_OWN_PER_STEP, PASSED_MG,
+    };
     use crate::piece::Color;
     use crate::position::Position;
     use crate::square::Square;
@@ -1425,6 +1501,857 @@ mod tests {
         assert!(
             ph.entries.iter().all(|e| e.key == 0),
             "key==0 path must not store → table stays all-zero"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M6.C — passed_pawn_term_white.
+    //
+    // These tests exercise `passed_pawn_term_white`, which is laid down as an
+    // `unimplemented!()` stub by the test-first gate (Slice A implements).
+    // They therefore PANIC against the stub — that is the intended red state;
+    // do NOT weaken the assertions to make them pass.
+    //
+    // Every expected value is hand-derived from the `eval::data` constants
+    // (`PASSED_MG/EG`, `PASSED_FREE_EG_DELTA`, `PASSED_KDIST_*`) and pinned
+    // symbolically over those constants so the M6.F joint-Texel re-tune
+    // auto-revalidates them. The algorithm is plan §5:
+    //   per passer (white sign +1 / black sign −1, rel = white rank /
+    //   7−rank for black):
+    //     mg += sign·PASSED_MG[rel]
+    //     eg += sign·PASSED_EG[rel]
+    //     eg += sign·(+Δ if front-span empty of all / −Δ if enemy on it / 0)
+    //     eg += sign·rel·OWN ·(CAP − own_d)   (own_d  = min(cheb(own_k ,promo),CAP))
+    //     eg += sign·rel·ENE·(enemy_d − CAP)  (enemy_d= min(cheb(enemy_k,promo),CAP))
+    //   promo = from_file_rank(file, 7) white / (file, 0) black.
+    // The `passed` argument is always the M6.B-cached `pawn_eval(&pos).passed`
+    // (or a hand-built bitboard where the test needs a square no real pawn
+    // can stand on, e.g. relative rank 7).
+    // (M6.C `PASSED_*` constants are imported at the top of `mod tests`.)
+    // -----------------------------------------------------------------------
+
+    /// Rank-bonus scaling. Two single-white-passer fixtures, both with an
+    /// empty front-span (path-clear +Δ) and both kings ≥ CAP Chebyshev from
+    /// the promotion square (king term = 0): the only difference is relative
+    /// rank, so the contribution must scale by the rank table.
+    ///
+    /// Fixture LOW: white Pc3 (file 2, rank idx 2 → rel-rank 2), white Ka1,
+    /// black kh1. promo = c8. cheb(a1,c8)=max(2,7)=7≥5 ⇒ own_d=5;
+    /// cheb(h1,c8)=max(5,7)=7≥5 ⇒ enemy_d=5 ⇒ king term =
+    /// rel·5·(5−5)+rel·7·(5−5)=0. c-file ahead of c3 unoccupied ⇒ +Δ.
+    ///   mg = PASSED_MG[2] = 3
+    ///   eg = PASSED_EG[2] + PASSED_FREE_EG_DELTA[2] + 0 = 4 + 4 = 8
+    ///
+    /// Fixture HIGH: white Pc7 (rel-rank 6), same kings (a1/h1). promo = c8,
+    /// king term 0; front-span {c8} unoccupied ⇒ +Δ.
+    ///   mg = PASSED_MG[6] = 34
+    ///   eg = PASSED_EG[6] + PASSED_FREE_EG_DELTA[6] + 0 = 118 + 98 = 216
+    ///
+    /// Pins: exact (mg,eg) symbolically from the `eval::data` constants — at
+    /// the shipped score-neutral config every `PASSED_*` is 0, so each LHS is
+    /// 0 = RHS; the symbolic forms auto-revalidate the EG-dominant / monotone
+    /// shape when M6.F re-tunes (the M6.B `pawn_eval` symbolic-pin precedent).
+    /// The weight-independent structural invariant the test exercises — that
+    /// each fixture's passer is detected at the asserted *relative rank* (2 vs
+    /// 6) — is pinned directly on the detection bitboard, so a rel-rank /
+    /// passer-detection bug still fails regardless of weights.
+    #[test]
+    fn passed_rank_bonus_scales_white() {
+        let low = Position::from_fen("8/8/8/8/8/2P5/8/K6k w - - 0 1").expect("rel-rank-2 passer");
+        let high = Position::from_fen("8/2P5/8/8/8/8/8/K6k w - - 0 1").expect("rel-rank-6 passer");
+        let (lmg, leg) = passed_pawn_term_white(&low, &pawn_eval(&low).passed);
+        let (hmg, heg) = passed_pawn_term_white(&high, &pawn_eval(&high).passed);
+
+        // Structural (weight-free): the lone white passer sits at rel-rank 2
+        // (c3) in LOW and rel-rank 6 (c7) in HIGH. rel-rank = sq.rank() for
+        // white; this is the exact index the term reads into PASSED_*[rel].
+        let low_p = pawn_eval(&low).passed[Color::White.index()];
+        let high_p = pawn_eval(&high).passed[Color::White.index()];
+        assert_eq!(
+            low_p,
+            Bitboard::from_square(Square::C3),
+            "LOW: lone white passer is c3 → rel-rank 2"
+        );
+        assert_eq!(
+            high_p,
+            Bitboard::from_square(Square::C7),
+            "HIGH: lone white passer is c7 → rel-rank 6"
+        );
+
+        assert_eq!(lmg, PASSED_MG[2], "rel-rank-2 mg = PASSED_MG[2]");
+        assert_eq!(
+            leg,
+            PASSED_EG[2] + PASSED_FREE_EG_DELTA[2],
+            "rel-rank-2 eg = PASSED_EG[2] + path-clear Δ[2] (kings far → king term 0)"
+        );
+        assert_eq!(hmg, PASSED_MG[6], "rel-rank-6 mg = PASSED_MG[6]");
+        assert_eq!(
+            heg,
+            PASSED_EG[6] + PASSED_FREE_EG_DELTA[6],
+            "rel-rank-6 eg = PASSED_EG[6] + path-clear Δ[6]"
+        );
+        // EG-dominant / monotone-in-advancement is a magnitude property zeroed
+        // by the shipped config; asserted symbolically so it holds at 0 and
+        // M6.F-revalidates (M6.B's relational→symbolic re-expression move).
+        assert!(
+            PASSED_EG[2] + PASSED_FREE_EG_DELTA[2] >= PASSED_MG[2],
+            "passed bonus is EG-dominant at rel-rank 2 (M6.F-revalidated)"
+        );
+        assert!(
+            PASSED_EG[6] + PASSED_FREE_EG_DELTA[6] >= PASSED_MG[6],
+            "passed bonus is EG-dominant at rel-rank 6 (M6.F-revalidated)"
+        );
+        assert!(
+            PASSED_MG[6] >= PASSED_MG[2],
+            "rank-6 mg ≥ rank-2 mg (monotone rank table; M6.F-revalidated)"
+        );
+        assert!(
+            PASSED_EG[6] + PASSED_FREE_EG_DELTA[6] >= PASSED_EG[2] + PASSED_FREE_EG_DELTA[2],
+            "rank-6 eg ≥ rank-2 eg (monotone rank table; M6.F-revalidated)"
+        );
+    }
+
+    /// D6 / research §7 "rank-7 MG non-zero" pitfall. A real pawn cannot stand
+    /// on the promotion rank, so the relative-rank-7 table entry is only ever
+    /// reached via a constructed `passed` bitboard — we pass `passed[White] =
+    /// {c8}` (c8 = file 2, rank idx 7 → rel-rank 7) over a bare-kings board.
+    ///
+    /// front-span of a rank-8 square = north_fill(shift_north) = ∅ (shifts off
+    /// the board) ⇒ path empty ⇒ +Δ[7]. promo = from_file_rank(2,7) = c8;
+    /// white Ka1 cheb(a1,c8)=7≥5, black kh1 cheb(h1,c8)=7≥5 ⇒ king term 0.
+    ///   mg = PASSED_MG[7] = 0     ← the D6 pin
+    ///   eg = PASSED_EG[7] + PASSED_FREE_EG_DELTA[7] = 170 + 141 = 311
+    #[test]
+    fn passed_rank7_mg_zero_eg_dominant() {
+        let pos = Position::from_fen("8/8/8/8/8/8/8/K6k w - - 0 1").expect("bare-kings board");
+        let passed = [Bitboard::from_square(Square::C8), Bitboard::EMPTY];
+        let (mg, eg) = passed_pawn_term_white(&pos, &passed);
+        // The D6 pin is weight-INDEPENDENT and survives literally: the rank-7
+        // MG entry is 0 by design (pre-zero literature default *and* the
+        // shipped score-neutral config). A misread that put a non-zero value
+        // at PASSED_MG[7] still fails this.
+        assert_eq!(
+            mg, PASSED_MG[7],
+            "rel-rank-7 MG entry is 0 (D6): a rank-7 passer is decisive in EG only"
+        );
+        assert_eq!(mg, 0, "PASSED_MG[7] is literally 0 (pins the table value)");
+        // Composition pinned symbolically (rank-8 square ⇒ empty front-span ⇒
+        // the +Δ branch; kings 7 cheb ⇒ king term 0). 0 = 0 at the shipped
+        // config; M6.F-revalidates the EG-dominant rank-7 magnitude.
+        assert_eq!(
+            eg,
+            PASSED_EG[7] + PASSED_FREE_EG_DELTA[7],
+            "rel-rank-7 eg = PASSED_EG[7] + path-clear Δ[7] (empty front-span, kings far)"
+        );
+        // Pre-zero literature anchor (PASSED_EG[7]=170 + Δ[7]=141 = 311) is the
+        // M6.F restart point — asserted as a symbolic property of the formula
+        // shape, not the shipped magnitude (which is 0). EG-dominance is the
+        // magnitude claim the shipped config zeroes; re-expressed symbolically.
+        assert!(
+            PASSED_EG[7] + PASSED_FREE_EG_DELTA[7] >= PASSED_MG[7],
+            "rank-7 passer is EG-dominant (M6.F-revalidated; 0 at shipped weights)"
+        );
+    }
+
+    /// Path-clear three-state, branch 1: empty front-span → +Δ. White Pe5
+    /// (rel-rank 4), no piece on the e-file ahead, both kings ≥5 cheb from
+    /// promo e8 (Ka1: cheb=7; kh1: cheb=7) → king term 0.
+    ///   mg = PASSED_MG[4] = 15
+    ///   eg = PASSED_EG[4] + PASSED_FREE_EG_DELTA[4] + 0 = 42 + 35 = 77
+    /// The discriminator: eg must be strictly greater than PASSED_EG[4] alone
+    /// (the +Δ branch fired).
+    #[test]
+    fn passed_path_clear_adds_delta() {
+        let pos = Position::from_fen("8/8/8/4P3/8/8/8/K6k w - - 0 1").expect("clear-path passer");
+        let (mg, eg) = passed_pawn_term_white(&pos, &pawn_eval(&pos).passed);
+        // Structural (weight-free): the path-CLEAR branch is selected because
+        // e5's white front-span ({e6,e7,e8}) is empty of ALL pieces. This is
+        // the exact classification `passed_pawn_term_white` keys the +Δ branch
+        // on; a path-state bug fails here regardless of weights.
+        let e5 = Bitboard::from_square(Square::E5);
+        let path = bitboard::white_front_spans(e5);
+        assert!(
+            (path & pos.occupied_all()).is_empty(),
+            "e5 front-span empty of all pieces → the +Δ (path-clear) branch fires"
+        );
+        assert_eq!(mg, PASSED_MG[4], "rel-rank-4 mg = PASSED_MG[4]");
+        assert_eq!(
+            eg,
+            PASSED_EG[4] + PASSED_FREE_EG_DELTA[4],
+            "empty front-span → +Δ[4] added to PASSED_EG[4]"
+        );
+        // +Δ being a strict bonus over the bare rank value is the magnitude
+        // claim zeroed by the shipped config; asserted symbolically (holds at
+        // 0, M6.F-revalidates that PASSED_FREE_EG_DELTA[4] ≥ 0).
+        assert!(
+            PASSED_EG[4] + PASSED_FREE_EG_DELTA[4] >= PASSED_EG[4],
+            "path-clear adds a non-negative Δ[4] (M6.F-revalidated)"
+        );
+    }
+
+    /// Path-clear three-state, branch 2: enemy piece on the front-span → −Δ.
+    /// White Pe5 (rel-rank 4), black knight e7 sits on e5's front-span
+    /// {e6,e7,e8}. e7 ∈ path ∧ e7 is an enemy piece ⇒ −Δ branch. Kings far
+    /// (Ka1 cheb(a1,e8)=7; kh1 cheb(h1,e8)=7) ⇒ king term 0. A non-pawn
+    /// enemy does not affect passer detection — e5 is still a passer.
+    ///   mg = PASSED_MG[4] = 15
+    ///   eg = PASSED_EG[4] − PASSED_FREE_EG_DELTA[4] + 0 = 42 − 35 = 7
+    #[test]
+    fn passed_path_enemy_piece_penalty() {
+        let pos = Position::from_fen("8/4n3/8/4P3/8/8/8/K6k w - - 0 1").expect("enemy-on-path");
+        let (mg, eg) = passed_pawn_term_white(&pos, &pawn_eval(&pos).passed);
+        // Structural (weight-free): the −Δ branch is selected because an ENEMY
+        // (black) piece (the e7 knight) lies on e5's white front-span while
+        // the span is NOT all-empty. e5 is still a passer (a non-pawn enemy
+        // does not affect passer detection). These are the exact predicates
+        // the term branches on — a sign/own-vs-enemy bug fails here at any
+        // weight.
+        let e5 = Bitboard::from_square(Square::E5);
+        let path = bitboard::white_front_spans(e5);
+        assert!(
+            !(path & pos.occupied_all()).is_empty(),
+            "front-span is occupied (knight on it) → not the +Δ branch"
+        );
+        assert!(
+            !(path & pos.occupied(Color::Black)).is_empty(),
+            "an ENEMY piece is on the front-span → the −Δ branch fires"
+        );
+        assert_eq!(
+            pawn_eval(&pos).passed[Color::White.index()],
+            e5,
+            "e5 is still a passer (a non-pawn enemy does not block detection)"
+        );
+        assert_eq!(mg, PASSED_MG[4], "rank bonus mg unaffected by path state");
+        assert_eq!(
+            eg,
+            PASSED_EG[4] - PASSED_FREE_EG_DELTA[4],
+            "enemy knight on the front-span → −Δ[4]"
+        );
+        // The penalty-below-bare-rank magnitude is zeroed by the shipped
+        // config; asserted symbolically (M6.F-revalidates Δ[4] ≥ 0 ⇒ −Δ is a
+        // penalty).
+        assert!(
+            PASSED_EG[4] - PASSED_FREE_EG_DELTA[4] <= PASSED_EG[4],
+            "enemy-blocked path is a non-positive Δ adjustment (M6.F-revalidated)"
+        );
+    }
+
+    /// Path-clear three-state, branch 3 (the D4 / research §3.2 refinement):
+    /// only a FRIENDLY piece on the front-span → neither +Δ nor −Δ (neutral).
+    /// White Pe5 (rel-rank 4), white knight e7 on e5's front-span. e7 ∈ path
+    /// but e7 is friendly, not enemy ⇒ neutral. Kings far ⇒ king term 0.
+    ///   mg = PASSED_MG[4] = 15
+    ///   eg = PASSED_EG[4] + 0 + 0 = 42   (NO delta either way)
+    #[test]
+    fn passed_path_friendly_only_neutral() {
+        let pos = Position::from_fen("8/4N3/8/4P3/8/8/8/K6k w - - 0 1").expect("friendly-on-path");
+        let (mg, eg) = passed_pawn_term_white(&pos, &pawn_eval(&pos).passed);
+        // Structural (weight-free) — the three-state D4 refinement: the path
+        // is occupied (so NOT the +Δ branch) but the occupant is FRIENDLY, not
+        // enemy (so NOT the −Δ branch either) → the neutral third state. A
+        // two-state implementation that penalised any occupied path would mis-
+        // classify here regardless of weights.
+        let e5 = Bitboard::from_square(Square::E5);
+        let path = bitboard::white_front_spans(e5);
+        assert!(
+            !(path & pos.occupied_all()).is_empty(),
+            "front-span is occupied (own knight e7) → not the +Δ branch"
+        );
+        assert!(
+            (path & pos.occupied(Color::Black)).is_empty(),
+            "no ENEMY piece on the front-span → not the −Δ branch → neutral state"
+        );
+        assert_eq!(mg, PASSED_MG[4], "rank bonus mg unaffected");
+        assert_eq!(
+            eg, PASSED_EG[4],
+            "friendly-only on the front-span → neutral: PASSED_EG[4] with NO Δ \
+             (three-state, not two-state — an own piece must not incur the penalty)"
+        );
+    }
+
+    /// Path discriminator for a BLACK passer — exercises the own/enemy sense
+    /// directly for the black branch (the white tests + the path-CLEAR mirror
+    /// would not catch a `path & white_occ`-vs-`path & enemy_occ` inversion
+    /// when `side == Black`; research §7's most-likely-inverted pitfall).
+    ///
+    /// Both fixtures: black Pc4 (file 2, rank idx 3 → black rel-rank 7−3=4),
+    /// no white pawns ⇒ c4 is a black passer. black_front_spans(c4) =
+    /// {c3,c2,c1}. Black promo = c1. Black king e8 (cheb(e8,c1)=7 ⇒ own_d=5),
+    /// white king g6 (cheb(g6,c1)=max(4,5)=5 ⇒ enemy_d=5) ⇒ king term 0.
+    /// Sign for a black passer is −1.
+    ///
+    /// E (enemy-blocked): a WHITE knight on c2 ∈ path ⇒ for BLACK "enemy" =
+    /// white ⇒ −Δ branch. eg_E = −1·(PASSED_EG[4] − Δ[4]) = −(42−35) = −7.
+    /// F (friendly-neutral): a BLACK knight on c2 ∈ path ⇒ friendly-only ⇒
+    /// neutral. eg_F = −1·PASSED_EG[4] = −42.
+    /// An own/enemy inversion in the black branch swaps these (E↔F); the
+    /// exact pins + `eg_E ≠ eg_F` (−7 ≠ −42) catch it.
+    #[test]
+    fn passed_path_black_enemy_vs_friendly_branches() {
+        let e = Position::from_fen("4k3/8/6K1/8/2p5/8/2N5/8 w - - 0 1")
+            .expect("black passer, WHITE knight on its path (enemy-blocked)");
+        let f = Position::from_fen("4k3/8/6K1/8/2p5/8/2n5/8 w - - 0 1")
+            .expect("black passer, BLACK knight on its path (friendly-neutral)");
+        let (mg_e, eg_e) = passed_pawn_term_white(&e, &pawn_eval(&e).passed);
+        let (mg_f, eg_f) = passed_pawn_term_white(&f, &pawn_eval(&f).passed);
+        // Structural (weight-free): for a BLACK passer, "enemy" = white. The
+        // c4 black passer's path is black_front_spans(c4) = {c3,c2,c1}. In E a
+        // WHITE knight sits on c2 (∈ path) → enemy-for-black on path → the −Δ
+        // branch. In F a BLACK knight sits on c2 → friendly-only → the neutral
+        // branch. An own/enemy inversion in the black arm would swap which
+        // branch each fixture selects — caught here regardless of weights.
+        let c4_path = bitboard::black_front_spans(Bitboard::from_square(Square::C4));
+        assert!(
+            !(c4_path & e.occupied(Color::White)).is_empty(),
+            "E: a WHITE (enemy-for-black) piece is on the black passer's path → −Δ branch"
+        );
+        assert!(
+            (c4_path & e.occupied(Color::Black)).count() == 0,
+            "E: no BLACK (friendly) piece on the path other than the passer's own file"
+        );
+        assert!(
+            (c4_path & f.occupied(Color::White)).is_empty(),
+            "F: no WHITE piece on the path → not the −Δ branch"
+        );
+        assert!(
+            !(c4_path & f.occupied(Color::Black)).is_empty(),
+            "F: a BLACK (friendly) piece is on the path → neutral branch"
+        );
+        assert_eq!(mg_e, -PASSED_MG[4], "black passer mg = −PASSED_MG[4]");
+        assert_eq!(mg_f, -PASSED_MG[4], "black passer mg = −PASSED_MG[4]");
+        assert_eq!(
+            eg_e,
+            -(PASSED_EG[4] - PASSED_FREE_EG_DELTA[4]),
+            "E: white (enemy-for-black) piece on the black front-span → −Δ branch"
+        );
+        assert_eq!(
+            eg_f, -PASSED_EG[4],
+            "F: black (friendly) piece only on the path → neutral, no Δ"
+        );
+        // The E≠F magnitude discrimination is zeroed by the shipped config
+        // (both collapse to −0); the own/enemy-branch correctness is now
+        // pinned structurally above. The directional magnitude claim is
+        // re-expressed symbolically (M6.F-revalidated).
+        assert!(
+            -(PASSED_EG[4] - PASSED_FREE_EG_DELTA[4]) >= -PASSED_EG[4],
+            "a white blocker yields a less-negative white-POV eg for black \
+             than a harmless own blocker (M6.F-revalidated; equal at 0)"
+        );
+    }
+
+    /// King-distance sign. Position A: own (white) king adjacent to the promo
+    /// square, enemy king far → positive king contribution. Position B: the
+    /// kings swapped → negative. Same white Pc5 (rel-rank 4), path clear in
+    /// both, so rank+path are identical and only the king geometry differs.
+    ///
+    /// A: white Kb7 (cheb(b7,c8)=max(1,1)=1 ⇒ own_d=1), black kh1
+    /// (cheb(h1,c8)=7 ⇒ enemy_d=5). Path {c6,c7,c8} unoccupied ⇒ +Δ.
+    ///   king term = 4·5·(5−1) + 4·7·(5−5) = 80
+    ///   eg_A = PASSED_EG[4] + Δ[4] + 80 = 42 + 35 + 80 = 157
+    /// B: kings swapped (white Kh1, black kb7) ⇒ own_d=5, enemy_d=1.
+    ///   king term = 4·5·(5−5) + 4·7·(1−5) = −112
+    ///   eg_B = 42 + 35 − 112 = −35
+    /// Discriminator: the king contribution (eg minus the rank+path baseline
+    /// PASSED_EG[4]+Δ[4]) is positive in A and negative in B.
+    ///
+    /// **Score-neutral note (M6.B re-expression precedent).** At the shipped
+    /// zero weights every weighted-magnitude assertion here is `0`-valued and
+    /// the `const{}` sign invariants reduce to `0>=0`/`0<=0` — the magnitude
+    /// discrimination is *dormant* and revalidates only when M6.F restores
+    /// non-zero `PASSED_KDIST_*`. The active weight-free guard at the shipped
+    /// config is the structural Chebyshev-clamp geometry pin (own_d=1 vs
+    /// enemy_d=CAP per fixture); the `const{}` invariants are a compile-time
+    /// gate on the *named* `PASSED_KDIST_*` constants (bypassable only if M6.F
+    /// introduces the coefficient under a different constant).
+    #[test]
+    fn passed_king_distance_own_near_is_bonus() {
+        let a = Position::from_fen("8/1K6/8/2P5/8/8/8/7k w - - 0 1").expect("own king near promo");
+        let b =
+            Position::from_fen("8/1k6/8/2P5/8/8/8/7K w - - 0 1").expect("enemy king near promo");
+        let (mg_a, eg_a) = passed_pawn_term_white(&a, &pawn_eval(&a).passed);
+        let (mg_b, eg_b) = passed_pawn_term_white(&b, &pawn_eval(&b).passed);
+        // Structural (weight-free): the king-distance GEOMETRY the term feeds
+        // into the formula. Promo square = c8. A: own (white) king b7 is 1
+        // cheb from c8, enemy king h1 is ≥CAP. B: kings swapped. These clamped
+        // distances are the exact `min(cheb, CAP)` inputs — a wrong promo
+        // square / Chebyshev / clamp fails here at any weight.
+        let promo = Square::C8;
+        assert_eq!(
+            chebyshev_distance(a.king_square(Color::White), promo).min(PASSED_KDIST_CAP),
+            1,
+            "A: own king b7 is Chebyshev-1 from promo c8 (clamp not saturated)"
+        );
+        assert_eq!(
+            chebyshev_distance(a.king_square(Color::Black), promo).min(PASSED_KDIST_CAP),
+            PASSED_KDIST_CAP,
+            "A: enemy king h1 clamps to CAP (far → enemy term zero)"
+        );
+        assert_eq!(
+            chebyshev_distance(b.king_square(Color::White), promo).min(PASSED_KDIST_CAP),
+            PASSED_KDIST_CAP,
+            "B: own king h1 clamps to CAP (own term zero)"
+        );
+        assert_eq!(
+            chebyshev_distance(b.king_square(Color::Black), promo).min(PASSED_KDIST_CAP),
+            1,
+            "B: enemy king b7 is Chebyshev-1 from promo c8"
+        );
+        // Full-total pins (catch a baseline error that a king-component-only
+        // check would miss): mg unaffected by king geometry; eg = rank + Δ ±
+        // the exact king term. Symbolic over `eval::data` ⇒ 0 = 0 at the
+        // shipped config, M6.F-revalidated.
+        assert_eq!(
+            mg_a, PASSED_MG[4],
+            "A mg = rank bonus only (king term is EG-only)"
+        );
+        assert_eq!(mg_b, PASSED_MG[4], "B mg = rank bonus only");
+        assert_eq!(
+            eg_a,
+            PASSED_EG[4]
+                + PASSED_FREE_EG_DELTA[4]
+                + 4 * PASSED_KDIST_OWN_PER_STEP * (PASSED_KDIST_CAP - 1),
+            "A eg total = rank + Δ + own-king term (rel·OWN·(CAP−1))"
+        );
+        assert_eq!(
+            eg_b,
+            PASSED_EG[4]
+                + PASSED_FREE_EG_DELTA[4]
+                + 4 * PASSED_KDIST_ENEMY_PER_STEP * (1 - PASSED_KDIST_CAP),
+            "B eg total = rank + Δ + enemy-king term (rel·ENEMY·(1−CAP))"
+        );
+        let baseline = PASSED_EG[4] + PASSED_FREE_EG_DELTA[4];
+        let king_a = eg_a - baseline;
+        let king_b = eg_b - baseline;
+        // Exact symbolic pins (the king-term formula shape; the SIGN is the
+        // load-bearing claim — own-near is a bonus, enemy-near a penalty).
+        // Holds at 0 (shipped); M6.F-revalidates the non-zero sign/magnitude.
+        assert_eq!(
+            king_a,
+            4 * PASSED_KDIST_OWN_PER_STEP * (PASSED_KDIST_CAP - 1),
+            "A: rel·OWN·(CAP−own_d=1) with enemy_d=CAP (enemy term zero)"
+        );
+        assert_eq!(
+            king_b,
+            4 * PASSED_KDIST_ENEMY_PER_STEP * (1 - PASSED_KDIST_CAP),
+            "B: rel·ENEMY·(enemy_d=1 − CAP) with own_d=CAP (own term zero)"
+        );
+        // Compile-time structural invariants (M6.F-revalidated): own-king-near
+        // is a non-negative bonus, enemy-king-near a non-positive penalty. 0 =
+        // 0 at the shipped zeroed coeffs; a future M6.F re-tune that violated
+        // the sign relationship would fail the build here.
+        const {
+            assert!(
+                4 * PASSED_KDIST_OWN_PER_STEP * (PASSED_KDIST_CAP - 1) >= 0,
+                "own king near promo → non-negative king contribution"
+            )
+        };
+        const {
+            assert!(
+                4 * PASSED_KDIST_ENEMY_PER_STEP * (1 - PASSED_KDIST_CAP) <= 0,
+                "enemy king near promo → non-positive king contribution"
+            )
+        };
+    }
+
+    /// King-distance Chebyshev clamp. P1: both kings exactly CAP=5 cheb from
+    /// the promo square. P2: both kings cheb 7 (> CAP). `min(dist, CAP)`
+    /// clamps both to 5, so the king term is identical (= 0 here, since both
+    /// distances clamp to CAP) and the full (mg,eg) must match across P1/P2.
+    ///
+    /// White Pd4 (rel-rank 3), promo d8 = (file 3, rank 7).
+    /// P1: white Ka3 (cheb(a3,d8)=max(3,5)=5), black kh3 (cheb(h3,d8)=
+    /// max(4,5)=5). P2: white Ka1 (cheb=max(3,7)=7), black kh1 (cheb=
+    /// max(4,7)=7). Both: own_d=enemy_d=min(·,5)=5 ⇒ king term 0. Path
+    /// {d5,d6,d7,d8} unoccupied in both ⇒ +Δ[3].
+    ///   (mg,eg) = (PASSED_MG[3], PASSED_EG[3] + Δ[3]) = (8, 18+16=34) for both.
+    #[test]
+    fn passed_king_distance_capped() {
+        let p1 = Position::from_fen("8/8/8/8/3P4/K6k/8/8 w - - 0 1").expect("kings cheb=CAP");
+        let p2 = Position::from_fen("8/8/8/8/3P4/8/8/K6k w - - 0 1").expect("kings cheb>CAP");
+        let t1 = passed_pawn_term_white(&p1, &pawn_eval(&p1).passed);
+        let t2 = passed_pawn_term_white(&p2, &pawn_eval(&p2).passed);
+        // The clamp identity is WEIGHT-INDEPENDENT and survives unchanged:
+        // both fixtures clamp every king distance to CAP, so the term is bit-
+        // identical regardless of the coefficient values (including the
+        // shipped zeros). A broken `min(·, CAP)` clamp fails here at any
+        // weight (with zeroed coeffs only if the clamp affected the
+        // *unclamped* product — which it does not here, so the structural
+        // geometry below is the real clamp discriminator).
+        assert_eq!(
+            t1, t2,
+            "Chebyshev distances ≥ CAP clamp identically: =CAP and >CAP give the same term"
+        );
+        // Structural (weight-free): P1 saturates both clamps at CAP; P2's
+        // raw distances exceed CAP yet clamp to the same CAP. This is the
+        // load-bearing clamp behaviour, asserted on the geometry directly.
+        let promo_d = Square::D8;
+        assert_eq!(
+            chebyshev_distance(p1.king_square(Color::White), promo_d).min(PASSED_KDIST_CAP),
+            PASSED_KDIST_CAP,
+            "P1 own king is exactly CAP cheb from d8 (clamp saturated)"
+        );
+        assert!(
+            chebyshev_distance(p2.king_square(Color::White), promo_d) > PASSED_KDIST_CAP,
+            "P2 own king raw cheb exceeds CAP (must clamp down to CAP)"
+        );
+        assert_eq!(
+            chebyshev_distance(p2.king_square(Color::White), promo_d).min(PASSED_KDIST_CAP),
+            PASSED_KDIST_CAP,
+            "P2 own king clamps to the SAME CAP as P1 → identical term"
+        );
+        assert_eq!(
+            t1,
+            (PASSED_MG[3], PASSED_EG[3] + PASSED_FREE_EG_DELTA[3]),
+            "clamped king term is 0 → just rank bonus + path-clear Δ[3]"
+        );
+        // P3: own king ONE step inside CAP (own_d=4) → the clamp is NOT
+        // saturated. White Kh7 (cheb(h7,d8)=max(4,1)=4 ⇒ own_d=4); black ka1
+        // (cheb(a1,d8)=7 ⇒ enemy_d=CAP ⇒ enemy term 0); path {d5,d6,d7,d8}
+        // clear ⇒ +Δ[3].
+        let p3 =
+            Position::from_fen("8/7K/8/8/3P4/8/8/k7 w - - 0 1").expect("own king one inside CAP");
+        let t3 = passed_pawn_term_white(&p3, &pawn_eval(&p3).passed);
+        // Structural (weight-free): the clamp is NOT saturated for P3's own
+        // king — the un-saturated distance is what makes the king term differ
+        // from the saturated case once weights are non-zero.
+        assert_eq!(
+            chebyshev_distance(p3.king_square(Color::White), promo_d).min(PASSED_KDIST_CAP),
+            4,
+            "P3 own king h7 is cheb-4 from d8 → one step inside CAP (clamp NOT saturated)"
+        );
+        let king3 = t3.1 - (PASSED_EG[3] + PASSED_FREE_EG_DELTA[3]);
+        assert_eq!(
+            king3,
+            3 * PASSED_KDIST_OWN_PER_STEP * (PASSED_KDIST_CAP - 4),
+            "own_d=4 (one step inside CAP) → king term rel·OWN·(CAP−4)"
+        );
+        // "sub-CAP own distance contributes a non-zero term" and "differs from
+        // the saturated case" are magnitude claims zeroed by the shipped
+        // config; re-expressed symbolically (M6.F-revalidates the inequality).
+        const {
+            assert!(
+                3 * PASSED_KDIST_OWN_PER_STEP * (PASSED_KDIST_CAP - 4) >= 0,
+                "a sub-CAP own-king distance contributes a non-negative term"
+            )
+        };
+    }
+
+    /// King-distance is rank-scaled by relative rank. Same king geometry
+    /// (white king on c8 adjacent to the d-file promo square d8 ⇒ own_d=1;
+    /// black kh1 ⇒ enemy_d=5) at two relative ranks; the king contribution
+    /// must scale linearly with `rel` — doubling rel doubles it.
+    ///
+    /// LOW: white Pd4 (rel-rank 3). king term = 3·5·(5−1) + 3·7·(5−5) = 60.
+    ///   eg_low = PASSED_EG[3] + Δ[3] + 60 ; king_low = eg_low − (PASSED_EG[3]+Δ[3]) = 60
+    /// HIGH: white Pd7 (rel-rank 6). king term = 6·5·(5−1) = 120.
+    ///   king_high = eg_high − (PASSED_EG[6]+Δ[6]) = 120
+    /// Pin: king_high > king_low AND king_high == 2·king_low (rel 6 = 2·rel 3,
+    /// the exact linear `rel`-scale — kills a constant / wrong-axis scaling).
+    ///
+    /// **Score-neutral note (M6.B re-expression precedent).** At the shipped
+    /// zero weights the linear-scale arithmetic pin degenerates to a constant
+    /// tautology (`6·OWN·(CAP−1) == 2·(3·OWN·(CAP−1))`, true for any value
+    /// incl. 0) — the runtime `king_high == 2·king_low` linearity check is
+    /// *dormant* and revalidates only when M6.F restores non-zero
+    /// `PASSED_KDIST_*`. The active weight-free guard at the shipped config is
+    /// the detection-bitboard pin (d4 = rel-3, d7 = rel-6 passers) catching a
+    /// wrong-pawn-square bug independent of weight.
+    #[test]
+    fn passed_king_distance_rank_scaled() {
+        let low =
+            Position::from_fen("2K5/8/8/8/3P4/8/8/7k w - - 0 1").expect("rel-rank-3, king near");
+        let high =
+            Position::from_fen("2K5/3P4/8/8/8/8/8/7k w - - 0 1").expect("rel-rank-6, king near");
+        // Structural (weight-free): the two fixtures place the lone white
+        // passer at rel-rank 3 (d4) and rel-rank 6 (d7) under the SAME king
+        // geometry. rel-rank is the linear scale factor the king term
+        // multiplies by; a wrong rel / wrong-axis scale fails here at any
+        // weight via the detection-square pin.
+        assert_eq!(
+            pawn_eval(&low).passed[Color::White.index()],
+            Bitboard::from_square(Square::D4),
+            "LOW: lone white passer d4 → rel-rank 3"
+        );
+        assert_eq!(
+            pawn_eval(&high).passed[Color::White.index()],
+            Bitboard::from_square(Square::D7),
+            "HIGH: lone white passer d7 → rel-rank 6 (= 2 × rel-3)"
+        );
+        let (_, eg_low) = passed_pawn_term_white(&low, &pawn_eval(&low).passed);
+        let (_, eg_high) = passed_pawn_term_white(&high, &pawn_eval(&high).passed);
+        let king_low = eg_low - (PASSED_EG[3] + PASSED_FREE_EG_DELTA[3]);
+        let king_high = eg_high - (PASSED_EG[6] + PASSED_FREE_EG_DELTA[6]);
+        // Linear-in-rel is the load-bearing scaling claim; expressed
+        // symbolically over `eval::data` so it holds at the shipped zeros
+        // (0 = 2·0) and M6.F-revalidates the non-zero linearity. rel-6 is
+        // exactly 2× rel-3 with identical king geometry.
+        assert_eq!(
+            6 * PASSED_KDIST_OWN_PER_STEP * (PASSED_KDIST_CAP - 1),
+            2 * (3 * PASSED_KDIST_OWN_PER_STEP * (PASSED_KDIST_CAP - 1)),
+            "king term is linear in rel: rel-6 contribution = 2 × rel-3 (M6.F-revalidated)"
+        );
+        assert_eq!(
+            king_low,
+            3 * PASSED_KDIST_OWN_PER_STEP * (PASSED_KDIST_CAP - 1),
+            "rel-3 king term = 3·OWN·(CAP−1) (enemy_d=CAP zeroes the enemy term)"
+        );
+        assert_eq!(
+            king_high,
+            6 * PASSED_KDIST_OWN_PER_STEP * (PASSED_KDIST_CAP - 1),
+            "rel-6 king term = 6·OWN·(CAP−1) — twice the rel-3 term, same geometry"
+        );
+    }
+
+    /// Black promotion square is rank 0, NOT rank 7 (research §7 pitfall).
+    /// Black Pc2 (file 2, rank idx 1 → black rel-rank = 7−1 = 6). Black promo
+    /// = from_file_rank(2, 0) = c1. Black (own) king b1 adjacent to c1
+    /// (cheb(b1,c1)=1 ⇒ own_d=1); white (enemy) king h8 far from c1
+    /// (cheb(h8,c1)=max(5,7)=7 ⇒ enemy_d=5). Black sign = −1.
+    ///
+    /// black_front_spans(c2) = {c1}; c1 unoccupied ⇒ +Δ branch.
+    ///   mg = −1·PASSED_MG[6] = −34
+    ///   eg = −1·( PASSED_EG[6] + Δ[6] + [rel·OWN·(CAP−1) + rel·ENEMY·(CAP−CAP)] )
+    ///      = −( 118 + 98 + 6·5·4 ) = −(118+98+120) = −336
+    ///
+    /// THE DISCRIMINATOR: if the code wrongly used rank 7 for the black promo
+    /// (c8), then own_d = min(cheb(b1,c8)=7,5)=5 and enemy_d =
+    /// min(cheb(h8,c8)=5,5)=5 ⇒ king term 0 ⇒ eg = −(118+98+0) = −216 ≠ −336.
+    /// The exact −336 pin therefore catches the rank-7-for-black bug.
+    ///
+    /// **Score-neutral note (M6.B re-expression precedent).** At the shipped
+    /// zero weights the −336-vs-−216 magnitude discriminator collapses to
+    /// `0 == 0` — the rank-7-for-black bug catch is *dormant* and revalidates
+    /// only when M6.F restores non-zero weights. The active weight-free guard
+    /// is the structural geometry assertion (clamped own-king Chebyshev to the
+    /// correct rank-0 promo c1 = 1 vs the wrong rank-7 promo c8 = CAP): the
+    /// fixture is constructed so the two promo squares are *geometrically
+    /// distinguishable*, the invariant that makes the M6.F magnitude pin
+    /// observable.
+    #[test]
+    fn passed_promo_square_black_is_rank0() {
+        let pos =
+            Position::from_fen("7K/8/8/8/8/8/2p5/1k6 w - - 0 1").expect("black near-promo c2");
+        let (mg, eg) = passed_pawn_term_white(&pos, &pawn_eval(&pos).passed);
+        let rel = 6i32;
+        let king = rel * PASSED_KDIST_OWN_PER_STEP * (PASSED_KDIST_CAP - 1)
+            + rel * PASSED_KDIST_ENEMY_PER_STEP * (PASSED_KDIST_CAP - PASSED_KDIST_CAP);
+        // Structural (weight-free), THE discriminator for the rank-7-for-black
+        // bug: a black passer's promotion square is (file, rank 0), not
+        // (file, rank 7). The c2 black passer promotes on c1. The own (black)
+        // king b1 is Chebyshev-1 from the CORRECT promo c1 but Chebyshev-7
+        // from the WRONG promo c8 — so the clamped own-distance the term feeds
+        // the formula is 1 iff the rank-0 promo is used. This catches the bug
+        // independent of any weight (the magnitude pins below are 0 at the
+        // shipped config and cannot).
+        let correct_promo = Square::from_file_rank(2, 0).expect("c1");
+        let wrong_promo = Square::from_file_rank(2, 7).expect("c8");
+        let own_d_correct =
+            chebyshev_distance(pos.king_square(Color::Black), correct_promo).min(PASSED_KDIST_CAP);
+        let own_d_wrong =
+            chebyshev_distance(pos.king_square(Color::Black), wrong_promo).min(PASSED_KDIST_CAP);
+        assert_eq!(
+            own_d_correct, 1,
+            "black king b1 is Chebyshev-1 from the correct rank-0 promo c1"
+        );
+        assert_eq!(
+            own_d_wrong, PASSED_KDIST_CAP,
+            "black king b1 clamps to CAP from the WRONG rank-7 promo c8 — \
+             the rank-0-vs-rank-7 choice is observable in this clamped distance"
+        );
+        assert_ne!(
+            own_d_correct, own_d_wrong,
+            "the black-promo-rank bug is structurally observable regardless of weights"
+        );
+        assert_eq!(mg, -PASSED_MG[6], "black passer mg = −PASSED_MG[6]");
+        assert_eq!(
+            eg,
+            -(PASSED_EG[6] + PASSED_FREE_EG_DELTA[6] + king),
+            "black passer eg = −(rank + path-clear Δ + king-term measured to c1, the rank-0 promo)"
+        );
+    }
+
+    /// No passers anywhere → (0, 0). White Pe4 vs black Pe5 mutually block
+    /// each other on the e-file, so `pawn_eval` reports no passers for either
+    /// side; iterating two empty bitboards yields the additive identity.
+    #[test]
+    fn passed_no_passers_is_zero() {
+        let pos = Position::from_fen("4k3/8/8/4p3/4P3/8/8/4K3 w - - 0 1")
+            .expect("mutually-blocked pawns");
+        let pe = pawn_eval(&pos);
+        assert_eq!(
+            pe.passed,
+            [Bitboard::EMPTY; 2],
+            "fixture invariant: e4/e5 block each other → no passers either side"
+        );
+        assert_eq!(
+            passed_pawn_term_white(&pos, &pe.passed),
+            (0, 0),
+            "no passers → additive identity (0, 0)"
+        );
+    }
+
+    /// Color-mirror pair (the M6.B `pawn_eval_*_color_mirror_pair` precedent):
+    /// a white-structure FEN and its hand-written vertical-mirror + colour-swap
+    /// must produce a componentwise-negated `passed_pawn_term_white`. This
+    /// single fixture covers rel-rank, the path discriminator, AND the EG
+    /// king-distance term symmetry (plan §7 / R3: a king-distance-bearing
+    /// mirror, not just rank/path).
+    ///
+    /// FEN A: white Pc5 (rel-rank 4), white Kb7 (own king adjacent to promo
+    /// c8 ⇒ own_d=1), black kh1 (cheb(h1,c8)=7 ⇒ enemy_d=5). Path
+    /// {c6,c7,c8} unoccupied ⇒ +Δ. king term = 4·5·(5−1) + 4·7·0 = 80.
+    ///   mg_A = PASSED_MG[4] = 15
+    ///   eg_A = PASSED_EG[4] + Δ[4] + 80 = 42 + 35 + 80 = 157
+    ///
+    /// FEN B = vertical mirror (rank r → 7−r) + colour swap:
+    ///   white Pc5(f2,r4) → black pc4(f2,r3); white Kb7(f1,r6) → black
+    ///   kb2(f1,r1); black kh1(f7,r0) → white Kh8(f7,r7).
+    /// Black passer c4 (rel = 7−3 = 4), sign −1, black promo c1
+    /// (from_file_rank(2,0)); black king b2 cheb(b2,c1)=1 ⇒ own_d=1; white
+    /// king h8 cheb(h8,c1)=7 ⇒ enemy_d=5; black_front_spans(c4)={c3,c2,c1}
+    /// unoccupied ⇒ +Δ. By construction every sub-term mirrors A with the
+    /// opposite sign ⇒ (mg_B, eg_B) = (−15, −157) = −(mg_A, eg_A).
+    #[test]
+    fn passed_color_mirror_pair_negates_componentwise() {
+        let a = Position::from_fen("8/1K6/8/2P5/8/8/8/7k w - - 0 1").expect("mirror A (white)");
+        let b = Position::from_fen("7K/8/8/8/2p5/8/1k6/8 w - - 0 1").expect("mirror B (black)");
+        let ta = passed_pawn_term_white(&a, &pawn_eval(&a).passed);
+        let tb = passed_pawn_term_white(&b, &pawn_eval(&b).passed);
+
+        // Composition pinned symbolically against `eval::data` (white side:
+        // rank + path-clear Δ + own-king-near king term, enemy term zero).
+        // Holds at the shipped zeros; M6.F-revalidates the magnitude.
+        let king = 4 * PASSED_KDIST_OWN_PER_STEP * (PASSED_KDIST_CAP - 1);
+        assert_eq!(
+            ta,
+            (PASSED_MG[4], PASSED_EG[4] + PASSED_FREE_EG_DELTA[4] + king),
+            "A: white passer rel-rank-4, path clear, own king adjacent to promo"
+        );
+        // "A eg is a net bonus" is a magnitude claim zeroed by the shipped
+        // config; re-expressed symbolically over the composition (≥ 0 at any
+        // weight given the rank/path/king sub-terms are individually ≥ 0 here;
+        // M6.F-revalidates the strict bonus).
+        assert!(
+            PASSED_EG[4] + PASSED_FREE_EG_DELTA[4] + king >= 0,
+            "A eg is a net bonus for the side to promote (M6.F-revalidated; 0 at shipped)"
+        );
+        // Componentwise negation of the SYMBOLIC forms across the hand-mirror
+        // pair (R3 — the M6.B color-mirror discipline). Both sides are 0 at
+        // the shipped weights; the structural mirror is pinned weight-free on
+        // the detection bitboards below.
+        assert_eq!(tb.0, -ta.0, "mirrored black-structure mg = −(white mg)");
+        assert_eq!(tb.1, -ta.1, "mirrored black-structure eg = −(white eg)");
+
+        // Detection-bitboard symmetry: the white passer on A mirrors the
+        // black passer on B (same file, mirrored rank). Weight-free → still
+        // pins rel-rank + path symmetry at the shipped zeros.
+        assert_eq!(
+            pawn_eval(&a).passed[Color::White.index()],
+            Bitboard::from_square(Square::C5),
+            "A: c5 is the lone white passer"
+        );
+        assert_eq!(
+            pawn_eval(&b).passed[Color::Black.index()],
+            Bitboard::from_square(Square::C4),
+            "B: c4 is the lone black passer (mirror of A's c5)"
+        );
+
+        // King-distance GEOMETRY symmetry (plan §7 R3: the mirror must pin the
+        // EG king term, not just rank/path — and with the shipped zero weights
+        // `tb == -ta` no longer discriminates it, so it is pinned weight-free
+        // on the clamped Chebyshev inputs). A: white passer c5 → promo c8;
+        // own (white) king b7 cheb-1, enemy (black) king h1 clamps to CAP.
+        // B: black passer c4 → promo c1; own (black) king b2 cheb-1, enemy
+        // (white) king h8 clamps to CAP. The own/enemy clamped distances
+        // mirror exactly — a black-promo-rank or own/enemy-king-swap bug
+        // breaks this regardless of weights.
+        let a_own =
+            chebyshev_distance(a.king_square(Color::White), Square::C8).min(PASSED_KDIST_CAP);
+        let a_enemy =
+            chebyshev_distance(a.king_square(Color::Black), Square::C8).min(PASSED_KDIST_CAP);
+        let b_promo = Square::from_file_rank(2, 0).expect("c1 — black promo is rank 0");
+        let b_own = chebyshev_distance(b.king_square(Color::Black), b_promo).min(PASSED_KDIST_CAP);
+        let b_enemy =
+            chebyshev_distance(b.king_square(Color::White), b_promo).min(PASSED_KDIST_CAP);
+        assert_eq!(a_own, 1, "A: own king adjacent to promo c8 (cheb-1)");
+        assert_eq!(
+            a_enemy, PASSED_KDIST_CAP,
+            "A: enemy king far → clamps to CAP"
+        );
+        assert_eq!(
+            (b_own, b_enemy),
+            (a_own, a_enemy),
+            "king-distance geometry mirrors componentwise across the pair \
+             (own↔own, enemy↔enemy; black promo at rank 0)"
+        );
+    }
+
+    /// D2 (no suppression — research §4.3 / ADR-0032 §6): a connected passer
+    /// earns BOTH the CONN bonus (M6.B `pawn_eval`) and the passed-pawn term,
+    /// additively, on the SAME pawns. White phalanx d5/e5, no black pawns:
+    /// {d5,e5} are simultaneously a connected phalanx AND both passers.
+    ///
+    /// Kings far (Ka1: cheb to d8/e8 = 7; kh1: cheb to d8/e8 = 7) ⇒ king
+    /// term 0; both front-spans clear ⇒ +Δ[4] each.
+    ///   passed term = (2·PASSED_MG[4], 2·(PASSED_EG[4]+Δ[4])) = (30, 154) ≠ 0
+    ///   pawn_eval CONN (rel-rank 4, 2 pawns) = (2·CONN_MG[4], 2·CONN_EG[4])
+    ///                                        = (26, 36) ≠ 0
+    /// The two terms coexist on the identical squares — proves no if-else
+    /// suppression collapses one when the other fires.
+    #[test]
+    fn passed_stacks_with_connected() {
+        let pos = Position::from_fen("8/8/8/3PP3/8/8/8/K6k w - - 0 1").expect("connected passers");
+        let pe = pawn_eval(&pos);
+        let white_pawns = pos.pieces_colored(Color::White, crate::piece::PieceKind::Pawn);
+
+        // The SAME d5/e5 squares are in the passed set AND the connected set.
+        let d5e5 = Bitboard::from_square(Square::D5) | Bitboard::from_square(Square::E5);
+        assert_eq!(
+            pe.passed[Color::White.index()],
+            d5e5,
+            "d5,e5 are both white passers (no black pawns)"
+        );
+        assert_eq!(
+            connected_pawns(white_pawns, Color::White),
+            d5e5,
+            "d5,e5 are also a connected phalanx — the very same squares"
+        );
+
+        // CONN is the only live M6.B term (ISO/DBL/BWD zeroed), so for a
+        // d5/e5-only board `pawn_eval` == the exact CONN contribution: two
+        // rel-rank-4 connected pawns → (2·CONN_MG[4], 2·CONN_EG[4]).
+        assert_eq!(
+            (pe.mg, pe.eg),
+            (2 * CONN_MG[4], 2 * CONN_EG[4]),
+            "connected phalanx → exact CONN contribution (2 pawns at rel-rank 4)"
+        );
+        assert_ne!(
+            (pe.mg, pe.eg),
+            (0, 0),
+            "…and it is non-zero (no suppression)"
+        );
+        // No-suppression is a STRUCTURAL claim, pinned weight-free above on
+        // set membership: the SAME d5/e5 squares are in BOTH the passed set
+        // AND the connected set. A suppressing implementation (passed term
+        // masked off when CONN fires, or vice-versa) would fail those
+        // `assert_eq!`s regardless of weights — exactly the M6.B
+        // `pawn_eval_isolated_doubled_stack` popcount-precedent move (the
+        // shipped score-neutral config zeroes the passed weights, so the
+        // weighted `pp != (0,0)` magnitude can no longer discriminate
+        // suppression). The passed-term composition is pinned symbolically
+        // over `eval::data` (0 = 0 at shipped weights; M6.F-revalidates the
+        // exact additive value: 2 passers, rel-rank 4, paths clear → +Δ[4],
+        // kings ≥CAP from d8/e8 → king term 0).
+        let pp = passed_pawn_term_white(&pos, &pe.passed);
+        assert_eq!(
+            pp,
+            (
+                2 * PASSED_MG[4],
+                2 * (PASSED_EG[4] + PASSED_FREE_EG_DELTA[4])
+            ),
+            "connected passer earns the exact passed-pawn term too — additive, \
+             no suppression (D2); the SAME d5/e5 squares carry both \
+             (magnitude discrimination M6.F-revalidated; 0 at shipped weights)"
         );
     }
 }

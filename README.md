@@ -3,7 +3,9 @@
 A Rust chess engine, written from scratch and grown incrementally toward
 GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 
-> **Status: M6 in progress (M6.B landed 2026-05-16, CONN-only, +45 Elo vs `M6.A`).** Fail-soft
+> **Status: M6 in progress (M6.C landed 2026-05-17 — passed-pawn infra,
+> score-neutral; all passed weights deferred to M6.F. Production HEAD = `M6.C`,
+> strength unchanged vs `M6.B` by construction).** Fail-soft
 > alpha-beta with quiescence search, iterative deepening, transposition
 > table (Zobrist-keyed, 16 MiB default; qsearch participates per ADR-0028),
 > killer-aware move ordering (TT move + MVV-LVA captures + 2 killer slots
@@ -34,8 +36,14 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > SPRT-regressed −100 vs `M6.A`, a per-term subset screen exposed a
 > catastrophic ISO×CONN connectivity-axis double-count, CONN-only is
 > the largest interaction-immune gain at **+45 Elo**; M6.F re-introduces
-> ISO/DBL/BWD via joint Texel + rescales CONN), and
-> `compute_caps`-driven time management. `bench` UCI command for
+> ISO/DBL/BWD via joint Texel + rescales CONN), the **passed-pawn term**
+> — per-passer rank bonus + EG path discriminator + EG king-tropism,
+> computed live, never cached — shipped **score-neutral** (M6.C;
+> ADR-0032 §8: a three-config screen ladder proved the literature
+> defaults a scale-invariant structural mismatch with this engine, so
+> every passed weight is zeroed and the whole set defers to M6.F's
+> reshape; the term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.B`),
+> and `compute_caps`-driven time management. `bench` UCI command for
 > deterministic node-count regression baselines. The remaining strength
 > path (pawn structure, mobility, king safety, Texel tuning across M6.B–F;
 > then NNUE) is tracked in [`docs/roadmap.md`](docs/roadmap.md).

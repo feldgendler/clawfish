@@ -10570,19 +10570,68 @@ mod tests {
     /// in-check version visits the full evasion move loop; the not-in-check
     /// version fires NMP cutoff. Both fixtures retain non-pawn material so
     /// the zugzwang gate cannot be the differentiator.
+    ///
+    /// **Illegal-fixture defect fix (M6.B Legality precedent; ADR-0032 §7).**
+    /// The defect was discovered during the M6.C contingency screen but is
+    /// **independent of the deferred passed-pawn weights** — M6.C ships
+    /// score-neutral (eval == `M6.B` byte-for-byte), so this fix is a
+    /// standalone correctness repair, not an eval-magnitude recalibration.
+    /// The original M6.B fixtures
+    /// (`7k/8/8/8/3Q4/8/4nPPP/6K1 w` and `7k/8/7n/8/3Q4/8/5PPP/6K1 w`)
+    /// were **illegal**: White Qd4's d4→h8 diagonal is unobstructed, so the
+    /// *black* king on h8 is in check with White to move — the side NOT to
+    /// move is in check (FIDE-illegal). M6.B's move ordering never explored
+    /// the king-capture branch, masking the defect; exploring it surfaces
+    /// `generate_moves` emitting `Qd4xh8`, tripping `debug_assert!` at
+    /// `src/mov.rs:589`. The fixtures' validation only checked the
+    /// side-to-move's check status, never the opponent's — the same
+    /// defect-hiding gap as M6.B's `fail_low_fixture` "Legality (M6.B defect
+    /// fix)" lesson, generalized; reverting it would knowingly re-introduce
+    /// a FIDE-illegal fixture (the project's correctness-over-Elo precedent,
+    /// M5.E). Both fixtures are re-pinned to the queen on b3 (`1Q6`), which
+    /// attacks neither king: White Kg1, Qb3, Pf2/Pg2/Ph2; Black Kh8.
+    /// In-check fixture adds Black Ne2 (a knight on e2 attacks g1 → White in
+    /// check); the no-check sister moves the knight to h6 (attacks none of
+    /// White's pieces). Qb3 covers neither g1 nor h8 (b3's diagonals run
+    /// b3-c4-d5-e6-f7-g8 and b3-a2 / b3-c2-d1, its file is b, its rank is 3
+    /// — none reach h8; none reach g1 either), so the side-not-to-move is
+    /// never in check in either fixture. A new `opponent-not-in-check`
+    /// assertion (via `make_null_move` then `in_check`, mirroring the
+    /// production NMP/zobrist-probe precedent at search.rs ~1619 / ~10942)
+    /// pins the previously-missing invariant. Both retain White's queen so
+    /// the zugzwang gate passes in both. Observed under the shipped
+    /// score-neutral config (debug, deterministic across reruns,
+    /// `cargo test --lib`): shared `beta = min(stm_static_eval-50) = 889`;
+    /// `nodes_in = 38` (full evasion loop), `nodes_no = 2` (NMP cutoff) →
+    /// distinct, `nodes_in > nodes_no` holds.
     #[test]
     fn negamax_skips_nmp_when_in_check() {
         use crate::movegen::in_check;
 
-        // In-check fixture: White K g1, Q d4, P f2/g2/h2. Black K h8, N e2
-        // (knight on e2 attacks g1). White is in check. Reused from
-        // `qsearch_does_not_stand_pat_in_check`.
-        let pos_check = Position::from_fen("7k/8/8/8/3Q4/8/4nPPP/6K1 w - - 0 1")
+        // Helper: is the side NOT to move in check? (The previously-missing
+        // legality invariant — a position with the opponent in check while
+        // it is the other side's move is FIDE-illegal and would let
+        // `generate_moves` emit a king capture, tripping mov.rs:589.)
+        // Implemented via a null move (pass the turn) then the standard
+        // side-to-move `in_check`, mirroring the production NMP make_null /
+        // zobrist-probe precedent elsewhere in this module.
+        let opponent_in_check = |pos: &Position| -> bool {
+            let mut p = *pos;
+            let undo = p.make_null_move();
+            let c = in_check(&p);
+            p.unmake_null_move(undo);
+            c
+        };
+
+        // In-check fixture: White Kg1, Qb3, Pf2/Pg2/Ph2. Black Kh8, Ne2
+        // (a knight on e2 attacks g1). White is in check; Qb3 attacks
+        // neither king, so Black is NOT in check (legal position).
+        let pos_check = Position::from_fen("7k/8/8/8/8/1Q6/4nPPP/6K1 w - - 0 1")
             .expect("in-check FEN must parse");
         // Sister: same skeleton, knight moved from e2 to h6 (attacks none of
         // White's pieces; not check). White still has its queen as non-pawn
         // material, so the zugzwang gate passes in both fixtures.
-        let pos_no_check = Position::from_fen("7k/8/7n/8/3Q4/8/5PPP/6K1 w - - 0 1")
+        let pos_no_check = Position::from_fen("7k/8/7n/8/8/1Q6/5PPP/6K1 w - - 0 1")
             .expect("no-check FEN must parse");
 
         // Programmatically verify the check / no-check property of the
@@ -10595,6 +10644,19 @@ mod tests {
         assert!(
             !in_check(&pos_no_check),
             "fixture pos_no_check must NOT be in check"
+        );
+        // Legality invariant (M6.C illegal-fixture defect fix): the side NOT
+        // to move must also not be in check, else the position is illegal
+        // and `generate_moves` can emit an opponent-king capture, tripping
+        // the `src/mov.rs:589` debug_assert. This is the invariant the
+        // pre-M6.C fixture validation omitted.
+        assert!(
+            !opponent_in_check(&pos_check),
+            "in-check fixture must be legal: the side NOT to move (Black) must NOT be in check"
+        );
+        assert!(
+            !opponent_in_check(&pos_no_check),
+            "no-check fixture must be legal: the side NOT to move (Black) must NOT be in check"
         );
         assert!(
             has_non_pawn_material(&pos_check, Color::White),
@@ -10641,10 +10703,17 @@ mod tests {
         );
         let nodes_no = ab_no.nodes;
 
+        // Directional, not merely `!=` (test-suite-review nit): the in-check
+        // fixture skips NMP and runs the full evasion move loop (≫ nodes);
+        // the no-check sister fires the NMP cutoff (≪ nodes). Observed
+        // 38 vs 2 under the shipped score-neutral config (debug,
+        // deterministic). `>` closes the pathological-pass gap where a
+        // broken NMP gate produced fewer in-check nodes.
         assert!(
-            nodes_in != nodes_no,
-            "in-check vs no-check must produce different node counts; \
-             got in_check={nodes_in}, no_check={nodes_no}"
+            nodes_in > nodes_no,
+            "in-check (NMP-skipped, full evasion loop) must visit MORE nodes \
+             than the no-check sister (NMP cutoff); got in_check={nodes_in}, \
+             no_check={nodes_no}"
         );
     }
 
