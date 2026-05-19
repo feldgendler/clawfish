@@ -7,6 +7,8 @@
 
 pub mod bench;
 pub mod bitboard;
+/// M6.G — reusable game-result-labeled quiet-position corpus (data infra).
+pub mod corpus;
 /// Tournament-harness binary glue (`elo-iterate`). See `docs/decisions/0020-eloh-harness.md`.
 pub mod elo_iterate;
 pub mod engine;

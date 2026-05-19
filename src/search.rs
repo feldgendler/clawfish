@@ -3274,6 +3274,75 @@ pub fn is_fifty_move_draw(halfmove_clock: u8) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// M6.G corpus seam — quiescence eval accessor (additive, behavior-neutral).
+//
+// Reads the *existing* `AlphaBetaMover::qsearch` with a full window at ply 0.
+// Introduces no new search/eval logic and touches no existing code path, so
+// `evaluate`/negamax/qsearch and the deterministic `bench` signature are
+// byte-identical (the M6.G "no engine build / no bench" clause targets
+// strength/bench-affecting change). White-POV (Texel needs White-positive);
+// `qsearch` returns a side-to-move-relative score, negated for Black here.
+//
+// Consumed by `corpus::quiet` (M6.G) and downstream by M6.H, the
+// tuning-backlog "PST co-tuning" Arm B, future SPSA campaigns, and M10
+// NNUE data-prep — a deliberately public data-infra seam.
+// ---------------------------------------------------------------------------
+
+/// Opaque per-worker quiescence-eval handle. Wraps the crate-private
+/// searcher so the M6.G seam does not leak engine internals (the
+/// `evaluate_cached` `pub(crate)`-type-leak precedent). Construct once per
+/// worker thread and reuse across positions — do **not** allocate per
+/// position (R6/R7: avoids per-position searcher/TT/pawn-hash allocation).
+pub struct QSearcher(AlphaBetaMover);
+
+impl Default for QSearcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QSearcher {
+    /// New reusable handle.
+    pub fn new() -> Self {
+        QSearcher(AlphaBetaMover::new())
+    }
+
+    /// White-POV quiescence-search score (centipawns) of `pos`.
+    /// `evaluate`/qsearch logic is unchanged; this only *reads* it. White-POV
+    /// because Texel needs White-positive (`qsearch` is side-to-move-relative,
+    /// negated for Black here).
+    pub fn eval_white(&mut self, pos: &Position) -> i32 {
+        let caps = TimeCaps {
+            soft: Duration::MAX,
+            hard: Duration::MAX,
+        };
+        let ctx = SearchContext {
+            stop: Arc::new(AtomicBool::new(false)),
+            caps,
+            virtual_clock: false,
+            limits: SearchLimits::default(),
+            history: Vec::new(),
+            tt: None,
+        };
+        let clock = SearchClock::start_for(false, caps);
+        let mut work = *pos;
+        let stm_score = self.0.qsearch(&mut work, -INF, INF, 0, &ctx, &clock);
+        if pos.side_to_move() == crate::Color::White {
+            stm_score
+        } else {
+            -stm_score
+        }
+    }
+}
+
+/// White-POV quiescence-search score (centipawns) of `pos`. Convenience
+/// wrapper that allocates a throwaway [`QSearcher`]; for bulk corpus use
+/// prefer a per-worker-reused `QSearcher`.
+pub fn quiescence_eval_white(pos: &Position) -> i32 {
+    QSearcher::new().eval_white(pos)
+}
+
+// ---------------------------------------------------------------------------
 // M5.H1 — MoveStager: iterator over the negamax move sequence.
 //
 // H1 v2 implementation: thin wrapper around a single eager-sorted Vec, matching
