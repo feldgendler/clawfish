@@ -187,7 +187,7 @@ The correct constant: in LERF indexing (a1=0, h8=63), the light squares are `0x5
 
 The literature range for MG is 10–50; EG is 40–60. The cluster in Texel-tuned engines (engines that started at 50/50 and allowed the tuner to move values) tends toward MG ~30–35, EG ~48–55.
 
-**Recommendation**: MG +30 cp / EG +50 cp as the literature-default starting values. This is conservative enough not to distort the SPRT signal from the tapering change itself, and the correct values will be recovered by the M6.F Texel pass.
+**Recommendation**: MG +30 cp / EG +50 cp as the literature-default starting values. This is conservative enough not to distort the SPRT signal from the tapering change itself, and the correct values will be recovered by the M6.H Texel pass.
 
 ### 4.3 Predicate Inversion vs. KBvKB-Same-Color
 
@@ -302,7 +302,7 @@ if advantage_cp > 100 && raw_phase < 4 {
 }
 ```
 
-This is a simple guard; the M6.A plan should decide whether to apply this scaling or rely purely on the phase gate. The phase gate alone is likely sufficient at the M6.A stage; refinement via Texel tuning in M6.F will calibrate the magnitudes.
+This is a simple guard; the M6.A plan should decide whether to apply this scaling or rely purely on the phase gate. The phase gate alone is likely sufficient at the M6.A stage; refinement via Texel tuning in M6.H will calibrate the magnitudes.
 
 ---
 
@@ -485,7 +485,7 @@ The plan must add named (non-proptest) unit tests for each of these edge cases t
 
 3. **Storage layout**: use the explicit triple `(static_mg_white: i32, static_eg_white: i32, raw_phase: u8)` on `Position`. Do not use the packed-i32 trick (documented sign-extension hazard at i16 saturation). The packed-i64 is safe but offers no advantage over the explicit triple. Provide a single-pass `eval_state_from_scratch` helper for the debug round-trip assert.
 
-4. **Bishop pair bonus**: MG +30 cp / EG +50 cp as literature-default starting values, recoverable by Texel tuning in M6.F. Predicate: `(bishops & LIGHT_SQUARES).any() && (bishops & DARK_SQUARES).any()`. Implement as a named function distinct from the KBvKB-same-color predicate.
+4. **Bishop pair bonus**: MG +30 cp / EG +50 cp as literature-default starting values, recoverable by Texel tuning in M6.H. Predicate: `(bishops & LIGHT_SQUARES).any() && (bishops & DARK_SQUARES).any()`. Implement as a named function distinct from the KBvKB-same-color predicate.
 
 5. **KBvKB same-color draw**: predicate `square_color(wb_sq) == square_color(bb_sq)` activated when total piece count is 4, white has exactly one bishop, and black has exactly one bishop. Returns 0 from `evaluate`. The predicate checks for **same** color — opposite from the bishop-pair condition.
 

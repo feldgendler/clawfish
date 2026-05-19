@@ -50,10 +50,12 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 | Search trait | `Search` trait + `SearchContext` + `SearchLimits` + `SearchResult` (unchanged since M2.C) | ADR-0011; "Search v1" below |
 | UCI options | `Random_Seed` (M2.D), `MoveOverhead` (M3.E), `Hash` (M4.A) | `docs/plans/m2.d.md`, ADR-0017, ADR-0018 |
 | Evaluation v2 | Tapered PeSTO MG+EG material+PST (`PSQT_MG`/`PSQT_EG` const tables) blended by phase + bishop pair + KBvKB-same-color + mop-up | "Evaluation v2 — tapered" below; ADR-0031 (supersedes ADR-0014 §1/§5) |
-| Pawn-structure infra (M6.B) | Pawn-only Zobrist substream `Position::pawn_zobrist` (structural 3-XOR, Polyglot pawn keys); 4 MiB search-owned always-replace `PawnHashTable` on `AlphaBetaMover` (cleared in `Search::reset`); isolated/doubled/backward/connected predicates + passed detection; `evaluate_core`/`evaluate`/`evaluate_cached` (pure accelerator, D6). **Shipped config: `PAWN_STRUCTURE_IN_EVAL = true`, CONN-only — `ISO/DBL/BWD` weights zeroed in `eval::data` (every multi-term subset collapses via an ISO×CONN connectivity double-count; CONN-only Δ Elo +45.42 vs `M6.A`). M6.F re-introduces ISO/DBL/BWD via joint Texel + rescales CONN.** | "Pawn-structure infra" below; ADR-0032 (§7) |
-| Passed-pawn term (M6.C) | `pawns::passed_pawn_term_white` (rank bonus + EG three-state path + EG king-tropism), reads M6.B's cached `passed[2]`, **computed live in `evaluate_core` — never cached** (king-distance/path are not pawn-only, ADR-0032 §3); blend-numerator only, not `static_eval_white`/mop-up (§4). **Shipped score-neutral: every passed weight zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.B`** (a three-config screen ladder proved the literature defaults a scale-invariant structural mismatch; whole weight set → M6.F). Term math live at zero weight, M6.F-ready. | "Passed-pawn term" below; ADR-0032 (§8) |
-| Piece-mobility term (M6.D) | `eval::mobility::mobility_term_white(pos) -> (i32, i32)` — N/B/R/Q `popcount(piece_attacks(sq, occ_all) ∩ area)`, `area = !(own_occupied ∪ enemy_pawn_attacked)`, per-kind MG/EG tables; **computed live in `evaluate_core` — never cached** (not pawn-only, the ADR-0032 §3 class); blend-numerator only, not `static_eval_white`/mop-up (the ADR-0032 §4 boundary class). Sliders use full `occ_all` (enemy-non-pawn first-blocker counted); pins scored **pseudolegally**; **no x-ray** — deliberate roadmap-committed deferrals. King/pawn excluded. **Shipped score-neutral: all 8 `*_MOBILITY_*` weights zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.C`** (the landing-gate + full §11 per-kind screen proved the Stockfish-HCE literature defaults a scale-invariant structural mismatch with our PeSTO PSTs — co-scale ×0.5 *worsened* to −220; whole weight set → M6.F per-kind reshape). `MOBILITY_IN_EVAL=true`, term math live at zero weight, M6.F-ready. **No ADR** — roadmap M6.D row + `docs/milestones/m6.d.md` commit the semantic (ADR-0032 is pawn-structure-scoped). | "Piece-mobility term" below; roadmap §M6 / m6.d.md |
-| King-safety term (M6.E) | `eval::king_safety::king_safety_term_white(pos) -> (i32, i32)` — king-zone attacker S-curve (`KING_SAFETY_TABLE[units.clamp(0,99)]`, units = Σ per-kind `KING_ATTACK_WEIGHT·popcount(attacks & king_zone)`, gated `<2 attackers ∨ no queen`, MG-only) + castled pawn-shield (SHIELD_1/2, relative-rank mirror) + MG-only open/semi-open-file penalty (both-adjacent amplifier). Zone via the single-source `pub(crate) king_zone(side,ksq)` = `ring \| (fwd & !from_square(ksq))` (king square excluded; 11 central / 8 back-rank / 5 corner). **Computed live in `evaluate_core` — never cached** (not pawn-only — king square + attacker squares; ADR-0033 §6 **supersedes ADR-0032 §3**'s pawn-shield-cache reservation as a correctness hazard). Blend-numerator only, not `static_eval_white`/mop-up (the ADR-0032 §4 boundary class). Pawn-storm omitted (ADR-0033 §3 — documented gap). **Shipped score-neutral: all 13 king-safety weights zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.D`**. **No SPRT screen ladder** (the M6.C/M6.D divergence, owned — ADR-0033 §8): research transfer-risk HIGH (PeSTO king-PST double-count) + the three-phase law + SPRT-noisiness + coupled-by-design components ⇒ negative-EV screen; line-296 satisfied vacuously (inert ⇒ no Elo claim). `KING_SAFETY_IN_EVAL=true`, term math live at zero weight, M6.F-ready. ADR-0033 (binds on M6.E per roadmap §M6). | "King-safety term" below; ADR-0033 / m6.e.md |
+| Pawn-structure infra (M6.B) | Pawn-only Zobrist substream `Position::pawn_zobrist` (structural 3-XOR, Polyglot pawn keys); 4 MiB search-owned always-replace `PawnHashTable` on `AlphaBetaMover` (cleared in `Search::reset`); isolated/doubled/backward/connected predicates + passed detection; `evaluate_core`/`evaluate`/`evaluate_cached` (pure accelerator, D6). **Shipped config: `PAWN_STRUCTURE_IN_EVAL = true`, CONN-only — `ISO/DBL/BWD` weights zeroed in `eval::data` (every multi-term subset collapses via an ISO×CONN connectivity double-count; CONN-only Δ Elo +45.42 vs `M6.A`). M6.H re-introduces ISO/DBL/BWD via joint Texel + rescales CONN.** | "Pawn-structure infra" below; ADR-0032 (§7) |
+| Passed-pawn term (M6.C) | `pawns::passed_pawn_term_white` (rank bonus + EG three-state path + EG king-tropism), reads M6.B's cached `passed[2]`, **computed live in `evaluate_core` — never cached** (king-distance/path are not pawn-only, ADR-0032 §3); blend-numerator only, not `static_eval_white`/mop-up (§4). **Shipped score-neutral: every passed weight zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.B`** (a three-config screen ladder proved the literature defaults a scale-invariant structural mismatch; whole weight set → M6.H). Term math live at zero weight, M6.H-ready. | "Passed-pawn term" below; ADR-0032 (§8) |
+| Piece-mobility term (M6.D) | `eval::mobility::mobility_term_white(pos) -> (i32, i32)` — N/B/R/Q `popcount(piece_attacks(sq, occ_all) ∩ area)`, `area = !(own_occupied ∪ enemy_pawn_attacked)`, per-kind MG/EG tables; **computed live in `evaluate_core` — never cached** (not pawn-only, the ADR-0032 §3 class); blend-numerator only, not `static_eval_white`/mop-up (the ADR-0032 §4 boundary class). Sliders use full `occ_all` (enemy-non-pawn first-blocker counted); pins scored **pseudolegally**; **no x-ray** — deliberate roadmap-committed deferrals. King/pawn excluded. **Shipped score-neutral: all 8 `*_MOBILITY_*` weights zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.C`** (the landing-gate + full §11 per-kind screen proved the Stockfish-HCE literature defaults a scale-invariant structural mismatch with our PeSTO PSTs — co-scale ×0.5 *worsened* to −220; whole weight set → M6.H per-kind reshape). `MOBILITY_IN_EVAL=true`, term math live at zero weight, M6.H-ready. **No ADR** — roadmap M6.D row + `docs/milestones/m6.d.md` commit the semantic (ADR-0032 is pawn-structure-scoped). | "Piece-mobility term" below; roadmap §M6 / m6.d.md |
+| King-safety term (M6.E) | `eval::king_safety::king_safety_term_white(pos) -> (i32, i32)` — king-zone attacker S-curve (`KING_SAFETY_TABLE[units.clamp(0,99)]`, units = Σ per-kind `KING_ATTACK_WEIGHT·popcount(attacks & king_zone)`, gated `<2 attackers ∨ no queen`, MG-only) + castled pawn-shield (SHIELD_1/2, relative-rank mirror) + MG-only open/semi-open-file penalty (both-adjacent amplifier). Zone via the single-source `pub(crate) king_zone(side,ksq)` = `ring \| (fwd & !from_square(ksq))` (king square excluded; 11 central / 8 back-rank / 5 corner). **Computed live in `evaluate_core` — never cached** (not pawn-only — king square + attacker squares; ADR-0033 §6 **supersedes ADR-0032 §3**'s pawn-shield-cache reservation as a correctness hazard). Blend-numerator only, not `static_eval_white`/mop-up (the ADR-0032 §4 boundary class). Pawn-storm omitted (ADR-0033 §3 — documented gap). **Shipped score-neutral: all 13 king-safety weights zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.D`**. **No SPRT screen ladder** (the M6.C/M6.D divergence, owned — ADR-0033 §8): research transfer-risk HIGH (PeSTO king-PST double-count) + the three-phase law + SPRT-noisiness + coupled-by-design components ⇒ negative-EV screen; line-296 satisfied vacuously (inert ⇒ no Elo claim). `KING_SAFETY_IN_EVAL=true`, term math live at zero weight, M6.H-ready. ADR-0033 (binds on M6.E per roadmap §M6). | "King-safety term" below; ADR-0033 / m6.e.md |
+| Tier-1 HCE features (M6.F) | Three lightweight features added before the joint Texel pass (research `docs/research/m6-remaining-hce-features.md`): (1) **outposts** — knight/bishop on an enemy-pawn-unchallengeable hole in the enemy half, pawn-supported (reads M6.B's pawn-attack-span fills + the `file_fill` helper); (2) **rook on open/semi-open file** — `file_fill(rooks) & ~file_fill(pawns)` discriminator; (3) **endgame scaling / draw-dampening** — OCB-with-pawns multiplier + pawnless-draw material patterns + 50-move-proximity taper (KBvKB-same-color already in M6.A — **not** duplicated). **Computed live in `evaluate_core`** (the ADR-0032 §3 / ADR-0033 §6 live-term class); blend-numerator only, the §4 boundary class. **Shipped score-neutral inert per the M6.C/M6.D/M6.E precedent: all new weights zeroed ⇒ outpost/rook-file ≡ (0,0), endgame-scaling multiplier ≡ identity ⇒ `evaluate` byte-identical to `M6.E` ⇒ bench `1213649`/d4 `90591` byte-for-byte ⇒ provably inert ⇒ no confirmation SPRT, no SPRT screen ladder.** `*_IN_EVAL=true`-style flags, term math live at zero weight, M6.H-ready. **Open ADR question:** endgame-scaling is a correctness feature the research says does not strictly need Texel calibration — the M6.F plan/ADR may land that one sub-feature *live* with a correctness gate (M5.E precedent) rather than inert; default framing inert-per-precedent. ADR allocated at landing. | "Tier-1 HCE features" below; roadmap §M6 / `docs/research/m6-remaining-hce-features.md` |
+| Tuning corpus infra (M6.G) | Reusable game-result-labeled position corpus (data infra, **no `evaluate`/`Position`/search touch — no engine build, no bench**): CCRL + band-filtered Lichess + diversified-opening-book clawfish self-play + label-verified Zurichess quiet set; clock-loss / time-forfeit exclusion + TC-class filter; quiet-position extraction (quiet *definition* pinned by M6.H's tuner qsearch — an M6.G↔M6.H interface contract); opening-ply skip; FEN dedup / per-FEN caps; ADR-0003 label-provenance audit (game-result labels ONLY); held-out deployment-distributed self-play validation set; frozen snapshot + manifest + RNG seeds + re-run script vendored in `bench/`. **Gate: data-quality checks, NOT SPRT** (the M5.E correctness-only-gate precedent applied to data; no Elo claim). Consumers: M6.H, the tuning-backlog "PST co-tuning" Arm B, future SPSA campaigns, M10 NNUE data-prep. | "Tuning corpus infra" below; roadmap §M6 (M6.G scope detail) / ADR (allocated at landing) |
 | Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D + M5.E refinements + M5.F TT participation) + ID + caps (M3.E) + TT (M4.A + M5.F qsearch tier) + killers (M4.B) + history (M4.C) + aspiration (M4.D) + NMP (M5.A) + RFP (M5.B) + LMR (M5.C) + FFP (M5.D) + SE (M5.G) + staged movegen (M5.H1 architecture, eager generation; M5.H2 will enable lazy generation); `bench` regression baseline (M3.F) | "Search v1" below; ADR-0016, ADR-0017, ADR-0018, ADR-0019, ADR-0023, ADR-0024, ADR-0025, ADR-0026, ADR-0027, ADR-0028, ADR-0029, ADR-0030 |
 | Transposition table (M4.A + M5.F) | `TranspositionTable` in `src/tt.rs`: `UnsafeCell<Vec<TtEntry>>` + `AtomicUsize` mask + `AtomicU8` generation; depth-preferred + age-bias replacement; full 64-bit Zobrist key; mate-score depth-adjustment; bound-aware probe with cutoffs at non-PV nodes (negamax) and unconditionally (qsearch); `Hash` UCI option (default 16 MiB, range 1–4096). M5.F: qsearch participates with `depth = 0` entries; `is_empty()` discriminator changes to `key == 0`; non-terminal qsearch stores only Lower/Upper (no Exact, per Stockfish 45e5e65). | "Transposition table" below; ADR-0018, ADR-0028 |
 | Game history + draw helpers | `Engine::game_history: Vec<u64>` + `is_repetition` + `is_fifty_move_draw` | "Game history and draw-detection helpers" below |
@@ -127,7 +129,7 @@ See `decisions/0009-polyglot-zobrist.md`.
 
 **Piggyback terms (at the `evaluate()` boundary, not incrementally tracked):**
 
-- **Bishop pair** — `+30 MG / +50 EG` when a side covers *both* colour complexes (a light-square AND a dark-square bishop). Literature defaults; Texel-calibrated in M6.F.
+- **Bishop pair** — `+30 MG / +50 EG` when a side covers *both* colour complexes (a light-square AND a dark-square bishop). Literature defaults; Texel-calibrated in M6.H.
 - **KBvKB-same-color** — `is_kbkb_same_color`: total_count==4, each side exactly one bishop, both on the *same* complex → 0. The *logical opposite* of the bishop-pair predicate (distinct named functions to prevent the inversion bug).
 - **Mop-up** — `4·CMD(losing_king) + 2·(14 − chebyshev(kings))`, signed for the winning side, gated `raw_phase < MOP_UP_PHASE_MAX = 5` ∧ `|blended advantage| > 100 cp`. `MOP_UP_PHASE_MAX = 5` (not 4) is load-bearing — KQK has `raw_phase = 4` (lone queen); a `< 4` gate would exclude the canonical KQK conversion case.
 
@@ -170,9 +172,9 @@ confirmed gain and structurally interaction-immune; landing-gate mixed-TC
 SPRT vs `M6.A` (elo0=0/elo1=5, seed `…014`) = `continue@400-cap`, **Δ Elo
 +45.42 [+19.68, +71.67]**, lands by the M5.F/M5.G-v2 outcome-ladder
 precedent (ADR-0032 §7). bench `1213649` / depth-4 `90591`. Caveat: per-TC
-depth reversal (fast-TC strong+, 60+0.6 negative) — M6.F watch-item. The
-zeroed ISO/DBL/BWD constants + term math stay (M6.F-ready); `pe.passed` is
-cached for M6.C. **M6.F re-introduces ISO/DBL/BWD via joint Texel against the
+depth reversal (fast-TC strong+, 60+0.6 negative) — M6.H watch-item. The
+zeroed ISO/DBL/BWD constants + term math stay (M6.H-ready); `pe.passed` is
+cached for M6.C. **M6.H re-introduces ISO/DBL/BWD via joint Texel against the
 CONN-only baseline and rescales CONN** (the gate is already live).
 
 **Passed-pawn term (M6.C; ADR-0032 §8) — shipped score-neutral.**
@@ -194,8 +196,8 @@ M6.B precedent). A three-config screen ladder proved the literature defaults
 have a scale-invariant structural mismatch with this engine (KDIST
 slow-TC-toxic; RANK+PATH fast-TC over-magnitude vs the PeSTO EG pawn PST;
 `{RANK+PATH}/2` co-scale migrates the failure — the M6.B `(ISO+CONN)/2`
-plateau). Term math live at zero weight (M6.F-ready, the
-`PAWN_STRUCTURE_IN_EVAL` precedent). **M6.F re-derives the rank table against
+plateau). Term math live at zero weight (M6.H-ready, the
+`PAWN_STRUCTURE_IN_EVAL` precedent). **M6.H re-derives the rank table against
 our PeSTO EG pawn PST and reshapes (not rescales) king-distance, jointly with
 the ISO/DBL/BWD + CONN obligation.**
 
@@ -213,7 +215,7 @@ enemy-non-pawn-occupied squares kept — captures count as mobility). Sliders
 use full `occ_all` (the first enemy non-pawn blocker is counted). King and
 pawn mobility excluded. Pins scored **pseudolegally** and **no x-ray**
 through friendly sliders — deliberate roadmap-committed deferrals (the eval
-leaf has no movegen context; M6.F absorbs the average over-credit). The
+leaf has no movegen context; M6.H absorbs the average over-credit). The
 index-bound invariant (empty-board geometric maxima 8/13/14/27 = table top
 indices; `occ_all`/`& area` only reduce) is a `debug_assert!`, not a clamp
 (the M6.A trust-the-invariant-in-release discipline). The term is **not
@@ -229,8 +231,8 @@ the term ≡ `(0,0)` ⇒ `evaluate` byte-identical to `M6.C`** (the landing-gate
 Stockfish-HCE literature defaults a scale-invariant structural mismatch with
 our PeSTO PSTs: all-four −131.62 H0; per-kind all non-positive; ×0.5
 co-scale −220.18 *worsened*; no positive interaction-immune subset). Term
-math live at zero weight (M6.F-ready, the M6.B/M6.C `*_IN_EVAL` precedent).
-**M6.F re-derives the entire N/B/R/Q mobility weight set against our PeSTO
+math live at zero weight (M6.H-ready, the M6.B/M6.C `*_IN_EVAL` precedent).
+**M6.H re-derives the entire N/B/R/Q mobility weight set against our PeSTO
 PSTs (per-kind reshape, not a global rescale — the co-scale-worsens
 verdict), jointly with the M6.B ISO/DBL/BWD + CONN and the M6.C passed-pawn
 obligations (one joint pass).** The dominant offender was the slider EG
@@ -238,7 +240,7 @@ obligations (one joint pass).** The dominant offender was the slider EG
 the research-predicted N/B PST double-count.
 
 See the roadmap M6.D row + `docs/milestones/m6.d.md` (semantic + screen
-ledger + the M6.F reshape brief) and `docs/research/m6-mobility.md`. **No
+ledger + the M6.H reshape brief) and `docs/research/m6-mobility.md`. **No
 separate ADR** — ADR-0032 is pawn-structure-scoped; mobility is a distinct
 roadmap-committed concern.
 
@@ -284,15 +286,78 @@ interaction-immune subset to find) ⇒ the screen's only outcome is "defer," at
 the highest screen cost of any M6 term ⇒ negative expected value. Roadmap §M6
 line-296 is satisfied **vacuously** for an inert landing (eval byte-identical
 to `M6.D` ⇒ no Elo claim ⇒ SPRT measures zero by construction — the settled
-M6.C/M6.D disposition). Term math live at zero weight (M6.F-ready, the M6.B–D
-`*_IN_EVAL` precedent). **M6.F re-derives the entire king-safety weight set
+M6.C/M6.D disposition). Term math live at zero weight (M6.H-ready, the M6.B–D
+`*_IN_EVAL` precedent). **M6.H re-derives the entire king-safety weight set
 (S-curve table + per-kind attacker weights + shield + open-file + MG/EG
 split) against our PeSTO PSTs, jointly with the M6.B ISO/DBL/BWD + CONN, the
-M6.C passed-pawn, and the M6.D mobility obligations (one joint pass).**
+M6.C passed-pawn, the M6.D mobility, and the M6.F outpost/rook-file/endgame-scaling obligations (one joint pass).**
 
 See ADR-0033 + the roadmap M6.E row + `docs/milestones/m6.e.md` (the
-no-screen divergence rationale + the M6.F reshape brief) and
+no-screen divergence rationale + the M6.H reshape brief) and
 `docs/research/m6-king-safety.md`.
+
+**Tier-1 HCE features (M6.F; binding research `docs/research/m6-remaining-hce-features.md`)
+— shipped score-neutral inert per the M6.C/M6.D/M6.E precedent.** Three
+lightweight features added *before* M6.H's joint Texel pass so they
+co-calibrate in the one tune (the "extend then tune" law — Texel cannot
+discover absent features): (1) **outposts** — a knight/bishop in the enemy
+half on a square no enemy pawn can ever attack (the M6.B pawn-attack
+front-span / hole predicate), defended by an own pawn; reads M6.B's
+`pawn_attack_spans` fills + the `file_fill` helper already present (the
+*real code dependency on M6.E* — the M6.B pawn-data infra must be in tree).
+(2) **rook on open/semi-open file** —
+`file_fill(rooks) & ~(file_fill(own_pawns) | file_fill(enemy_pawns))` for
+open, the own-pawn-absent variant for semi-open; mobility counts moves, not
+file-open status. (3) **endgame scaling / draw-dampening** — a multiplicative
+reduction on the blended eval for structurally drawish material:
+opposite-colored-bishops-with-pawns, pawnless-draw patterns (KNN vs K etc.),
+and a 50-move-proximity taper; **KBvKB-same-color is already in M6.A
+(`is_insufficient_material`) — not duplicated**. Computed live in
+`evaluate_core` (the ADR-0032 §3 / ADR-0033 §6 live-term class);
+blend-numerator only (the ADR-0032 §4 boundary class). **Shipped
+score-neutral: all new weights zeroed ⇒ outpost/rook-file ≡ (0,0),
+endgame-scaling multiplier ≡ identity (1.0) ⇒ `evaluate` byte-identical to
+`M6.E` ⇒ bench `1213649`/d4 `90591` byte-for-byte ⇒ provably inert ⇒ no
+confirmation SPRT, no SPRT screen ladder.** `*_IN_EVAL=true`-style flags +
+term math live at zero weight, M6.H-ready (the M6.B–E `*_IN_EVAL`
+precedent). The outpost / rook-file weights and (if inert) the
+endgame-scaling coefficient enter the M6.H joint Texel pass. **Open ADR
+question (not pre-decided):** endgame-scaling is a *correctness* feature the
+research says does not strictly need Texel calibration — the M6.F plan/ADR
+may elect to land that one sub-feature *live* behind a correctness gate (the
+M5.E "correctness over Elo" precedent) rather than inert; default framing is
+inert-per-precedent. ADR allocated at landing.
+
+See the roadmap M6.F row + `docs/research/m6-remaining-hce-features.md`
+(Priority-1 list + the "extend then tune" law). ADR allocated at landing
+per project convention.
+
+**Tuning corpus infra (M6.G) — reusable labeled-position data infra,
+gated on data-quality checks (NOT SPRT).** A standalone data pipeline +
+vendored corpus artifact with **no `evaluate` / `Position` / search touch**
+(no engine build, no bench, no Elo claim — the M5.E correctness-only-gate
+precedent applied to *data*). Acquires CCRL PGN snapshots + band-filtered
+Lichess open-database PGNs + diversified-opening-book clawfish self-play +
+the (label-verified) Zurichess quiet set; filters clock-loss / time-forfeit
+games + by TC-class, skips opening plies, dedups FENs under per-FEN caps,
+extracts quiet positions (the quiet *definition* is fixed by M6.H's tuner
+qsearch — an M6.G↔M6.H interface contract pinned at M6.G plan time). Runs an
+**ADR-0003 label-provenance audit (game-result labels ONLY** — no
+engine-score-labeled corpora; the audit verifies the Zurichess labels are
+outcomes). Holds out a **deployment-distributed self-play validation set**.
+Emits a frozen snapshot + manifest + RNG seeds + re-run script vendored in
+`bench/`. M6.G delivers the sources + held-out set + the *stratified*
+selection objective (aggregate held-out logistic loss **plus** per-theme STS
+blind-spot strata — the M6.A per-theme STS sub-gate discipline; outposts =
+STS theme #3) + the selection harness; the *actual mixture selection*
+(bi-level: inner Texel / outer coarse simplex / K refit per candidate / SPRT
+confirms the winner only) runs in M6.H, which needs the inner Texel.
+Acquisition/filtering is largely independent of the M6.F eval features and
+can run **in parallel with M6.F**. Consumers: M6.H, the tuning-backlog "PST
+co-tuning" Arm B, future SPSA campaigns, M10 NNUE data-prep.
+
+See the roadmap M6.G row + the "M6.G scope detail" section. ADR allocated
+at landing per project convention.
 
 ## Search v1 (production: alpha-beta)
 

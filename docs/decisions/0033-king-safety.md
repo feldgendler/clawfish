@@ -2,8 +2,12 @@
 
 **Status:** Accepted (M6.E ships the king-safety infrastructure **wired but with
 every weight zeroed** — score-neutral vs `M6.D`, the entire weight set deferred
-to the M6.F joint-Texel reshape; the M6.C/M6.D inert-landing disposition. See
+to the M6.H joint-Texel reshape; the M6.C/M6.D inert-landing disposition. See
 Decision §8.).
+
+**Changelog.**
+- 2026-05-19: milestone renumber — Texel pass M6.F→M6.G; new M6.F = Tier-1 HCE features (outposts/rook-file/endgame-scaling), binding research `docs/research/m6-remaining-hce-features.md`. ADR forward-references relabelled M6.F→M6.G; substantive decisions unchanged.
+- 2026-05-19: M6.G split → M6.G = corpus construction (data-quality gate), M6.H = Texel tuning. ADR forward-references to the Texel pass relabelled M6.G→M6.H; §8's "M6.B–E" obligation list kept as the faithful king-safety-scoped snapshot (codes relabelled only); substantive decisions unchanged.
 
 ## Context
 
@@ -62,7 +66,7 @@ knight 2, bishop 2, rook 3, queen 4. Index `SAFETY_TABLE[min(attack_units, 99)]`
 (the cited 100-entry CPW-Engine/Glaurung/Fruit S-curve, research §6). **Gating
 (CPW-Engine):** `attack_units = 0` unless ≥ 2 distinct enemy pieces attack the
 zone **and** the attacking side has a queen (research §9 q3 — conservative at
-M6.E, M6.F may relax). King-attack is **MG-only** (EG contribution 0; research
+M6.E, M6.H may relax). King-attack is **MG-only** (EG contribution 0; research
 §5 — the king walks in the endgame, a large EG king-safety penalty fights the
 PeSTO EG king PST's centralization incentive).
 
@@ -74,9 +78,9 @@ wider variant (research §3). For each of the three files (king file ± 1, clamp
 to board): a friendly pawn on the king's 2nd rank scores `SHIELD_1`, else one on
 the 3rd rank scores `SHIELD_2`, else 0. 2nd-rank > 3rd-rank (unmoved shield
 strictly better; universal). White ranks 2/3, Black ranks 7/6 (relative-rank
-mirror, the `CONN_*` precedent). Small EG component permitted (M6.F discovers
+mirror, the `CONN_*` precedent). Small EG component permitted (M6.H discovers
 it). **Pawn storm is omitted at M6.E** (research §3/§9 q4 — CPW backfire
-warning; not pawn-only-cacheable; M6.F's pawn-structure Texel covers it; a
+warning; not pawn-only-cacheable; M6.H's pawn-structure Texel covers it; a
 documented strategic gap).
 
 ### 4. Open / semi-open file toward the king — MG-only
@@ -94,7 +98,7 @@ King safety is a white-perspective `(mg, eg)` pair blended by the existing
 TSCP-style material scaling (research §5; material scaling fights the project's
 phase blend). MG-heavy: the S-curve and open-file components are MG-only (EG 0);
 shield carries a small EG term. Setting EG≈0 *is* the "hard-off in EG" extreme
-expressed smoothly; M6.F Texel discovers any nonzero EG.
+expressed smoothly; M6.H Texel discovers any nonzero EG.
 
 ### 6. Computed live in `evaluate_core`, never cached — supersedes ADR-0032 §3's pawn-shield-cache note
 
@@ -116,7 +120,7 @@ the [pawn-hash] entry with pawn-shield masks"). That note was a reserved
 - Extending `PawnHashEntry` breaks the `#[repr(C)]` 32-byte / 2¹⁷-entry /
   4-MiB size-pin (the `const _: () = assert!(size_of == 32)` + the
   `PAWN_HASH_ENTRIES == 131072` arithmetic) for negligible gain.
-- A **zeroed** term (§8) has zero cache benefit by construction; M6.F reads the
+- A **zeroed** term (§8) has zero cache benefit by construction; M6.H reads the
   live-recompute structure.
 
 The term enters the blend **numerator only** — never `static_eval_white()` (the
@@ -125,9 +129,9 @@ boundary class). Pinned by boundary regression tests mirroring
 `static_accessor_excludes_mobility` + `mop_up_addend_excludes_mobility_vs_m6c`
 verbatim in shape.
 
-### 7. Independence / double-count (the M6.F brief)
+### 7. Independence / double-count (the M6.H brief)
 
-Research §7 ranks the overlaps the M6.F joint Texel must decorrelate: (a)
+Research §7 ranks the overlaps the M6.H joint Texel must decorrelate: (a)
 **pawn-shield × PeSTO MG king PST — moderate**, the dominant axis (the PST
 already prices the castled-king square); (b) **attack-S-curve × PeSTO king PST —
 low-moderate** (S-curve is dynamic, PST is static); (c) **shield × M6.B CONN —
@@ -137,17 +141,17 @@ shared score). The S-curve, shield, and open-file components are **coupled by
 design** (shield weakness feeds the danger the S-curve and open-file both
 price) — there is no M6.B-style interaction-immune subset.
 
-### 8. M6.E ships score-neutral; whole weight set → M6.F joint Texel
+### 8. M6.E ships score-neutral; whole weight set → M6.H joint Texel
 
 Per the research §8 transfer-risk verdict (HIGH; the strongest of any M6 term)
 and the three-phase law, M6.E ships the infrastructure **wired but with every
 king-safety weight zeroed** in `eval::data`: `KING_ATTACK_WEIGHT_{N,B,R,Q} = 0`,
 `KING_SAFETY_TABLE = [0; 100]`, `SHIELD_1_{MG,EG} = SHIELD_2_{MG,EG} = 0`,
 `KS_FILE_{SEMI_OPEN,OPEN,BOTH_ADJ}_MG = 0` (the literature defaults preserved in
-the `data.rs` provenance block as the M6.F starting point — the M6.C/M6.D
+the `data.rs` provenance block as the M6.H starting point — the M6.C/M6.D
 `PASSED_*`/`*_MOBILITY_*` precedent verbatim). `const KING_SAFETY_IN_EVAL =
 true`; the full term math (zone, attacker count, S-curve lookup, shield,
-open-file) is live and tested at zero weight (M6.F-ready).
+open-file) is live and tested at zero weight (M6.H-ready).
 
 **Reconciliation with the roadmap §M6 per-phase-SPRT exit criterion (line
 296).** "Each phase commits its own SPRT-positive change vs. the prior phase's
@@ -171,12 +175,12 @@ possible outcome is "defer," at the highest screen cost of any M6 term.
 Attempting even the open-file-only screen (research §8 Stage 1, the "most
 likely to transfer" component) was considered and rejected on the same EV
 grounds (it is itself S-curve-coupled, MG-small, and the noisiest term's screen
-is the costliest). **To preserve the M6.F directional brief that M6.C/M6.D got
+is the costliest). **To preserve the M6.H directional brief that M6.C/M6.D got
 from their screens, M6.E commits to the one cheap substitute:** a single
 live-default same-campaign WAC/STS diagnostic (RUN ALONE, ~20 min — *not* a
 ~40 h screen), run time-permitting after the inert landing is committed,
 recorded as a rejected-config diagnostic (next paragraph). It does not gate the
-landing; it gives M6.F's king-safety reshape the per-theme directional signal
+landing; it gives M6.H's king-safety reshape the per-theme directional signal
 the mobility/passed-pawn briefs received.
 
 **Landing gate (the M6.C/M6.D inert-landing disposition verbatim).** Zeroed
@@ -188,12 +192,12 @@ the shipped build** (eval == `M6.D` by construction; the M6.C/M6.D precedent).
 The committed live-default same-campaign WAC/STS run (preceding paragraph) is
 recorded as a **rejected-config diagnostic** (the M6.C/M6.D "directionally
 correct, mis-shaped not mis-designed — reshape, don't delete" corroboration for
-M6.F, king-safety claiming STS theme "King Activity" + "AKPC"); it is **not** a
+M6.H, king-safety claiming STS theme "King Activity" + "AKPC"); it is **not** a
 landing gate and the milestone does not block on it (run time-permitting,
 RUN-ALONE, via a throwaway non-zero-weights build fully reverted before the
 clean apply — the M6.D screen-build hygiene).
 
-**M6.F obligation (extended).** The single joint-Texel pass now also re-derives
+**M6.H obligation (extended).** The single joint-Texel pass now also re-derives
 the entire king-safety weight set (S-curve table + per-kind attacker weights +
 shield + open-file + MG/EG split) against our PeSTO PSTs — *jointly* with the
 M6.B ISO/DBL/BWD re-introduction + CONN rescale, the M6.C passed-pawn rank-
@@ -211,10 +215,12 @@ that pass.
   marginal cost is the king-zone `&` + popcount + the pawn-derived lookups.
   NPS drop > 10% on bench = should-investigate (roadmap policy); the
   zeroed-but-live term still pays full compute (the M6.C/M6.D precedent — the
-  honest cost of an M6.F-ready inert landing).
+  honest cost of an M6.H-ready inert landing).
 - **Bench node count.** Unchanged: `king_safety_term_white ≡ (0,0)` ⇒
   `evaluate` byte-identical to `M6.D` ⇒ `bench 1213649` byte-for-byte. The
-  ADR-0010 determinism contract holds; M6.E's bench anchors M6.F.
+  ADR-0010 determinism contract holds; M6.E's bench anchors M6.F (M6.F inert ≡
+  M6.E; M6.G is corpus data infra with no engine build / no bench; M6.H is
+  where eval/bench changes via the joint Texel tune).
 - **Architectural boundary.** No change to `PawnHashEntry`/`PawnEval`/the pawn
   hash, Zobrist, movegen, make/unmake, or the negamax/qsearch loop — a pure
   additive `evaluate()` term reading existing M1 attack fns + `Position`
@@ -249,7 +255,7 @@ that pass.
   the same decay smoothly (research §5).
 - **Include an explicit pawn-storm term.** Rejected at M6.E: CPW backfire
   warning, not pawn-only-cacheable, low marginal value over the existing
-  pawn-structure terms; M6.F's pawn-structure Texel is the right vehicle
+  pawn-structure terms; M6.H's pawn-structure Texel is the right vehicle
   (research §3/§9 q4). Documented strategic gap.
 
 ## Supersedes

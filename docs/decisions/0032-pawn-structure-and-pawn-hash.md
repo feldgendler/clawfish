@@ -1,10 +1,14 @@
 # ADR-0032 — Pawn structure evaluation + pawn hash + pawn-Zobrist substream
 
 **Status:** Accepted (M6.B ships the **connected-pawn term only**; ISO/DBL/BWD
-zeroed pending M6.F joint Texel — see Decision §7. Δ Elo +45.42 vs `M6.A`.
+zeroed pending M6.H joint Texel — see Decision §7. Δ Elo +45.42 vs `M6.A`.
 **M6.C** adds the passed-pawn term **wired but all weights zeroed** — score-
-neutral vs `M6.B`, entire weight set deferred to the M6.F joint-Texel reshape;
+neutral vs `M6.B`, entire weight set deferred to the M6.H joint-Texel reshape;
 see Decision §8.).
+
+**Changelog.**
+- 2026-05-19: milestone renumber — Texel pass M6.F→M6.G; new M6.F = Tier-1 HCE features (outposts/rook-file/endgame-scaling), binding research `docs/research/m6-remaining-hce-features.md`. ADR forward-references relabelled M6.F→M6.G; substantive decisions unchanged.
+- 2026-05-19: M6.G split → M6.G = corpus construction (data-quality gate), M6.H = Texel tuning. ADR forward-references to the Texel pass relabelled M6.G→M6.H; substantive decisions unchanged.
 
 ## Context
 
@@ -122,9 +126,9 @@ M6.B determinism guarantee (ADR-0010): the cache changes speed, never result.
 - **Passed (detection only)** — no enemy pawn on the file or either adjacent
   file strictly ahead; cached as `passed_pawns[color]`. Bonus is M6.C.
 - Isolated/doubled/backward **stack** (no if-else suppression). Literature-
-  default weights ship un-tuned; M6.F Texel calibrates.
+  default weights ship un-tuned; M6.H Texel calibrates.
 
-### 7. M6.B ships **CONN-only**; M6.F re-introduces ISO/DBL/BWD via joint Texel
+### 7. M6.B ships **CONN-only**; M6.H re-introduces ISO/DBL/BWD via joint Texel
 
 **First attempt — all four §6 literature-default terms, single-TC `10+0.1`
 SPRT vs `M6.A`: verdict=H0, Δ Elo −99.88 [−140.71, −61.58]** (218 games /
@@ -155,7 +159,7 @@ dropping BWD made it *worse*). The −100 is a **catastrophic ISO×CONN
 interaction**: ISO and CONN are opposite-signed measurements of the *same
 pawn-connectivity axis* with grossly mismatched magnitudes (CONN rank-scaled
 to +95; ISO flat −20), coherent only after the joint Texel co-calibration §6
-always assigned to M6.F. Applied raw together they double-count connectivity
+always assigned to M6.H. Applied raw together they double-count connectivity
 into an internally-contradictory, over-scaled signal. This is precisely the
 double-counting §6 anticipated — now empirically proven, not theorized.
 
@@ -183,14 +187,14 @@ two failure modes: **~+204 Elo of the −198 was pure over-magnitude**
 co-scaled pair still **plateaus at ≈0, ~100 Elo below CONN-only's +103 and
 ISO-only's +83** — that residual is the **scale-invariant structural /
 wrong-shape double-count** (flat ISO vs rank-scaled CONN, opposite signs on
-one axis) that *no global multiplier can fix*. ⇒ M6.F's task is **reshape,
+one axis) that *no global multiplier can fix*. ⇒ M6.H's task is **reshape,
 not rescale**: re-attach CONN's modulation context + decorrelate the axis
 via joint Texel; a uniform weight scale provably plateaus at break-even.
 
 **Decision.** M6.B ships the **connected-pawn term only**:
 `const PAWN_STRUCTURE_IN_EVAL = true`; `ISO_MG=ISO_EG=DBL_MG=DBL_EG=BWD_MG=
 BWD_EG = 0` in `eval::data` (CONN keeps its literature-default table). The
-zeroed constants and their term math in `pawn_eval` stay (M6.F-ready,
+zeroed constants and their term math in `pawn_eval` stay (M6.H-ready,
 referenced at zero weight); every predicate stays live and tested;
 `pe.passed` is still cached for M6.C; `evaluate_cached == evaluate` (D6)
 trivially holds. CONN-only is the **largest** confirmed gain *and*
@@ -208,22 +212,22 @@ landed precedents (M5.F +13.03 [−10.92,+37.12]; M5.G-v2 +23.49
 [+0.65,+46.53]). It is unambiguously not a regression and a real, no-tuning
 strength gain over the score-neutral baseline (which was 0 by construction).
 
-**Caveat — per-TC depth reversal (M6.F watch-item).** summary-by-tc:
+**Caveat — per-TC depth reversal (M6.H watch-item).** summary-by-tc:
 `10+0.1 W72-L17` (strong+), `20+0.2 W32-L33` (flat), `40+0.4 W36-L23` (+),
 `60+0.6 W16-L31` (**negative**). Unlike M6.A's depth-robust eval gain,
 CONN-only's benefit is fast-TC-concentrated and *reverses* at the slowest
 bucket — CONN's raw magnitude over-helps shallow move ordering and washes
 out / hurts with deeper search. The aggregate **mixed-TC** game (the ELOH.D
-gate object) is firmly positive; the slow-TC component is adverse. M6.F's
+gate object) is firmly positive; the slow-TC component is adverse. M6.H's
 joint Texel must rescale CONN (and re-introduce ISO/DBL/BWD) against the
 CONN-only baseline — the depth reversal is direct evidence the literature
 CONN table is over-scaled for this engine.
 
-**M6.F obligation (revised).** No longer "flip a gate" — the gate is live.
-M6.F **re-introduces ISO/DBL/BWD via joint Texel against the shipped
+**M6.H obligation (revised).** No longer "flip a gate" — the gate is live.
+M6.H **re-introduces ISO/DBL/BWD via joint Texel against the shipped
 CONN-only baseline** — and per the `(ISO+CONN)/2` probe this must be a
 **reshape, not a rescale**: a uniform multiplier on the literature pair
-plateaus at break-even (≈0), so M6.F must (a) re-attach CONN's
+plateaus at break-even (≈0), so M6.H must (a) re-attach CONN's
 phalanx/supported/opposed modulation context (the de-modulated-fragment
 provenance), (b) decorrelate the ISO/CONN connectivity axis, and (c) fix the
 slow-TC CONN over-scaling — jointly, not by scalar tuning. Precedent for the
@@ -259,7 +263,7 @@ No positive interaction-immune subset exists (contrast M6.B's clean CONN-only
 +103 H1). M6.C therefore ships **`PASSED_MG=PASSED_EG=PASSED_FREE_EG_DELTA=
 PASSED_KDIST_OWN_PER_STEP=PASSED_KDIST_ENEMY_PER_STEP = 0`** in `eval::data`
 (`PASSED_KDIST_CAP=5` kept as the named structural clamp); the term math
-stays live at zero weight (M6.F-ready) — the §7 / M6.B
+stays live at zero weight (M6.H-ready) — the §7 / M6.B
 `PAWN_STRUCTURE_IN_EVAL` precedent verbatim.
 
 **Landing gate.** Zeroed weights ⇒ `passed_pawn_term_white` ≡ `(0,0)` ⇒
@@ -270,7 +274,7 @@ provably behaviorally inert ⇒ M6.C lands **without a confirmation SPRT** (the
 the term is directionally correct, mis-scaled not mis-designed; the shipped
 build's WAC/STS == `M6.B`'s by construction.
 
-**M6.F obligation (extended).** The M6.F joint-Texel pass now also
+**M6.H obligation (extended).** The M6.H joint-Texel pass now also
 **re-derives the passed-pawn rank table against our PeSTO EG pawn PST and
 reshapes (not rescales) king-distance** — jointly with the §7 ISO/DBL/BWD
 re-introduction + CONN rescale. One joint pass; until then the passed term

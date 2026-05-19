@@ -7,10 +7,10 @@
 
 ## Headline recommendations
 
-- **Committed mobility-area semantic is valid.** It is a defensible simplification of the Stockfish-style richer definition. What clawfish omits (own-queen exclusion for minors, own-blocked-pawn exclusion, own pawns on ranks 2–3, x-ray through own rook/queen) was itself tuned away from in Stockfish's calibrated tables; M6.F Texel will absorb the residual.
+- **Committed mobility-area semantic is valid.** It is a defensible simplification of the Stockfish-style richer definition. What clawfish omits (own-queen exclusion for minors, own-blocked-pawn exclusion, own pawns on ranks 2–3, x-ray through own rook/queen) was itself tuned away from in Stockfish's calibrated tables; M6.H Texel will absorb the residual.
 - **Recommended weight source: Stockfish classical HCE** tables as reproduced in TalkChess (full arrays in §6 below). These are internally co-calibrated across all four piece kinds under a single Texel-tuned regime. No other citable set with full MG/EG arrays for all four piece kinds exists outside engine source.
 - **Calibration-mismatch risk is real but structurally different from M6.C.** Stockfish's tables were tuned against non-PeSTO PSTs; PeSTO's PSTs already bake in implicit mobility signal for piece centralization. Over-magnitude is the expected failure mode (especially for knights/bishops where PeSTO PST already rewards center placement). Run the same per-kind subset screen used for M6.B if the all-four SPRT collapses.
-- **Contingency posture: per-kind subset screen first, then co-scale.** Disable one kind at a time to identify the problematic interaction. If all individual terms pass but combined fails, try a uniform ×0.5 co-scale. If co-scale fails to recover Elo across TC profile, defer all to M6.F (M6.C precedent).
+- **Contingency posture: per-kind subset screen first, then co-scale.** Disable one kind at a time to identify the problematic interaction. If all individual terms pass but combined fails, try a uniform ×0.5 co-scale. If co-scale fails to recover Elo across TC profile, defer all to M6.H (M6.C precedent).
 - **Enemy-occupied squares count as mobility** (standard practice — confirmed below). Captures of enemy pieces stay in the mobility area because the mobility area only subtracts friendly-occupied and enemy-pawn-attacked squares; enemy non-pawn pieces occupy squares that remain in the area.
 
 ---
@@ -30,7 +30,7 @@
 - PeSTO's PSTs are PST-only and explicitly contain **no separate mobility term** — mobility signal is baked into the positional bonus values via Texel tuning. [PeSTO description on rofchade.nl](https://rofchade.nl/?p=307)
 - Adding an explicit mobility term on top of PeSTO PSTs creates double-counting: the PST already rewards the central knight, and then mobility adds more.
 - The standard mitigation is joint Texel retuning of PST + mobility weights simultaneously, so that the PST lowers its implicit mobility signal as the explicit term takes over.
-- **At M6.D, no joint retune occurs** (that is M6.F). The literature-default tables will over-magnitude against PeSTO PSTs in the same direction as M6.B/C — the over-magnitude is the expected failure mode for the SPRT screen.
+- **At M6.D, no joint retune occurs** (that is M6.H). The literature-default tables will over-magnitude against PeSTO PSTs in the same direction as M6.B/C — the over-magnitude is the expected failure mode for the SPRT screen.
 
 ### What mobility captures vs. what PSTs capture
 
@@ -79,7 +79,7 @@ The delta is small and systematic:
 - The effect shifts the count one bucket lower on average, so the mobility bonus is slightly deflated relative to the table value.
 - When the Stockfish tables are tuned assuming the richer definition, using the simpler definition (which counts more squares) will read a slightly higher bucket, yielding slightly higher bonuses than intended — a mild over-magnitude offset.
 - This is the same direction as the PST overlap over-magnitude described in §1.
-- M6.F joint Texel will correct for both offsets simultaneously.
+- M6.H joint Texel will correct for both offsets simultaneously.
 
 ### Confirmation: captures count as mobility
 
@@ -124,7 +124,7 @@ CPW: "in the opening, the mobility of the bishops and knights is more important 
 - At a typical mid-table bonus of ~5–8 cp/square and a pinned knight with 4 pseudolegal squares: ~20–32 cp over-credit per pinned piece.
 - Pins are statistically rare (< 5% of positions in typical search trees) and transient (resolved within 1–3 plies).
 - Expected average over-credit: < 2 cp per eval call, weighted by pin frequency.
-- The M6.F Texel pass calibrates weights against actual game positions where pins are already distributed at their base-rate frequency; the average over-credit folds into slightly lower per-count weights in the tuned vector.
+- The M6.H Texel pass calibrates weights against actual game positions where pins are already distributed at their base-rate frequency; the average over-credit folds into slightly lower per-count weights in the tuned vector.
 
 ### Literature assessment
 
@@ -159,7 +159,7 @@ Clawfish uses `magic::rook_attacks(sq, occ_all)` / `magic::bishop_attacks(sq, oc
 - This is an **under-magnitude offset** for rooks in batteries, opposite to the over-magnitude offset from PST double-counting in §1.
 - Net effect: the two offsets partially cancel, and the Stockfish rook table may transfer more cleanly than the bishop/knight tables for typical positions.
 - Magnitude: rook batteries occur in roughly 10–20% of evaluated positions; the count difference is typically 7–14 squares (number of squares on the file/rank behind the blocker). At an EG bonus of ~12 cp/square at mid-table, the expected delta is ~20–30 cp per rook in battery, weighted by position frequency — a small but non-negligible calibration gap.
-- Assessment: flag as M6.F/post-M6.D watch-item; not a blocker for M6.D (the offset is systematic and absorbed by Texel tuning).
+- Assessment: flag as M6.H/post-M6.D watch-item; not a blocker for M6.D (the offset is systematic and absorbed by Texel tuning).
 
 ### Risk classification
 
@@ -393,9 +393,9 @@ Assessment: **moderate probability of partial transfer** — at least some kinds
 If the all-four SPRT fails (H0 or negative CI):
 
 1. **Per-kind subset screen** (same method as M6.B): enable one kind at a time with the other three zeroed. Identify which kinds individually pass.
-2. **Keep passing kinds only** — ship positive-CI kinds, zero failing kinds (M6.F re-introduces via joint Texel).
-3. **If all four individually pass but combined fails**: run a uniform `×0.5` co-scale screen (all tables halved). If that recovers positive CI across TC profile, ship at ×0.5 with an M6.F watch-item.
-4. **If co-scale fails to recover across TC profile** (the M6.C `{RANK+PATH}/2` failure mode): zero all four, ship score-neutral, defer entirely to M6.F joint Texel. Record the directionally-correct diagnostic signal (positive WAC/STS from the zeroed-weight live-term path, as with M6.C).
+2. **Keep passing kinds only** — ship positive-CI kinds, zero failing kinds (M6.H re-introduces via joint Texel).
+3. **If all four individually pass but combined fails**: run a uniform `×0.5` co-scale screen (all tables halved). If that recovers positive CI across TC profile, ship at ×0.5 with an M6.H watch-item.
+4. **If co-scale fails to recover across TC profile** (the M6.C `{RANK+PATH}/2` failure mode): zero all four, ship score-neutral, defer entirely to M6.H joint Texel. Record the directionally-correct diagnostic signal (positive WAC/STS from the zeroed-weight live-term path, as with M6.C).
 
 ### The M6.B/C "co-calibrated-elsewhere ≠ transfers here" lesson applies
 

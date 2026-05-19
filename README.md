@@ -4,7 +4,7 @@ A Rust chess engine, written from scratch and grown incrementally toward
 GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 
 > **Status: M6 in progress (M6.E landed 2026-05-19 — king-safety infra,
-> score-neutral; all king-safety weights deferred to M6.F. Production HEAD = `M6.E`,
+> score-neutral; all king-safety weights deferred to M6.H. Production HEAD = `M6.E`,
 > eval byte-identical to `M6.D` / `M6.C` / `M6.B`, strength unchanged by construction).** Fail-soft
 > alpha-beta with quiescence search, iterative deepening, transposition
 > table (Zobrist-keyed, 16 MiB default; qsearch participates per ADR-0028),
@@ -35,13 +35,13 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > in `eval::data`; M6.B; ADR-0032 §7: the all-four literature defaults
 > SPRT-regressed −100 vs `M6.A`, a per-term subset screen exposed a
 > catastrophic ISO×CONN connectivity-axis double-count, CONN-only is
-> the largest interaction-immune gain at **+45 Elo**; M6.F re-introduces
+> the largest interaction-immune gain at **+45 Elo**; M6.H re-introduces
 > ISO/DBL/BWD via joint Texel + rescales CONN), the **passed-pawn term**
 > — per-passer rank bonus + EG path discriminator + EG king-tropism,
 > computed live, never cached — shipped **score-neutral** (M6.C;
 > ADR-0032 §8: a three-config screen ladder proved the literature
 > defaults a scale-invariant structural mismatch with this engine, so
-> every passed weight is zeroed and the whole set defers to M6.F's
+> every passed weight is zeroed and the whole set defers to M6.H's
 > reshape; the term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.B`),
 > the **piece-mobility term** — N/B/R/Q pseudolegal-attack count ∩
 > mobility area, per-kind MG/EG tables, computed live, never cached —
@@ -49,7 +49,7 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > landing-gate + a full per-kind screen proved the Stockfish-HCE
 > literature defaults a scale-invariant structural mismatch with our
 > PeSTO PSTs — all-four −131.62, ×0.5 co-scale −220.18 *worsened*; every
-> mobility weight zeroed, whole set defers to M6.F's per-kind reshape;
+> mobility weight zeroed, whole set defers to M6.H's per-kind reshape;
 > the term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.C`),
 > the **king-safety term** — king-zone attacker S-curve + castled
 > pawn-shield + MG-only open/semi-open-file penalty, computed live,
@@ -57,13 +57,15 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > research transfer-risk verdict HIGH + the M6.B→C→D three-phase law +
 > king-safety SPRT-noisiness + coupled-by-design components ⇒ **no SPRT
 > screen ladder** (the owned M6.C/M6.D divergence), every king-safety
-> weight zeroed, whole set defers to M6.F's reshape; ADR-0033 §6
+> weight zeroed, whole set defers to M6.H's reshape; ADR-0033 §6
 > supersedes ADR-0032 §3's pawn-shield-cache reservation; the term ≡
 > (0,0) ⇒ `evaluate` byte-identical to `M6.D`),
 > and `compute_caps`-driven time management. `bench` UCI command for
 > deterministic node-count regression baselines. The remaining strength
-> path (pawn structure, mobility, king safety, Texel tuning across M6.B–F;
-> then NNUE) is tracked in [`docs/roadmap.md`](docs/roadmap.md).
+> path (the M6.F Tier-1 HCE features — outposts, rook-on-file, endgame
+> draw-scaling — added score-neutral/inert before the M6.H joint Texel
+> tuning pass over the cumulative M6.B–F surface; then NNUE) is tracked in
+> [`docs/roadmap.md`](docs/roadmap.md).
 >
 > **Current strength: ~2648 Elo on the Stockfish 18 UCI_LimitStrength
 > scale at uniform mixed TC** (M6.B CONN-only, measured 2026-05-16,
@@ -83,7 +85,7 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > transfer 1:1; the M6.A +250 was outsized because `M5.H1` was MG-only
 > with no endgame king PST. Caveat: CONN-only's gain is fast-TC-concentrated
 > and reverses at `60+0.6` (the literature CONN table is over-scaled for
-> deep search) — an M6.F joint-Texel watch-item; the aggregate mixed-TC
+> deep search) — an M6.H joint-Texel watch-item; the aggregate mixed-TC
 > game (the actual gate object) is firmly positive.
 >
 > **Per-phase SPRT chain, bench history, and diagnostic-suite numbers**
@@ -162,7 +164,7 @@ scripts/epd-suite.sh run sts           # HEAD on STS
 scripts/epd-suite.sh backfill          # iterate baseline tags (worktree-isolated builds)
 ```
 
-**HEAD (M6.A):** WAC **271/300 (90.3%)**, STS **9620/15000 (64.1% → STS-Elo ~2613)**, measured at `--movetime 500` in the M6.A same-campaign RUN-ALONE re-baseline (M6.A vs a fresh `M5.H1` rebuild: WAC +1 within ±2 noise; STS **+834 credit / +248 STS-Elo**, decisive). Note the movetime differs from the legacy `--movetime 1000` figures in [`bench/epd-suites.md`](bench/epd-suites.md)'s 2026-05-09 snapshot table — that snapshot is stale and not directly comparable; the same-campaign M6.A row is the load-bearing measurement (per the roadmap's "Same-campaign re-baseline required" rule). Per-piggyback sub-gates: mop-up lifts the "King Activity" theme +95 (404→499); the bishop-pair term is flat on "Bishop vs Knight" (Texel-calibrated in M6.F). STS-Elo systematically underestimates game-playing strength (the ~2613 STS-Elo lags the ~2678 mixed-TC rating estimate); the relative ranking across tags is the load-bearing signal. Per-baseline backfill + per-theme breakdown: [`bench/epd-suites.md`](bench/epd-suites.md).
+**HEAD (M6.A):** WAC **271/300 (90.3%)**, STS **9620/15000 (64.1% → STS-Elo ~2613)**, measured at `--movetime 500` in the M6.A same-campaign RUN-ALONE re-baseline (M6.A vs a fresh `M5.H1` rebuild: WAC +1 within ±2 noise; STS **+834 credit / +248 STS-Elo**, decisive). Note the movetime differs from the legacy `--movetime 1000` figures in [`bench/epd-suites.md`](bench/epd-suites.md)'s 2026-05-09 snapshot table — that snapshot is stale and not directly comparable; the same-campaign M6.A row is the load-bearing measurement (per the roadmap's "Same-campaign re-baseline required" rule). Per-piggyback sub-gates: mop-up lifts the "King Activity" theme +95 (404→499); the bishop-pair term is flat on "Bishop vs Knight" (Texel-calibrated in M6.H). STS-Elo systematically underestimates game-playing strength (the ~2613 STS-Elo lags the ~2678 mixed-TC rating estimate); the relative ranking across tags is the load-bearing signal. Per-baseline backfill + per-theme breakdown: [`bench/epd-suites.md`](bench/epd-suites.md).
 
 ## Scope
 

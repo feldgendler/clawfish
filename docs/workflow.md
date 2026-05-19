@@ -434,9 +434,12 @@ Every milestone phase gets a tag, including ones that landed before SPRT was ava
 | `M5.I` | Descope (third aspiration tier, Elo-neutral; deferred). Production unchanged. |
 | `M6.A` | + tapered eval foundation (PeSTO EG + bishop pair + mop-up). H1-accept +250.57 vs `M5.H1`. ADR-0031. |
 | `M6.B` | + pawn-structure infra, CONN-only (+45.42 vs `M6.A`). ADR-0032 §7. |
-| `M6.C` | + passed-pawn infra, score-neutral (== `M6.B` eval; weights → M6.F). ADR-0032 §8. |
-| `M6.D` | + piece-mobility infra, score-neutral (== `M6.C` eval; weights → M6.F). No ADR (roadmap-committed). |
-| `M6.E` | + king-safety infra, score-neutral (== `M6.D` eval; weights → M6.F). No SPRT screen ladder (the M6.C/M6.D divergence, owned). ADR-0033 (supersedes ADR-0032 §3). **Current production HEAD.** |
+| `M6.C` | + passed-pawn infra, score-neutral (== `M6.B` eval; weights → M6.H). ADR-0032 §8. |
+| `M6.D` | + piece-mobility infra, score-neutral (== `M6.C` eval; weights → M6.H). No ADR (roadmap-committed). |
+| `M6.E` | + king-safety infra, score-neutral (== `M6.D` eval; weights → M6.H). No SPRT screen ladder (the M6.C/M6.D divergence, owned). ADR-0033 (supersedes ADR-0032 §3). **Current production HEAD.** |
+| `M6.F` | + Tier-1 HCE features (outposts + rook-on-file + endgame-scaling), score-neutral inert (== `M6.E` eval; weights → M6.H) per the M6.C/M6.D/M6.E precedent. ADR allocated at landing; binding research `docs/research/m6-remaining-hce-features.md`. Reference for **M6.H's SPRT** (the baseline tag — not `M6.E`, not `M6.G`). |
+| `M6.G` | + Corpus construction — reusable labeled-position data infra (frozen corpus + manifest + RNG seeds + re-run script vendored in `bench/`); **data-quality gate, NOT SPRT** (no engine build, no bench, no Elo claim — the M5.E correctness-only-gate precedent applied to data). The `M6.G` tag is a frozen-corpus-artifact reference, **not an SPRT engine baseline**; can land in parallel with `M6.F`. ADR allocated at landing. |
+| `M6.H` | + Texel tuning. Single joint-Texel pass over the cumulative A–F surface, consuming the frozen `M6.G` corpus, vs the `M6.F` baseline (not `M6.G`); M6 closes here (ship tuned, or revert to `M6.F` literature defaults per verdict ladder). ADR allocated at landing. |
 | `ELOH.A` | In-process Elo-iteration harness foundation. ADR-0020. |
 | `ELOH.B` | Statistical layer (RM K-update, σ-stopping, N-parallel, threshold adjudication). |
 | `ELOH.C` | `VirtualClock` UCI option + harness handshake. ADR-0021. |
