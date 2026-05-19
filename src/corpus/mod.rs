@@ -199,6 +199,8 @@ pub enum CorpusError {
     Fen(crate::FenError),
     /// Checkpoint / shard frame corruption beyond the tolerated torn tail.
     Checkpoint(String),
+    /// Manifest JSON malformed / schema mismatch.
+    Json(String),
     /// A data-quality gate check failed (the landing gate).
     QualityGate(String),
 }
@@ -210,6 +212,7 @@ impl fmt::Display for CorpusError {
             CorpusError::Pgn(s) => write!(f, "pgn: {s}"),
             CorpusError::Fen(e) => write!(f, "fen: {e:?}"),
             CorpusError::Checkpoint(s) => write!(f, "checkpoint: {s}"),
+            CorpusError::Json(s) => write!(f, "json: {s}"),
             CorpusError::QualityGate(s) => write!(f, "quality-gate: {s}"),
         }
     }
