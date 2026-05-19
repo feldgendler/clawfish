@@ -4,62 +4,27 @@
 //!
 //! The manifest is the bytes consumers freeze on.  It records every source
 //! file's path, byte-count, and SHA-256 digest so a consumer (M6.H tuner)
-//! can verify the corpus it reads is the one that was produced.
+//! can verify the corpus it reads is the one that was produced. The R-TC
+//! reproducibility contract adds the campaign seeds + depth ladder + the
+//! corpus-bytes digest so the quality gate can re-verify the on-disk
+//! artifact byte-identically.
 //!
 //! ## JSON encoding
 //!
 //! `write_manifest`/`read_manifest` use a hand-rolled minimal JSON writer and
 //! parser.  Only the value shapes this struct uses are supported: strings,
 //! `u32`/`u64`, `f64`, and arrays of objects.  Malformed input returns
-//! [`CorpusError`].
+//! the canonical [`CorpusError::Json`] (see `super::CorpusError`).
 //!
 //! ## File I/O
 //!
 //! `write_manifest` writes the manifest file directly (not via atomic rename).
-//! The integration slice that assembles the full corpus pipeline can swap to
-//! `corpus::store::atomic_write` once that module is available; keeping direct
-//! I/O here avoids a cross-slice dependency.
+//! `read_manifest` accepts only valid UTF-8.
 
 use std::fs;
-use std::io;
 use std::path::Path;
 
-use super::{HIGH_SCORE_CP, OPENING_SKIP_PLIES, PER_GAME_CAP, QUIET_MARGIN_CP};
-
-// ── Error ─────────────────────────────────────────────────────────────────────
-
-/// Errors from corpus manifest operations.
-#[derive(Debug)]
-pub enum CorpusError {
-    /// Underlying I/O failure (file read, write, etc.).
-    Io(io::Error),
-    /// JSON structure did not match the expected manifest schema.
-    MalformedJson(String),
-}
-
-impl std::fmt::Display for CorpusError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CorpusError::Io(e) => write!(f, "corpus I/O error: {e}"),
-            CorpusError::MalformedJson(s) => write!(f, "corpus manifest JSON error: {s}"),
-        }
-    }
-}
-
-impl std::error::Error for CorpusError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            CorpusError::Io(e) => Some(e),
-            CorpusError::MalformedJson(_) => None,
-        }
-    }
-}
-
-impl From<io::Error> for CorpusError {
-    fn from(e: io::Error) -> Self {
-        CorpusError::Io(e)
-    }
-}
+use super::{CorpusError, HIGH_SCORE_CP, OPENING_SKIP_PLIES, PER_GAME_CAP, QUIET_MARGIN_CP};
 
 // ── SHA-256 (FIPS 180-4) ──────────────────────────────────────────────────────
 
@@ -235,7 +200,10 @@ pub struct SourceEntry {
 /// Corpus manifest: the frozen-artifact provenance record.
 ///
 /// Written alongside the corpus by the extraction pipeline and read by M6.H
-/// to verify it is consuming the correct corpus snapshot.
+/// to verify it is consuming the correct corpus snapshot. The R-TC
+/// reproducibility contract pins `self_play_seed` + `split_seed` +
+/// `depth_ladder` + `corpus_sha256`, so the data-quality gate can re-derive
+/// the bytes and check them against the digest recorded here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {
     /// Corpus schema version — bump when the format changes incompatibly.
@@ -250,6 +218,18 @@ pub struct Manifest {
     pub validation_fraction: f64,
     /// One entry per source file.
     pub sources: Vec<SourceEntry>,
+    /// Self-play campaign base seed (R-TC: pairs with the depth ladder so
+    /// `corpus selfplay --seed <self_play_seed>` re-derives identical bytes).
+    pub self_play_seed: u64,
+    /// Train/val game-level split seed (R3 reproducible split).
+    pub split_seed: u64,
+    /// Calibrated R-TC depth-ladder rungs `(depth, weight)`, written here so
+    /// `corpus rerun` reproduces the empirically-anchored sampling.
+    pub depth_ladder: Vec<(u8, u32)>,
+    /// SHA-256 (lowercase hex) of the frozen corpus bytes themselves. The
+    /// reproducibility check (quality gate) re-derives this from disk and
+    /// fails if the digest drifts.
+    pub corpus_sha256: String,
 }
 
 // ── Minimal JSON writer ───────────────────────────────────────────────────────
@@ -323,7 +303,21 @@ fn write_manifest_json(m: &Manifest) -> String {
         }
         out.push('\n');
     }
-    out.push_str("  ]\n");
+    out.push_str("  ],\n");
+    out.push_str(&format!("  \"self_play_seed\": {},\n", m.self_play_seed));
+    out.push_str(&format!("  \"split_seed\": {},\n", m.split_seed));
+    out.push_str("  \"depth_ladder\": [\n");
+    for (i, (depth, weight)) in m.depth_ladder.iter().enumerate() {
+        out.push_str(&format!("    {{\"depth\": {depth}, \"weight\": {weight}}}"));
+        if i + 1 < m.depth_ladder.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("  ],\n");
+    out.push_str("  \"corpus_sha256\": ");
+    write_json_string(&mut out, &m.corpus_sha256);
+    out.push('\n');
     out.push('}');
     out
 }
@@ -374,7 +368,7 @@ impl<'a> Parser<'a> {
     }
 
     fn err(&self, msg: impl Into<String>) -> CorpusError {
-        CorpusError::MalformedJson(format!("at byte {}: {}", self.pos, msg.into()))
+        CorpusError::Json(format!("at byte {}: {}", self.pos, msg.into()))
     }
 
     fn peek(&self) -> Option<u8> {
@@ -548,7 +542,7 @@ impl<'a> Parser<'a> {
 fn require_str<'a>(val: &'a JsonVal, field: &str) -> Result<&'a str, CorpusError> {
     match val {
         JsonVal::Str(s) => Ok(s),
-        _ => Err(CorpusError::MalformedJson(format!(
+        _ => Err(CorpusError::Json(format!(
             "field {field:?} must be a string"
         ))),
     }
@@ -560,13 +554,13 @@ fn require_u64(val: &JsonVal, field: &str) -> Result<u64, CorpusError> {
             let v = *n as u64;
             // Round-trip check: the stored integer must survive f64 → u64.
             if (v as f64 - n).abs() > 0.5 {
-                return Err(CorpusError::MalformedJson(format!(
+                return Err(CorpusError::Json(format!(
                     "field {field:?} value {n} is not an integer"
                 )));
             }
             Ok(v)
         }
-        _ => Err(CorpusError::MalformedJson(format!(
+        _ => Err(CorpusError::Json(format!(
             "field {field:?} must be a number"
         ))),
     }
@@ -575,13 +569,13 @@ fn require_u64(val: &JsonVal, field: &str) -> Result<u64, CorpusError> {
 fn require_u32(val: &JsonVal, field: &str) -> Result<u32, CorpusError> {
     let v = require_u64(val, field)?;
     u32::try_from(v)
-        .map_err(|_| CorpusError::MalformedJson(format!("field {field:?} value {v} overflows u32")))
+        .map_err(|_| CorpusError::Json(format!("field {field:?} value {v} overflows u32")))
 }
 
 fn require_f64(val: &JsonVal, field: &str) -> Result<f64, CorpusError> {
     match val {
         JsonVal::Num(n) => Ok(*n),
-        _ => Err(CorpusError::MalformedJson(format!(
+        _ => Err(CorpusError::Json(format!(
             "field {field:?} must be a number"
         ))),
     }
@@ -591,7 +585,7 @@ fn find_field<'a>(obj: &'a [(String, JsonVal)], key: &str) -> Result<&'a JsonVal
     obj.iter()
         .find(|(k, _)| k == key)
         .map(|(_, v)| v)
-        .ok_or_else(|| CorpusError::MalformedJson(format!("missing field {key:?}")))
+        .ok_or_else(|| CorpusError::Json(format!("missing field {key:?}")))
 }
 
 fn parse_source_entry(obj: &[(String, JsonVal)]) -> Result<SourceEntry, CorpusError> {
@@ -632,14 +626,43 @@ fn parse_manifest_json(src: &str) -> Result<Manifest, CorpusError> {
             .iter()
             .map(|item| match item {
                 JsonVal::Obj(obj) => parse_source_entry(obj),
-                _ => Err(CorpusError::MalformedJson(
+                _ => Err(CorpusError::Json(
                     "sources array element must be an object".into(),
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?,
         _ => {
-            return Err(CorpusError::MalformedJson(
+            return Err(CorpusError::Json(
                 "field \"sources\" must be an array".into(),
+            ));
+        }
+    };
+
+    let self_play_seed = require_u64(find_field(&top, "self_play_seed")?, "self_play_seed")?;
+    let split_seed = require_u64(find_field(&top, "split_seed")?, "split_seed")?;
+    let corpus_sha256 =
+        require_str(find_field(&top, "corpus_sha256")?, "corpus_sha256")?.to_owned();
+
+    let depth_ladder_val = find_field(&top, "depth_ladder")?;
+    let depth_ladder = match depth_ladder_val {
+        JsonVal::Arr(arr) => arr
+            .iter()
+            .map(|item| match item {
+                JsonVal::Obj(obj) => {
+                    let depth = require_u32(find_field(obj, "depth")?, "depth")?;
+                    let weight = require_u32(find_field(obj, "weight")?, "weight")?;
+                    let depth = u8::try_from(depth)
+                        .map_err(|_| CorpusError::Json(format!("depth {depth} overflows u8")))?;
+                    Ok((depth, weight))
+                }
+                _ => Err(CorpusError::Json(
+                    "depth_ladder array element must be an object".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, CorpusError>>()?,
+        _ => {
+            return Err(CorpusError::Json(
+                "field \"depth_ladder\" must be an array".into(),
             ));
         }
     };
@@ -651,6 +674,10 @@ fn parse_manifest_json(src: &str) -> Result<Manifest, CorpusError> {
         total_positions,
         validation_fraction,
         sources,
+        self_play_seed,
+        split_seed,
+        depth_ladder,
+        corpus_sha256,
     })
 }
 
@@ -674,7 +701,7 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, CorpusError> {
     let path = dir.join("manifest.json");
     let bytes = fs::read(path)?;
     let s = std::str::from_utf8(&bytes)
-        .map_err(|_| CorpusError::MalformedJson("manifest.json is not valid UTF-8".into()))?;
+        .map_err(|_| CorpusError::Json("manifest.json is not valid UTF-8".into()))?;
     parse_manifest_json(s)
 }
 
@@ -746,7 +773,8 @@ mod tests {
 
     // ── JSON round-trip ───────────────────────────────────────────────────────
 
-    /// Round-trip: construct a Manifest with ≥2 SourceEntry, write+read, assert equal.
+    /// Round-trip: construct a Manifest with ≥2 SourceEntry and non-default
+    /// R-TC reproducibility fields, write+read, assert equal.
     #[test]
     fn manifest_json_roundtrip() {
         let manifest = Manifest {
@@ -773,6 +801,14 @@ mod tests {
                     positions_extracted: 600_000,
                 },
             ],
+            // f64-exact integers so the JSON number representation
+            // roundtrips: under ~2^53. The pipeline uses small/structured
+            // seeds (campaign defaults), not crypto-random u64s.
+            self_play_seed: 12_345_678_901_234,
+            split_seed: 98_765_432_109_876,
+            depth_ladder: vec![(4, 1), (6, 1), (8, 1), (10, 1)],
+            corpus_sha256: "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+                .to_owned(),
         };
 
         let dir = tempdir();

@@ -444,7 +444,6 @@ pub fn run(cfg: &SelfPlayConfig, stop: &AtomicBool) -> Result<SelfPlayStats, Cor
             for w in 0..workers {
                 let tx = tx.clone();
                 let h = scope.spawn(move || -> (u64, u64) {
-                    let mut searcher = AlphaBetaMover::new();
                     let stop_arc = Arc::new(AtomicBool::new(false));
                     let mut local_emitted = 0u64;
                     let mut local_dropped = 0u64;
@@ -462,6 +461,12 @@ pub fn run(cfg: &SelfPlayConfig, stop: &AtomicBool) -> Result<SelfPlayStats, Cor
                         // Mirror the campaign stop into the per-search stop
                         // so an interrupt aborts the in-flight search.
                         stop_arc.store(stop.load(Ordering::Relaxed), Ordering::Relaxed);
+                        // Fresh searcher per game (R3 bit-identical-resume:
+                        // post-crash games must not depend on the TT state
+                        // accumulated by prior games on the warm worker; a
+                        // cold-start resume would otherwise diverge). Also
+                        // improves self-play decorrelation (research §2.4/§5).
+                        let mut searcher = AlphaBetaMover::new();
                         match play_one_game(
                             &mut searcher,
                             i,

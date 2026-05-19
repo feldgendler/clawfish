@@ -1,0 +1,10 @@
+train_records=92
+val_records=10
+val_fraction=0.1
+split_seed=7
+corpus_sha256=ba3aeec4899a26465cd741f70b4ccc10f16c54c68258097a2687d9685b012acb
+dropped_opening=0
+dropped_eval_cap=167
+dropped_in_check=79
+dropped_not_quiet=243
+QUIET_MARGIN_CP=30

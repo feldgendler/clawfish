@@ -6,9 +6,850 @@
 //! append-block log. Implemented in the M6.G integration slice per
 //! `docs/plans/m6.g.md` §2/§5.
 
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use clawfish::Position;
+use clawfish::corpus::dedup::{dedup_fen, per_game_cap};
+use clawfish::corpus::filter::{GameFilter, position_admitted};
+use clawfish::corpus::manifest::{
+    Manifest, hex_digest, read_manifest, sha256_bytes, write_filter_spec, write_manifest,
+};
+use clawfish::corpus::objective::strata_for;
+use clawfish::corpus::pgn::{PgnStats, stream_pgn};
+use clawfish::corpus::quality_gate::{FEN_LEAKAGE_TAU, QualityReport, run_quality_gate};
+use clawfish::corpus::quiet::{is_quiet, static_eval_white};
+use clawfish::corpus::selfplay::{SelfPlayConfig, calibrate_ladder, run as selfplay_run};
+use clawfish::corpus::split::split_by_game;
+use clawfish::corpus::store::{GameBlock, append_block, atomic_write, scan_valid_blocks};
+use clawfish::corpus::{
+    CorpusRecord, DEPTH_RUNG_EXTERNAL, HIGH_SCORE_CP, Label, OPENING_SKIP_PLIES, PER_GAME_CAP,
+    QUIET_MARGIN_CP, Source,
+};
+use clawfish::search::QSearcher;
 
 fn main() -> ExitCode {
-    eprintln!("corpus: M6.G integration slice not yet implemented");
-    ExitCode::FAILURE
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() < 2 || argv[1] == "--help" || argv[1] == "-h" {
+        print_top_help();
+        return if argv.len() < 2 {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
+    let cmd = argv[1].as_str();
+    let rest = &argv[2..];
+    let res = match cmd {
+        "calibrate-ladder" => cmd_calibrate_ladder(rest),
+        "selfplay" => cmd_selfplay(rest),
+        "ingest-pgn" => cmd_ingest_pgn(rest),
+        "build" => cmd_build(rest),
+        "quality-gate" => cmd_quality_gate(rest),
+        "export" => cmd_export(rest),
+        "rerun" => cmd_rerun(rest),
+        _ => {
+            eprintln!("corpus: unknown subcommand {cmd:?}");
+            print_top_help();
+            return ExitCode::FAILURE;
+        }
+    };
+    match res {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("corpus: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn print_top_help() {
+    eprintln!(
+        "corpus — M6.G corpus-construction CLI.
+
+Usage: corpus <subcommand> [options]
+
+Subcommands:
+  calibrate-ladder   Empirically measure the R-TC depth ladder from `bench` movetime
+                     buckets and write it to filter_spec.txt + manifest.json.
+  selfplay           Run a deterministic fixed-depth self-play campaign.
+                     Crash-safe (per-game append-block log + checkpoint).
+  ingest-pgn         Stream-parse a CCRL/Lichess PGN into the shard log.
+  build              Apply filter → quiet → strata → dedup → cap → split;
+                     emit train+val shards, manifest.json, filter_spec.txt.
+  quality-gate       Run the six data-quality checks; exit 0 iff the gate passes.
+  export             Convert the binary shard log to human-greppable TSV.
+  rerun              Re-execute the stage→build→quality-gate flow from a manifest.
+
+Use `corpus <subcommand> --help` for details."
+    );
+}
+
+// ─── argv parsing helpers ──────────────────────────────────────────────────
+
+struct Args {
+    flags: BTreeMap<String, String>,
+}
+
+fn parse_args(argv: &[String]) -> Args {
+    let mut flags = BTreeMap::new();
+    let mut i = 0;
+    while i < argv.len() {
+        let a = &argv[i];
+        if let Some(key) = a.strip_prefix("--") {
+            // Forms: --key=value | --key value | --key (bool)
+            if let Some(eq) = key.find('=') {
+                let (k, v) = key.split_at(eq);
+                flags.insert(k.to_string(), v[1..].to_string());
+            } else if i + 1 < argv.len() && !argv[i + 1].starts_with("--") {
+                flags.insert(key.to_string(), argv[i + 1].clone());
+                i += 1;
+            } else {
+                flags.insert(key.to_string(), String::new());
+            }
+        }
+        i += 1;
+    }
+    Args { flags }
+}
+
+impl Args {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.flags.get(key).map(String::as_str)
+    }
+    fn require(&self, key: &str) -> Result<&str, String> {
+        self.get(key)
+            .ok_or_else(|| format!("missing required flag --{key}"))
+    }
+    fn parse_u64(&self, key: &str, default: u64) -> Result<u64, String> {
+        self.get(key)
+            .map(|s| s.parse::<u64>().map_err(|e| format!("--{key}: {e}")))
+            .unwrap_or(Ok(default))
+    }
+    fn parse_u32(&self, key: &str, default: u32) -> Result<u32, String> {
+        self.get(key)
+            .map(|s| s.parse::<u32>().map_err(|e| format!("--{key}: {e}")))
+            .unwrap_or(Ok(default))
+    }
+    fn parse_usize(&self, key: &str, default: usize) -> Result<usize, String> {
+        self.get(key)
+            .map(|s| s.parse::<usize>().map_err(|e| format!("--{key}: {e}")))
+            .unwrap_or(Ok(default))
+    }
+    fn parse_f64(&self, key: &str, default: f64) -> Result<f64, String> {
+        self.get(key)
+            .map(|s| s.parse::<f64>().map_err(|e| format!("--{key}: {e}")))
+            .unwrap_or(Ok(default))
+    }
+    fn has(&self, key: &str) -> bool {
+        self.flags.contains_key(key)
+    }
+}
+
+// ─── signal handler (graceful SIGTERM/SIGINT → set stop) ───────────────────
+
+fn install_signal_handler(stop: Arc<AtomicBool>) {
+    // Background thread that polls the signal-arrived atomic flag set by
+    // the OS handler. We register the handler with `libc::signal` so a
+    // SIGTERM or SIGINT flips an atomic that this thread observes and
+    // forwards into the `stop` flag the campaign reads. No `unsafe`
+    // shenanigans inside the handler itself — just a relaxed store.
+    static GOT_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn handle(_sig: libc::c_int) {
+        GOT_SIGNAL.store(true, Ordering::Relaxed);
+    }
+
+    unsafe {
+        libc::signal(libc::SIGTERM, handle as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handle as *const () as libc::sighandler_t);
+    }
+
+    std::thread::spawn(move || {
+        loop {
+            if GOT_SIGNAL.load(Ordering::Relaxed) {
+                stop.store(true, Ordering::Relaxed);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+}
+
+// ─── calibrate-ladder ──────────────────────────────────────────────────────
+
+fn cmd_calibrate_ladder(argv: &[String]) -> Result<ExitCode, String> {
+    let args = parse_args(argv);
+    if args.has("help") {
+        eprintln!(
+            "corpus calibrate-ladder --buckets <ms,ms,...> --out <dir>
+
+Measure clawfish's median completed iterative-deepening depth at each
+deployment movetime bucket over the bench corpus. Writes filter_spec.txt
++ a manifest stub recording the calibration.
+
+Flags:
+  --buckets <list>   Comma-separated movetime budgets in ms (default: 100,200,400,600)
+  --out <dir>        Output directory (created if missing)"
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let out = PathBuf::from(args.require("out")?);
+    let buckets_str = args.get("buckets").unwrap_or("100,200,400,600");
+    let buckets: Vec<u64> = buckets_str
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<u64>()
+                .map_err(|e| format!("--buckets: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    fs::create_dir_all(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
+
+    eprintln!("corpus: calibrating depth ladder over bucket(s) {buckets:?} ms on bench corpus...");
+    let ladder = calibrate_ladder(&buckets);
+    eprintln!("corpus: calibrated ladder = {ladder:?}");
+
+    // Write the ladder + the pinned-interface constants to filter_spec.txt
+    // (the M6.G↔M6.H contract surface).
+    write_filter_spec(&out).map_err(|e| format!("write_filter_spec: {e}"))?;
+    // Append the ladder, the FEN-leakage tau, and the bucket→depth mapping.
+    let mut spec = fs::read_to_string(out.join("filter_spec.txt"))
+        .map_err(|e| format!("read filter_spec.txt: {e}"))?;
+    spec.push_str("# R-TC depth ladder (corpus calibrate-ladder).\n");
+    for ((depth, weight), bucket) in ladder.iter().zip(buckets.iter()) {
+        spec.push_str(&format!("DEPTH_RUNG_{bucket}MS={depth},{weight}\n"));
+    }
+    spec.push_str(&format!("FEN_LEAKAGE_TAU={FEN_LEAKAGE_TAU}\n"));
+    fs::write(out.join("filter_spec.txt"), spec).map_err(|e| format!("write filter_spec: {e}"))?;
+
+    // Write a minimal manifest stub (no corpus bytes yet — just records the
+    // calibration so a subsequent `selfplay` can refer to it).
+    let manifest = Manifest {
+        schema_version: 1,
+        created_at: timestamp(),
+        engine_commit: engine_commit(),
+        total_positions: 0,
+        validation_fraction: 0.0,
+        sources: Vec::new(),
+        self_play_seed: 0,
+        split_seed: 0,
+        depth_ladder: ladder,
+        corpus_sha256: String::new(),
+    };
+    write_manifest(&out, &manifest).map_err(|e| format!("write_manifest: {e}"))?;
+    eprintln!(
+        "corpus: wrote {}/manifest.json + filter_spec.txt",
+        out.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+// ─── selfplay ──────────────────────────────────────────────────────────────
+
+fn cmd_selfplay(argv: &[String]) -> Result<ExitCode, String> {
+    let args = parse_args(argv);
+    if args.has("help") {
+        eprintln!(
+            "corpus selfplay --seed <u64> --games <N> --workers <N> --out <dir> \\
+                [--max-plies <N>] [--opening-random-plies <N>] [--val-fraction <f>]
+
+Run a deterministic fixed-depth self-play campaign. Uses the calibrated
+depth ladder from <out>/manifest.json if present, else falls back to
+depth 4. Crash-safe (R1/R2/R3). SIGTERM/SIGINT triggers a graceful
+drop-in-flight + checkpoint flush."
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let out = PathBuf::from(args.require("out")?);
+    fs::create_dir_all(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
+    let seed = args.parse_u64("seed", 0)?;
+    let games = args.parse_u64("games", 100)?;
+    let workers = args.parse_usize("workers", num_workers_default())?;
+    let max_plies = args.parse_u32("max-plies", 400)?;
+    let opening_random_plies = args.parse_u32("opening-random-plies", 8)?;
+    let val_fraction = args.parse_f64("val-fraction", 0.1)?;
+
+    // Pick up the depth ladder from a pre-existing manifest if present
+    // (calibrate-ladder writes one). Empty ladder ⇒ selfplay defaults to a
+    // shallow depth-4 rung (documented in `selfplay::run`).
+    let depth_ladder = match read_manifest(&out) {
+        Ok(m) if !m.depth_ladder.is_empty() => m.depth_ladder,
+        _ => {
+            eprintln!("corpus: no pre-existing manifest depth_ladder — defaulting to [(4, 1)]");
+            vec![(4, 1)]
+        }
+    };
+
+    let cfg = SelfPlayConfig {
+        seed,
+        games,
+        workers,
+        depth_ladder: depth_ladder.clone(),
+        opening_random_plies,
+        max_plies,
+        out_dir: out.clone(),
+        val_fraction,
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    install_signal_handler(Arc::clone(&stop));
+
+    eprintln!(
+        "corpus: starting self-play campaign seed={seed} games={games} workers={workers} \
+         depth_ladder={depth_ladder:?} val_fraction={val_fraction} out={}",
+        out.display()
+    );
+
+    let stats = selfplay_run(&cfg, &stop).map_err(|e| format!("selfplay::run: {e}"))?;
+    eprintln!(
+        "corpus: campaign done — games_completed={} dropped_inflight={} positions_emitted={}",
+        stats.games_completed, stats.games_dropped_inflight, stats.positions_emitted
+    );
+
+    // Pin the self-play seed into the manifest so a subsequent `build` +
+    // `quality-gate` records it in the frozen artifact (the R-TC
+    // reproducibility contract).
+    if let Ok(mut m) = read_manifest(&out) {
+        m.self_play_seed = seed;
+        write_manifest(&out, &m).map_err(|e| format!("update self_play_seed: {e}"))?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn num_workers_default() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+// ─── ingest-pgn ────────────────────────────────────────────────────────────
+
+fn cmd_ingest_pgn(argv: &[String]) -> Result<ExitCode, String> {
+    let args = parse_args(argv);
+    if args.has("help") {
+        eprintln!(
+            "corpus ingest-pgn --path <pgn> --out <dir> [--source ccrl|lichess]
+
+Stream-parse a CCRL or Lichess PGN; apply `GameFilter::default()`;
+emit each accepted game as one CRC-framed block in <out>/pgn-shard.bin
+(separate from the self-play shard so the two streams remain
+distinguishable for the audit). The `--source` tag determines the
+provenance recorded on every emitted record."
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let path = PathBuf::from(args.require("path")?);
+    let out = PathBuf::from(args.require("out")?);
+    fs::create_dir_all(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
+    let source = match args.get("source").unwrap_or("ccrl") {
+        "ccrl" => Source::Ccrl,
+        "lichess" => Source::LichessOpen,
+        other => {
+            return Err(format!(
+                "--source must be `ccrl` or `lichess`, got {other:?}"
+            ));
+        }
+    };
+    let filter = GameFilter::default();
+
+    let f = fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let r = BufReader::new(f);
+    let shard = out.join("pgn-shard.bin");
+
+    // Reserve a game-id range for this PGN: start above any existing
+    // self-play game-ids in <out>/shard.bin to keep audit traces clean.
+    let base_id = match scan_valid_blocks(&out.join("shard.bin")) {
+        Ok((blocks, _)) => blocks.iter().map(|b| b.game_id).max().unwrap_or(0) + 1,
+        Err(_) => 0,
+    };
+
+    let mut stats = PgnStats::default();
+    let shard_ref = shard.clone();
+    let mut on_game = move |gp: clawfish::corpus::pgn::GamePositions| {
+        // Game-level admission first (Termination/TC/Elo).
+        if !clawfish::corpus::filter::game_admitted(&gp.tags, &filter) {
+            return;
+        }
+        let label = match gp.tags.result {
+            Some(l) => l,
+            None => return,
+        };
+        let recs: Vec<CorpusRecord> = gp
+            .positions
+            .into_iter()
+            .map(|(pos, ply)| CorpusRecord {
+                fen: pos.to_fen(),
+                label,
+                source,
+                game_id: gp.game_id,
+                ply,
+                depth_rung: DEPTH_RUNG_EXTERNAL,
+                strata: 0,
+            })
+            .collect();
+        if !recs.is_empty()
+            && let Err(e) = append_block(&shard_ref, gp.game_id, &recs)
+        {
+            eprintln!("corpus: append_block failed for game {}: {e}", gp.game_id);
+        }
+    };
+
+    let next_id =
+        stream_pgn(r, base_id, &mut on_game, &mut stats).map_err(|e| format!("stream_pgn: {e}"))?;
+    eprintln!(
+        "corpus: PGN ingest done — games_seen={} emitted={} parse_failures={} \
+         no_result_dropped={} next_id={}",
+        stats.games_seen,
+        stats.games_emitted,
+        stats.parse_failures,
+        stats.no_result_dropped,
+        next_id
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+// ─── build ─────────────────────────────────────────────────────────────────
+
+fn cmd_build(argv: &[String]) -> Result<ExitCode, String> {
+    let args = parse_args(argv);
+    if args.has("help") {
+        eprintln!(
+            "corpus build --in <dir> [--out <dir>] [--val-fraction <f>] \\
+                [--split-seed <u64>] [--max-mem-mb <N>] [--max-spill-gb <N>]
+
+Re-scan the input shard logs (self-play + PGN), apply the pinned
+filter→quiet→strata pipeline, run dedup→cap→split, and emit the frozen
+corpus to <out>/train.bin + <out>/val.bin + manifest.json + filter_spec.txt
++ corpus_stats.txt. Default --out = --in."
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let in_dir = PathBuf::from(args.require("in")?);
+    let out = match args.get("out") {
+        Some(s) => PathBuf::from(s),
+        None => in_dir.clone(),
+    };
+    fs::create_dir_all(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
+    let val_fraction = args.parse_f64("val-fraction", 0.1)?;
+    let split_seed = args.parse_u64("split-seed", 7)?;
+    let max_mem_mb = args.parse_u64("max-mem-mb", 512)?;
+    let max_spill_gb = args.parse_u64("max-spill-gb", 8)?;
+
+    // Load the pre-existing manifest's metadata (depth ladder, self-play
+    // seed) if available — `build` does not overwrite the calibration.
+    let existing_manifest = read_manifest(&in_dir).ok();
+
+    // 1) Read all shards into memory (R6 streaming would chunk this; the
+    //    landing-budget corpus is small enough to fit, and the dedup spill
+    //    handles the rest).
+    let mut all: Vec<CorpusRecord> = Vec::new();
+    for name in ["shard.bin", "pgn-shard.bin"] {
+        let p = in_dir.join(name);
+        if !p.exists() {
+            continue;
+        }
+        let (blocks, _) =
+            scan_valid_blocks(&p).map_err(|e| format!("scan {}: {e}", p.display()))?;
+        for b in blocks {
+            for r in b.records {
+                all.push(r);
+            }
+        }
+    }
+    eprintln!("corpus: loaded {} raw records", all.len());
+
+    // 2) Filter→quiet→strata pass. One reusable QSearcher per process
+    //    (single-threaded build pass — fine for the landing-budget corpus;
+    //    a future commit can shard this).
+    let mut q = QSearcher::new();
+    let mut admitted: Vec<CorpusRecord> = Vec::with_capacity(all.len());
+    let mut drop_in_check = 0u64;
+    let mut drop_eval_cap = 0u64;
+    let mut drop_opening = 0u64;
+    let mut drop_not_quiet = 0u64;
+    for r in all {
+        let pos = match Position::from_fen(&r.fen) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let se = static_eval_white(&pos);
+        if r.ply < OPENING_SKIP_PLIES {
+            drop_opening += 1;
+            continue;
+        }
+        if se.abs() > HIGH_SCORE_CP {
+            drop_eval_cap += 1;
+            continue;
+        }
+        if !position_admitted(&pos, r.ply, se) {
+            drop_in_check += 1;
+            continue;
+        }
+        let qs = q.eval_white(&pos);
+        if !is_quiet(&pos, se, qs) {
+            drop_not_quiet += 1;
+            continue;
+        }
+        let strata = strata_for(&pos);
+        admitted.push(CorpusRecord { strata, ..r });
+    }
+    eprintln!(
+        "corpus: admitted {} records (dropped opening={drop_opening}, eval_cap={drop_eval_cap}, \
+         in_check={drop_in_check}, not_quiet={drop_not_quiet})",
+        admitted.len()
+    );
+
+    // 3) Dedup → per-game cap → game-level split.
+    let spill_dir = std::env::temp_dir().join("clawfish-corpus-spill");
+    let after_dedup = dedup_fen(admitted.into_iter(), &spill_dir, max_mem_mb, max_spill_gb)
+        .map_err(|e| format!("dedup_fen: {e}"))?;
+    eprintln!("corpus: after dedup_fen = {} records", after_dedup.len());
+    let after_cap = per_game_cap(after_dedup, PER_GAME_CAP, split_seed);
+    eprintln!(
+        "corpus: after per_game_cap(cap={PER_GAME_CAP}) = {} records",
+        after_cap.len()
+    );
+    let split = split_by_game(after_cap, val_fraction, split_seed);
+    let train_n = split.train.len();
+    let val_n = split.val.len();
+    eprintln!("corpus: split → train={train_n} val={val_n}");
+
+    // 4) Emit the frozen shards. Group by game_id so the on-disk frame is
+    //    one block per game (the §3.6 contract). When the val split is
+    //    empty (small corpus + low val_fraction) we still emit a zero-byte
+    //    val.bin so downstream tooling can scan it unconditionally — the
+    //    `scan_valid_blocks` path treats a missing file as empty too.
+    let train_path = out.join("train.bin");
+    let val_path = out.join("val.bin");
+    let _ = fs::remove_file(&train_path);
+    let _ = fs::remove_file(&val_path);
+    emit_records_per_game(&train_path, &split.train)?;
+    emit_records_per_game(&val_path, &split.val)?;
+    if !val_path.exists() {
+        fs::write(&val_path, b"").map_err(|e| format!("create empty val.bin: {e}"))?;
+    }
+    if !train_path.exists() {
+        fs::write(&train_path, b"").map_err(|e| format!("create empty train.bin: {e}"))?;
+    }
+
+    // 5) Compute the frozen-corpus SHA-256 = sha256(train ‖ val).
+    let mut bytes =
+        fs::read(&train_path).map_err(|e| format!("read {}: {e}", train_path.display()))?;
+    let val_bytes = fs::read(&val_path).map_err(|e| format!("read {}: {e}", val_path.display()))?;
+    bytes.extend_from_slice(&val_bytes);
+    let corpus_digest = hex_digest(&sha256_bytes(&bytes));
+
+    // 6) Re-emit manifest.json with the post-build totals + digest.
+    let manifest = Manifest {
+        schema_version: 1,
+        created_at: timestamp(),
+        engine_commit: engine_commit(),
+        total_positions: (train_n + val_n) as u64,
+        validation_fraction: val_fraction,
+        sources: existing_manifest
+            .as_ref()
+            .map(|m| m.sources.clone())
+            .unwrap_or_default(),
+        self_play_seed: existing_manifest
+            .as_ref()
+            .map(|m| m.self_play_seed)
+            .unwrap_or(0),
+        split_seed,
+        depth_ladder: existing_manifest
+            .as_ref()
+            .map(|m| m.depth_ladder.clone())
+            .unwrap_or_else(|| vec![(4, 1)]),
+        corpus_sha256: corpus_digest.clone(),
+    };
+    write_manifest(&out, &manifest).map_err(|e| format!("write_manifest: {e}"))?;
+    write_filter_spec(&out).map_err(|e| format!("write_filter_spec: {e}"))?;
+
+    // Stats file — recorded knobs the gate / a reviewer can inspect.
+    let mut stats = String::new();
+    stats.push_str(&format!("train_records={train_n}\n"));
+    stats.push_str(&format!("val_records={val_n}\n"));
+    stats.push_str(&format!("val_fraction={val_fraction}\n"));
+    stats.push_str(&format!("split_seed={split_seed}\n"));
+    stats.push_str(&format!("corpus_sha256={corpus_digest}\n"));
+    stats.push_str(&format!("dropped_opening={drop_opening}\n"));
+    stats.push_str(&format!("dropped_eval_cap={drop_eval_cap}\n"));
+    stats.push_str(&format!("dropped_in_check={drop_in_check}\n"));
+    stats.push_str(&format!("dropped_not_quiet={drop_not_quiet}\n"));
+    stats.push_str(&format!("QUIET_MARGIN_CP={QUIET_MARGIN_CP}\n"));
+    atomic_write(&out.join("corpus_stats.txt"), stats.as_bytes())
+        .map_err(|e| format!("write corpus_stats: {e}"))?;
+
+    // Promote train.bin → shard.bin (the gate's `Layout::discover` reads
+    // `shard.bin` + `val.bin`). `fs::rename` overwrites the existing
+    // shard.bin atomically on POSIX — that is exactly what we want here:
+    // the raw input shard is replaced by the filtered/dedup'd output.
+    let _ = fs::remove_file(out.join("shard.bin"));
+    fs::rename(&train_path, out.join("shard.bin"))
+        .map_err(|e| format!("rename train.bin → shard.bin: {e}"))?;
+
+    // Write the re-run.sh template + its sister scripts (R5 staging).
+    write_rerun_script(&out)?;
+
+    eprintln!(
+        "corpus: build complete — total={}, sha256={}",
+        train_n + val_n,
+        corpus_digest
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn emit_records_per_game(path: &Path, records: &[CorpusRecord]) -> Result<(), String> {
+    let mut by_game: BTreeMap<u64, Vec<CorpusRecord>> = BTreeMap::new();
+    for r in records {
+        by_game.entry(r.game_id).or_default().push(r.clone());
+    }
+    for (gid, recs) in &by_game {
+        append_block(path, *gid, recs).map_err(|e| format!("append_block {gid}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn write_rerun_script(dir: &Path) -> Result<(), String> {
+    let body = r#"#!/usr/bin/env sh
+# bench/corpus/re-run.sh — operator script to re-derive the corpus bytes.
+# Generated by `corpus build`. POSIX-sh-compatible.
+#
+# Stages:
+#   1) (External) stage raw CCRL/Lichess PGNs into target/corpus-raw/ if any
+#      are listed in manifest.json. Re-derivability is the weaker contract
+#      for those slices (research §1 / plan §1) — re-download then ingest.
+#   2) corpus selfplay  — deterministic given (seed, depth_ladder, binary).
+#   3) corpus ingest-pgn — once per PGN listed in the manifest.
+#   4) corpus build      — apply filter→quiet→dedup→cap→split → frozen bytes.
+#   5) corpus quality-gate — must PASS.
+#
+# Tooling: requires `zstd` to decompress Lichess `.pgn.zst` and (optionally)
+# `7z` for CCRL. Both are system tools, NOT Rust deps (R5).
+
+set -eu
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN="${CORPUS_BIN:-corpus}"
+
+echo "corpus re-run: using binary '$BIN' against $DIR"
+
+# Re-read seeds + ladder from manifest.json (operator-readable JSON).
+SEED="$(grep -E '\"self_play_seed\"' "$DIR/manifest.json" | head -1 | tr -d ' ,' | cut -d: -f2)"
+SPLITS="$(grep -E '\"split_seed\"' "$DIR/manifest.json" | head -1 | tr -d ' ,' | cut -d: -f2)"
+echo "corpus re-run: seed=$SEED split_seed=$SPLITS"
+
+# (1) external staging: read manifest.sources and re-download each.
+# (Left as an operator step — the manifest pins URLs + SHA-256.)
+
+# (2) self-play (uses the manifest depth_ladder).
+"$BIN" selfplay --seed "$SEED" --games "${GAMES:-200}" --workers "${WORKERS:-4}" \
+    --out "$DIR"
+
+# (3) Each PGN source: corpus ingest-pgn …
+# (4) Build the frozen corpus.
+"$BIN" build --in "$DIR" --split-seed "$SPLITS" --val-fraction "${VAL_FRACTION:-0.1}"
+
+# (5) Run the data-quality gate (must PASS).
+"$BIN" quality-gate --dir "$DIR"
+"#;
+    let path = dir.join("re-run.sh");
+    fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+    // Mark executable on Unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = fs::metadata(&path)
+            .map_err(|e| format!("stat re-run.sh: {e}"))?
+            .permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&path, perm).map_err(|e| format!("chmod re-run.sh: {e}"))?;
+    }
+    Ok(())
+}
+
+fn timestamp() -> String {
+    // ISO-8601 UTC. We approximate using SystemTime::now -> seconds.
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO);
+    let secs = dur.as_secs() as i64;
+    let (year, month, day, hour, min, sec) = unix_to_ymd(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Crude Unix→YMD conversion (no chrono dep). Good for a manifest timestamp.
+fn unix_to_ymd(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
+    let hour = (time_of_day / 3600) as u32;
+    let min = ((time_of_day % 3600) / 60) as u32;
+    let sec = (time_of_day % 60) as u32;
+    // Howard Hinnant's date algorithms (public-domain).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i32) + era as i32 * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d, hour, min, sec)
+}
+
+fn engine_commit() -> String {
+    // Best-effort: read CLAWFISH_COMMIT env (set by scripts/corpus.sh) or
+    // fall back to "unknown". Avoids running `git rev-parse` from a Rust
+    // process (dependency-hygiene-clean; the operator script can stamp it).
+    std::env::var("CLAWFISH_COMMIT").unwrap_or_else(|_| "unknown".into())
+}
+
+// ─── quality-gate ──────────────────────────────────────────────────────────
+
+fn cmd_quality_gate(argv: &[String]) -> Result<ExitCode, String> {
+    let args = parse_args(argv);
+    if args.has("help") {
+        eprintln!(
+            "corpus quality-gate --dir <dir>
+
+Run the six data-quality checks against the frozen corpus at <dir>.
+Exit 0 iff the gate passes (the three must-PASS checks all PASSed)."
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let dir = PathBuf::from(args.require("dir")?);
+    let report = run_quality_gate(&dir).map_err(|e| format!("run_quality_gate: {e}"))?;
+    print_report(&report);
+    if report.gate_passed() {
+        eprintln!("corpus: data-quality gate PASS");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        eprintln!("corpus: data-quality gate FAIL");
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+fn print_report(report: &QualityReport) {
+    println!("name                                must  passed  detail");
+    println!("----                                ----  ------  ------");
+    for c in &report.checks {
+        let mp = if c.must_pass { "YES" } else { " no" };
+        let p = if c.passed { "PASS" } else { "FAIL" };
+        println!("{:36} {mp:4}  {p:6}  {}", c.name, c.detail);
+    }
+}
+
+// ─── export ────────────────────────────────────────────────────────────────
+
+fn cmd_export(argv: &[String]) -> Result<ExitCode, String> {
+    let args = parse_args(argv);
+    if args.has("help") {
+        eprintln!(
+            "corpus export --in <dir>
+
+Convert the on-disk binary shard log to TSV on stdout. Columns:
+fen\\tlabel\\tsource\\tgame_id\\tply\\tdepth_rung\\tstrata.
+
+Reads <dir>/shard.bin + <dir>/val.bin + <dir>/pgn-shard.bin if present."
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let in_dir = PathBuf::from(args.require("in")?);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "fen\tlabel\tsource\tgame_id\tply\tdepth_rung\tstrata")
+        .map_err(|e| format!("write tsv header: {e}"))?;
+    let mut total = 0u64;
+    for name in ["shard.bin", "val.bin", "pgn-shard.bin"] {
+        let p = in_dir.join(name);
+        if !p.exists() {
+            continue;
+        }
+        let (blocks, _) =
+            scan_valid_blocks(&p).map_err(|e| format!("scan {}: {e}", p.display()))?;
+        for b in blocks {
+            total += dump_block_tsv(&mut out, &b)?;
+        }
+    }
+    eprintln!("corpus: exported {total} records as TSV");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn dump_block_tsv(out: &mut impl Write, block: &GameBlock) -> Result<u64, String> {
+    let mut n = 0u64;
+    for r in &block.records {
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            r.fen,
+            label_name(r.label),
+            source_name(r.source),
+            r.game_id,
+            r.ply,
+            r.depth_rung,
+            r.strata
+        )
+        .map_err(|e| format!("write tsv row: {e}"))?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+fn label_name(l: Label) -> &'static str {
+    match l {
+        Label::WhiteWin => "1-0",
+        Label::Draw => "1/2-1/2",
+        Label::BlackWin => "0-1",
+    }
+}
+
+fn source_name(s: Source) -> &'static str {
+    match s {
+        Source::SelfPlay => "self_play",
+        Source::Ccrl => "ccrl",
+        Source::LichessOpen => "lichess",
+    }
+}
+
+// ─── rerun ─────────────────────────────────────────────────────────────────
+
+fn cmd_rerun(argv: &[String]) -> Result<ExitCode, String> {
+    let args = parse_args(argv);
+    if args.has("help") {
+        eprintln!(
+            "corpus rerun --manifest <path>
+
+Convenience wrapper: re-execute the stage→build→quality-gate flow
+documented in `bench/corpus/re-run.sh`. The vendored script is the
+operator-facing artifact; this subcommand simply prints a pointer
+to that script so a re-run is always traceable to a committed file."
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let m = args.require("manifest")?;
+    let p = Path::new(m);
+    if !p.exists() {
+        return Err(format!("--manifest {}: not found", p.display()));
+    }
+    let dir = p.parent().unwrap_or(Path::new("."));
+    let script = dir.join("re-run.sh");
+    if script.exists() {
+        eprintln!(
+            "corpus: re-run script is at {} — invoke it directly:\n  sh {}",
+            script.display(),
+            script.display()
+        );
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Err(format!(
+            "no re-run.sh found next to {}; re-run `corpus build` to regenerate",
+            p.display()
+        ))
+    }
 }
