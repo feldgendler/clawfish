@@ -215,6 +215,117 @@ pub(crate) const QUEEN_MOBILITY_EG: [i32; 28] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
+// ---------------------------------------------------------------------------
+// M6.E king-safety weight constants. Source: CPW-Engine/Fruit/Glaurung
+// lineage (docs/research/m6-king-safety.md §2/§6; ADR-0003-clean — not
+// engine source). Per-kind attacker-unit multipliers; 100-entry S-curve
+// SafetyTable; castled-king pawn-shield bonuses (two rank tiers, three
+// files); open/semi-open file MG-only penalties.
+//
+// **Shipped config: ALL king-safety weights zeroed (score-neutral landing).**
+// Research §8 verdict: HIGH transfer risk — the single highest-risk M6 term:
+//   - PeSTO's MG king PST already prices ~30–50 cp of castled-king safety
+//     (the dominant double-count axis, stronger than M6.D's PST double-count).
+//   - The SafetyTable S-curve saturates at 500 cp (calibrated against engines
+//     with jointly-tuned PSTs; our zeroed mobility/pawn-structure baseline is
+//     not that baseline).
+//   - King safety is the noisiest term to SPRT (TC-dependent, opening-pool-
+//     dominated variance; mixed-TC screens ~5× M6.B cost).
+//   - Components are coupled by design (shield weakness feeds S-curve;
+//     open-file and S-curve price the same king-danger state): no
+//     interaction-immune subset (contrast M6.B's clean CONN-only +103).
+// The M6.C/M6.D three-phase "co-calibrated-elsewhere ≠ transfers here" law
+// (M6.B −197.94 / M6.C −21.74 / M6.D −131.62 / co-scale *worsened* −220.18)
+// applies with strongest force here. **M6.E skips the diagnostic screen ladder
+// entirely** (ADR-0033 §8 / plan §10) on the justified prediction that the
+// screen's only outcome is "defer" at the highest screen cost of any M6 term.
+// Inert landing: zeroed weights ⇒ term ≡ (0,0) ⇒ evaluate byte-identical to
+// M6.D ⇒ bench 1213649 / depth-4 90591 byte-for-byte ⇒ no SPRT needed.
+//
+// **M6.F joint Texel obligation (extended).** Re-derives the entire king-safety
+// weight set (S-curve table shape + per-kind attacker multipliers + shield +
+// open-file + MG/EG split) *jointly* with M6.B ISO/DBL/BWD + CONN rescale,
+// M6.C passed-pawn reshape, and M6.D mobility reshape — one joint pass. The
+// §7 double-count axes (pawn-shield × PeSTO king MG PST — dominant; attack
+// S-curve × king PST — low-moderate; CONN × shield — low) are the load-
+// bearing inputs to that pass. ADR-0033 §7/§8.
+//
+// **Literature defaults (the M6.F starting point, recorded verbatim):**
+//
+// Per-kind attacker multipliers (CPW-Engine form: units = weight × attacked
+// king-zone squares, summed to SAFETY_TABLE index). Source: CPW-Engine eval
+// (Glaurung/Fruit lineage, the one complete citable set outside engine source
+// repos — ADR-0003-clean):
+//   KING_ATTACK_WEIGHT_N = 2   KING_ATTACK_WEIGHT_B = 2
+//   KING_ATTACK_WEIGHT_R = 3   KING_ATTACK_WEIGHT_Q = 4
+//
+// SAFETY_TABLE (100-entry CPW-Engine S-curve, Glaurung 1.2 lineage verbatim;
+// same values reproduced on CPW King Safety page and CPW-Engine eval page;
+// S-curve: slow rise 0–10, steeper 10–60, flat 500 from index 61+):
+//   [  0,  0,  1,  2,  3,  5,  7,  9, 12, 15,
+//     18, 22, 26, 30, 35, 39, 44, 50, 56, 62,
+//     68, 75, 82, 85, 89, 97,105,113,122,131,
+//    140,150,169,180,191,202,213,225,237,248,
+//    260,272,283,295,307,319,330,342,354,366,
+//    377,389,401,412,424,436,448,459,471,483,
+//    494,500,500,500,500,500,500,500,500,500,
+//    500,500,500,500,500,500,500,500,500,500,
+//    500,500,500,500,500,500,500,500,500,500,
+//    500,500,500,500,500,500,500,500,500,500]
+//
+// Gating (CPW-Engine): attack_units = 0 if < 2 distinct attackers OR enemy
+// has no queen (conservative at M6.E; M6.F may relax). Index clamped to
+// min(units, 99) — the saturating tail is by design (S-curve flat at 500).
+// Attack penalty MG-only (EG = 0; king walks in EG, fights PeSTO EG king PST
+// centralization incentive — ADR-0033 §2/§5; research §5).
+//
+// Pawn-shield defaults (center of literature range; two-tier: SHIELD_1 >
+// SHIELD_2, unmoved rank-2 pawn strictly better than rank-3):
+//   SHIELD_1_MG = 10   SHIELD_1_EG = 5   (rank-2 pawn)
+//   SHIELD_2_MG =  5   SHIELD_2_EG = 3   (rank-3 pawn)
+//
+// Open/semi-open file defaults (MG-only; research §4):
+//   KS_KFILE_SEMI_OPEN_MG = -15   KS_KFILE_OPEN_MG = -20
+//   KS_ADJ_SEMI_OPEN_MG  = -10   (per adjacent file)
+//   KS_BOTH_ADJ_SEMI_OPEN_MG = -10  (extra when both adj semi-open)
+//
+// These are data constants, not logic — excluded from `cargo mutants` per
+// `.cargo/mutants.toml` alongside the PST/mobility arrays.
+// ---------------------------------------------------------------------------
+
+/// King-zone attacker-unit multiplier, knight. Zeroed (score-neutral, M6.F re-tunes).
+pub(crate) const KING_ATTACK_WEIGHT_N: i32 = 0; // lit 2
+/// King-zone attacker-unit multiplier, bishop. Zeroed — see `KING_ATTACK_WEIGHT_N`.
+pub(crate) const KING_ATTACK_WEIGHT_B: i32 = 0; // lit 2
+/// King-zone attacker-unit multiplier, rook. Zeroed — see `KING_ATTACK_WEIGHT_N`.
+pub(crate) const KING_ATTACK_WEIGHT_R: i32 = 0; // lit 3
+/// King-zone attacker-unit multiplier, queen. Zeroed — see `KING_ATTACK_WEIGHT_N`.
+pub(crate) const KING_ATTACK_WEIGHT_Q: i32 = 0; // lit 4
+
+/// CPW-Engine 100-entry S-curve SafetyTable. Indexed by accumulated attack
+/// units; clamped to [0, 99]. Zeroed — see block comment (M6.F re-derives).
+/// The literature defaults are recorded verbatim in the block comment above.
+#[rustfmt::skip]
+pub(crate) const KING_SAFETY_TABLE: [i32; 100] = [0; 100];
+
+/// Pawn-shield bonus: friendly pawn on king's 2nd rank, middlegame. Zeroed.
+pub(crate) const SHIELD_1_MG: i32 = 0; // lit  10
+/// Pawn-shield bonus: friendly pawn on king's 2nd rank, endgame. Zeroed.
+pub(crate) const SHIELD_1_EG: i32 = 0; // lit   5
+/// Pawn-shield bonus: friendly pawn on king's 3rd rank, middlegame. Zeroed.
+pub(crate) const SHIELD_2_MG: i32 = 0; // lit   5
+/// Pawn-shield bonus: friendly pawn on king's 3rd rank, endgame. Zeroed.
+pub(crate) const SHIELD_2_EG: i32 = 0; // lit   3
+
+/// MG penalty: king file is semi-open (no own pawn, enemy pawn present). Zeroed.
+pub(crate) const KS_KFILE_SEMI_OPEN_MG: i32 = 0; // lit -15
+/// MG penalty: king file is fully open (no pawn of either color). Zeroed.
+pub(crate) const KS_KFILE_OPEN_MG: i32 = 0; // lit -20
+/// MG penalty per adjacent file that is semi-open (no own pawn). Zeroed.
+pub(crate) const KS_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
+/// MG amplification: both adjacent files semi-open (no-cover threshold). Zeroed.
+pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
+
 /// Centipawn material values indexed by `PieceKind::index()` (P=0 … K=5).
 /// King material is 0 — kings are never captured; the king PST term is
 /// purely positional.

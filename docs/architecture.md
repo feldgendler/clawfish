@@ -53,6 +53,7 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 | Pawn-structure infra (M6.B) | Pawn-only Zobrist substream `Position::pawn_zobrist` (structural 3-XOR, Polyglot pawn keys); 4 MiB search-owned always-replace `PawnHashTable` on `AlphaBetaMover` (cleared in `Search::reset`); isolated/doubled/backward/connected predicates + passed detection; `evaluate_core`/`evaluate`/`evaluate_cached` (pure accelerator, D6). **Shipped config: `PAWN_STRUCTURE_IN_EVAL = true`, CONN-only — `ISO/DBL/BWD` weights zeroed in `eval::data` (every multi-term subset collapses via an ISO×CONN connectivity double-count; CONN-only Δ Elo +45.42 vs `M6.A`). M6.F re-introduces ISO/DBL/BWD via joint Texel + rescales CONN.** | "Pawn-structure infra" below; ADR-0032 (§7) |
 | Passed-pawn term (M6.C) | `pawns::passed_pawn_term_white` (rank bonus + EG three-state path + EG king-tropism), reads M6.B's cached `passed[2]`, **computed live in `evaluate_core` — never cached** (king-distance/path are not pawn-only, ADR-0032 §3); blend-numerator only, not `static_eval_white`/mop-up (§4). **Shipped score-neutral: every passed weight zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.B`** (a three-config screen ladder proved the literature defaults a scale-invariant structural mismatch; whole weight set → M6.F). Term math live at zero weight, M6.F-ready. | "Passed-pawn term" below; ADR-0032 (§8) |
 | Piece-mobility term (M6.D) | `eval::mobility::mobility_term_white(pos) -> (i32, i32)` — N/B/R/Q `popcount(piece_attacks(sq, occ_all) ∩ area)`, `area = !(own_occupied ∪ enemy_pawn_attacked)`, per-kind MG/EG tables; **computed live in `evaluate_core` — never cached** (not pawn-only, the ADR-0032 §3 class); blend-numerator only, not `static_eval_white`/mop-up (the ADR-0032 §4 boundary class). Sliders use full `occ_all` (enemy-non-pawn first-blocker counted); pins scored **pseudolegally**; **no x-ray** — deliberate roadmap-committed deferrals. King/pawn excluded. **Shipped score-neutral: all 8 `*_MOBILITY_*` weights zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.C`** (the landing-gate + full §11 per-kind screen proved the Stockfish-HCE literature defaults a scale-invariant structural mismatch with our PeSTO PSTs — co-scale ×0.5 *worsened* to −220; whole weight set → M6.F per-kind reshape). `MOBILITY_IN_EVAL=true`, term math live at zero weight, M6.F-ready. **No ADR** — roadmap M6.D row + `docs/milestones/m6.d.md` commit the semantic (ADR-0032 is pawn-structure-scoped). | "Piece-mobility term" below; roadmap §M6 / m6.d.md |
+| King-safety term (M6.E) | `eval::king_safety::king_safety_term_white(pos) -> (i32, i32)` — king-zone attacker S-curve (`KING_SAFETY_TABLE[units.clamp(0,99)]`, units = Σ per-kind `KING_ATTACK_WEIGHT·popcount(attacks & king_zone)`, gated `<2 attackers ∨ no queen`, MG-only) + castled pawn-shield (SHIELD_1/2, relative-rank mirror) + MG-only open/semi-open-file penalty (both-adjacent amplifier). Zone via the single-source `pub(crate) king_zone(side,ksq)` = `ring \| (fwd & !from_square(ksq))` (king square excluded; 11 central / 8 back-rank / 5 corner). **Computed live in `evaluate_core` — never cached** (not pawn-only — king square + attacker squares; ADR-0033 §6 **supersedes ADR-0032 §3**'s pawn-shield-cache reservation as a correctness hazard). Blend-numerator only, not `static_eval_white`/mop-up (the ADR-0032 §4 boundary class). Pawn-storm omitted (ADR-0033 §3 — documented gap). **Shipped score-neutral: all 13 king-safety weights zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.D`**. **No SPRT screen ladder** (the M6.C/M6.D divergence, owned — ADR-0033 §8): research transfer-risk HIGH (PeSTO king-PST double-count) + the three-phase law + SPRT-noisiness + coupled-by-design components ⇒ negative-EV screen; line-296 satisfied vacuously (inert ⇒ no Elo claim). `KING_SAFETY_IN_EVAL=true`, term math live at zero weight, M6.F-ready. ADR-0033 (binds on M6.E per roadmap §M6). | "King-safety term" below; ADR-0033 / m6.e.md |
 | Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D + M5.E refinements + M5.F TT participation) + ID + caps (M3.E) + TT (M4.A + M5.F qsearch tier) + killers (M4.B) + history (M4.C) + aspiration (M4.D) + NMP (M5.A) + RFP (M5.B) + LMR (M5.C) + FFP (M5.D) + SE (M5.G) + staged movegen (M5.H1 architecture, eager generation; M5.H2 will enable lazy generation); `bench` regression baseline (M3.F) | "Search v1" below; ADR-0016, ADR-0017, ADR-0018, ADR-0019, ADR-0023, ADR-0024, ADR-0025, ADR-0026, ADR-0027, ADR-0028, ADR-0029, ADR-0030 |
 | Transposition table (M4.A + M5.F) | `TranspositionTable` in `src/tt.rs`: `UnsafeCell<Vec<TtEntry>>` + `AtomicUsize` mask + `AtomicU8` generation; depth-preferred + age-bias replacement; full 64-bit Zobrist key; mate-score depth-adjustment; bound-aware probe with cutoffs at non-PV nodes (negamax) and unconditionally (qsearch); `Hash` UCI option (default 16 MiB, range 1–4096). M5.F: qsearch participates with `depth = 0` entries; `is_empty()` discriminator changes to `key == 0`; non-terminal qsearch stores only Lower/Upper (no Exact, per Stockfish 45e5e65). | "Transposition table" below; ADR-0018, ADR-0028 |
 | Game history + draw helpers | `Engine::game_history: Vec<u64>` + `is_repetition` + `is_fifty_move_draw` | "Game history and draw-detection helpers" below |
@@ -240,6 +241,58 @@ See the roadmap M6.D row + `docs/milestones/m6.d.md` (semantic + screen
 ledger + the M6.F reshape brief) and `docs/research/m6-mobility.md`. **No
 separate ADR** — ADR-0032 is pawn-structure-scoped; mobility is a distinct
 roadmap-committed concern.
+
+**King-safety term (M6.E; ADR-0033 — supersedes ADR-0032 §3) — shipped
+score-neutral.** `eval::king_safety::king_safety_term_white(pos) -> (i32,
+i32)` adds a white-perspective term, ±sign per defended king, with three
+components: (a) an **attacker S-curve** — per enemy N/B/R/Q,
+`KING_ATTACK_WEIGHT[k]·popcount(piece_attacks(sq, occ_all) & king_zone)`
+summed to `units`, gated `attackers < 2 ∨ no enemy queen`, indexed
+`KING_SAFETY_TABLE[units.clamp(0,99)]`, MG-only; (b) a **castled pawn-shield**
+(king file `≥ f ∨ ≤ c`; per king-file±1: rank-2 → SHIELD_1, else rank-3 →
+SHIELD_2; relative-rank mirror White r2/r3 ↔ Black r7/r6); (c) an **MG-only
+open/semi-open king-file + adjacent-file** penalty with the
+both-adjacent-semi-open amplifier. The king-zone is the single-source-of-truth
+`pub(crate) king_zone(side, ksq)` = `ring | (fwd & !Bitboard::from_square(
+ksq))` (`ring = king_attacks(ksq)`; `fwd = ring.shift_north()` White /
+`shift_south()` Black) — 11 squares central / 8 back-rank / 5 corner, **king
+square excluded** (the `& !from_square(ksq)` mask removes the square the
+toward-enemy shift re-introduces for a non-back-rank king). Pawn-storm
+omitted (ADR-0033 §3 — a documented strategic gap). The term is **not
+pawn-only** (king square + every attacker's square) ⇒ **computed live in
+`evaluate_core`, never cached / never in `PawnEval`/the pawn hash** — this is
+the ADR-0032 §3 class, and **ADR-0033 §6 supersedes ADR-0032 §3's
+forward-looking "M6.E will extend the [pawn-hash] entry with pawn-shield
+masks" reservation** (caching a king-file-dependent value under a pawn-only
+Zobrist key would be a correctness hazard; ADR-0032's pawn-hash entry /
+substream / §4 boundary rule are otherwise unaffected). It enters the blend
+numerator only (gated by `const KING_SAFETY_IN_EVAL: bool`, shipped `true`) —
+never `static_eval_white()` nor the mop-up estimate (the ADR-0032 §4 boundary
+class; pinned by `static_accessor_excludes_king_safety` +
+`mop_up_addend_excludes_king_safety_vs_m6d`). `units.clamp(0,99)` is a real
+clamp (the saturating S-curve tail is by design — research §6), unlike M6.D's
+`debug_assert!` index invariant. **Shipped config: all 13 king-safety weight
+constants zeroed in `eval::data` ⇒ the term ≡ `(0,0)` ⇒ `evaluate`
+byte-identical to `M6.D`.** Unlike M6.B–D this phase ran **no SPRT screen
+ladder** (ADR-0033 §8; the M6.C/M6.D divergence, owned, not papered as
+precedent): research transfer-risk verdict HIGH (PeSTO MG king PST already
+prices ~30–50 cp of castled-king safety — the dominant double-count axis,
+structurally the M6.D PST-double-count finding but stronger) + the M6.B→C→D
+three-phase law + king-safety's universal SPRT-noisiness (mixed-TC screens
+mandatory, ~5× M6.B's single-TC cost) + components coupled-by-design (no
+interaction-immune subset to find) ⇒ the screen's only outcome is "defer," at
+the highest screen cost of any M6 term ⇒ negative expected value. Roadmap §M6
+line-296 is satisfied **vacuously** for an inert landing (eval byte-identical
+to `M6.D` ⇒ no Elo claim ⇒ SPRT measures zero by construction — the settled
+M6.C/M6.D disposition). Term math live at zero weight (M6.F-ready, the M6.B–D
+`*_IN_EVAL` precedent). **M6.F re-derives the entire king-safety weight set
+(S-curve table + per-kind attacker weights + shield + open-file + MG/EG
+split) against our PeSTO PSTs, jointly with the M6.B ISO/DBL/BWD + CONN, the
+M6.C passed-pawn, and the M6.D mobility obligations (one joint pass).**
+
+See ADR-0033 + the roadmap M6.E row + `docs/milestones/m6.e.md` (the
+no-screen divergence rationale + the M6.F reshape brief) and
+`docs/research/m6-king-safety.md`.
 
 ## Search v1 (production: alpha-beta)
 

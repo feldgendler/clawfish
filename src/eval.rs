@@ -14,6 +14,7 @@ use crate::piece::{Color, PieceKind};
 use crate::position::Position;
 use crate::square::Square;
 
+pub(crate) mod king_safety;
 pub(crate) mod mobility;
 pub(crate) mod pawns;
 
@@ -299,8 +300,25 @@ fn evaluate_core(pos: &Position, pe: pawns::PawnEval) -> i32 {
         (0, 0)
     };
 
-    let blended = ((mg + bp_mg + pe_mg + pp_mg + mob_mg) * phase
-        + (eg + bp_eg + pe_eg + pp_eg + mob_eg) * (24 - phase))
+    // M6.E king safety (zone attacker S-curve + castled pawn-shield +
+    // MG-only open/semi-open-file penalty). **Shipped score-neutral** — every
+    // king-safety weight zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate`
+    // byte-identical to `M6.D` (ADR-0033 §8; research §8 HIGH transfer risk;
+    // the M6.C/M6.D inert-landing precedent). Computed live (not pawn-only ⇒
+    // never cached — ADR-0033 §6, supersedes ADR-0032 §3). Enters the blend
+    // numerator ONLY — never `static_eval_white()` (the RFP/NMP/FFP input) nor the
+    // mop-up estimate (ADR-0032 §4; pinned by `static_accessor_excludes_king_
+    // safety` + `mop_up_addend_excludes_king_safety_vs_m6d`). Term math stays
+    // live at zero weight; M6.F joint Texel re-derives the whole set.
+    const KING_SAFETY_IN_EVAL: bool = true;
+    let (ks_mg, ks_eg) = if KING_SAFETY_IN_EVAL {
+        king_safety::king_safety_term_white(pos)
+    } else {
+        (0, 0)
+    };
+
+    let blended = ((mg + bp_mg + pe_mg + pp_mg + mob_mg + ks_mg) * phase
+        + (eg + bp_eg + pe_eg + pp_eg + mob_eg + ks_eg) * (24 - phase))
         / 24;
     let result_white = blended + mop_up;
 
@@ -1556,6 +1574,118 @@ mod tests {
             bonus, 38,
             "mop-up addend must equal its hand-derived formula value \
              (4·CMD(a8)=24 + 2·(14−cheb(g1,a8)=7)=14 → 38); the mobility \
+             term must be excluded from the mop-up advantage estimate \
+             (PST-only inputs)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M6.E boundary regression tests (ADR-0033 §6, mirrors the M6.D pair).
+    // -----------------------------------------------------------------------
+
+    /// Regression pin: `static_mg_white()` / `static_eg_white()` PST-only
+    /// accessors used by RFP/NMP/FFP must NOT include the king-safety term.
+    ///
+    /// Fixture: a position with a castled white king (g1, file ≥ 5) + ≥2
+    /// enemy mobile pieces + an enemy queen, so the king-safety sub-components
+    /// (S-curve, shield, open-file) are all exercised — the structural boundary
+    /// the test pins. The non-zero-value discriminator (king-safety ≠ (0,0)) is
+    /// **M6.F-dormant** at the score-neutral zeroed weights and auto-revalidates
+    /// when M6.F sets live weights (the M6.D `static_accessor_excludes_mobility`
+    /// precedent verbatim in shape; suffix `_mobility` → `_king_safety`).
+    ///
+    /// TDD state: GREEN now (accessor is PST-only by construction) and stays
+    /// green after the impl (king safety enters only the blend numerator, not
+    /// the accessor — ADR-0033 §6). Weight-free.
+    #[test]
+    fn static_accessor_excludes_king_safety() {
+        // Midgame position: White Kg1 (castled-side) + mobile pieces; Black has
+        // a queen + mobile pieces attacking the white king zone.
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("midgame fixture must parse");
+        // Weight-free structural fixture invariant: the fixture must contain
+        // ≥1 mobile white piece (N/B/R/Q) and an enemy queen (the boundary
+        // the test pins; value discriminator is M6.F-dormant at the score-
+        // neutral zeroed king-safety weights).
+        assert!(
+            pos.pieces_colored(Color::White, PieceKind::Knight).any()
+                || pos.pieces_colored(Color::White, PieceKind::Bishop).any()
+                || pos.pieces_colored(Color::White, PieceKind::Rook).any()
+                || pos.pieces_colored(Color::White, PieceKind::Queen).any(),
+            "fixture invariant: ≥1 mobile white piece (N/B/R/Q) must be present"
+        );
+        assert!(
+            pos.pieces_colored(Color::Black, PieceKind::Queen).any(),
+            "fixture invariant: enemy queen must be present (king-safety exercises \
+             the S-curve path with the attacker gate)"
+        );
+        let (from_scratch_mg, from_scratch_eg, _) = eval_state_from_scratch(&pos);
+        assert_eq!(
+            pos.static_mg_white(),
+            from_scratch_mg,
+            "static_mg_white() must equal the PST-only from-scratch mg \
+             (king safety must NOT enter this accessor)"
+        );
+        assert_eq!(
+            pos.static_eg_white(),
+            from_scratch_eg,
+            "static_eg_white() must equal the PST-only from-scratch eg \
+             (king safety must NOT enter this accessor)"
+        );
+    }
+
+    /// Mop-up addend regression — pins ADR-0033 §6 for M6.E: the king-safety
+    /// term must NOT enter the mop-up advantage estimate. Mirrors
+    /// `mop_up_addend_excludes_mobility_vs_m6c` verbatim in shape; suffix
+    /// `_vs_m6c` → `_vs_m6d` (M6.E's baseline is `M6.D`).
+    ///
+    /// Fixture: White Kh1 + Qa4, Black Ke8. raw_phase = queen 4 <
+    /// MOP_UP_PHASE_MAX 5 → mop-up eligible. White winning hugely (queen up) →
+    /// advantage ≫ 100. White Kh1 on file 7 (≥ 5 → castled-side gate passes
+    /// for white king safety). White queen is 1 enemy mobile piece for black's
+    /// king safety (gate fires at < 2 — S-curve = 0 from data; other
+    /// sub-components also 0 at zeroed weights). The structural boundary:
+    /// king-safety code runs but produces (0,0); mop-up must use PST-only
+    /// inputs regardless.
+    ///
+    /// mop_up_term_white uses PST-only `(mg, eg)` inputs. Hand-derived longhand:
+    ///   White winning: drive black king (e8) to corner.
+    ///   CMD(e8) = min(|4−3|,|4−4|) + min(|7−3|,|7−4|) = 0 + 3 = 3.
+    ///   cheb(h1, e8) = max(|7−4|, |0−7|) = max(3, 7) = 7.
+    ///   bonus = 4·CMD(e8) + 2·(14 − cheb(h1,e8)) = 4·3 + 2·(14−7)
+    ///         = 12 + 14 = 26.
+    #[test]
+    fn mop_up_addend_excludes_king_safety_vs_m6d() {
+        // FEN: White Kh1 + Qa4, Black Ke8.
+        // raw_phase = queen(4) = 4 < MOP_UP_PHASE_MAX(5) → mop-up eligible.
+        // White king on h1 (file 7 ≥ 5 → castled-side gate passes for white
+        // king safety). White queen = 1 enemy mobile piece for black king safety
+        // (attacker gate fires at < 2 ⇒ S-curve = 0 from data). All other
+        // sub-components 0 at zeroed weights ⇒ king_safety_term_white ≡ (0,0).
+        let pos = Position::from_fen("4k3/8/8/8/Q7/8/8/7K w - - 0 1")
+            .expect("KQ vs K mop-up fixture (White Kh1 + Qa4, Black Ke8)");
+        // Weight-free structural fixture invariant: white queen present (exercises
+        // king-safety code path); white king on castled-side file (h1, file 7 ≥ 5).
+        assert!(
+            pos.pieces_colored(Color::White, PieceKind::Queen).any(),
+            "fixture invariant: a mobile white queen must be present (exercises \
+             king-safety code path for black king; value discriminator is \
+             M6.F-dormant at the score-neutral zeroed weights)"
+        );
+        assert!(
+            pos.king_square(Color::White).file() >= 5,
+            "fixture invariant: white king must be on a castled-side file (≥ f, \
+             exercises the white shield gate)"
+        );
+        let mg = pos.static_mg_white();
+        let eg = pos.static_eg_white();
+        let bonus = mop_up_term_white(&pos, mg, eg);
+        assert_eq!(
+            bonus, 26,
+            "mop-up addend must equal its hand-derived formula value \
+             (4·CMD(e8)=12 + 2·(14−cheb(h1,e8)=7)=14 → 26); the king-safety \
              term must be excluded from the mop-up advantage estimate \
              (PST-only inputs)"
         );

@@ -3,9 +3,9 @@
 A Rust chess engine, written from scratch and grown incrementally toward
 GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 
-> **Status: M6 in progress (M6.D landed 2026-05-17 — piece-mobility infra,
-> score-neutral; all mobility weights deferred to M6.F. Production HEAD = `M6.D`,
-> eval byte-identical to `M6.C` / `M6.B`, strength unchanged by construction).** Fail-soft
+> **Status: M6 in progress (M6.E landed 2026-05-19 — king-safety infra,
+> score-neutral; all king-safety weights deferred to M6.F. Production HEAD = `M6.E`,
+> eval byte-identical to `M6.D` / `M6.C` / `M6.B`, strength unchanged by construction).** Fail-soft
 > alpha-beta with quiescence search, iterative deepening, transposition
 > table (Zobrist-keyed, 16 MiB default; qsearch participates per ADR-0028),
 > killer-aware move ordering (TT move + MVV-LVA captures + 2 killer slots
@@ -51,6 +51,15 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > PeSTO PSTs — all-four −131.62, ×0.5 co-scale −220.18 *worsened*; every
 > mobility weight zeroed, whole set defers to M6.F's per-kind reshape;
 > the term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.C`),
+> the **king-safety term** — king-zone attacker S-curve + castled
+> pawn-shield + MG-only open/semi-open-file penalty, computed live,
+> never cached — also shipped **score-neutral** (M6.E; ADR-0033:
+> research transfer-risk verdict HIGH + the M6.B→C→D three-phase law +
+> king-safety SPRT-noisiness + coupled-by-design components ⇒ **no SPRT
+> screen ladder** (the owned M6.C/M6.D divergence), every king-safety
+> weight zeroed, whole set defers to M6.F's reshape; ADR-0033 §6
+> supersedes ADR-0032 §3's pawn-shield-cache reservation; the term ≡
+> (0,0) ⇒ `evaluate` byte-identical to `M6.D`),
 > and `compute_caps`-driven time management. `bench` UCI command for
 > deterministic node-count regression baselines. The remaining strength
 > path (pawn structure, mobility, king safety, Texel tuning across M6.B–F;

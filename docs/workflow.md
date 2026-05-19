@@ -435,7 +435,8 @@ Every milestone phase gets a tag, including ones that landed before SPRT was ava
 | `M6.A` | + tapered eval foundation (PeSTO EG + bishop pair + mop-up). H1-accept +250.57 vs `M5.H1`. ADR-0031. |
 | `M6.B` | + pawn-structure infra, CONN-only (+45.42 vs `M6.A`). ADR-0032 §7. |
 | `M6.C` | + passed-pawn infra, score-neutral (== `M6.B` eval; weights → M6.F). ADR-0032 §8. |
-| `M6.D` | + piece-mobility infra, score-neutral (== `M6.C` eval; weights → M6.F). No ADR (roadmap-committed). **Current production HEAD.** |
+| `M6.D` | + piece-mobility infra, score-neutral (== `M6.C` eval; weights → M6.F). No ADR (roadmap-committed). |
+| `M6.E` | + king-safety infra, score-neutral (== `M6.D` eval; weights → M6.F). No SPRT screen ladder (the M6.C/M6.D divergence, owned). ADR-0033 (supersedes ADR-0032 §3). **Current production HEAD.** |
 | `ELOH.A` | In-process Elo-iteration harness foundation. ADR-0020. |
 | `ELOH.B` | Statistical layer (RM K-update, σ-stopping, N-parallel, threshold adjudication). |
 | `ELOH.C` | `VirtualClock` UCI option + harness handshake. ADR-0021. |
