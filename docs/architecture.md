@@ -54,7 +54,7 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 | Passed-pawn term (M6.C) | `pawns::passed_pawn_term_white` (rank bonus + EG three-state path + EG king-tropism), reads M6.B's cached `passed[2]`, **computed live in `evaluate_core` — never cached** (king-distance/path are not pawn-only, ADR-0032 §3); blend-numerator only, not `static_eval_white`/mop-up (§4). **Shipped score-neutral: every passed weight zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.B`** (a three-config screen ladder proved the literature defaults a scale-invariant structural mismatch; whole weight set → M6.H). Term math live at zero weight, M6.H-ready. | "Passed-pawn term" below; ADR-0032 (§8) |
 | Piece-mobility term (M6.D) | `eval::mobility::mobility_term_white(pos) -> (i32, i32)` — N/B/R/Q `popcount(piece_attacks(sq, occ_all) ∩ area)`, `area = !(own_occupied ∪ enemy_pawn_attacked)`, per-kind MG/EG tables; **computed live in `evaluate_core` — never cached** (not pawn-only, the ADR-0032 §3 class); blend-numerator only, not `static_eval_white`/mop-up (the ADR-0032 §4 boundary class). Sliders use full `occ_all` (enemy-non-pawn first-blocker counted); pins scored **pseudolegally**; **no x-ray** — deliberate roadmap-committed deferrals. King/pawn excluded. **Shipped score-neutral: all 8 `*_MOBILITY_*` weights zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.C`** (the landing-gate + full §11 per-kind screen proved the Stockfish-HCE literature defaults a scale-invariant structural mismatch with our PeSTO PSTs — co-scale ×0.5 *worsened* to −220; whole weight set → M6.H per-kind reshape). `MOBILITY_IN_EVAL=true`, term math live at zero weight, M6.H-ready. **No ADR** — roadmap M6.D row + `docs/milestones/m6.d.md` commit the semantic (ADR-0032 is pawn-structure-scoped). | "Piece-mobility term" below; roadmap §M6 / m6.d.md |
 | King-safety term (M6.E) | `eval::king_safety::king_safety_term_white(pos) -> (i32, i32)` — king-zone attacker S-curve (`KING_SAFETY_TABLE[units.clamp(0,99)]`, units = Σ per-kind `KING_ATTACK_WEIGHT·popcount(attacks & king_zone)`, gated `<2 attackers ∨ no queen`, MG-only) + castled pawn-shield (SHIELD_1/2, relative-rank mirror) + MG-only open/semi-open-file penalty (both-adjacent amplifier). Zone via the single-source `pub(crate) king_zone(side,ksq)` = `ring \| (fwd & !from_square(ksq))` (king square excluded; 11 central / 8 back-rank / 5 corner). **Computed live in `evaluate_core` — never cached** (not pawn-only — king square + attacker squares; ADR-0033 §6 **supersedes ADR-0032 §3**'s pawn-shield-cache reservation as a correctness hazard). Blend-numerator only, not `static_eval_white`/mop-up (the ADR-0032 §4 boundary class). Pawn-storm omitted (ADR-0033 §3 — documented gap). **Shipped score-neutral: all 13 king-safety weights zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.D`**. **No SPRT screen ladder** (the M6.C/M6.D divergence, owned — ADR-0033 §8): research transfer-risk HIGH (PeSTO king-PST double-count) + the three-phase law + SPRT-noisiness + coupled-by-design components ⇒ negative-EV screen; line-296 satisfied vacuously (inert ⇒ no Elo claim). `KING_SAFETY_IN_EVAL=true`, term math live at zero weight, M6.H-ready. ADR-0033 (binds on M6.E per roadmap §M6). | "King-safety term" below; ADR-0033 / m6.e.md |
-| Tier-1 HCE features (M6.F) | Three lightweight features added before the joint Texel pass (research `docs/research/m6-remaining-hce-features.md`): (1) **outposts** — knight/bishop on an enemy-pawn-unchallengeable hole in the enemy half, pawn-supported (reads M6.B's pawn-attack-span fills + the `file_fill` helper); (2) **rook on open/semi-open file** — `file_fill(rooks) & ~file_fill(pawns)` discriminator; (3) **endgame scaling / draw-dampening** — OCB-with-pawns multiplier + pawnless-draw material patterns + 50-move-proximity taper (KBvKB-same-color already in M6.A — **not** duplicated). **Computed live in `evaluate_core`** (the ADR-0032 §3 / ADR-0033 §6 live-term class); blend-numerator only, the §4 boundary class. **Shipped score-neutral inert per the M6.C/M6.D/M6.E precedent: all new weights zeroed ⇒ outpost/rook-file ≡ (0,0), endgame-scaling multiplier ≡ identity ⇒ `evaluate` byte-identical to `M6.E` ⇒ bench `1213649`/d4 `90591` byte-for-byte ⇒ provably inert ⇒ no confirmation SPRT, no SPRT screen ladder.** `*_IN_EVAL=true`-style flags, term math live at zero weight, M6.H-ready. **Open ADR question:** endgame-scaling is a correctness feature the research says does not strictly need Texel calibration — the M6.F plan/ADR may land that one sub-feature *live* with a correctness gate (M5.E precedent) rather than inert; default framing inert-per-precedent. ADR allocated at landing. | "Tier-1 HCE features" below; roadmap §M6 / `docs/research/m6-remaining-hce-features.md` |
+| Tier-1 HCE features (M6.F) | `eval::tier1`: (1) **`outpost_term_white`** iterating the `pub(crate) outpost_squares(pos,side) -> Bitboard` seam (`!*_attack_front_spans(enemy_pawns)` ∩ own-pawn-defended), then the `(3..=5)` relative-rank gate + per-kind per-rank `OUTPOST_{KNIGHT,BISHOP}_{MG,EG}` tables — **the gate is correctness-load-bearing** (the span-complement is a valid hole test only in the enemy half); (2) **`rook_file_term_white`** — `file_fill` projection (`(file_fill(own_pawns) & from_square(rook)).any()`), open > semi-open precedence; (3) **`endgame_scale`** — numerator over the **structural** `EG_SCALE_DEN`, applied `blended * scale / EG_SCALE_DEN` **before** `+ mop_up` (`is_ocb_with_pawns` exactly-1-bishop-each opposite complexes + no Q/R + ≥1 pawn; `is_pawnless_drawish` narrow KNNvK/balanced-≤1-minor accept-list, KBNvK/KBBvK excluded as wins; 50-move ramp; `is_kbkb_same_color` already in M6.A — **not** duplicated, disjoint). **Computed live in `evaluate_core` — never cached** (the ADR-0033 §6 live-term class); additive terms blend-numerator only; the scale multiplies the blend numerator only — never `static_eval_white`/mop-up (the ADR-0032 §4 boundary, the **first multiplicative construct** so it gets its own `endgame_scale_excludes_static_accessor_vs_m6e` pin). **Shipped score-neutral inert per the M6.C/M6.D/M6.E precedent: all additive weights zeroed + every scale tunable == `EG_SCALE_DEN` (scale ≡ identity) ⇒ outpost/rook-file ≡ (0,0), `endgame_scale ≡ EG_SCALE_DEN`, `blended·D/D == blended` byte-exact ⇒ `evaluate` byte-identical to `M6.E` ⇒ bench `1213649`/d4 `90591` byte-for-byte (deterministic ×2) ⇒ provably inert ⇒ no confirmation SPRT, no SPRT screen ladder.** `TIER1_IN_EVAL=true`, term math live at the inert config, M6.H-ready. **Endgame-scaling inert-vs-live open ADR question resolved inert-per-precedent** (ADR-0034 §4 — roadmap-stated default; the reinforcing optimizer argument is conditional on the open M6.H optimizer ADR and honorable at M6.H without M6.F landing live; dominated correctness-timing axis costs zero strength — no rated play in the M6.F→M6.G→M6.H gap; owned, not papered). ADR-0034 (binds on M6.F per roadmap §M6). | "Tier-1 HCE features" below; ADR-0034 / m6.f.md |
 | Tuning corpus infra (M6.G) | Reusable game-result-labeled position corpus (data infra, **no `evaluate`/`Position`/search touch — no engine build, no bench**): CCRL + band-filtered Lichess + diversified-opening-book clawfish self-play + label-verified Zurichess quiet set; clock-loss / time-forfeit exclusion + TC-class filter; quiet-position extraction (quiet *definition* pinned by M6.H's tuner qsearch — an M6.G↔M6.H interface contract); opening-ply skip; FEN dedup / per-FEN caps; ADR-0003 label-provenance audit (game-result labels ONLY); held-out deployment-distributed self-play validation set; frozen snapshot + manifest + RNG seeds + re-run script vendored in `bench/`. **Gate: data-quality checks, NOT SPRT** (the M5.E correctness-only-gate precedent applied to data; no Elo claim). Consumers: M6.H, the tuning-backlog "PST co-tuning" Arm B, future SPSA campaigns, M10 NNUE data-prep. | "Tuning corpus infra" below; roadmap §M6 (M6.G scope detail) / ADR (allocated at landing) |
 | Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D + M5.E refinements + M5.F TT participation) + ID + caps (M3.E) + TT (M4.A + M5.F qsearch tier) + killers (M4.B) + history (M4.C) + aspiration (M4.D) + NMP (M5.A) + RFP (M5.B) + LMR (M5.C) + FFP (M5.D) + SE (M5.G) + staged movegen (M5.H1 architecture, eager generation; M5.H2 will enable lazy generation); `bench` regression baseline (M3.F) | "Search v1" below; ADR-0016, ADR-0017, ADR-0018, ADR-0019, ADR-0023, ADR-0024, ADR-0025, ADR-0026, ADR-0027, ADR-0028, ADR-0029, ADR-0030 |
 | Transposition table (M4.A + M5.F) | `TranspositionTable` in `src/tt.rs`: `UnsafeCell<Vec<TtEntry>>` + `AtomicUsize` mask + `AtomicU8` generation; depth-preferred + age-bias replacement; full 64-bit Zobrist key; mate-score depth-adjustment; bound-aware probe with cutoffs at non-PV nodes (negamax) and unconditionally (qsearch); `Hash` UCI option (default 16 MiB, range 1–4096). M5.F: qsearch participates with `depth = 0` entries; `is_empty()` discriminator changes to `key == 0`; non-terminal qsearch stores only Lower/Upper (no Exact, per Stockfish 45e5e65). | "Transposition table" below; ADR-0018, ADR-0028 |
@@ -296,41 +296,71 @@ See ADR-0033 + the roadmap M6.E row + `docs/milestones/m6.e.md` (the
 no-screen divergence rationale + the M6.H reshape brief) and
 `docs/research/m6-king-safety.md`.
 
-**Tier-1 HCE features (M6.F; binding research `docs/research/m6-remaining-hce-features.md`)
-— shipped score-neutral inert per the M6.C/M6.D/M6.E precedent.** Three
-lightweight features added *before* M6.H's joint Texel pass so they
-co-calibrate in the one tune (the "extend then tune" law — Texel cannot
-discover absent features): (1) **outposts** — a knight/bishop in the enemy
-half on a square no enemy pawn can ever attack (the M6.B pawn-attack
-front-span / hole predicate), defended by an own pawn; reads M6.B's
-`pawn_attack_spans` fills + the `file_fill` helper already present (the
-*real code dependency on M6.E* — the M6.B pawn-data infra must be in tree).
-(2) **rook on open/semi-open file** —
-`file_fill(rooks) & ~(file_fill(own_pawns) | file_fill(enemy_pawns))` for
-open, the own-pawn-absent variant for semi-open; mobility counts moves, not
-file-open status. (3) **endgame scaling / draw-dampening** — a multiplicative
-reduction on the blended eval for structurally drawish material:
-opposite-colored-bishops-with-pawns, pawnless-draw patterns (KNN vs K etc.),
-and a 50-move-proximity taper; **KBvKB-same-color is already in M6.A
-(`is_insufficient_material`) — not duplicated**. Computed live in
-`evaluate_core` (the ADR-0032 §3 / ADR-0033 §6 live-term class);
-blend-numerator only (the ADR-0032 §4 boundary class). **Shipped
-score-neutral: all new weights zeroed ⇒ outpost/rook-file ≡ (0,0),
-endgame-scaling multiplier ≡ identity (1.0) ⇒ `evaluate` byte-identical to
-`M6.E` ⇒ bench `1213649`/d4 `90591` byte-for-byte ⇒ provably inert ⇒ no
-confirmation SPRT, no SPRT screen ladder.** `*_IN_EVAL=true`-style flags +
-term math live at zero weight, M6.H-ready (the M6.B–E `*_IN_EVAL`
-precedent). The outpost / rook-file weights and (if inert) the
-endgame-scaling coefficient enter the M6.H joint Texel pass. **Open ADR
-question (not pre-decided):** endgame-scaling is a *correctness* feature the
-research says does not strictly need Texel calibration — the M6.F plan/ADR
-may elect to land that one sub-feature *live* behind a correctness gate (the
-M5.E "correctness over Elo" precedent) rather than inert; default framing is
-inert-per-precedent. ADR allocated at landing.
+**Tier-1 HCE features (M6.F; ADR-0034; binding research
+`docs/research/m6-remaining-hce-features.md`) — shipped score-neutral inert
+per the M6.C/M6.D/M6.E precedent.** `eval::tier1`, three constructs added
+*before* M6.H's joint Texel pass so they co-calibrate in the one tune (the
+"extend then tune" law — Texel cannot discover absent features):
 
-See the roadmap M6.F row + `docs/research/m6-remaining-hce-features.md`
-(Priority-1 list + the "extend then tune" law). ADR allocated at landing
-per project convention.
+- **`outpost_term_white(pos) -> (i32,i32)`** iterating the `pub(crate)
+  outpost_squares(pos, side) -> Bitboard` **seam** (the M6.E
+  `king_zone`-seam mandate — the structural test pins the *real* selector,
+  not an inline reconstruction; without it the per-side span / `& vs |` /
+  sign mutants are killed by no test at the inert config). `outpost_squares`
+  = `!*_attack_front_spans(enemy_pawns)` (the "hole") ∩ the side's immediate
+  pawn-attack set ("supported"). The per-piece loop applies the **`(3..=5)`
+  relative-rank gate** then indexes per-kind per-relative-rank
+  `OUTPOST_{KNIGHT,BISHOP}_{MG,EG}` tables. **The gate is
+  correctness-load-bearing, not a removable filter**: the
+  front-span-complement is a valid "no enemy pawn can ever challenge" test
+  *only* for enemy-half squares.
+- **`rook_file_term_white(pos) -> (i32,i32)`** — `file_fill` projection;
+  the rook's own square is in `file_fill(own_pawns)` iff a pawn is on its
+  file (`(own_files & Bitboard::from_square(sq)).any()`) — **no per-file
+  mask helper exists or is needed**. Open (`!on_own ∧ !on_enemy`) >
+  semi-open (`!on_own`) precedence.
+- **`endgame_scale(pos) -> i32`** — a numerator over the **structural**
+  denominator `EG_SCALE_DEN` (not a tunable); `evaluate_core` applies
+  `blended * scale / EG_SCALE_DEN` **before** `+ mop_up` (mop-up is the
+  unscaled won-endgame conversion nudge). `is_ocb_with_pawns` (exactly one
+  bishop each, opposite complexes, no Q/R, ≥1 pawn) + `is_pawnless_drawish`
+  (the narrow KNNvK / balanced-≤1-minor accept-list — **KBNvK/KBBvK
+  explicitly EXCLUDED as forced wins**; the KBvK/KNvK overlap with
+  `is_insufficient_material` is unobservable in eval, the `eval.rs:228`
+  early-return precedes the scale) + the 50-move ramp. **KBvKB-same-color
+  is already in M6.A (`is_insufficient_material`) — not duplicated, the
+  predicates are disjoint by construction.**
+
+All computed live in `evaluate_core`, never cached (the ADR-0033 §6
+live-term class). Additive terms blend-numerator only; the scale multiplies
+the blend numerator only — never `static_eval_white`/mop-up (the ADR-0032
+§4 boundary; the **first multiplicative construct** in M6, so it gets its
+own `endgame_scale_excludes_static_accessor_vs_m6e` boundary pin in addition
+to the M6.E-mirrored accessor/mop-up tests). **Shipped score-neutral inert:
+all additive weights zeroed + every scale tunable == `EG_SCALE_DEN` (scale ≡
+identity) ⇒ outpost/rook-file ≡ (0,0), `endgame_scale ≡ EG_SCALE_DEN`,
+`blended·D/D == blended` byte-exact ⇒ `evaluate` byte-identical to `M6.E` ⇒
+bench `1213649`/d4 `90591` byte-for-byte (deterministic ×2,
+orchestrator-re-verified) ⇒ provably inert ⇒ no confirmation SPRT, no SPRT
+screen ladder; roadmap line-296 satisfied vacuously.** `TIER1_IN_EVAL=true`,
+term math live at the inert config, M6.H-ready (the M6.B–E `*_IN_EVAL`
+precedent). The outpost / rook-file weights enter the M6.H joint Texel pass;
+`EG_SCALE_DEN` / `FIFTY_MOVE_TAPER_FROM` stay **structural** (out of the
+tunable vector — the ADR-0034 §4 optimizer-linearity rationale). **The
+endgame-scaling inert-vs-live open ADR question was resolved
+inert-per-precedent** (ADR-0034 §4): the roadmap-stated default is inert;
+the reinforcing optimizer-tractability argument is conditional on the
+still-open M6.H optimizer ADR and is fully honorable at M6.H without M6.F
+landing live (the scale coefficients can be fixed + excluded from the
+tunable vector then); the dominated correctness-timing axis costs zero
+measurable strength (no rated play in the M6.F→M6.G→M6.H gap); owned, not
+papered (§4 honestly concedes live-with-fixed-coefficient dominates on 2 of
+3 axes). Unlike M6.E there is **no diagnostic-screen-skip novelty** (M6.F
+carries no SPRT gate by roadmap construction).
+
+See ADR-0034, the roadmap M6.F row, `docs/milestones/m6.f.md`, and
+`docs/research/m6-remaining-hce-features.md` (Priority-1 list + the "extend
+then tune" law).
 
 **Tuning corpus infra (M6.G) — reusable labeled-position data infra,
 gated on data-quality checks (NOT SPRT).** A standalone data pipeline +

@@ -326,6 +326,107 @@ pub(crate) const KS_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
 /// MG amplification: both adjacent files semi-open (no-cover threshold). Zeroed.
 pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
 
+// ---------------------------------------------------------------------------
+// M6.F Tier-1 HCE feature constants. Sources: CPW Outposts, CPW Rook on Open
+// File, CPW Bishops of Opposite Colors, MadChess dev-blog Elo figures (Knight
+// Outpost +25, Endgame Eval Scaling +12). ADR-0003-clean — not engine source.
+//
+// **Shipped config: ALL Tier-1 additive weights ZEROED; ALL endgame-scale
+// tunables = EG_SCALE_DEN (identity).** Score-neutral inert landing per the
+// M6.C/M6.D/M6.E precedent (ADR-0034 §2); the full term math is live and
+// M6.H-ready; M6.H joint Texel re-derives the entire weight/coefficient set.
+//
+// Inert-identity construction:
+//   - Additive terms: weight = 0 ⇒ term ≡ (0, 0).
+//   - Multiplicative scale: every tunable = EG_SCALE_DEN ⇒ the min/taper
+//     returns EG_SCALE_DEN for all inputs ⇒ blended * D / D == blended exactly
+//     in i32. ⇒ evaluate byte-identical to M6.E ⇒ bench 1213649 / depth-4
+//     90591 byte-for-byte. ADR-0034 §2.
+//
+// **Literature defaults (M6.H starting point, recorded verbatim):**
+//
+// Outpost per-kind per-relative-rank MG/EG bonuses. Relative rank 0..7; only
+// ranks 3..=5 (chess ranks 4–6) are scored (the classic outpost band). Values
+// from CPW Outposts page + MadChess dev-blog, adjusted to centipawn scale:
+//   Knight outpost: ~[0,0,0, 18, 28, 16, 0, 0] MG / ~[0,0,0, 12, 18, 10, 0, 0] EG
+//   Bishop outpost: ~[0,0,0, 12, 18, 10, 0, 0] MG / ~[0,0,0,  8, 12,  6, 0, 0] EG
+//
+// Rook on open / semi-open file (CPW Rook on Open File / Crazyhouse eval
+// survey; common literature range MG 15–25, EG 5–15):
+//   ROOK_OPEN_FILE_MG = 20    ROOK_OPEN_FILE_EG = 10
+//   ROOK_SEMI_OPEN_FILE_MG = 10   ROOK_SEMI_OPEN_FILE_EG = 5
+//
+// Endgame draw-scale (CPW Bishops of Opposite Colors, MadChess +12 Elo;
+// literature draw-probability fraction: OCB ~0.5, pawnless ~0.125):
+//   OCB_WITH_PAWNS_SCALE  ≈ 32  (0.5 × DEN)
+//   PAWNLESS_DRAW_SCALE   ≈  8  (0.125 × DEN)
+//   FIFTY_MOVE_FLOOR      ≈ 16  (0.25 × DEN — scale at halfmove 100)
+//   FIFTY_MOVE_TAPER_FROM = 80  structural onset (not tuned)
+//
+// EG_SCALE_DEN = 64: a STRUCTURAL fixed-point denominator (NOT a tunable —
+// the PASSED_KDIST_CAP structural-constant precedent). Keeps the per-position
+// scale a known per-position constant that folds into the M6.H cached feature
+// mask, preserving optimizer linearity (ADR-0034 §4 / §8).
+// FIFTY_MOVE_TAPER_FROM = 80: structural onset (not tuned — it is the
+// semantically correct onset for 50-move proximity; tuning it would change the
+// meaning of the taper, not just its magnitude).
+//
+// These are data constants, not logic — excluded from `cargo mutants` per
+// `.cargo/mutants.toml` alongside the PST/mobility/king-safety arrays.
+// ---------------------------------------------------------------------------
+
+// Outpost — per-kind, per-relative-rank MG/EG (rel-rank 0..7; predicate gates
+// rel-rank ∈ 3..=5 i.e. chess ranks 4–6 so out-of-band entries never index).
+/// Knight outpost bonus, middlegame, indexed by relative rank (0..7). Zeroed
+/// (M6.H re-derives); literature defaults ~[0,0,0,18,28,16,0,0].
+// Used from tier1.rs; #[allow] covers the stub-slice gap until impl is wired.
+#[allow(dead_code)]
+pub(crate) const OUTPOST_KNIGHT_MG: [i32; 8] = [0; 8]; // lit ~[0,0,0,18,28,16,0,0]
+/// Knight outpost bonus, endgame. Zeroed — see `OUTPOST_KNIGHT_MG`.
+#[allow(dead_code)]
+pub(crate) const OUTPOST_KNIGHT_EG: [i32; 8] = [0; 8]; // lit ~[0,0,0,12,18,10,0,0]
+/// Bishop outpost bonus, middlegame. Zeroed — see `OUTPOST_KNIGHT_MG`.
+#[allow(dead_code)]
+pub(crate) const OUTPOST_BISHOP_MG: [i32; 8] = [0; 8]; // lit ~[0,0,0,12,18,10,0,0]
+/// Bishop outpost bonus, endgame. Zeroed — see `OUTPOST_KNIGHT_MG`.
+#[allow(dead_code)]
+pub(crate) const OUTPOST_BISHOP_EG: [i32; 8] = [0; 8]; // lit ~[0,0,0, 8,12, 6,0,0]
+
+/// Rook on fully open file (no pawn either color) bonus, middlegame. Zeroed.
+#[allow(dead_code)]
+pub(crate) const ROOK_OPEN_FILE_MG: i32 = 0; // lit  20
+/// Rook on fully open file bonus, endgame. Zeroed — see `ROOK_OPEN_FILE_MG`.
+#[allow(dead_code)]
+pub(crate) const ROOK_OPEN_FILE_EG: i32 = 0; // lit  10
+/// Rook on semi-open file (own pawn absent, enemy present) bonus, middlegame. Zeroed.
+#[allow(dead_code)]
+pub(crate) const ROOK_SEMI_OPEN_FILE_MG: i32 = 0; // lit  10
+/// Rook on semi-open file bonus, endgame. Zeroed — see `ROOK_SEMI_OPEN_FILE_MG`.
+#[allow(dead_code)]
+pub(crate) const ROOK_SEMI_OPEN_FILE_EG: i32 = 0; // lit   5
+
+/// Endgame draw-scale fixed-point denominator. STRUCTURAL — not a tunable;
+/// the per-position scale = numerator / EG_SCALE_DEN ∈ [0, 1].
+/// Every scale tunable at ship = EG_SCALE_DEN ⇒ scale ≡ identity.
+#[allow(dead_code)]
+pub(crate) const EG_SCALE_DEN: i32 = 64; // structural (not tuned)
+/// OCB-with-pawns draw-scale numerator. M6.H tunable; identity value =
+/// EG_SCALE_DEN. Shipped = EG_SCALE_DEN (identity); literature ~32 (0.5×DEN).
+#[allow(dead_code)]
+pub(crate) const OCB_WITH_PAWNS_SCALE: i32 = 64; // = DEN ⇒ identity; lit ~32 (0.5)
+/// Pawnless drawish endgame scale numerator. M6.H tunable; identity =
+/// EG_SCALE_DEN. Shipped = EG_SCALE_DEN (identity); literature ~8 (0.125×DEN).
+#[allow(dead_code)]
+pub(crate) const PAWNLESS_DRAW_SCALE: i32 = 64; // = DEN ⇒ identity; lit ~8
+/// 50-move proximity taper onset in halfmoves. STRUCTURAL — not a tunable
+/// (semantically correct onset; tuning changes meaning, not magnitude).
+#[allow(dead_code)]
+pub(crate) const FIFTY_MOVE_TAPER_FROM: i32 = 80; // structural onset (halfmoves)
+/// 50-move taper floor: scale value at halfmove 100. M6.H tunable; identity =
+/// EG_SCALE_DEN. Shipped = EG_SCALE_DEN (identity, ramp flat); lit ~16 (0.25).
+#[allow(dead_code)]
+pub(crate) const FIFTY_MOVE_FLOOR: i32 = 64; // = DEN ⇒ identity; lit ~16
+
 /// Centipawn material values indexed by `PieceKind::index()` (P=0 … K=5).
 /// King material is 0 — kings are never captured; the king PST term is
 /// purely positional.

@@ -3,9 +3,10 @@
 A Rust chess engine, written from scratch and grown incrementally toward
 GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 
-> **Status: M6 in progress (M6.E landed 2026-05-19 — king-safety infra,
-> score-neutral; all king-safety weights deferred to M6.H. Production HEAD = `M6.E`,
-> eval byte-identical to `M6.D` / `M6.C` / `M6.B`, strength unchanged by construction).** Fail-soft
+> **Status: M6 in progress (M6.F landed 2026-05-19 — Tier-1 HCE infra:
+> outposts + rook-on-file + endgame draw-scaling, score-neutral inert; all
+> weights deferred to M6.H. Production HEAD = `M6.F`, eval byte-identical to
+> `M6.E` / `M6.D` / `M6.C` / `M6.B`, strength unchanged by construction).** Fail-soft
 > alpha-beta with quiescence search, iterative deepening, transposition
 > table (Zobrist-keyed, 16 MiB default; qsearch participates per ADR-0028),
 > killer-aware move ordering (TT move + MVV-LVA captures + 2 killer slots
@@ -60,11 +61,22 @@ GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 > weight zeroed, whole set defers to M6.H's reshape; ADR-0033 §6
 > supersedes ADR-0032 §3's pawn-shield-cache reservation; the term ≡
 > (0,0) ⇒ `evaluate` byte-identical to `M6.D`),
+> the **Tier-1 HCE infrastructure** — knight/bishop outposts (a
+> `pub(crate) outpost_squares` seam: enemy-pawn-unchallengeable hole ∩
+> own-pawn-defended, gated to the enemy-half rank band), rook on
+> open/semi-open file, and an endgame draw-scale (`blended * scale /
+> EG_SCALE_DEN` before mop-up; OCB-with-pawns + pawnless-non-mating
+> residue + 50-move ramp), all computed live, never cached — shipped
+> **score-neutral inert** (M6.F; ADR-0034: the "extend then tune" law —
+> added before the joint Texel pass so the set co-calibrates in M6.H's
+> one tune; all additive weights zeroed + every scale tunable ==
+> `EG_SCALE_DEN` ⇒ scale ≡ identity ⇒ terms ≡ (0,0) ⇒ `evaluate`
+> byte-identical to `M6.E`; the endgame-scaling inert-vs-live open ADR
+> question resolved inert-per-precedent, owned in ADR-0034 §4),
 > and `compute_caps`-driven time management. `bench` UCI command for
 > deterministic node-count regression baselines. The remaining strength
-> path (the M6.F Tier-1 HCE features — outposts, rook-on-file, endgame
-> draw-scaling — added score-neutral/inert before the M6.H joint Texel
-> tuning pass over the cumulative M6.B–F surface; then NNUE) is tracked in
+> path (M6.G corpus construction → the M6.H joint Texel tuning pass over
+> the cumulative M6.B–F surface; then NNUE) is tracked in
 > [`docs/roadmap.md`](docs/roadmap.md).
 >
 > **Current strength: ~2648 Elo on the Stockfish 18 UCI_LimitStrength

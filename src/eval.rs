@@ -17,6 +17,7 @@ use crate::square::Square;
 pub(crate) mod king_safety;
 pub(crate) mod mobility;
 pub(crate) mod pawns;
+pub(crate) mod tier1;
 
 mod data;
 use data::{
@@ -317,10 +318,34 @@ fn evaluate_core(pos: &Position, pe: pawns::PawnEval) -> i32 {
         (0, 0)
     };
 
-    let blended = ((mg + bp_mg + pe_mg + pp_mg + mob_mg + ks_mg) * phase
-        + (eg + bp_eg + pe_eg + pp_eg + mob_eg + ks_eg) * (24 - phase))
+    // M6.F Tier-1 HCE: outposts + rook-on-open/semi-open-file (additive (mg,eg))
+    // + endgame draw-scale (multiplicative on the blended value). **Shipped
+    // score-neutral** — all additive weights zeroed + scale ≡ identity
+    // (EG_SCALE_DEN/EG_SCALE_DEN) ⇒ `evaluate` byte-identical to `M6.E`
+    // (ADR-0034 §2; the M6.C/M6.D/M6.E inert-landing precedent). Computed live
+    // (not pawn-only ⇒ never cached). Additive terms enter the blend numerator
+    // ONLY; the scale multiplies the blended value BEFORE `+ mop_up` (mop-up is
+    // the unscaled conversion nudge — ADR-0034 §5). Never `static_eval_white()`
+    // (RFP/NMP/FFP input) nor the mop-up estimate (ADR-0032 §4; pinned by
+    // `static_accessor_excludes_tier1` + `mop_up_addend_excludes_tier1_vs_m6e`
+    // + `endgame_scale_excludes_static_accessor_vs_m6e`). Term math stays live;
+    // M6.H joint Texel re-derives the whole set.
+    const TIER1_IN_EVAL: bool = true;
+    let ((op_mg, op_eg), (rf_mg, rf_eg), scale) = if TIER1_IN_EVAL {
+        (
+            tier1::outpost_term_white(pos),
+            tier1::rook_file_term_white(pos),
+            tier1::endgame_scale(pos),
+        )
+    } else {
+        ((0, 0), (0, 0), data::EG_SCALE_DEN)
+    };
+
+    let blended = ((mg + bp_mg + pe_mg + pp_mg + mob_mg + ks_mg + op_mg + rf_mg) * phase
+        + (eg + bp_eg + pe_eg + pp_eg + mob_eg + ks_eg + op_eg + rf_eg) * (24 - phase))
         / 24;
-    let result_white = blended + mop_up;
+    let scaled = blended * scale / data::EG_SCALE_DEN;
+    let result_white = scaled + mop_up;
 
     debug_assert!(
         result_white.abs() < MATE_IN_MAX_PLY - 1,
@@ -1688,6 +1713,185 @@ mod tests {
              (4·CMD(e8)=12 + 2·(14−cheb(h1,e8)=7)=14 → 26); the king-safety \
              term must be excluded from the mop-up advantage estimate \
              (PST-only inputs)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M6.F boundary regression tests (ADR-0034 §5; mirrors M6.E pair verbatim
+    // in shape; suffix `_vs_m6d` → `_vs_m6e`).
+    // -----------------------------------------------------------------------
+
+    /// Regression pin: `static_mg_white()` / `static_eg_white()` PST-only
+    /// accessors used by RFP/NMP/FFP must NOT include the Tier-1 additive terms
+    /// (outpost, rook-file) OR the endgame scale.
+    ///
+    /// Fixture invariant: an outpost-eligible knight + a rook on a genuinely
+    /// open file (the two additive-term inputs exercised). Note: this fixture
+    /// intentionally has a rook present, which means it is NOT an OCB-with-pawns
+    /// position (OCB requires no rooks or queens). The OCB-scale-vs-accessor
+    /// exclusion is pinned by `endgame_scale_excludes_static_accessor_vs_m6e`.
+    ///
+    /// At zeroed weights the non-zero-value discriminator is **M6.H-dormant**
+    /// (both PST-only and term values are 0) — auto-revalidates when M6.H sets
+    /// non-zero weights (the M6.E `static_accessor_excludes_king_safety`
+    /// precedent verbatim in shape).
+    ///
+    /// TDD state: GREEN now (accessor is PST-only by construction; Tier-1 is
+    /// not wired into `evaluate_core` yet and even when wired does not touch
+    /// the accessor — ADR-0034 §5).
+    #[test]
+    fn static_accessor_excludes_tier1() {
+        // Outpost-eligible: White Nd5 pawn-supported by c4+e4, unchallengeable
+        // (no black c/e pawns). Open-rook-file: White Ra1 on a-file, no pawns
+        // on a-file for either side.
+        // Black Ka8, Black Bc7 (dark bishop present for the bishop fixture
+        // invariant below — not OCB eligible since a rook is also present).
+        // FEN: k7/2b5/8/3N4/2P1P3/8/4B1P1/R3K3 w - - 0 1
+        //   rank8: k at a8. rank7: b at c7. rank5: N at d5. rank4: P at c4, P at e4.
+        //   rank2: B at e2, P at g2. rank1: R at a1, K at e1.
+        let pos = Position::from_fen("k7/2b5/8/3N4/2P1P3/8/4B1P1/R3K3 w - - 0 1")
+            .expect("fixture FEN must parse");
+
+        // Structural fixture invariants (weight-free):
+        assert!(
+            pos.pieces_colored(Color::White, PieceKind::Knight).any(),
+            "fixture invariant: white knight present (outpost-eligible)"
+        );
+        assert!(
+            pos.pieces_colored(Color::White, PieceKind::Rook).any(),
+            "fixture invariant: white rook present (rook-file boundary)"
+        );
+        // Rook is present → cannot be OCB (OCB requires no rooks/queens).
+        assert!(
+            pos.pieces(PieceKind::Rook).any(),
+            "fixture invariant: rook present confirms this is not OCB-eligible \
+             (OCB-scale boundary is pinned by endgame_scale_excludes_static_accessor_vs_m6e)"
+        );
+
+        let (from_scratch_mg, from_scratch_eg, _) = eval_state_from_scratch(&pos);
+        assert_eq!(
+            pos.static_mg_white(),
+            from_scratch_mg,
+            "static_mg_white() must equal PST-only from-scratch mg \
+             (Tier-1 additive terms AND scale must NOT enter this accessor)"
+        );
+        assert_eq!(
+            pos.static_eg_white(),
+            from_scratch_eg,
+            "static_eg_white() must equal PST-only from-scratch eg \
+             (Tier-1 additive terms AND scale must NOT enter this accessor)"
+        );
+    }
+
+    /// Mop-up addend regression — pins ADR-0034 §5 for M6.F: neither the Tier-1
+    /// additive terms nor the endgame scale must enter the mop-up advantage
+    /// estimate. Mirrors `mop_up_addend_excludes_king_safety_vs_m6d` verbatim
+    /// in shape; suffix `_vs_m6d` → `_vs_m6e` (M6.F's baseline is `M6.E`).
+    ///
+    /// Fixture: White Kh1 + Ra4 (rook on open a-file — exercises the Tier-1
+    /// rook-file term), Black Ka8. raw_phase = rook(2) = 2 < MOP_UP_PHASE_MAX(5)
+    /// → mop-up eligible. White winning (rook up) → mop_up > 0. Note: a queen
+    /// alone would also give raw_phase < 5, but a queen does NOT trigger
+    /// `rook_file_term_white` (only a rook does — should-fix #5 from review).
+    ///
+    /// Hand-derived from THIS fixture's king geometry (not the king_safety baseline):
+    ///   White winning: drive black king (a8) to corner.
+    ///   CMD(a8) = min(|0−3|,|0−4|) + min(|7−3|,|7−4|) = 3 + 3 = 6.
+    ///   cheb(h1, a8) = max(|7−0|, |0−7|) = max(7, 7) = 7.
+    ///   bonus = 4·CMD(a8) + 2·(14 − cheb(h1,a8)) = 4·6 + 2·(14−7)
+    ///         = 24 + 14 = 38.
+    ///
+    /// TDD state: GREEN now (mop-up uses PST-only inputs by construction).
+    #[test]
+    fn mop_up_addend_excludes_tier1_vs_m6e() {
+        // White Kh1; White Ra4 (rook on the a-file, no pawns anywhere → an
+        // OPEN file, so this fixture genuinely exercises `rook_file_term_white`
+        // — the M6.F Tier-1 boundary input this test pins out of the mop-up
+        // estimate); Black Ka8. raw_phase = rook(2) = 2 < 5 → mop-up fires.
+        // FEN: k7/8/8/8/R7/8/8/7K w - - 0 1
+        let pos =
+            Position::from_fen("k7/8/8/8/R7/8/8/7K w - - 0 1").expect("fixture FEN must parse");
+
+        // Structural fixture invariants:
+        assert!(
+            pos.pieces_colored(Color::White, PieceKind::Rook).any(),
+            "fixture invariant: white rook present (exercises `rook_file_term_white`; \
+             value discriminator is M6.H-dormant at zeroed weights)"
+        );
+        assert!(
+            pos.king_square(Color::White).file() >= 5,
+            "fixture invariant: white king on castled-side file (h1, file 7 ≥ 5)"
+        );
+        // raw_phase check: rook(2) < MOP_UP_PHASE_MAX(5) → mop-up must fire.
+        assert!(
+            pos.raw_phase() < MOP_UP_PHASE_MAX,
+            "fixture invariant: raw_phase={} must be < MOP_UP_PHASE_MAX={} \
+             (mop-up must fire for this boundary regression to be non-trivial)",
+            pos.raw_phase(),
+            MOP_UP_PHASE_MAX
+        );
+
+        let mg = pos.static_mg_white();
+        let eg = pos.static_eg_white();
+        let bonus = mop_up_term_white(&pos, mg, eg);
+        assert_eq!(
+            bonus, 38,
+            "mop-up addend must equal its hand-derived formula value \
+             (4·CMD(a8)=24 + 2·(14−cheb(h1,a8)=7)=14 → 38); neither Tier-1 \
+             additive terms nor the endgame scale must enter the mop-up estimate \
+             (PST-only inputs)"
+        );
+    }
+
+    /// Scale-specific boundary regression: the endgame scale multiplies only
+    /// the blend numerator — it must NEVER enter the `static_eval_white()`
+    /// RFP/NMP/FFP pruning input. This is the **first** M6.F-specific boundary
+    /// test (a multiplicative construct is the first that *could* leak into the
+    /// pruning eval — ADR-0034 §5 / plan §4).
+    ///
+    /// Fixture: a deliberately OCB-with-pawns position. `static_mg_white()` /
+    /// `static_eg_white()` must equal the PST-only from-scratch `(mg, eg)` —
+    /// the scale never touches the accessor.
+    ///
+    /// TDD state: GREEN now (accessor is PST-only by construction; even after
+    /// wiring, `endgame_scale` applies only to the blend numerator in
+    /// `evaluate_core` — ADR-0034 §5). Weight-free.
+    #[test]
+    fn endgame_scale_excludes_static_accessor_vs_m6e() {
+        // OCB-with-pawns fixture: White Be2 (light) + pawn g2, Black Bc7 (dark).
+        // Kings on e1 / e8. No queens, no rooks.
+        let pos = Position::from_fen("4k3/2b5/8/8/8/8/4B1P1/4K3 w - - 0 1")
+            .expect("fixture FEN must parse");
+
+        // Structural fixture invariant: OCB-eligible (both sides have exactly
+        // one bishop on opposite complexes; pawns present; no majors).
+        let wb = pos.pieces_colored(Color::White, PieceKind::Bishop);
+        let bb = pos.pieces_colored(Color::Black, PieceKind::Bishop);
+        assert!(
+            wb.count() == 1 && bb.count() == 1,
+            "fixture invariant: each side has exactly one bishop"
+        );
+        assert!(
+            pos.pieces(PieceKind::Pawn).any(),
+            "fixture invariant: at least one pawn present (OCB-with-pawns boundary)"
+        );
+        assert!(
+            !pos.pieces(PieceKind::Queen).any() && !pos.pieces(PieceKind::Rook).any(),
+            "fixture invariant: no queens/rooks (OCB-drawishness condition)"
+        );
+
+        let (from_scratch_mg, from_scratch_eg, _) = eval_state_from_scratch(&pos);
+        assert_eq!(
+            pos.static_mg_white(),
+            from_scratch_mg,
+            "static_mg_white() must equal PST-only from-scratch mg \
+             (endgame scale must NOT enter the static accessor — ADR-0034 §5)"
+        );
+        assert_eq!(
+            pos.static_eg_white(),
+            from_scratch_eg,
+            "static_eg_white() must equal PST-only from-scratch eg \
+             (endgame scale must NOT enter the static accessor — ADR-0034 §5)"
         );
     }
 }
