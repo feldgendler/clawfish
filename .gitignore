@@ -14,3 +14,20 @@ fuzz/artifacts/
 # at REPO_ROOT/config.json. (Other cwds either fall under /target or land
 # outside the repo entirely and don't need a gitignore rule.)
 /config.json
+
+# M6.G corpus bytes: gitignored (operator-materialized via re-run.sh from
+# the manifest's pinned knobs). The committed manifest + filter_spec + the
+# vendored opening book are sufficient for byte-identical reproduction; the
+# bytes themselves can be hundreds of MB at M6.H scale and grow without
+# meaningful git delta, so we don't track them. Future hosting (GitHub
+# release asset / S3 / sister-repo) will let consumers download a frozen
+# canonical artifact instead of re-running re-run.sh. See ADR-0035 §8.
+/bench/corpus/shard.bin
+/bench/corpus/val.bin
+/bench/corpus/checkpoint.bin
+/bench/corpus/pgn-shard.bin
+# Per-spill / per-stage operator artifacts.
+/target/corpus-raw/
+/target/corpus-spill/
+/target/corpus-work/
+/target/corpus-campaign.log

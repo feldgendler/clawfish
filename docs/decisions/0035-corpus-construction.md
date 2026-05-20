@@ -217,7 +217,7 @@ primitive: corpus bytes are a deterministic function of the input
 multiset, independent of self-play worker scheduling. `corpus_sha256`
 is therefore worker-count-independent.
 
-### 8. Reproducibility — full manifest knob pinning + the committed-bytes contract
+### 8. Reproducibility — manifest-driven recipe contract (post-tag amendment)
 
 The committed `bench/corpus/manifest.json` records **every** knob
 needed to byte-reproduce the artifact: `self_play_seed`, `games`,
@@ -229,18 +229,48 @@ substitution. `scripts/corpus.sh` is the **operator fresh-build** tool;
 `bench/corpus/re-run.sh` is the **byte-identical reproduction** tool —
 the header of each documents the distinction.
 
-The **committed frozen artifact is the bytes consumers freeze on** (the
-strong R5 / reproducibility-mandate guarantee). The self-play slice is
-additionally reproducible from `{seed + clawfish binary}` with no
-network. The CCRL/Lichess slice is reproducible from raw sources
-*given source availability* (the weaker re-derivable guarantee — the
-manifest pins the URLs + SHA-256 + year-month, but the raw blob is not
-git-vendored).
+**Post-tag amendment (the corpus bytes are gitignored).** The original
+ADR §8 + the plan §1 committed to "consumers freeze on bytes" — but
+that contract only fit a tens-of-MB artifact. At M6.H production scale
+(1.5–3 M records ≈ 100–300 MB, plus raw external sources at multi-GB)
+git is the wrong tool: GitHub's 100 MB hard file cap, pack-inflation
+across nightly regenerations, and useless diff/blame on binary push
+us out of git's design envelope. Resolution: `bench/corpus/shard.bin`,
+`bench/corpus/val.bin`, `bench/corpus/checkpoint.bin`, and
+`bench/corpus/pgn-shard.bin` are now **gitignored**. The committed
+artifacts in `bench/corpus/` are the **manifest + filter_spec +
+corpus_stats + re-run.sh + the vendored opening book** (the recipe);
+**consumers freeze on the manifest, not the bytes.** The bytes are
+**operator-materialized** by running `sh bench/corpus/re-run.sh`,
+which consumes the manifest's pinned knobs + the vendored opening
+book + (operator-staged) external sources and emits byte-identical
+shard.bin / val.bin in place.
+
+Reproducibility properties under the amendment:
+
+| Slice | Reproducibility | What's needed |
+|---|---|---|
+| Self-play | **Strong (offline)** | Manifest seed + games + max_plies + opening_random_plies + workers + depth_ladder + opening_book_sha256 + the engine binary at this commit + the vendored book file. No network. |
+| CCRL/Lichess external | **Weaker (re-derivable)** | Above + the raw PGN files at their pinned SHA-256s available at their source URL (or operator-staged from another source). |
+| `corpus_sha256` | Verifiable post-build | The manifest's recorded digest is checked by `corpus quality-gate`'s `reproducibility_rerun_match`; mismatch means the recipe drifted. |
+
+**Future hosting (deferred, not in scope for this commit).** Re-running
+re-run.sh costs CPU-days at M6.H scale — burning that on every
+consumer wanting to reproduce the Texel tune is wasteful. A future
+follow-up (separate ADR or hosting-decision note) will pick a canonical
+host for the frozen artifact bytes: GitHub Release asset on the `M6.G`
+/ `M6.H` tag, S3-style bucket with the manifest's `corpus_sha256` as
+the key, or sister-repo `clawfish-corpus`. Consumers download the
+bytes + sha256-verify against the manifest; the manifest stays the
+truth source. Until that lands, the operator's local materialized
+`bench/corpus/{shard,val}.bin` is the only copy.
 
 The integration test `tests/corpus_reproducibility.rs::rerun_byte_identical`
 drives the full pipeline twice into sibling temp dirs and asserts
 SHA-256 equality of `shard.bin` + `val.bin` — the reproducibility gate
-in test form.
+in test form (unchanged across the gitignore-the-bytes amendment, since
+the test produces both directories fresh and never depends on
+git-committed bytes).
 
 ### 9. Disposition — data-quality gate (NOT SPRT); committed artifact is self-play-dominant
 
@@ -291,11 +321,19 @@ artifact with CCRL/Lichess slices.
 ## Alternatives considered
 
 - **Vendor only the self-play slice; CCRL/Lichess as a documented
-  recipe-only path.** Rejected (plan-review pass-1 must-fix #4): the
-  consumers freeze on bytes, not recipes; a network-only recipe leaves
-  the offline-repro guarantee weaker than the plan's "vendored data
-  file in `bench/`" wording. Resolution: the *full filtered* artifact
-  is vendored (compact post-filter); raw DBs are not.
+  recipe-only path.** Rejected at M6.G landing (plan-review pass-1
+  must-fix #4): the consumers freeze on bytes, not recipes; a
+  network-only recipe leaves the offline-repro guarantee weaker than
+  the plan's "vendored data file in `bench/`" wording. At landing the
+  *full filtered* artifact was vendored (compact post-filter); raw DBs
+  weren't. **Subsequently amended (§8 post-tag amendment): the bytes
+  are gitignored, only the manifest + recipe stay in git** — at M6.H
+  production scale (100–300 MB filtered, multi-GB raw) git is the
+  wrong tool, and the manifest captures all reproducibility-load-
+  bearing state regardless of where the bytes live. Future hosting
+  (release asset / S3 / sister-repo) is the long-term home for a
+  canonical frozen-bytes copy so consumers don't pay CPU-days
+  re-running re-run.sh.
 - **Wall-clock self-play with `VirtualClock`** (R4 literal). Rejected
   for the one-frozen-build / R-TC-explicit-carve-out reasoning above —
   fixed-depth gives R3/R4 *by construction* with no clock surface.
