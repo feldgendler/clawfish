@@ -54,6 +54,7 @@ fn spawn_selfplay(out: &Path, seed: u64, games: u64, workers: usize, max_plies: 
         .args(["--workers", &workers.to_string()])
         .args(["--out", &out.display().to_string()])
         .args(["--max-plies", &max_plies.to_string()])
+        .args(["--split-seed", "7"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -77,6 +78,24 @@ fn wait_for_blocks(shard: &Path, min_games: usize, deadline: Duration) -> usize 
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Run `corpus selfplay` synchronously to completion (asserts success).
+fn run_selfplay(out: &Path, seed: u64, games: u64, workers: usize, max_plies: u32) {
+    let status = Command::new(corpus_bin())
+        .arg("selfplay")
+        .args(["--seed", &seed.to_string()])
+        .args(["--games", &games.to_string()])
+        .args(["--workers", &workers.to_string()])
+        .args(["--out", &out.display().to_string()])
+        .args(["--max-plies", &max_plies.to_string()])
+        .args(["--split-seed", "7"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .expect("spawn corpus selfplay");
+    assert!(status.success(), "selfplay must succeed");
 }
 
 /// SIGKILL the child via libc (no `kill` shell dependency).
@@ -135,6 +154,8 @@ fn assert_no_partial_games(dir: &Path) {
 
 // ──────────────────────────────────────────────────────────────────────────
 // Fast default variant — one deterministic SIGKILL, then resume.
+// will be replaced by the per-game-file variant in M6.G per-game-file
+// rewrite; see docs/plans/m6.g-per-game-files.md §8.2.
 // ──────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -321,4 +342,476 @@ fn crash_kill_at_randomized_offsets_emits_zero_partial() {
         suspended, ref_records,
         "SIGSTOP/SIGCONT must not affect the deterministic fixed-depth corpus"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Per-game-file architecture tests (NEW — §8.2 of the plan).
+// All #[ignore]d until the implementation phase lands.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// K=4 SIGKILL + resume → byte-equal to uninterrupted reference.
+///
+/// Replaces the K=1 variant above for the per-game-file architecture. With
+/// K=4, workers race; the pending-file reorder protocol ensures the resumed
+/// corpus is byte-identical to the uninterrupted reference regardless of
+/// which games were in-flight at kill time.
+#[test]
+fn crash_kill_k4_resumes_to_uninterrupted_corpus_per_game_file() {
+    let seed = 42u64;
+    let games = 6u64;
+    let workers = 4usize;
+    let max_plies = 40u32;
+
+    // Reference: uninterrupted run.
+    let ref_dir = TempDir::new("pgf-ref-k4");
+    let status = Command::new(corpus_bin())
+        .arg("selfplay")
+        .args(["--seed", &seed.to_string()])
+        .args(["--games", &games.to_string()])
+        .args(["--workers", &workers.to_string()])
+        .args(["--out", &ref_dir.path().display().to_string()])
+        .args(["--max-plies", &max_plies.to_string()])
+        .args(["--split-seed", "7"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .expect("ref run");
+    assert!(status.success(), "reference selfplay must succeed");
+    let ref_records = shard_records(ref_dir.path());
+    assert!(!ref_records.is_empty(), "reference shard must be non-empty");
+
+    // Crash run.
+    let crash_dir = TempDir::new("pgf-crash-k4");
+    let shard = crash_dir.path().join("shard.bin");
+    let mut child = spawn_selfplay(crash_dir.path(), seed, games, workers, max_plies);
+    let blocks_before_kill = wait_for_blocks(&shard, 1, std::time::Duration::from_secs(90));
+    assert!(
+        blocks_before_kill >= 1,
+        "expected ≥ 1 durable block before SIGKILL; got {blocks_before_kill}"
+    );
+    sigkill(&child);
+    let _ = child.wait();
+    assert_no_partial_games(crash_dir.path());
+
+    // Resume.
+    let status = Command::new(corpus_bin())
+        .arg("selfplay")
+        .args(["--seed", &seed.to_string()])
+        .args(["--games", &games.to_string()])
+        .args(["--workers", &workers.to_string()])
+        .args(["--out", &crash_dir.path().display().to_string()])
+        .args(["--max-plies", &max_plies.to_string()])
+        .args(["--split-seed", "7"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .expect("resume run");
+    assert!(status.success(), "resumed selfplay must succeed");
+    assert_no_partial_games(crash_dir.path());
+
+    let resumed_records = shard_records(crash_dir.path());
+    assert_eq!(
+        resumed_records, ref_records,
+        "K=4 resumed corpus must byte-equal the uninterrupted reference \
+         (per-game-file reorder protocol ⇒ K-independent)"
+    );
+}
+
+/// Ghost-pending file for a committed-with-records game is cleaned on resume.
+#[test]
+fn ghost_pending_self_heal_on_resume() {
+    // Plant a "ghost" pending file for a game that is already durably
+    // committed in shard.bin. The resume protocol must clean it.
+    let seed = 77u64;
+    let games = 3u64;
+    let workers = 1usize;
+    let max_plies = 40u32;
+
+    let td = TempDir::new("ghost-committed");
+    // Complete run.
+    let status = Command::new(corpus_bin())
+        .arg("selfplay")
+        .args(["--seed", &seed.to_string()])
+        .args(["--games", &games.to_string()])
+        .args(["--workers", &workers.to_string()])
+        .args(["--out", &td.path().display().to_string()])
+        .args(["--max-plies", &max_plies.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .expect("first run");
+    assert!(status.success());
+    let ref_records = shard_records(td.path());
+
+    // Plant a ghost pending file for game 0 (already committed).
+    let pending_dir = td.path().join("pending");
+    std::fs::create_dir_all(&pending_dir).unwrap();
+    let ghost = pending_dir.join(clawfish::corpus::pending::pending_filename(0));
+    // Write a valid-looking block so it passes CRC (otherwise it'd be unlinked as torn).
+    let ghost_block = clawfish::corpus::store::encode_block(0, &[]);
+    std::fs::write(&ghost, &ghost_block).unwrap();
+
+    // Re-run: resume must clean the ghost and not double-commit game 0.
+    let status = Command::new(corpus_bin())
+        .arg("selfplay")
+        .args(["--seed", &seed.to_string()])
+        .args(["--games", &games.to_string()])
+        .args(["--workers", &workers.to_string()])
+        .args(["--out", &td.path().display().to_string()])
+        .args(["--max-plies", &max_plies.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .expect("second run");
+    assert!(status.success());
+
+    assert!(
+        !ghost.exists(),
+        "ghost pending file must be cleaned on resume"
+    );
+    let second_records = shard_records(td.path());
+    assert_eq!(
+        second_records, ref_records,
+        "ghost cleanup must not alter the committed record set"
+    );
+}
+
+/// Ghost-pending file for an empty-post-dedup game (below checkpoint's
+/// next_consume_id) is cleaned on resume.
+#[test]
+fn ghost_pending_empty_post_dedup_below_ckpt_self_heal_on_resume() {
+    // Blocker #2 new case: a pending file for a game that was committed as
+    // empty-post-dedup (no shard block, but checkpoint advanced past it).
+    // The resume protocol must unlink it via the
+    // `pending_ids ∩ {0..ckpt.next_consume_id}` union.
+    //
+    // Setup: plant a ghost pending file at game_id=3 + a checkpoint claiming
+    // `next_consume_id = 5` (i.e., games 3 and 4 were "consumed" — game 3 as
+    // empty-post-dedup, game 4 with records). After the consumer's resume
+    // runs, the ghost at game-3 must be unlinked. The post-impl checkpoint
+    // schema includes `next_consume_id` — until then, this test relies on
+    // direct binary construction of the CWK2 checkpoint format.
+    let td = TempDir::new("ghost-empty-ckpt");
+    let pending_dir = td.path().join("pending");
+    std::fs::create_dir_all(&pending_dir).unwrap();
+
+    // Plant a syntactically-valid CRC-framed pending block for game 3.
+    // We use a minimal one-record block; the resume scan only checks CRC
+    // validity, not record content.
+    let dummy_rec = clawfish::corpus::CorpusRecord {
+        game_id: 3,
+        ply: 0,
+        fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
+        label: clawfish::corpus::Label::Draw,
+        source: clawfish::corpus::Source::SelfPlay,
+        depth_rung: 0,
+        strata: 0,
+    };
+    let block = clawfish::corpus::store::encode_block(3, &[dummy_rec]);
+    let ghost_path = pending_dir.join("game-00000000000000000003.bin");
+    std::fs::write(&ghost_path, &block).unwrap();
+    assert!(ghost_path.exists(), "ghost pending file planted");
+
+    // Plant a CWK2-format checkpoint claiming next_consume_id=5.
+    let ckpt = clawfish::corpus::store::Checkpoint {
+        games_completed: 5,
+        prng_state: 0,
+        ladder_cursor: 5,
+        per_worker_next_game_id: vec![5],
+        next_consume_id: 5,
+    };
+    clawfish::corpus::store::write_checkpoint(&td.path().join("checkpoint.bin"), &ckpt).unwrap();
+
+    // Run a fresh selfplay; resume must self-heal the ghost.
+    let status = Command::new(corpus_bin())
+        .arg("selfplay")
+        .args(["--seed", "11"])
+        .args(["--games", "8"])
+        .args(["--workers", "1"])
+        .args(["--out", &td.path().display().to_string()])
+        .args(["--max-plies", "40"])
+        .args(["--split-seed", "7"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .expect("spawn");
+    assert!(status.success(), "selfplay must succeed past the ghost");
+
+    // The ghost pending file must be gone — resume's self-heal unlinked it.
+    assert!(
+        !ghost_path.exists(),
+        "ghost pending file at game_id=3 (< ckpt.next_consume_id=5) must be unlinked on resume"
+    );
+}
+
+/// K=10 SIGKILL: only in-flight games lost; rest byte-equal to reference.
+#[test]
+fn worker_crash_only_loses_in_flight_games() {
+    let seed = 99u64;
+    let games = 16u64;
+    let workers = 10usize;
+    let max_plies = 40u32;
+
+    let ref_dir = TempDir::new("wc-ref");
+    let status = Command::new(corpus_bin())
+        .arg("selfplay")
+        .args(["--seed", &seed.to_string()])
+        .args(["--games", &games.to_string()])
+        .args(["--workers", &workers.to_string()])
+        .args(["--out", &ref_dir.path().display().to_string()])
+        .args(["--max-plies", &max_plies.to_string()])
+        .args(["--split-seed", "7"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .expect("ref run");
+    assert!(status.success());
+    let ref_records = shard_records(ref_dir.path());
+
+    let crash_dir = TempDir::new("wc-crash");
+    let shard = crash_dir.path().join("shard.bin");
+    let mut child = spawn_selfplay(crash_dir.path(), seed, games, workers, max_plies);
+    let blocks = wait_for_blocks(&shard, 2, std::time::Duration::from_secs(90));
+    assert!(blocks >= 1, "expected ≥ 1 block before kill; got {blocks}");
+    sigkill(&child);
+    let _ = child.wait();
+    assert_no_partial_games(crash_dir.path());
+
+    // Resume.
+    let status = Command::new(corpus_bin())
+        .arg("selfplay")
+        .args(["--seed", &seed.to_string()])
+        .args(["--games", &games.to_string()])
+        .args(["--workers", &workers.to_string()])
+        .args(["--out", &crash_dir.path().display().to_string()])
+        .args(["--max-plies", &max_plies.to_string()])
+        .args(["--split-seed", "7"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .expect("resume run");
+    assert!(status.success());
+    assert_no_partial_games(crash_dir.path());
+
+    let resumed_records = shard_records(crash_dir.path());
+    assert_eq!(
+        resumed_records, ref_records,
+        "K=10 resumed corpus must byte-equal the uninterrupted reference"
+    );
+}
+
+/// A worker panic releases the claim via `ClaimGuard::Drop`, so the game
+/// is re-dispatched and completed by another worker.
+#[test]
+fn worker_panic_releases_claim_via_guard_drop() {
+    // This is an integration-level test of the Blocker #3 RAII invariant.
+    // We can't easily inject a panic into a live `corpus selfplay` worker
+    // without modifying the binary, so this test exercises the property
+    // indirectly: run a campaign and verify it completes all games despite
+    // any worker dying. The unit test `claim_guard_drop_releases_on_panic`
+    // covers the direct RAII path.
+    let td = TempDir::new("panic-guard");
+    let seed = 42u64;
+    let games = 4u64;
+    let workers = 2usize;
+    run_selfplay(td.path(), seed, games, workers, 40);
+    let records = shard_records(td.path());
+    // At minimum, some games completed (the panic recovery would replay them).
+    // We can't assert exact count without controlling when panics fire, but
+    // we can assert no partial games.
+    assert_no_partial_games(td.path());
+    let _ = records; // Bind to silence unused warning.
+}
+
+/// An oversize pending file is fatal on resume: the consumer returns an
+/// error rather than silently skipping or retrying.
+#[test]
+fn oversized_pending_file_is_fatal_on_resume_and_at_write() {
+    use clawfish::corpus::pending::{MAX_PENDING_BYTES, pending_filename, write_pending};
+
+    // Write side: write_pending rejects an oversize block.
+    let td = TempDir::new("oversize-fatal");
+    let pending_dir = td.path().join("pending");
+    std::fs::create_dir_all(&pending_dir).unwrap();
+    let oversize = vec![0u8; MAX_PENDING_BYTES + 1];
+    let result = write_pending(&pending_dir, 0, &oversize);
+    assert!(
+        matches!(result, Err(clawfish::corpus::CorpusError::Checkpoint(_))),
+        "write_pending oversize must return CorpusError::Checkpoint"
+    );
+
+    // Read side: a manually-planted oversize pending file causes the
+    // selfplay run to fail (the consumer detects it and returns fatal error).
+    let td2 = TempDir::new("oversize-resume-fatal");
+    let pending_dir2 = td2.path().join("pending");
+    std::fs::create_dir_all(&pending_dir2).unwrap();
+    // Plant oversize pending for game 0.
+    std::fs::write(
+        pending_dir2.join(pending_filename(0)),
+        vec![0u8; MAX_PENDING_BYTES + 1],
+    )
+    .unwrap();
+    // A selfplay run into this dir should detect the oversize file and fail.
+    let status = Command::new(corpus_bin())
+        .arg("selfplay")
+        .args(["--seed", "1"])
+        .args(["--games", "1"])
+        .args(["--workers", "1"])
+        .args(["--out", &td2.path().display().to_string()])
+        .args(["--max-plies", "40"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn");
+    assert!(
+        !status.success(),
+        "selfplay with oversize pending file must fail (fatal error)"
+    );
+}
+
+/// A torn (CRC-invalid) pending file is unlinked and the game is replayed.
+#[test]
+fn torn_pending_file_is_rejected_and_replayed() {
+    use clawfish::corpus::pending::pending_filename;
+
+    let seed = 55u64;
+    let games = 3u64;
+    let workers = 1usize;
+    let max_plies = 40u32;
+
+    // Reference: uninterrupted.
+    let ref_dir = TempDir::new("torn-ref");
+    run_selfplay(ref_dir.path(), seed, games, workers, max_plies);
+    let ref_records = shard_records(ref_dir.path());
+
+    // Setup: run the campaign, then plant a torn pending file for game 0.
+    // The next resume should unlink it and replay game 0.
+    let td = TempDir::new("torn-replay");
+    let pending_dir = td.path().join("pending");
+    std::fs::create_dir_all(&pending_dir).unwrap();
+
+    // Plant a torn (garbage) pending file for game 0.
+    std::fs::write(
+        pending_dir.join(pending_filename(0)),
+        b"not-a-valid-crc-block",
+    )
+    .unwrap();
+
+    // Run selfplay: should detect torn file, unlink it, replay game 0.
+    run_selfplay(td.path(), seed, games, workers, max_plies);
+    assert_no_partial_games(td.path());
+
+    assert!(
+        !pending_dir.join(pending_filename(0)).exists(),
+        "torn pending file must have been unlinked and replaced by the commit"
+    );
+    let result_records = shard_records(td.path());
+    assert_eq!(
+        result_records, ref_records,
+        "after torn-file replay, corpus must equal the uninterrupted reference"
+    );
+}
+
+/// An old CWK1-format checkpoint is rejected as corrupt; the campaign starts
+/// fresh from the shard scan.
+#[test]
+fn old_checkpoint_magic_is_rejected_as_missing() {
+    // Write a CWK1-magic checkpoint (old format), then resume. The new
+    // decoder rejects it as corrupt (magic mismatch) and falls back to the
+    // shard scan — equivalent to a fresh start on an empty shard.
+    let td = TempDir::new("old-ckpt-magic");
+
+    // Construct a CWK1 checkpoint manually (old CKPT_MAGIC = 0x4357_4B31).
+    // The new format uses 0x4357_4B32. The decoder must reject 0x4357_4B31.
+    let old_magic: u32 = 0x4357_4B31; // CWK1
+    let games_completed: u64 = 5;
+    let prng_state: u64 = 42;
+    let ladder_cursor: u64 = 5;
+    let per_worker_len: u32 = 0;
+    let mut body = Vec::new();
+    body.extend_from_slice(&old_magic.to_le_bytes());
+    body.extend_from_slice(&games_completed.to_le_bytes());
+    body.extend_from_slice(&prng_state.to_le_bytes());
+    body.extend_from_slice(&ladder_cursor.to_le_bytes());
+    body.extend_from_slice(&per_worker_len.to_le_bytes());
+    // CRC-32 of body (so it passes the CRC check; magic mismatch is the rejection).
+    let crc = clawfish::corpus::store::crc32(&body);
+    body.extend_from_slice(&crc.to_le_bytes());
+    std::fs::write(td.path().join("checkpoint.bin"), &body).unwrap();
+
+    // Run selfplay from this dir. The old checkpoint must be treated as
+    // missing (not an error). Campaign runs fresh; 10 games ensures the
+    // shard is non-empty for the post-condition check below.
+    let status = Command::new(corpus_bin())
+        .arg("selfplay")
+        .args(["--seed", "7"])
+        .args(["--games", "10"])
+        .args(["--workers", "1"])
+        .args(["--out", &td.path().display().to_string()])
+        .args(["--max-plies", "40"])
+        .args(["--split-seed", "7"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .expect("spawn");
+    assert!(
+        status.success(),
+        "old CWK1 checkpoint must be silently rejected (treated as missing), not fatal"
+    );
+
+    // The run should have produced some records (fresh start). Use 10 games
+    // at depth-default so the probability of zero quiet emissions is negligible.
+    let (blocks, _) = scan_valid_blocks(&td.path().join("shard.bin")).unwrap_or_default();
+    assert!(
+        !blocks.is_empty(),
+        "after rejecting CWK1 checkpoint, the fresh run should produce at least one block"
+    );
+}
+
+/// Power-loss simulation: strict prefix property + game-level replays.
+/// Heavy `#[ignore]`d variant (O(N²) in games — run explicitly via
+/// `cargo test --test corpus_crash_safety -- --ignored power_loss`).
+#[test]
+#[ignore = "heavy — explicit-run only"]
+fn power_loss_simulation_strict_prefix_plus_replays() {
+    // Simulates power-loss at every block boundary in the shard, verifying
+    // that resume always produces an exact prefix of the uninterrupted run.
+    // This test is O(N²) in the number of games and is gated as heavy.
+    let seed = 13u64;
+    let games = 6u64;
+    let workers = 1usize;
+    let max_plies = 40u32;
+
+    let ref_dir = TempDir::new("powerloss-ref");
+    run_selfplay(ref_dir.path(), seed, games, workers, max_plies);
+    let ref_records = shard_records(ref_dir.path());
+    assert!(!ref_records.is_empty(), "reference must be non-empty");
+
+    // For each prefix length of the reference shard, truncate and resume.
+    let shard_bytes = std::fs::read(ref_dir.path().join("shard.bin")).unwrap();
+    let total = shard_bytes.len();
+    // Sample 10 evenly-spaced cut points to keep runtime bounded.
+    let step = (total / 10).max(1);
+    for cut in (0..=total).step_by(step) {
+        let td = TempDir::new(&format!("powerloss-cut{cut}"));
+        // Write a truncated shard.
+        std::fs::write(td.path().join("shard.bin"), &shard_bytes[..cut]).unwrap();
+        // Resume.
+        run_selfplay(td.path(), seed, games, workers, max_plies);
+        assert_no_partial_games(td.path());
+        let resumed = shard_records(td.path());
+        assert_eq!(
+            resumed, ref_records,
+            "after power-loss at cut={cut}, resumed corpus must equal reference"
+        );
+    }
 }

@@ -46,6 +46,9 @@ pub struct Checkpoint {
     pub ladder_cursor: u64,
     /// Per-worker next `game_id` (R7 striping resume).
     pub per_worker_next_game_id: Vec<u64>,
+    /// Consumer cursor: the next game_id the consumer will process.
+    /// Authoritative for the per-game-file architecture (CWK2 format).
+    pub next_consume_id: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,7 +136,7 @@ pub fn encode_block(game_id: u64, records: &[CorpusRecord]) -> Vec<u8> {
 /// Decode one block starting at `buf[0]`. Returns `(GameBlock, consumed)` on
 /// a fully-valid frame, or `None` if the frame is incomplete/corrupt (a torn
 /// tail — the caller stops scanning here and truncates).
-fn decode_block(buf: &[u8]) -> Option<(GameBlock, usize)> {
+pub(crate) fn decode_block(buf: &[u8]) -> Option<(GameBlock, usize)> {
     if buf.len() < HEADER_LEN + CRC_LEN {
         return None;
     }
@@ -257,6 +260,16 @@ pub fn append_block(
     Ok(())
 }
 
+/// Append pre-encoded bytes (the output of `encode_block`) to the shard and
+/// `fsync`. Used by the consumer to avoid re-encoding blocks that have already
+/// been dedup-capped.
+pub fn append_raw_bytes(path: &Path, bytes: &[u8]) -> Result<(), CorpusError> {
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Atomic whole-file replace (checkpoint + manifest only).
 // ---------------------------------------------------------------------------
@@ -296,7 +309,10 @@ fn tmp_path(path: &Path) -> std::path::PathBuf {
 // resume falls back to the shard scan, never a half-parsed cursor).
 // ---------------------------------------------------------------------------
 
-const CKPT_MAGIC: u32 = 0x4357_4B31; // "CWK1"
+/// Checkpoint magic for the CWK2 format (adds `next_consume_id`).
+/// Old CWK1 (`0x4357_4B31`) checkpoints are rejected as corrupt → resume
+/// falls back to the shard scan and derives the cursor from committed_ids.
+pub const CKPT_MAGIC: u32 = 0x4357_4B32; // "CWK2"
 
 fn encode_checkpoint(ckpt: &Checkpoint) -> Vec<u8> {
     let mut body = Vec::new();
@@ -308,6 +324,7 @@ fn encode_checkpoint(ckpt: &Checkpoint) -> Vec<u8> {
     for g in &ckpt.per_worker_next_game_id {
         body.extend_from_slice(&g.to_le_bytes());
     }
+    body.extend_from_slice(&ckpt.next_consume_id.to_le_bytes());
     let crc = crc32(&body);
     body.extend_from_slice(&crc.to_le_bytes());
     body
@@ -315,7 +332,9 @@ fn encode_checkpoint(ckpt: &Checkpoint) -> Vec<u8> {
 
 fn decode_checkpoint(bytes: &[u8]) -> Result<Checkpoint, CorpusError> {
     let bad = || CorpusError::Checkpoint("corrupt checkpoint".to_string());
-    if bytes.len() < 4 + 8 + 8 + 8 + 4 + CRC_LEN {
+    // Minimum: magic(4) + games_completed(8) + prng_state(8) + ladder_cursor(8)
+    //          + worker_count(4) + next_consume_id(8) + crc(4) = 44
+    if bytes.len() < 4 + 8 + 8 + 8 + 4 + 8 + CRC_LEN {
         return Err(bad());
     }
     let crc_at = bytes.len() - CRC_LEN;
@@ -332,7 +351,8 @@ fn decode_checkpoint(bytes: &[u8]) -> Result<Checkpoint, CorpusError> {
     let ladder_cursor = u64::from_le_bytes(bytes[20..28].try_into().map_err(|_| bad())?);
     let n = u32::from_le_bytes(bytes[28..32].try_into().map_err(|_| bad())?) as usize;
     let mut off = 32;
-    if off + n * 8 + CRC_LEN != bytes.len() {
+    // Expect: n worker ids (8 bytes each) + next_consume_id (8) + crc (4)
+    if off + n * 8 + 8 + CRC_LEN != bytes.len() {
         return Err(bad());
     }
     let mut per_worker_next_game_id = Vec::with_capacity(n);
@@ -342,11 +362,13 @@ fn decode_checkpoint(bytes: &[u8]) -> Result<Checkpoint, CorpusError> {
         ));
         off += 8;
     }
+    let next_consume_id = u64::from_le_bytes(bytes[off..off + 8].try_into().map_err(|_| bad())?);
     Ok(Checkpoint {
         games_completed,
         prng_state,
         ladder_cursor,
         per_worker_next_game_id,
+        next_consume_id,
     })
 }
 
@@ -637,6 +659,7 @@ mod tests {
             prng_state: 0xDEAD_BEEF_CAFE_F00D,
             ladder_cursor: 99,
             per_worker_next_game_id: vec![3, 7, 11, 4],
+            next_consume_id: 1234,
         };
         assert_eq!(read_checkpoint(&p).unwrap(), None);
         write_checkpoint(&p, &ckpt).unwrap();
@@ -655,6 +678,7 @@ mod tests {
                 prng_state: 42,
                 ladder_cursor: 0,
                 per_worker_next_game_id: vec![1],
+                next_consume_id: 5,
             },
         )
         .unwrap();
@@ -675,6 +699,7 @@ mod tests {
                 prng_state: 1,
                 ladder_cursor: 2,
                 per_worker_next_game_id: vec![0, 0],
+                next_consume_id: 8,
             },
         )
         .unwrap();
@@ -721,6 +746,7 @@ mod tests {
                 prng_state: 10,
                 ladder_cursor: 1,
                 per_worker_next_game_id: vec![2],
+                next_consume_id: 1,
             },
         )
         .unwrap();

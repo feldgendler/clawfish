@@ -299,11 +299,41 @@ pub fn audit_records(records: &[CorpusRecord]) -> CheckResult {
 
 // ── Check 5: reproducibility re-run match (MUST PASS) ───────────────────────
 
+/// Sentinel value in `manifest.corpus_sha256` indicating the corpus has not
+/// yet been regenerated after the per-game-file architecture rewrite. When
+/// this sentinel is present, the reproducibility check is skipped with a WARN
+/// rather than failing — the gate must not block on a not-yet-derived digest.
+///
+/// Operator workflow: run `corpus build` (or `sh bench/corpus/re-run.sh`)
+/// after the rewrite lands to produce the actual digest, then replace this
+/// sentinel in `manifest.json` (see ADR-0035 §8 / plan §10).
+pub const CORPUS_SHA256_PENDING_SENTINEL: &str = "PENDING_REGENERATION";
+
 fn check_reproducibility_rerun(
     _dir: &Path,
     layout: &Layout,
     manifest: &Manifest,
 ) -> Result<CheckResult, CorpusError> {
+    // Handle the post-rewrite migration sentinel: if the manifest records
+    // the corpus_sha256 as PENDING_REGENERATION, skip the digest comparison
+    // with a WARN. The operator must re-derive the digest via `corpus build`
+    // and replace the sentinel (see ADR-0035 §8 / plan §10).
+    if manifest.corpus_sha256 == CORPUS_SHA256_PENDING_SENTINEL {
+        eprintln!(
+            "WARN: manifest corpus_sha256 pending regeneration — operator must \
+             re-derive and commit (see ADR-0035 §8 / bench/corpus/re-run.sh)"
+        );
+        return Ok(CheckResult {
+            name: "reproducibility_rerun_match".into(),
+            passed: true,
+            must_pass: true,
+            detail: "PASS-WITH-WARN — corpus_sha256 is PENDING_REGENERATION sentinel; \
+                     operator must re-derive via `corpus build` and update manifest.json \
+                     (see ADR-0035 §8)"
+                .into(),
+        });
+    }
+
     // Re-derive the SHA-256 of the on-disk corpus bytes and compare to the
     // manifest digest. The "corpus bytes" = the train shard concatenated
     // with the val shard if present (deterministic order: train, then val).

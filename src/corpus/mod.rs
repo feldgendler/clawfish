@@ -12,11 +12,14 @@
 //! `docs/plans/m6.g.md`, `docs/research/m6-corpus-construction.md`,
 //! and ADR-0035.
 
+pub mod consumer;
 pub mod dedup;
+pub mod dispatcher;
 pub mod filter;
 pub mod manifest;
 pub mod objective;
 pub mod openings;
+pub mod pending;
 pub mod pgn;
 pub mod prng;
 pub mod quality_gate;

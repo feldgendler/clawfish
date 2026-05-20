@@ -333,6 +333,7 @@ meta-tunable axis of the corpus-mixture search)."
         );
     }
 
+    let split_seed = args.parse_u64("split-seed", 7)?;
     let cfg = SelfPlayConfig {
         seed,
         games,
@@ -344,6 +345,8 @@ meta-tunable axis of the corpus-mixture search)."
         val_fraction,
         book: book.clone(),
         book_fraction,
+        poll_interval_ms: None,
+        split_seed,
     };
     let stop = Arc::new(AtomicBool::new(false));
     install_signal_handler(Arc::clone(&stop));
@@ -362,8 +365,8 @@ meta-tunable axis of the corpus-mixture search)."
 
     let stats = selfplay_run(&cfg, &stop).map_err(|e| format!("selfplay::run: {e}"))?;
     eprintln!(
-        "corpus: campaign done — games_completed={} dropped_inflight={} positions_emitted={}",
-        stats.games_completed, stats.games_dropped_inflight, stats.positions_emitted
+        "corpus: campaign done — games_committed={} dropped_inflight={} positions_committed={}",
+        stats.games_committed, stats.games_dropped_inflight, stats.positions_committed
     );
 
     // Record the ACTUAL durable game count at exit (resume-safe across
@@ -374,7 +377,7 @@ meta-tunable axis of the corpus-mixture search)."
     // byte-reproduces the durable shard.
     let games_durable = scan_valid_blocks(&out.join("shard.bin"))
         .map(|(blocks, _)| blocks.len() as u64)
-        .unwrap_or(stats.games_completed);
+        .unwrap_or(stats.games_committed);
 
     // Pin every self-play knob into the manifest so a subsequent `build` +
     // `quality-gate` records them in the frozen artifact (the R-TC

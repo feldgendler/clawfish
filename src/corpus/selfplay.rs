@@ -1,31 +1,32 @@
 //! In-process deterministic fixed-depth self-play corpus generator
 //! (R1–R7, R-TC).
 //!
-//! Two-pass: this emits EVERY post-opening-skip position with the game
-//! label + `depth_rung`, transactionally per game (does NOT apply the quiet
-//! predicate — `build` does, so this slice has no `quiet` dependency).
+//! Per-game-file architecture: each worker writes its completed game to
+//! `pending/game-{game_id:020}.bin`; a single consumer thread polls for the
+//! next-expected game_id in strict order, applies dedup → cap → split inline,
+//! and appends to `shard.bin` / `val.bin`. This makes the shard bytes a
+//! deterministic function of `(seed, split_seed, game_id)`, independent of
+//! worker count K (the primary acceptance property).
+//!
 //! Determinism precondition: `SearchLimits{ depth: Some(d), nodes: None,
 //! movetime: None, infinite: false }` with `TimeCaps{soft:MAX,hard:MAX}` ⇒
 //! `should_abort` only via `ctx.stop`; a `stop`-aborted in-flight game is
 //! DROPPED (R2). Fixed-depth ⇒ load/suspend/renice-independent ⇒ R3/R4
 //! without `VirtualClock`.
-//!
-//! Implemented by the M6.G `selfplay+store` (Opus) coder slice per
-//! `docs/plans/m6.g.md` §3.5.
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use super::consumer::{ConsumerStats, consumer_loop, resume};
+use super::dispatcher::{ClaimGuard, Dispatcher};
 use super::objective::strata_for;
 use super::openings::Book;
+use super::pending::write_pending;
 use super::prng::{Prng, substream_seed};
 use super::quiet::{is_quiet, static_eval_white};
-use super::store::{
-    Checkpoint, append_block, read_checkpoint, scan_valid_blocks, write_checkpoint,
-};
+use super::store::encode_block;
 use super::{
     CorpusError, CorpusRecord, HIGH_SCORE_CP, Label, OPENING_SKIP_PLIES, STRATUM_BOOK_OPENING,
 };
@@ -66,17 +67,43 @@ pub struct SelfPlayConfig {
     /// opening. Range `[0.0, 1.0]`; ignored when `book` is `None`. The
     /// M6.H **meta-tunable** axis (ADR-0035 §9 / plan §3.8).
     pub book_fraction: f64,
+    /// Consumer poll interval override (ms). `None` ⇒ use the default
+    /// `POLL_INTERVAL_MS` constant. Overridable per `cfg` so tests can
+    /// drive a fast poll without sleeping 10 ms per iteration. Has no
+    /// effect on byte-identity — only on commit latency (§2.6 /
+    /// Substantive #7).
+    pub poll_interval_ms: Option<u64>,
+    /// Seed for the per-game train/val split coin flip and the per-game
+    /// reservoir-cap sampling. Deterministic given `(split_seed, game_id)`;
+    /// K-independent (the split depends only on the seed, not on worker
+    /// scheduling). Pinned in the manifest for reproducibility.
+    pub split_seed: u64,
 }
 
 /// Self-play campaign outcome counters.
+///
+/// Field provenance (§4.4):
+/// - `games_emitted` / `games_dropped_inflight`: worker-side counters.
+/// - `games_committed` / `games_empty_post_dedup` / `positions_committed`:
+///   consumer-side counters (per-game-file architecture). In the legacy
+///   channel architecture these are derived from the writer thread.
 #[derive(Clone, Debug, Default)]
 pub struct SelfPlayStats {
-    /// Games that reached a natural terminal result and were committed.
-    pub games_completed: u64,
-    /// Games abandoned in-flight (interrupt) — contributed ZERO labels.
+    /// Worker: completed-game pending files written (or in the legacy arch,
+    /// games sent to the writer thread).
+    pub games_emitted: u64,
+    /// Worker: games abandoned in-flight (stop-abort) — contributed ZERO records.
     pub games_dropped_inflight: u64,
-    /// Total positions emitted (pre-filter; `build` does quiet/cap/dedup).
-    pub positions_emitted: u64,
+    /// Consumer: pending files processed (games committed, incl. empty ones).
+    /// In the legacy arch: games written to shard.bin by the writer thread.
+    pub games_committed: u64,
+    /// Consumer: games that committed zero records (all FENs were
+    /// dedup-duplicates or post-dedup-cap count was zero).
+    pub games_empty_post_dedup: u64,
+    /// Consumer: records appended to the shards after dedup + cap.
+    /// Renamed from `positions_emitted` (which counted pre-dedup-cap records
+    /// in the legacy architecture; the new name matches the consumer's role).
+    pub positions_committed: u64,
 }
 
 /// One completed game's transactional payload: the game id + every
@@ -401,7 +428,12 @@ pub fn calibrate_ladder(buckets_ms: &[u64]) -> Vec<(u8, u32)> {
 }
 
 // ---------------------------------------------------------------------------
-// Campaign driver (R7: workers → bounded channel → single writer thread).
+// Campaign driver — per-game-file architecture.
+//
+// Workers write completed games to `pending/game-{id:020}.bin`; a single
+// consumer thread commits them in strict game_id order with inline
+// dedup → cap → split. This makes shard bytes a deterministic function of
+// (seed, split_seed, game_id), independent of worker count K.
 // ---------------------------------------------------------------------------
 
 /// Per-game depth rung, sampled deterministically from the seeded stream by
@@ -421,176 +453,250 @@ fn sample_rung(ladder: &[(u8, u32)], rng: &mut Prng) -> u8 {
     unreachable!("cumulative draw < total always selects a rung")
 }
 
-/// One unit of writer work: a completed game to durably append.
-enum WriterMsg {
-    Game(GameRecord),
+/// RAII guard that decrements `alive_workers` on drop (covers panics and clean
+/// exits). Declared BEFORE `ClaimGuard` in the worker scope so it drops AFTER
+/// `ClaimGuard` (Rust drops in reverse declaration order — §11a.3).
+pub struct AliveGuard {
+    alive_workers: Arc<AtomicUsize>,
+}
+
+impl AliveGuard {
+    /// Create an `AliveGuard` that decrements `alive_workers` when dropped.
+    pub fn new(alive_workers: Arc<AtomicUsize>) -> Self {
+        Self { alive_workers }
+    }
+}
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.alive_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Per-worker outcome counters.
+#[derive(Default)]
+pub struct WorkerStats {
+    /// Pending files successfully written (one per completed game).
+    pub games_emitted: u64,
+    /// Games abandoned in-flight due to stop signal (zero records emitted).
+    pub games_dropped_inflight: u64,
+    /// First fatal I/O error from this worker, if any; `None` on clean exit.
+    pub fatal_io_error: Option<String>,
+}
+
+/// Single worker loop body.
+///
+/// Drop order (§11a.3): `_alive_guard` is declared first in the signature so
+/// it drops AFTER the local `claim_guard` (last-declared drops first). This
+/// ensures any released claim reaches `gap_queue` before `alive_workers`
+/// decrements, preventing a spurious consumer-wedge race.
+fn worker_loop(
+    _worker_id: usize,
+    dispatcher: &Dispatcher,
+    cfg: &SelfPlayConfig,
+    stop: &AtomicBool,
+    pending_dir: &std::path::Path,
+    _alive_guard: AliveGuard, // drops AFTER claim_guard (declared first)
+    _alive_workers: &AtomicUsize,
+) -> WorkerStats {
+    let ladder = if cfg.depth_ladder.is_empty() {
+        &[(4u8, 1u32)] as &[(u8, u32)]
+    } else {
+        &cfg.depth_ladder
+    };
+    let book_ref: Option<&Book> = cfg.book.as_deref();
+    // Per-worker stop Arc so we can pass &Arc<AtomicBool> to play_one_game.
+    let stop_arc = Arc::new(AtomicBool::new(false));
+    let mut stats = WorkerStats::default();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // claim_guard declared AFTER _alive_guard → drops FIRST (§11a.3).
+        let claim_guard: ClaimGuard<'_> = match dispatcher.claim_next() {
+            Some(g) => g,
+            None => break,
+        };
+        let game_id = claim_guard.game_id();
+
+        // Mirror the campaign stop.
+        stop_arc.store(stop.load(Ordering::Relaxed), Ordering::Relaxed);
+
+        let mut rng = Prng::new(substream_seed(cfg.seed, game_id));
+        let depth = sample_rung(ladder, &mut rng);
+        // Fresh searcher per game (R3: resumed game must not depend on TT
+        // state from prior games on this worker).
+        let mut searcher = AlphaBetaMover::new();
+        let mut qsearcher = QSearcher::new();
+
+        match play_one_game(
+            &mut searcher,
+            &mut qsearcher,
+            book_ref,
+            cfg.book_fraction,
+            game_id,
+            depth,
+            cfg.opening_random_plies,
+            cfg.max_plies,
+            &mut rng,
+            &stop_arc,
+        ) {
+            None => {
+                // Stop-aborted in-flight game: R2 — zero records.
+                // Drop claim_guard → release_unclaimed via Drop.
+                drop(claim_guard);
+                stats.games_dropped_inflight += 1;
+            }
+            Some(gr) => {
+                let block = encode_block(game_id, &gr.records);
+                match write_pending(pending_dir, game_id, &block) {
+                    Ok(()) => {
+                        claim_guard.notify_completed();
+                        stats.games_emitted += 1;
+                    }
+                    Err(e) => {
+                        // Fatal I/O: release claim via Drop, exit the worker.
+                        drop(claim_guard);
+                        stats.fatal_io_error = Some(e.to_string());
+                        return stats;
+                    }
+                }
+            }
+        }
+    }
+
+    stats
 }
 
 /// Run the self-play campaign. Crash-safe (R1/R2), resumable (R3),
-/// all-cores renice-friendly (R7). `stop` set by SIGTERM/SIGINT (graceful
-/// drop+flush).
-///
-/// Workers and the single writer all live inside one `std::thread::scope`,
-/// so `stop` and the output paths are borrowed directly — no `'static` /
-/// `Arc` / unsafe-`Send` plumbing. `run` blocks on the scope until every
-/// thread joins, so the borrows strictly outlive the threads.
+/// K-independent byte-identical output (the per-game-file property).
+/// `stop` set by SIGTERM/SIGINT (graceful drop-in-flight + checkpoint flush).
 pub fn run(cfg: &SelfPlayConfig, stop: &AtomicBool) -> Result<SelfPlayStats, CorpusError> {
     std::fs::create_dir_all(&cfg.out_dir)?;
-    let shard_path = cfg.out_dir.join("shard.bin");
-    let ckpt_path = cfg.out_dir.join("checkpoint.bin");
+    let pending_dir = cfg.out_dir.join("pending");
+    std::fs::create_dir_all(&pending_dir)?;
 
-    // Resume: durable games are the source of truth. Truncate any torn tail
-    // wholesale, then skip already-present game_ids (idempotent — never
-    // partial, never double).
-    let (existing, valid_len) = scan_valid_blocks(&shard_path)?;
-    if shard_path.exists() {
-        super::store::truncate_to_valid(&shard_path, valid_len)?;
-    }
-    let present: std::collections::HashSet<u64> = existing.iter().map(|b| b.game_id).collect();
-    let resumed = read_checkpoint(&ckpt_path)?;
-    let resumed_completed = resumed.as_ref().map(|c| c.games_completed).unwrap_or(0);
+    // Resume: reconstruct ConsumerState from shards + checkpoint + pending.
+    let mut consumer_state = resume(&cfg.out_dir, &pending_dir)?;
 
-    let workers = cfg.workers.max(1);
-    let ladder = if cfg.depth_ladder.is_empty() {
-        vec![(4u8, 1u32)]
-    } else {
-        cfg.depth_ladder.clone()
+    // Compute dispatcher seed from the resume state.
+    // gap_list = [next_consume_id..upper) \ (committed_ids ∪ pending_ids).
+    // The checkpoint is authoritative: anything < next_consume_id is already
+    // "consumed" (either committed-with-records and present in committed_ids,
+    // or committed-as-empty-post-dedup and tracked only by the checkpoint
+    // cursor). Re-dispatching ids < next_consume_id would have workers
+    // re-create ghost pending files that the consumer (starting at
+    // next_consume_id) never processes — the file would persist in pending/
+    // forever (violates ghost-pending-self-heal contract per plan §2.7).
+    let pending_scan = super::pending::scan_pending(&pending_dir)?;
+    let pending_ids = &pending_scan.ids;
+    let committed_ids = &consumer_state.committed_ids_at_resume;
+    let next = consumer_state.next_consume_id;
+    let upper = {
+        let max_committed = committed_ids.iter().copied().max().unwrap_or(0);
+        let max_pending = pending_ids.iter().copied().max().unwrap_or(0);
+        max_committed.max(max_pending).max(next.saturating_sub(1)) + 1
     };
+    let next_dispatch_id = upper;
+    let accounted: std::collections::HashSet<u64> = committed_ids
+        .iter()
+        .chain(pending_ids.iter())
+        .copied()
+        .collect();
+    let gap_list: Vec<u64> = (next..upper).filter(|id| !accounted.contains(id)).collect();
 
-    // Bounded channel: workers → single writer thread. Bound = 2× workers
-    // so a slow fsync back-pressures dispatch without unbounded RAM (R6),
-    // and there is exactly one writer (no priority inversion / spinlock).
-    let (tx, rx): (SyncSender<WriterMsg>, Receiver<WriterMsg>) =
-        std::sync::mpsc::sync_channel(workers * 2);
+    let dispatcher = Dispatcher::new(gap_list, next_dispatch_id, cfg.games);
 
-    let games = cfg.games;
-    let base_seed = cfg.seed;
-    let opening = cfg.opening_random_plies;
-    let max_plies = cfg.max_plies;
-    let book_ref: Option<&Book> = cfg.book.as_deref();
-    let book_fraction = cfg.book_fraction;
-    let shard_path_ref = &shard_path;
-    let ckpt_path_ref = &ckpt_path;
-    let present_ref = &present;
-    let ladder_ref = &ladder;
+    let n_workers = cfg.workers.max(1);
+    let alive_workers = Arc::new(AtomicUsize::new(n_workers));
 
-    let mut emitted = 0u64;
-    let mut dropped = 0u64;
+    // All threads borrow from the enclosing scope via plain references
+    // (thread::scope guarantees the scope outlives all spawned threads).
+    let alive_workers_ref = &alive_workers;
+    let dispatcher_ref = &dispatcher;
+    let pending_dir_ref = &pending_dir;
+    let consumer_state_ref = &mut consumer_state;
 
-    // Workers + writer share one scope so `stop` / paths are plain borrows.
-    type ThreadPanic = Box<dyn std::any::Any + Send + 'static>;
-    let writer_outcome: Result<Result<u64, CorpusError>, ThreadPanic> =
-        std::thread::scope(|scope| -> Result<Result<u64, CorpusError>, ThreadPanic> {
-            // Writer: appends each completed game as ONE block + fsync (the
-            // atomic unit), THEN writes the checkpoint (the §3.5 ordering:
-            // game-block fsync precedes the checkpoint fsync+rename).
-            let writer = scope.spawn(move || -> Result<u64, CorpusError> {
-                let mut games_written = resumed_completed;
-                while let Ok(WriterMsg::Game(g)) = rx.recv() {
-                    append_block(shard_path_ref, g.game_id, &g.records)?;
-                    games_written += 1;
-                    write_checkpoint(
-                        ckpt_path_ref,
-                        &Checkpoint {
-                            games_completed: games_written,
-                            prng_state: g.game_id,
-                            ladder_cursor: games_written,
-                            per_worker_next_game_id: Vec::new(),
-                        },
-                    )?;
-                }
-                Ok(games_written)
+    let (worker_stats_all, consumer_stats): (Vec<WorkerStats>, Result<ConsumerStats, CorpusError>) =
+        std::thread::scope(|scope| {
+            // Spawn consumer first (ready before workers start producing).
+            let consumer_handle = scope.spawn(|| {
+                consumer_loop(
+                    cfg,
+                    consumer_state_ref,
+                    dispatcher_ref,
+                    Arc::clone(alive_workers_ref),
+                    stop,
+                    &cfg.out_dir,
+                )
             });
 
-            // Worker pool. Game i → worker i % workers; per-game seed =
-            // substream_seed(cfg.seed, i) so the union is
-            // scheduler-independent deterministic regardless of worker count.
-            let mut handles = Vec::with_capacity(workers);
-            for w in 0..workers {
-                let tx = tx.clone();
-                let h = scope.spawn(move || -> (u64, u64) {
-                    let stop_arc = Arc::new(AtomicBool::new(false));
-                    let mut local_emitted = 0u64;
-                    let mut local_dropped = 0u64;
-                    let mut i = w as u64;
-                    while i < games {
-                        if stop.load(Ordering::Relaxed) {
-                            break; // R7: stop dispatch.
-                        }
-                        if present_ref.contains(&i) {
-                            i += workers as u64;
-                            continue; // idempotent resume skip.
-                        }
-                        let mut rng = Prng::new(substream_seed(base_seed, i));
-                        let depth = sample_rung(ladder_ref, &mut rng);
-                        // Mirror the campaign stop into the per-search stop
-                        // so an interrupt aborts the in-flight search.
-                        stop_arc.store(stop.load(Ordering::Relaxed), Ordering::Relaxed);
-                        // Fresh searcher per game (R3 bit-identical-resume:
-                        // post-crash games must not depend on the TT state
-                        // accumulated by prior games on the warm worker; a
-                        // cold-start resume would otherwise diverge). Same
-                        // R3-analog discipline applies to the QSearcher —
-                        // qsearch consults the TT (M5.F qsearch-in-TT), so
-                        // a TT-warmed QSearcher would couple game N's
-                        // quiet check to game N-1. Allocate both fresh.
-                        // Also improves self-play decorrelation (research §2.4/§5).
-                        let mut searcher = AlphaBetaMover::new();
-                        let mut qsearcher = QSearcher::new();
-                        match play_one_game(
-                            &mut searcher,
-                            &mut qsearcher,
-                            book_ref,
-                            book_fraction,
-                            i,
-                            depth,
-                            opening,
-                            max_plies,
-                            &mut rng,
-                            &stop_arc,
-                        ) {
-                            Some(g) => {
-                                local_emitted += g.records.len() as u64;
-                                if tx.send(WriterMsg::Game(g)).is_err() {
-                                    break; // writer gone — stop.
-                                }
-                            }
-                            None => local_dropped += 1, // R2: zero records.
-                        }
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        i += workers as u64;
-                    }
-                    (local_emitted, local_dropped)
+            // Spawn N workers.
+            let mut worker_handles = Vec::with_capacity(n_workers);
+            for w in 0..n_workers {
+                let alive_guard = AliveGuard::new(Arc::clone(alive_workers_ref));
+                let h = scope.spawn(move || {
+                    worker_loop(
+                        w,
+                        dispatcher_ref,
+                        cfg,
+                        stop,
+                        pending_dir_ref,
+                        alive_guard,
+                        alive_workers_ref,
+                    )
                 });
-                handles.push(h);
+                worker_handles.push(h);
             }
-            // Drop the dispatcher's channel handle so the writer's `recv`
-            // terminates once all worker clones are dropped.
-            drop(tx);
-            for h in handles {
-                let (e, d) = h.join()?;
-                emitted += e;
-                dropped += d;
-            }
-            writer.join()
+
+            // Join workers first.
+            let worker_results: Vec<WorkerStats> = worker_handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| WorkerStats {
+                        fatal_io_error: Some("worker thread panicked".into()),
+                        ..WorkerStats::default()
+                    })
+                })
+                .collect();
+
+            // Join consumer.
+            let cs = consumer_handle.join().unwrap_or_else(|_| {
+                Err(CorpusError::Checkpoint("consumer thread panicked".into()))
+            });
+
+            (worker_results, cs)
         });
 
-    let games_written = match writer_outcome {
-        Ok(r) => r?,
-        Err(_) => return Err(CorpusError::Checkpoint("self-play thread panicked".into())),
-    };
+    // Propagate the first fatal worker I/O error.
+    for ws in &worker_stats_all {
+        if let Some(ref e) = ws.fatal_io_error {
+            return Err(CorpusError::Checkpoint(format!("worker fatal error: {e}")));
+        }
+    }
+
+    let consumer_stats = consumer_stats?;
+
+    let games_emitted: u64 = worker_stats_all.iter().map(|w| w.games_emitted).sum();
+    let games_dropped: u64 = worker_stats_all
+        .iter()
+        .map(|w| w.games_dropped_inflight)
+        .sum();
 
     Ok(SelfPlayStats {
-        games_completed: games_written,
-        games_dropped_inflight: dropped,
-        positions_emitted: emitted,
+        games_emitted,
+        games_dropped_inflight: games_dropped,
+        games_committed: consumer_stats.games_committed,
+        games_empty_post_dedup: consumer_stats.games_empty_post_dedup,
+        positions_committed: consumer_stats.positions_committed,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::store::scan_valid_blocks;
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
@@ -630,6 +736,8 @@ mod tests {
             val_fraction: 0.2,
             book: None,
             book_fraction: 0.0,
+            poll_interval_ms: None,
+            split_seed: 7,
         }
     }
 
@@ -1009,7 +1117,7 @@ mod tests {
         let td = TempDir::new("interrupt-campaign");
         let stop = AtomicBool::new(true);
         let stats = run(&cfg(td.0.clone(), 8, 2), &stop).unwrap();
-        assert_eq!(stats.positions_emitted, 0);
+        assert_eq!(stats.positions_committed, 0);
         let (blocks, _) = scan_valid_blocks(&td.0.join("shard.bin")).unwrap();
         assert!(
             blocks.is_empty(),

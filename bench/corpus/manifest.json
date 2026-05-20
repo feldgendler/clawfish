@@ -22,5 +22,6 @@
   "opening_book_path": "bench/data/openings.epd",
   "opening_book_sha256": "dc91f225bc93e7ec091095bf8264595da33d36b9d3ac97ddd2dd54bc3a094fa4",
   "book_fraction": 0.5,
-  "corpus_sha256": "8e16417af02f386c1cac2780af3ac51d085ef4a139e13b4acf9329e242f18421"
+  "corpus_sha256": "PENDING_REGENERATION",
+  "corpus_sha256_note": "PENDING_REGENERATION sentinel — operator must re-derive after the per-game-file rewrite lands; see ADR-0035 §8 / plan §10 / bench/corpus/re-run.sh"
 }

@@ -66,6 +66,8 @@ fn run_step(name: &str, mut cmd: Command) {
     }
 }
 
+// will be updated to K=10 in M6.G per-game-file rewrite; see
+// docs/plans/m6.g-per-game-files.md §8.2.
 #[test]
 fn rerun_byte_identical() {
     // Build a corpus from scratch in a temp dir using a fixed seed +
@@ -93,6 +95,7 @@ fn rerun_byte_identical() {
             .args(["--max-plies", max_plies])
             .args(["--opening-random-plies", opening_random_plies])
             .args(["--val-fraction", val_fraction])
+            .args(["--split-seed", split_seed])
             .args(["--out", &out.display().to_string()]);
         run_step("selfplay", sp);
         // build
@@ -134,4 +137,74 @@ fn rerun_byte_identical() {
     // Manual cleanup (we leaked the TempDir guards).
     let _ = std::fs::remove_dir_all(&a);
     let _ = std::fs::remove_dir_all(&b);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Per-game-file architecture: K-invariance test (NEW, §8.2).
+// #[ignore]d until the implementation phase lands.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// K-invariance: K ∈ {1, 4, 10} all produce byte-identical shard.bin and
+/// val.bin for the same seed + split_seed.
+///
+/// This is the strong form of the `k_independent_byte_identical` test in
+/// `tests/corpus_per_game_file.rs`, driven by the `selfplay` command alone
+/// (no `build` pass needed — the per-game-file consumer applies the full
+/// inline pipeline). The primary acceptance gate for the architecture.
+#[test]
+fn rerun_byte_identical_across_k() {
+    let seed = "12648430"; // 0xC0FFEE
+    let games = "6";
+    let max_plies = "40";
+    let split_seed = "7";
+    let val_fraction = "0.25";
+
+    let run_for_k = |k: usize| -> PathBuf {
+        let td = TempDir::new(&format!("k{k}"));
+        let out = td.0.clone();
+        let mut sp = Command::new(corpus_bin());
+        sp.arg("selfplay")
+            .args(["--seed", seed])
+            .args(["--games", games])
+            .args(["--workers", &k.to_string()])
+            .args(["--max-plies", max_plies])
+            .args(["--val-fraction", val_fraction])
+            .args(["--split-seed", split_seed])
+            .args(["--out", &out.display().to_string()]);
+        let out_result = sp
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap_or_else(|e| panic!("selfplay k={k} spawn failed: {e}"));
+        if !out_result.status.success() {
+            let stderr = String::from_utf8_lossy(&out_result.stderr);
+            panic!("selfplay k={k} failed:\nstderr: {stderr}");
+        }
+        std::mem::forget(td);
+        out
+    };
+
+    let ks: &[usize] = &[1, 4, 10];
+    let dirs: Vec<PathBuf> = ks.iter().map(|&k| run_for_k(k)).collect();
+
+    let ref_shard = sha256_file(&dirs[0].join("shard.bin")).expect("k1/shard.bin");
+    let ref_val = sha256_file(&dirs[0].join("val.bin"));
+
+    for (dir, &k) in dirs[1..].iter().zip(ks[1..].iter()) {
+        let shard = sha256_file(&dir.join("shard.bin"))
+            .unwrap_or_else(|| panic!("k={k}/shard.bin missing"));
+        assert_eq!(
+            shard, ref_shard,
+            "K={k}: shard.bin must be byte-identical to K=1 \
+             (per-game-file reorder protocol ⇒ K-independent)"
+        );
+        let val = sha256_file(&dir.join("val.bin"));
+        assert_eq!(val, ref_val, "K={k}: val.bin must be byte-identical to K=1");
+    }
+
+    // Manual cleanup.
+    for dir in &dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
