@@ -261,20 +261,29 @@ fn cmd_selfplay(argv: &[String]) -> Result<ExitCode, String> {
     let args = parse_args(argv);
     if args.has("help") {
         eprintln!(
-            "corpus selfplay --seed <u64> --games <N> --workers <N> --out <dir> \\
+            "corpus selfplay --seed <u64> [--games <N>] --workers <N> --out <dir> \\
                 [--max-plies <N>] [--opening-random-plies <N>] [--val-fraction <f>]
 
 Run a deterministic fixed-depth self-play campaign. Uses the calibrated
 depth ladder from <out>/manifest.json if present, else falls back to
 depth 4. Crash-safe (R1/R2/R3). SIGTERM/SIGINT triggers a graceful
-drop-in-flight + checkpoint flush."
+drop-in-flight + checkpoint flush.
+
+--games is OPTIONAL: omit it for an unbounded campaign (kill with
+Ctrl-C / SIGTERM when satisfied — R2 guarantees zero partial labels).
+With --games <N>, the campaign caps at game N-1 (matching R1's
+idempotent resume — repeated runs with the same seed and a larger
+--games extend the corpus). The manifest records the ACTUAL durable
+game count at exit, so re-run.sh reproduces what you have."
         );
         return Ok(ExitCode::SUCCESS);
     }
     let out = PathBuf::from(args.require("out")?);
     fs::create_dir_all(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
     let seed = args.parse_u64("seed", 0)?;
-    let games = args.parse_u64("games", 100)?;
+    // Default unbounded — campaign runs until SIGINT/SIGTERM. Resume on a
+    // later run skips already-durable game_ids (R1 idempotent resume).
+    let games = args.parse_u64("games", u64::MAX)?;
     let workers = args.parse_usize("workers", num_workers_default())?;
     let max_plies = args.parse_u32("max-plies", 400)?;
     let opening_random_plies = args.parse_u32("opening-random-plies", 8)?;
@@ -304,9 +313,15 @@ drop-in-flight + checkpoint flush."
     let stop = Arc::new(AtomicBool::new(false));
     install_signal_handler(Arc::clone(&stop));
 
+    let games_display = if games == u64::MAX {
+        "unbounded".to_string()
+    } else {
+        games.to_string()
+    };
     eprintln!(
-        "corpus: starting self-play campaign seed={seed} games={games} workers={workers} \
-         depth_ladder={depth_ladder:?} val_fraction={val_fraction} out={}",
+        "corpus: starting self-play campaign seed={seed} games={games_display} \
+         workers={workers} depth_ladder={depth_ladder:?} val_fraction={val_fraction} \
+         out={}",
         out.display()
     );
 
@@ -316,13 +331,23 @@ drop-in-flight + checkpoint flush."
         stats.games_completed, stats.games_dropped_inflight, stats.positions_emitted
     );
 
+    // Record the ACTUAL durable game count at exit (resume-safe across
+    // SIGINT-killed runs and across multi-night accumulation). Scan the
+    // shard once at end; if absent fall back to this run's increment.
+    // `re-run.sh` reads this number from the manifest and passes it to
+    // `corpus selfplay --games <N>` → resume + complete-to-N path that
+    // byte-reproduces the durable shard.
+    let games_durable = scan_valid_blocks(&out.join("shard.bin"))
+        .map(|(blocks, _)| blocks.len() as u64)
+        .unwrap_or(stats.games_completed);
+
     // Pin every self-play knob into the manifest so a subsequent `build` +
     // `quality-gate` records them in the frozen artifact (the R-TC
     // reproducibility contract — `re-run.sh` reads each from manifest.json,
     // no shell-default substitution for a pinned knob).
     if let Ok(mut m) = read_manifest(&out) {
         m.self_play_seed = seed;
-        m.games = games;
+        m.games = games_durable;
         m.max_plies = max_plies;
         m.opening_random_plies = opening_random_plies;
         m.workers = workers as u32;

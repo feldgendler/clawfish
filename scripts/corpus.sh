@@ -1,12 +1,26 @@
 #!/usr/bin/env sh
 # scripts/corpus.sh — OPERATOR FRESH-BUILD wrapper around the `corpus` binary.
 #
-# This script is for **building a new corpus from scratch** with operator-chosen
-# knobs (or env-var overrides). For **byte-identical reproduction of the
-# vendored `bench/corpus/` artifact**, run `bench/corpus/re-run.sh` instead —
-# that script reads every reproducibility knob from `manifest.json` (no
-# shell-default substitution), so the bytes it produces match the committed
-# corpus_sha256.
+# This script is for **building (or extending) a corpus** with operator-chosen
+# knobs (or env-var overrides). The natural overnight workflow:
+#
+#   sh scripts/corpus.sh        # runs unbounded; press Ctrl-C when satisfied
+#   sh scripts/corpus.sh        # next night — RESUMES from the durable shard,
+#                               # generates further games using the same SEED,
+#                               # appends them; corpus grows over time.
+#
+# Resumability is the R1/R2/R3 invariant: the per-game CRC-framed append-block
+# log is append-only with idempotent game_id resume, so a Ctrl-C / SIGTERM /
+# power-loss mid-game contributes ZERO partial labels and a later run picks
+# up exactly where the durable shard left off. Set `GAMES=<N>` to cap the
+# run (R1: extends to game N-1 across runs); omit it (the default) for
+# unbounded self-play — the manifest's `games` field records what's
+# actually in the shard at exit.
+#
+# For **byte-identical reproduction of the vendored `bench/corpus/`
+# artifact**, run `bench/corpus/re-run.sh` instead — that script reads every
+# reproducibility knob from `manifest.json` (no shell-default substitution),
+# so the bytes it produces match the committed corpus_sha256.
 #
 # Stages the canonical M6.G pipeline:
 #   1) cargo build --release --bin corpus   (compile once; reused for steps 2–5)
@@ -27,7 +41,11 @@ OUT_DIR="${OUT_DIR:-bench/corpus}"
 # byte-reproducible only via bench/corpus/re-run.sh (which reads all knobs
 # from manifest.json).
 SEED="${SEED:-12648430}"  # 0xC0FFEE in decimal
-GAMES="${GAMES:-12}"
+# Unbounded by default — kill with Ctrl-C / SIGTERM when satisfied.
+# Set GAMES=<N> to cap the run; R1's idempotent resume across runs means
+# repeated invocations with the same SEED and increasing N (or unbounded)
+# extend the durable shard rather than re-doing already-completed games.
+GAMES="${GAMES:-}"
 WORKERS="${WORKERS:-1}"
 VAL_FRACTION="${VAL_FRACTION:-0.1}"
 SPLIT_SEED="${SPLIT_SEED:-7}"
@@ -50,15 +68,26 @@ mkdir -p "$OUT_DIR"
 echo "corpus.sh: calibrating R-TC depth ladder (buckets=$BUCKETS)"
 "$CORPUS_BIN" calibrate-ladder --buckets "$BUCKETS" --out "$OUT_DIR"
 
-echo "corpus.sh: running deterministic self-play (seed=$SEED games=$GAMES workers=$WORKERS)"
-"$CORPUS_BIN" selfplay \
-    --seed "$SEED" \
-    --games "$GAMES" \
-    --workers "$WORKERS" \
-    --out "$OUT_DIR" \
-    --max-plies "$MAX_PLIES" \
-    --opening-random-plies "$OPENING_RANDOM_PLIES" \
-    --val-fraction "$VAL_FRACTION"
+if [ -n "$GAMES" ]; then
+    echo "corpus.sh: running deterministic self-play (seed=$SEED games=$GAMES workers=$WORKERS)"
+    "$CORPUS_BIN" selfplay \
+        --seed "$SEED" \
+        --games "$GAMES" \
+        --workers "$WORKERS" \
+        --out "$OUT_DIR" \
+        --max-plies "$MAX_PLIES" \
+        --opening-random-plies "$OPENING_RANDOM_PLIES" \
+        --val-fraction "$VAL_FRACTION"
+else
+    echo "corpus.sh: running unbounded deterministic self-play (seed=$SEED workers=$WORKERS) — Ctrl-C to stop"
+    "$CORPUS_BIN" selfplay \
+        --seed "$SEED" \
+        --workers "$WORKERS" \
+        --out "$OUT_DIR" \
+        --max-plies "$MAX_PLIES" \
+        --opening-random-plies "$OPENING_RANDOM_PLIES" \
+        --val-fraction "$VAL_FRACTION"
+fi
 
 # (4) PGN ingestion: operator-driven. Uncomment + adapt to stage raw
 #     CCRL/Lichess PGNs into target/corpus-raw/, then ingest:
