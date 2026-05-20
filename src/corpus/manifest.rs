@@ -221,8 +221,23 @@ pub struct Manifest {
     /// Self-play campaign base seed (R-TC: pairs with the depth ladder so
     /// `corpus selfplay --seed <self_play_seed>` re-derives identical bytes).
     pub self_play_seed: u64,
+    /// Number of games the self-play campaign produced (re-run knob).
+    pub games: u64,
+    /// Max half-moves before adjudicating an over-long self-play game.
+    pub max_plies: u32,
+    /// Seeded-random opening plies from startpos in self-play (R-TC knob).
+    pub opening_random_plies: u32,
+    /// Worker count used at corpus-build time. Pinned so the re-run.sh
+    /// reproduces the identical on-disk byte order (dedup is order-independent,
+    /// but the build pass writes shards in `(game_id, ply)` order so worker
+    /// count is byte-irrelevant — recorded here for full reproducibility audit).
+    pub workers: u32,
     /// Train/val game-level split seed (R3 reproducible split).
     pub split_seed: u64,
+    /// Held-out validation fraction passed to `corpus build` (mirrors
+    /// `validation_fraction`; pinned separately so the re-run script reads
+    /// the exact build-time knob from one place).
+    pub val_fraction: f64,
     /// Calibrated R-TC depth-ladder rungs `(depth, weight)`, written here so
     /// `corpus rerun` reproduces the empirically-anchored sampling.
     pub depth_ladder: Vec<(u8, u32)>,
@@ -305,7 +320,18 @@ fn write_manifest_json(m: &Manifest) -> String {
     }
     out.push_str("  ],\n");
     out.push_str(&format!("  \"self_play_seed\": {},\n", m.self_play_seed));
+    out.push_str(&format!("  \"games\": {},\n", m.games));
+    out.push_str(&format!("  \"max_plies\": {},\n", m.max_plies));
+    out.push_str(&format!(
+        "  \"opening_random_plies\": {},\n",
+        m.opening_random_plies
+    ));
+    out.push_str(&format!("  \"workers\": {},\n", m.workers));
     out.push_str(&format!("  \"split_seed\": {},\n", m.split_seed));
+    out.push_str(&format!(
+        "  \"val_fraction\": {},\n",
+        format_f64(m.val_fraction)
+    ));
     out.push_str("  \"depth_ladder\": [\n");
     for (i, (depth, weight)) in m.depth_ladder.iter().enumerate() {
         out.push_str(&format!("    {{\"depth\": {depth}, \"weight\": {weight}}}"));
@@ -640,6 +666,15 @@ fn parse_manifest_json(src: &str) -> Result<Manifest, CorpusError> {
 
     let self_play_seed = require_u64(find_field(&top, "self_play_seed")?, "self_play_seed")?;
     let split_seed = require_u64(find_field(&top, "split_seed")?, "split_seed")?;
+    // Reproducibility-contract knobs added after the initial schema:
+    // missing fields default to 0/`validation_fraction` so older manifests
+    // continue to round-trip. New manifests written by `cmd_selfplay` /
+    // `cmd_build` populate them with the actual run values.
+    let games = optional_u64(&top, "games").unwrap_or(0);
+    let max_plies = optional_u32(&top, "max_plies").unwrap_or(0);
+    let opening_random_plies = optional_u32(&top, "opening_random_plies").unwrap_or(0);
+    let workers = optional_u32(&top, "workers").unwrap_or(0);
+    let val_fraction = optional_f64(&top, "val_fraction").unwrap_or(validation_fraction);
     let corpus_sha256 =
         require_str(find_field(&top, "corpus_sha256")?, "corpus_sha256")?.to_owned();
 
@@ -675,10 +710,30 @@ fn parse_manifest_json(src: &str) -> Result<Manifest, CorpusError> {
         validation_fraction,
         sources,
         self_play_seed,
+        games,
+        max_plies,
+        opening_random_plies,
+        workers,
         split_seed,
+        val_fraction,
         depth_ladder,
         corpus_sha256,
     })
+}
+
+fn optional_u64(top: &[(String, JsonVal)], key: &str) -> Option<u64> {
+    let v = top.iter().find(|(k, _)| k == key).map(|(_, v)| v)?;
+    require_u64(v, key).ok()
+}
+
+fn optional_u32(top: &[(String, JsonVal)], key: &str) -> Option<u32> {
+    let v = top.iter().find(|(k, _)| k == key).map(|(_, v)| v)?;
+    require_u32(v, key).ok()
+}
+
+fn optional_f64(top: &[(String, JsonVal)], key: &str) -> Option<f64> {
+    let v = top.iter().find(|(k, _)| k == key).map(|(_, v)| v)?;
+    require_f64(v, key).ok()
 }
 
 // ── Public I/O ────────────────────────────────────────────────────────────────
@@ -805,7 +860,12 @@ mod tests {
             // roundtrips: under ~2^53. The pipeline uses small/structured
             // seeds (campaign defaults), not crypto-random u64s.
             self_play_seed: 12_345_678_901_234,
+            games: 24,
+            max_plies: 400,
+            opening_random_plies: 8,
+            workers: 1,
             split_seed: 98_765_432_109_876,
+            val_fraction: 0.1,
             depth_ladder: vec![(4, 1), (6, 1), (8, 1), (10, 1)],
             corpus_sha256: "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
                 .to_owned(),

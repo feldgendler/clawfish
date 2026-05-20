@@ -362,32 +362,55 @@ See ADR-0034, the roadmap M6.F row, `docs/milestones/m6.f.md`, and
 `docs/research/m6-remaining-hce-features.md` (Priority-1 list + the "extend
 then tune" law).
 
-**Tuning corpus infra (M6.G) — reusable labeled-position data infra,
-gated on data-quality checks (NOT SPRT).** A standalone data pipeline +
-vendored corpus artifact with **no `evaluate` / `Position` / search touch**
-(no engine build, no bench, no Elo claim — the M5.E correctness-only-gate
-precedent applied to *data*). Acquires CCRL PGN snapshots + band-filtered
-Lichess open-database PGNs + diversified-opening-book clawfish self-play +
-the (label-verified) Zurichess quiet set; filters clock-loss / time-forfeit
-games + by TC-class, skips opening plies, dedups FENs under per-FEN caps,
-extracts quiet positions (the quiet *definition* is fixed by M6.H's tuner
-qsearch — an M6.G↔M6.H interface contract pinned at M6.G plan time). Runs an
-**ADR-0003 label-provenance audit (game-result labels ONLY** — no
-engine-score-labeled corpora; the audit verifies the Zurichess labels are
-outcomes). Holds out a **deployment-distributed self-play validation set**.
-Emits a frozen snapshot + manifest + RNG seeds + re-run script vendored in
-`bench/`. M6.G delivers the sources + held-out set + the *stratified*
-selection objective (aggregate held-out logistic loss **plus** per-theme STS
-blind-spot strata — the M6.A per-theme STS sub-gate discipline; outposts =
-STS theme #3) + the selection harness; the *actual mixture selection*
-(bi-level: inner Texel / outer coarse simplex / K refit per candidate / SPRT
-confirms the winner only) runs in M6.H, which needs the inner Texel.
-Acquisition/filtering is largely independent of the M6.F eval features and
-can run **in parallel with M6.F**. Consumers: M6.H, the tuning-backlog "PST
-co-tuning" Arm B, future SPSA campaigns, M10 NNUE data-prep.
+## Corpus construction (M6.G; ADR-0035)
 
-See the roadmap M6.G row + the "M6.G scope detail" section. ADR allocated
-at landing per project convention.
+Reusable game-result-labeled quiet-position corpus + the data-quality
+landing gate. Data-infra phase: **no `evaluate` / `Position` / search
+behavior change** — bench byte-identical to `M6.F`. The only engine touch
+is an additive read-only `pub fn search::quiescence_eval_white` +
+`pub struct QSearcher` seam (an opaque per-worker reusable wrapper around
+the crate-private `AlphaBetaMover` so the seam does not leak engine
+internals).
+
+**Module layout.** `src/corpus/` is 12 modules:
+
+| Module | Role |
+|---|---|
+| `mod.rs` | Shared types (`Label`, `Source`, `CorpusRecord`, `CorpusError`) + the **pinned M6.G↔M6.H interface constants** (`QUIET_MARGIN_CP=30`, `OPENING_SKIP_PLIES=8`, `HIGH_SCORE_CP=600`, `PER_GAME_CAP=10`). |
+| `prng.rs` | SplitMix64; golden-pinned to identical literals as `elo_iterate::prng` (deliberate ~20-LOC dup keeps M6.G off the SPRT-critical harness). |
+| `pgn.rs` | Streaming SAN PGN reader; disambiguates against the legal move set (ADR-0007); whole-game-drop on any parse failure. |
+| `filter.rs` | Game/position admission (Termination, TC-class, Elo band, opening-skip, `|eval|` cutoff, in-check). |
+| `quiet.rs` | The pinned quiet predicate `!in_check ∧ |static_eval − qsearch| < QUIET_MARGIN_CP`. |
+| `selfplay.rs` | In-process deterministic fixed-depth self-play. **Fresh `AlphaBetaMover` per game** (R3). |
+| `store.rs` | Per-game CRC-framed append-block log + checkpoint ordering (R1/R2). Frame: `MAGIC \| game_id \| rec_count \| payload_len \| payload \| crc32`. |
+| `dedup.rs` | Bounded-memory external sort-merge FEN dedup; deterministic min-`(source, game_id, ply)` survivor. |
+| `split.rs` | Game-level train/val split; held-out integrity (game-disjoint hard; FEN-leakage ratio ≤ τ). |
+| `objective.rs` | Texel K-fit + logistic loss + stratified objective; **frozen-snapshot outpost stratum** (code-level copy of `eval::tier1::outpost_squares` at M6.F-snapshot time). |
+| `manifest.rs` | Hand-rolled SHA-256 + JSON (no `serde`/`sha2` dep); manifest + filter_spec writers. |
+| `quality_gate.rs` | The six §6 data-quality checks (3 must-PASS — landing gate). |
+
+**Interface contract (the load-bearing invariant; M6.H reads these).**
+
+- **Pinned constants** in `src/corpus/mod.rs`: `QUIET_MARGIN_CP=30`, `OPENING_SKIP_PLIES=8`, `HIGH_SCORE_CP=600`, `PER_GAME_CAP=10`, `FEN_LEAKAGE_TAU=0.05` (echoed into `bench/corpus/filter_spec.txt`).
+- **Score function:** a quiet-certified position is scored by `corpus::quiet::static_eval_white` (= White-POV `evaluate`). M6.H does NOT re-run qsearch at tune time — Predicate B was chosen precisely so `static_eval ≈ qsearch` within margin, resolving research §2.5's open question.
+- **Frozen outpost stratum:** `objective::frozen_outpost_squares` is a code-level snapshot of `eval::tier1::outpost_squares` at M6.F-snapshot time, NEVER a live call (closes the M6.H re-tune circularity). The `frozen_outpost_squares_byte_equals_live_at_m6f_snapshot` test pins backward correctness over `bench::BENCH_POSITIONS` × both colors.
+- **`Source` accept-list:** exactly `{SelfPlay, Ccrl, LichessOpen}` — Zurichess intentionally absent. Three-layer programmatic defense in the ADR-0003 audit: (a) enum omission; (b) `Source::from_u8` returns `None` for `b ≥ 3` and `store::decode_block` rejects unrecognized frames; (c) `check_adr0003_audit` carries an unconditional (release-mode) `assert_eq!(accept_list.len(), 3)`.
+
+**Crash-safety invariants (R1/R2/R3).** The shard is an append-only log of CRC-framed game blocks. A whole game is appended in one `write` + `fsync`; that is the atomic unit. `scan_valid_blocks` walks frames and truncates a torn final block **wholesale** (never line-by-line) at the last fully-valid byte. Ordering: game-block `fsync` THEN checkpoint `.tmp`→`fsync`→rename; resume skips already-present `game_id`s (idempotent). The `tests/corpus_crash_safety.rs::crash_kill_after_first_game_resumes_to_uninterrupted_corpus` integration test sends a real `libc::kill(pid, SIGKILL)`, resumes, and asserts shard-records *multiset byte equality* to an uninterrupted reference (with `--workers 1`, list-equality on disk).
+
+**Determinism precondition (R3/R4).** `Search::go(SearchLimits{ depth: Some(d), nodes: None, movetime: None, infinite: false })` with `TimeCaps{ soft: MAX, hard: MAX }` makes `should_abort` only reachable via `ctx.stop`; a stop-aborted in-flight game is dropped (R2). Each completed game's move sequence is therefore a pure deterministic function of `(start_pos, depth, seed)` — load/suspend/renice-independent. **R4 / VirtualClock deviation owned in ADR-0035 §5**: fixed-depth is load-independent without a clock; ADR-0021 §4's cross-version-SPRT objection does not bite a one-frozen-build corpus generator; R-TC explicitly carves out fixed-shallow-depth corpus generation. Per-game fresh `AlphaBetaMover` (the R3 invariant — pinned by `fresh_vs_warm_searcher_same_seed_same_game_identical`).
+
+**Reproducibility — every campaign knob pinned.** `bench/corpus/manifest.json` carries `self_play_seed`, `games`, `max_plies`, `opening_random_plies`, `workers`, `depth_ladder`, `split_seed`, `val_fraction`, `corpus_sha256`, and per-source provenance entries. `cmd_build` emits `train.bin`/`val.bin` with records sorted by `(game_id, ply, fen)` per game-block ⇒ corpus bytes are a deterministic function of the input multiset, independent of self-play worker scheduling. `bench/corpus/re-run.sh` reads every knob from the manifest (no `${X:-default}` shell substitution). `scripts/corpus.sh` is the operator fresh-build tool; `bench/corpus/re-run.sh` is the byte-identical-reproduction tool — the header of each documents the distinction.
+
+**R-TC empirical anchoring.** The fixed-depth ladder is NOT plan literals. `corpus calibrate-ladder` runs `Search::go` at each canonical deployment movetime bucket {100, 200, 400, 600 ms} over `bench::BENCH_POSITIONS`, records the median completed iterative-deepening depth per bucket, and writes the `(depth, weight)` rungs to `filter_spec.txt`/`manifest.json`. Residual proxy caveat owned: depth is a *proxy* for TC; the rung↔bucket correspondence is the measured median (±1 ply at fast buckets). Re-runs on different hardware produce a different (machine-local) ladder — the vendored manifest's ladder is the dev-machine value, frozen.
+
+**Two-pass discipline.** `selfplay` emits EVERY post-opening-skip position with the game label + `depth_rung`, transactionally per game — it does NOT apply the quiet predicate. The separate `corpus build` pass applies (in order) `static_eval_white` + `QSearcher::eval_white` → quiet predicate → `|eval|` cutoff → `strata_for` tagging → `dedup_fen` (deterministic survivor) → `per_game_cap` (seeded reservoir) → game-level `split_by_game` → emit train.bin + val.bin. This decouples `selfplay`/`store` from `quiet` (the §7 fan-out plan-edge is genuinely absent) and lets `build` apply per-worker-reused `QSearcher` (the R6/R7 invariant: never per-position allocation).
+
+**Frozen artifact disposition.** Per plan §1, the committed `bench/corpus/` artifact is the bytes consumers freeze on. The self-play slice is additionally reproducible from `{seed + clawfish binary}` with no network. CCRL/Lichess slices are reproducible from raw sources *given source availability* — the weaker re-derivable guarantee — raw blobs are NOT git-vendored. The committed artifact at landing is **self-play-dominant** (12 games — sandbox-budget-limited; plan §1 gap-as-coverage-stat acknowledges this); for production-scale M6.H tuning the operator extends via `scripts/corpus.sh` with larger `GAMES` or stages CCRL/Lichess + runs `re-run.sh`.
+
+**Consumers.** M6.H Texel tuning (next phase); the tuning-backlog "PST co-tuning Arm B" entry; future SPSA campaigns; M10 NNUE data-prep.
+
+See ADR-0035, the roadmap M6.G row, `docs/milestones/m6.g.md`, `docs/research/m6-corpus-construction.md`.
 
 ## Search v1 (production: alpha-beta)
 

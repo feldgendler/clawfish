@@ -1,10 +1,10 @@
-train_records=92
-val_records=10
+train_records=20
+val_records=0
 val_fraction=0.1
 split_seed=7
-corpus_sha256=ba3aeec4899a26465cd741f70b4ccc10f16c54c68258097a2687d9685b012acb
+corpus_sha256=c03f5aa99dcf20bcedb69801c1633b8c34e8e85c1880528be4e62a0ef0f50e60
 dropped_opening=0
-dropped_eval_cap=167
-dropped_in_check=79
-dropped_not_quiet=243
+dropped_eval_cap=2
+dropped_in_check=14
+dropped_not_quiet=41
 QUIET_MARGIN_CP=30

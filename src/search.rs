@@ -3293,7 +3293,15 @@ pub fn is_fifty_move_draw(halfmove_clock: u8) -> bool {
 /// `evaluate_cached` `pub(crate)`-type-leak precedent). Construct once per
 /// worker thread and reuse across positions — do **not** allocate per
 /// position (R6/R7: avoids per-position searcher/TT/pawn-hash allocation).
-pub struct QSearcher(AlphaBetaMover);
+pub struct QSearcher {
+    inner: AlphaBetaMover,
+    /// Reused per-call so each `eval_white` invocation does not allocate
+    /// a fresh `Arc<AtomicBool>` (≈6M allocations elided on a 3M-record
+    /// corpus build). The flag stays `false` for the lifetime of this
+    /// `QSearcher` — `eval_white` never sets `stop`, and there is no
+    /// other concurrent owner.
+    stop: Arc<AtomicBool>,
+}
 
 impl Default for QSearcher {
     fn default() -> Self {
@@ -3304,7 +3312,10 @@ impl Default for QSearcher {
 impl QSearcher {
     /// New reusable handle.
     pub fn new() -> Self {
-        QSearcher(AlphaBetaMover::new())
+        QSearcher {
+            inner: AlphaBetaMover::new(),
+            stop: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// White-POV quiescence-search score (centipawns) of `pos`.
@@ -3317,7 +3328,7 @@ impl QSearcher {
             hard: Duration::MAX,
         };
         let ctx = SearchContext {
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: Arc::clone(&self.stop),
             caps,
             virtual_clock: false,
             limits: SearchLimits::default(),
@@ -3326,7 +3337,7 @@ impl QSearcher {
         };
         let clock = SearchClock::start_for(false, caps);
         let mut work = *pos;
-        let stm_score = self.0.qsearch(&mut work, -INF, INF, 0, &ctx, &clock);
+        let stm_score = self.inner.qsearch(&mut work, -INF, INF, 0, &ctx, &clock);
         if pos.side_to_move() == crate::Color::White {
             stm_score
         } else {

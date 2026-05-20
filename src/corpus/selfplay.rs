@@ -558,14 +558,24 @@ mod tests {
         }
     }
 
-    fn shard_multiset(dir: &std::path::Path) -> Vec<(u64, String, u8, u32)> {
+    fn shard_multiset(dir: &std::path::Path) -> Vec<(u64, String, u8, u32, u8, u8)> {
         let (blocks, _) = scan_valid_blocks(&dir.join("shard.bin")).unwrap();
-        let mut v: Vec<(u64, String, u8, u32)> = blocks
+        // Include depth_rung + strata in the comparison tuple so a
+        // worker-count-dependent bug in rung sampling or stratum
+        // computation surfaces as a 1-vs-N divergence (SF4).
+        let mut v: Vec<(u64, String, u8, u32, u8, u8)> = blocks
             .iter()
             .flat_map(|b| {
-                b.records
-                    .iter()
-                    .map(|r| (r.game_id, r.fen.clone(), r.label.as_u8(), r.ply))
+                b.records.iter().map(|r| {
+                    (
+                        r.game_id,
+                        r.fen.clone(),
+                        r.label.as_u8(),
+                        r.ply,
+                        r.depth_rung,
+                        r.strata,
+                    )
+                })
             })
             .collect();
         v.sort();
@@ -590,6 +600,67 @@ mod tests {
         assert!(
             !a.records.is_empty(),
             "the game must emit at least one post-opening-skip position"
+        );
+    }
+
+    #[test]
+    fn fresh_vs_warm_searcher_same_seed_same_game_identical() {
+        // R3 invariant: `selfplay::run` constructs a fresh `AlphaBetaMover`
+        // per game so a resumed game cannot depend on the TT/history/killers
+        // accumulated by prior games on the warm worker (which a cold-start
+        // resume would lack). Pin it: a `play_one_game(seed=N)` on a WARM
+        // searcher (one already used for a prior game) must return the
+        // IDENTICAL records as a `play_one_game(seed=N)` on a COLD one.
+        let game_id: u64 = 5;
+        let depth: u8 = 3;
+        let opening: u32 = 4;
+        let max_plies: u32 = 60;
+
+        // Warm searcher: play a prior game first to populate TT/history.
+        let mut warm = AlphaBetaMover::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut rng_warmup = Prng::new(substream_seed(123, 0));
+        let _ = play_one_game(
+            &mut warm,
+            0,
+            depth,
+            opening,
+            max_plies,
+            &mut rng_warmup,
+            &stop,
+        )
+        .expect("warmup game completes");
+        let mut rng_warm = Prng::new(substream_seed(123, game_id));
+        let g_warm = play_one_game(
+            &mut warm,
+            game_id,
+            depth,
+            opening,
+            max_plies,
+            &mut rng_warm,
+            &stop,
+        )
+        .expect("warm-searcher game completes");
+
+        // Cold searcher: same game_id, fresh `AlphaBetaMover`.
+        let mut cold = AlphaBetaMover::new();
+        let mut rng_cold = Prng::new(substream_seed(123, game_id));
+        let g_cold = play_one_game(
+            &mut cold,
+            game_id,
+            depth,
+            opening,
+            max_plies,
+            &mut rng_cold,
+            &stop,
+        )
+        .expect("cold-searcher game completes");
+
+        assert_eq!(
+            g_warm, g_cold,
+            "game N on a warm `AlphaBetaMover` must equal game N on a fresh one — \
+             a divergence here means TT/history/killers leaked across games, breaking \
+             R3 bit-identical resume (the `selfplay::run` fresh-searcher-per-game fix)"
         );
     }
 
@@ -663,7 +734,10 @@ mod tests {
         // convention; plan §3.5 names `is_repetition`).
         let pos = Position::from_fen("8/8/8/4k3/8/4K3/8/7Q w - - 8 50").unwrap();
         let z = pos.zobrist();
-        // Repetition: same zobrist 4 plies back, within the halfmove clock.
+        // The `1, 2, 3` middle entries are PLACEHOLDER Zobrist values for
+        // the intervening positions — this test exercises `is_repetition`'s
+        // algorithmic counting (same zobrist 4 plies back, within the
+        // halfmove window), not the real-Zobrist-validity of those plies.
         let hist = vec![z, 1, 2, 3, z];
         assert_eq!(game_result(&pos, &hist), Some(Label::Draw));
     }
@@ -762,6 +836,29 @@ mod tests {
         // median_depth is a deterministic order statistic.
         assert_eq!(median_depth(vec![3, 1, 9, 5, 7]), 5);
         assert_eq!(median_depth(vec![8, 2]), 8); // upper-median on even n
+    }
+
+    #[test]
+    fn calibrate_ladder_runs_and_is_structural() {
+        // `calibrate_ladder` is wall-clock-dependent BY DESIGN (the
+        // documented residual caveat in ADR-0035 — it measures completed
+        // iterative-deepening depth at a movetime budget on the host).
+        // Run-to-run jitter ±1 ply at small budgets is expected; that is
+        // why the FROZEN dev-machine ladder ships in `manifest.json` and
+        // the gate verifies AGAINST the frozen ladder, not a re-calibration.
+        //
+        // What we CAN pin here is structural: the function runs without
+        // panicking, returns one rung per bucket, every rung has depth ≥ 1
+        // and weight ≥ 1. The pure `ladder_from_medians` /
+        // `median_depth` split (above) carries the determinism assertion.
+        let buckets = [10u64, 20];
+        let l = calibrate_ladder(&buckets);
+        assert!(!l.is_empty(), "ladder must be non-empty");
+        assert_eq!(l.len(), buckets.len(), "one rung per bucket");
+        for (depth, weight) in &l {
+            assert!(*depth >= 1, "every rung depth must be ≥ 1; got {depth}");
+            assert!(*weight >= 1, "every rung weight must be ≥ 1; got {weight}");
+        }
     }
 
     #[test]

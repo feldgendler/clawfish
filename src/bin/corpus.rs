@@ -238,7 +238,12 @@ Flags:
         validation_fraction: 0.0,
         sources: Vec::new(),
         self_play_seed: 0,
+        games: 0,
+        max_plies: 0,
+        opening_random_plies: 0,
+        workers: 0,
         split_seed: 0,
+        val_fraction: 0.0,
         depth_ladder: ladder,
         corpus_sha256: String::new(),
     };
@@ -311,12 +316,18 @@ drop-in-flight + checkpoint flush."
         stats.games_completed, stats.games_dropped_inflight, stats.positions_emitted
     );
 
-    // Pin the self-play seed into the manifest so a subsequent `build` +
-    // `quality-gate` records it in the frozen artifact (the R-TC
-    // reproducibility contract).
+    // Pin every self-play knob into the manifest so a subsequent `build` +
+    // `quality-gate` records them in the frozen artifact (the R-TC
+    // reproducibility contract — `re-run.sh` reads each from manifest.json,
+    // no shell-default substitution for a pinned knob).
     if let Ok(mut m) = read_manifest(&out) {
         m.self_play_seed = seed;
-        write_manifest(&out, &m).map_err(|e| format!("update self_play_seed: {e}"))?;
+        m.games = games;
+        m.max_plies = max_plies;
+        m.opening_random_plies = opening_random_plies;
+        m.workers = workers as u32;
+        m.val_fraction = val_fraction;
+        write_manifest(&out, &m).map_err(|e| format!("update selfplay knobs: {e}"))?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -325,6 +336,23 @@ fn num_workers_default() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
+}
+
+/// Largest `game_id` present across every shard in `dir` that an
+/// `ingest-pgn` invocation could collide with. Scans both `shard.bin`
+/// (self-play) and `pgn-shard.bin` (prior `ingest-pgn` runs) — missing
+/// files contribute 0, never an error (`scan_valid_blocks` returns
+/// `Ok((vec![], 0))` for a non-existent path).
+fn max_existing_game_id(dir: &Path) -> u64 {
+    let mut hi: u64 = 0;
+    for name in ["shard.bin", "pgn-shard.bin"] {
+        if let Ok((blocks, _)) = scan_valid_blocks(&dir.join(name))
+            && let Some(m) = blocks.iter().map(|b| b.game_id).max()
+        {
+            hi = hi.max(m);
+        }
+    }
+    hi
 }
 
 // ─── ingest-pgn ────────────────────────────────────────────────────────────
@@ -361,12 +389,11 @@ provenance recorded on every emitted record."
     let r = BufReader::new(f);
     let shard = out.join("pgn-shard.bin");
 
-    // Reserve a game-id range for this PGN: start above any existing
-    // self-play game-ids in <out>/shard.bin to keep audit traces clean.
-    let base_id = match scan_valid_blocks(&out.join("shard.bin")) {
-        Ok((blocks, _)) => blocks.iter().map(|b| b.game_id).max().unwrap_or(0) + 1,
-        Err(_) => 0,
-    };
+    // Reserve a game-id range for this PGN: start strictly above any
+    // existing game-id in BOTH the self-play shard AND any prior
+    // ingest-pgn shard. A second `ingest-pgn` invocation would otherwise
+    // collide with the first one's ids (which sat in `pgn-shard.bin`).
+    let base_id = max_existing_game_id(&out) + 1;
 
     let mut stats = PgnStats::default();
     let shard_ref = shard.clone();
@@ -544,7 +571,10 @@ corpus to <out>/train.bin + <out>/val.bin + manifest.json + filter_spec.txt
     bytes.extend_from_slice(&val_bytes);
     let corpus_digest = hex_digest(&sha256_bytes(&bytes));
 
-    // 6) Re-emit manifest.json with the post-build totals + digest.
+    // 6) Re-emit manifest.json with the post-build totals + digest. Every
+    //    reproducibility knob from `corpus selfplay` (recorded into the
+    //    manifest there) is carried through verbatim so `re-run.sh` reads
+    //    them all from one place.
     let manifest = Manifest {
         schema_version: 1,
         created_at: timestamp(),
@@ -559,7 +589,15 @@ corpus to <out>/train.bin + <out>/val.bin + manifest.json + filter_spec.txt
             .as_ref()
             .map(|m| m.self_play_seed)
             .unwrap_or(0),
+        games: existing_manifest.as_ref().map(|m| m.games).unwrap_or(0),
+        max_plies: existing_manifest.as_ref().map(|m| m.max_plies).unwrap_or(0),
+        opening_random_plies: existing_manifest
+            .as_ref()
+            .map(|m| m.opening_random_plies)
+            .unwrap_or(0),
+        workers: existing_manifest.as_ref().map(|m| m.workers).unwrap_or(0),
         split_seed,
+        val_fraction,
         depth_ladder: existing_manifest
             .as_ref()
             .map(|m| m.depth_ladder.clone())
@@ -604,11 +642,16 @@ corpus to <out>/train.bin + <out>/val.bin + manifest.json + filter_spec.txt
 }
 
 fn emit_records_per_game(path: &Path, records: &[CorpusRecord]) -> Result<(), String> {
+    // Group by game_id (BTreeMap iteration is sorted ⇒ deterministic block
+    // order) and sort each game's records by ply. The on-disk shard is then
+    // a pure function of the input multiset, independent of worker
+    // scheduling — `corpus_sha256` reproduces regardless of `--workers`.
     let mut by_game: BTreeMap<u64, Vec<CorpusRecord>> = BTreeMap::new();
     for r in records {
         by_game.entry(r.game_id).or_default().push(r.clone());
     }
-    for (gid, recs) in &by_game {
+    for (gid, recs) in &mut by_game {
+        recs.sort_by(|a, b| a.ply.cmp(&b.ply).then_with(|| a.fen.cmp(&b.fen)));
         append_block(path, *gid, recs).map_err(|e| format!("append_block {gid}: {e}"))?;
     }
     Ok(())
@@ -628,6 +671,12 @@ fn write_rerun_script(dir: &Path) -> Result<(), String> {
 #   4) corpus build      — apply filter→quiet→dedup→cap→split → frozen bytes.
 #   5) corpus quality-gate — must PASS.
 #
+# Every reproducibility knob is READ FROM manifest.json — no shell-default
+# substitution for a knob that is pinned in the manifest. The vendored
+# bytes were produced with these exact knobs; re-running with different
+# knobs (different seed, games, workers, val_fraction, ...) produces a
+# DIFFERENT corpus, not the frozen one.
+#
 # Tooling: requires `zstd` to decompress Lichess `.pgn.zst` and (optionally)
 # `7z` for CCRL. Both are system tools, NOT Rust deps (R5).
 
@@ -636,23 +685,39 @@ set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN="${CORPUS_BIN:-corpus}"
 
-echo "corpus re-run: using binary '$BIN' against $DIR"
+# `manifest_field <name>` extracts a JSON number/string value for a top-level
+# scalar field. Trims whitespace, comma, and quote chars. Good enough for the
+# small set of pinned knobs (no nested-object collisions because every
+# matched key is a top-level scalar — `sources`/`depth_ladder` are arrays
+# which we don't read this way).
+manifest_field() {
+    grep -E "\"$1\"" "$DIR/manifest.json" | head -1 | tr -d ' ,"' | cut -d: -f2
+}
 
-# Re-read seeds + ladder from manifest.json (operator-readable JSON).
-SEED="$(grep -E '\"self_play_seed\"' "$DIR/manifest.json" | head -1 | tr -d ' ,' | cut -d: -f2)"
-SPLITS="$(grep -E '\"split_seed\"' "$DIR/manifest.json" | head -1 | tr -d ' ,' | cut -d: -f2)"
-echo "corpus re-run: seed=$SEED split_seed=$SPLITS"
+SEED="$(manifest_field self_play_seed)"
+GAMES="$(manifest_field games)"
+MAX_PLIES="$(manifest_field max_plies)"
+OPENING_RANDOM_PLIES="$(manifest_field opening_random_plies)"
+WORKERS="$(manifest_field workers)"
+SPLIT_SEED="$(manifest_field split_seed)"
+VAL_FRACTION="$(manifest_field val_fraction)"
+
+echo "corpus re-run: using binary '$BIN' against $DIR"
+echo "corpus re-run: seed=$SEED games=$GAMES workers=$WORKERS \
+max_plies=$MAX_PLIES opening_random_plies=$OPENING_RANDOM_PLIES \
+split_seed=$SPLIT_SEED val_fraction=$VAL_FRACTION"
 
 # (1) external staging: read manifest.sources and re-download each.
 # (Left as an operator step — the manifest pins URLs + SHA-256.)
 
 # (2) self-play (uses the manifest depth_ladder).
-"$BIN" selfplay --seed "$SEED" --games "${GAMES:-200}" --workers "${WORKERS:-4}" \
-    --out "$DIR"
+"$BIN" selfplay --seed "$SEED" --games "$GAMES" --workers "$WORKERS" \
+    --max-plies "$MAX_PLIES" --opening-random-plies "$OPENING_RANDOM_PLIES" \
+    --val-fraction "$VAL_FRACTION" --out "$DIR"
 
 # (3) Each PGN source: corpus ingest-pgn …
 # (4) Build the frozen corpus.
-"$BIN" build --in "$DIR" --split-seed "$SPLITS" --val-fraction "${VAL_FRACTION:-0.1}"
+"$BIN" build --in "$DIR" --split-seed "$SPLIT_SEED" --val-fraction "$VAL_FRACTION"
 
 # (5) Run the data-quality gate (must PASS).
 "$BIN" quality-gate --dir "$DIR"
@@ -851,5 +916,85 @@ to that script so a re-run is always traceable to a committed file."
             "no re-run.sh found next to {}; re-run `corpus build` to regenerate",
             p.display()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clawfish::corpus::store::append_block;
+    use clawfish::corpus::{DEPTH_RUNG_EXTERNAL, Label};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let dir =
+                std::env::temp_dir().join(format!("clawfish-corpus-bin-test-{tag}-{pid}-{n}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            TempDir(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn rec(game_id: u64, ply: u32) -> CorpusRecord {
+        CorpusRecord {
+            fen: "8/8/8/8/8/8/8/k6K w - - 0 1".into(),
+            label: Label::Draw,
+            source: Source::Ccrl,
+            game_id,
+            ply,
+            depth_rung: DEPTH_RUNG_EXTERNAL,
+            strata: 0,
+        }
+    }
+
+    #[test]
+    fn max_existing_game_id_missing_dir_is_zero() {
+        let td = TempDir::new("missing");
+        assert_eq!(max_existing_game_id(td.path()), 0);
+    }
+
+    #[test]
+    fn max_existing_game_id_picks_max_across_both_shards() {
+        // Self-play shard.bin has game_ids up to 42; pgn-shard.bin has
+        // game_ids up to 100. `max_existing_game_id` must return 100, so a
+        // subsequent `ingest-pgn` starts at 101 (no collision with the
+        // prior PGN ingest's range).
+        let td = TempDir::new("both-shards");
+        for gid in [10u64, 25, 42] {
+            append_block(&td.path().join("shard.bin"), gid, &[rec(gid, 0)]).unwrap();
+        }
+        for gid in [50u64, 75, 100] {
+            append_block(&td.path().join("pgn-shard.bin"), gid, &[rec(gid, 0)]).unwrap();
+        }
+        assert_eq!(
+            max_existing_game_id(td.path()),
+            100,
+            "must scan pgn-shard.bin too — a 2nd ingest-pgn collides without this"
+        );
+    }
+
+    #[test]
+    fn cmd_ingest_pgn_base_id_includes_existing_pgn_shard() {
+        // Only pgn-shard.bin exists; max_existing_game_id reports the
+        // max from THERE (this is the case the bug-fix targets — a 2nd
+        // `ingest-pgn` invocation would re-use base_id 0 without this).
+        let td = TempDir::new("pgn-only");
+        for gid in [3u64, 7, 19] {
+            append_block(&td.path().join("pgn-shard.bin"), gid, &[rec(gid, 0)]).unwrap();
+        }
+        assert_eq!(max_existing_game_id(td.path()), 19);
     }
 }

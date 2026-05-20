@@ -485,6 +485,19 @@ mod tests {
 
     #[test]
     fn torn_final_block_discarded_wholesale() {
+        // Coverage map for this test:
+        //
+        //   - Loop body (`cut ∈ [after_g0, total)`): every byte position
+        //     strictly inside game 2's block — game 1 durable, game 2
+        //     torn — must yield exactly game 1 + truncate to the game-1
+        //     fsync boundary.
+        //
+        //   - Post-loop block (`cut == total`, the complete file): both
+        //     game 1 AND game 2 must scan cleanly. The sibling test
+        //     `complete_two_game_shard_yields_both_blocks` covers this
+        //     case explicitly so the two-block happy path has its own
+        //     named assertion.
+        //
         // Two games. Truncate at EVERY byte offset strictly inside game 2's
         // block (i.e. after game 1's durable fsync point, before game 2 is
         // complete) AND at the exact game-1 fsync boundary. Resume must
@@ -527,6 +540,31 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].records, g0);
         assert_eq!(valid_len, after_g0);
+    }
+
+    #[test]
+    fn complete_two_game_shard_yields_both_blocks() {
+        // The `cut == total` post-loop case from `torn_final_block_*`,
+        // extracted into its own named test: a complete two-game shard
+        // (no truncation, no corruption) must scan to BOTH game blocks.
+        let td = TempDir::new("two-game-complete");
+        let shard = td.path("shard.bin");
+        let g0 = game_records(100, 4);
+        let g1 = game_records(200, 6);
+        append_block(&shard, 100, &g0).unwrap();
+        append_block(&shard, 200, &g1).unwrap();
+        let total = std::fs::metadata(&shard).unwrap().len();
+
+        let (blocks, valid_len) = scan_valid_blocks(&shard).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].game_id, 100);
+        assert_eq!(blocks[0].records, g0);
+        assert_eq!(blocks[1].game_id, 200);
+        assert_eq!(blocks[1].records, g1);
+        assert_eq!(
+            valid_len, total,
+            "a complete shard validates every byte; no torn-tail truncation"
+        );
     }
 
     #[test]

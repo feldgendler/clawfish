@@ -3,10 +3,16 @@
 A Rust chess engine, written from scratch and grown incrementally toward
 GM-level standard-chess strength. Classical evaluation first; NNUE planned.
 
-> **Status: M6 in progress (M6.F landed 2026-05-19 — Tier-1 HCE infra:
-> outposts + rook-on-file + endgame draw-scaling, score-neutral inert; all
-> weights deferred to M6.H. Production HEAD = `M6.F`, eval byte-identical to
-> `M6.E` / `M6.D` / `M6.C` / `M6.B`, strength unchanged by construction).** Fail-soft
+> **Status: M6 in progress (M6.G landed 2026-05-20 — corpus construction
+> data-infra: `src/corpus/` library + `corpus` CLI + the vendored frozen
+> `bench/corpus/` artifact; data-quality gate PASS, no SPRT, no Elo claim
+> — the M5.E correctness-only-gate precedent applied to data. Production
+> HEAD remains `M6.F`, eval byte-identical to `M6.E`; bench `1213649`/d4
+> `90591` byte-for-byte unchanged across M6.G — the only engine touch is
+> the additive read-only `search::quiescence_eval_white` / `QSearcher`
+> seam, unreached by the bench corpus path. ADR-0003 label-provenance
+> audit verdict: Zurichess `c9` REJECTED. ADR-0035. Next phase: M6.H
+> Texel tuning).** Fail-soft
 > alpha-beta with quiescence search, iterative deepening, transposition
 > table (Zobrist-keyed, 16 MiB default; qsearch participates per ADR-0028),
 > killer-aware move ordering (TT move + MVV-LVA captures + 2 killer slots

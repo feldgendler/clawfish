@@ -372,56 +372,102 @@ mod tests {
     // ---------------------------------------------------------------------------
     #[test]
     fn score_closure_is_static_eval_white() {
-        // The plan states: M6.H scores a quiet-certified position by
-        // static_eval_white (= evaluate, White-POV) directly — NOT qsearch at
-        // tune time. `evaluate` is side-to-move-relative; static_eval_white
-        // is White-positive: negate when Black is to move.
-        //
-        // This test exercises that the objective functions accept a
-        // static_eval_white-shaped closure and produce finite results.
-        // It does NOT call the `quiet::static_eval_white` stub (which belongs
-        // to the filter+quiet slice); instead it implements the same semantics
-        // inline to avoid a cross-slice todo!() dependency.
-        let pos = Position::starting_position();
-        let rec = CorpusRecord {
-            fen: pos.to_fen(),
-            label: Label::Draw,
-            source: Source::SelfPlay,
-            game_id: 1,
-            ply: 10,
-            depth_rung: DEPTH_RUNG_EXTERNAL,
-            strata: 0,
-        };
-        let recs = vec![rec];
+        // The pinned tuning closure is `quiet::static_eval_white` — NOT a
+        // qsearch call at tune time. The quiet-certificate (Predicate B,
+        // `|static_eval − qsearch| < QUIET_MARGIN_CP`) makes the two scores
+        // close BY CONSTRUCTION on a quiet corpus, so static-eval is the
+        // cheap, correct tuning score. This test exercises both closures
+        // on a diverse fixture and asserts the fit Ks land in the same
+        // ball-park — if they diverge, the quiet predicate isn't doing
+        // its job.
+        use crate::bench::BENCH_POSITIONS;
+        use crate::search::QSearcher;
 
-        // White-POV static eval closure (the M6.H tuning closure).
-        // evaluate() is STM-relative; negate for Black to get White-POV.
-        let static_eval_closure = |r: &CorpusRecord| -> i32 {
-            let p = Position::from_fen(&r.fen).expect("valid FEN in test record");
-            let stm_score = crate::eval::evaluate(&p);
+        // Build a fixture of ~16 positions from the bench corpus. Assign
+        // plausible labels by sign of the white-POV static eval (an
+        // imperfect proxy, but it gives non-degenerate K-fit data).
+        let recs: Vec<CorpusRecord> = BENCH_POSITIONS
+            .iter()
+            .enumerate()
+            .map(|(i, fen)| {
+                let p = Position::from_fen(fen).expect("BENCH_POSITIONS FEN");
+                let stm = crate::eval::evaluate(&p);
+                let white_pov = match p.side_to_move() {
+                    Color::White => stm,
+                    Color::Black => -stm,
+                };
+                let label = if white_pov > 50 {
+                    Label::WhiteWin
+                } else if white_pov < -50 {
+                    Label::BlackWin
+                } else {
+                    Label::Draw
+                };
+                CorpusRecord {
+                    fen: fen.to_string(),
+                    label,
+                    source: Source::SelfPlay,
+                    game_id: i as u64,
+                    ply: 10,
+                    depth_rung: DEPTH_RUNG_EXTERNAL,
+                    strata: 0,
+                }
+            })
+            .collect();
+        assert!(
+            recs.len() >= 10,
+            "fixture should have ≥ 10 diverse positions; got {}",
+            recs.len()
+        );
+
+        // Closure A — the pinned production closure: white-POV static eval.
+        let static_closure = |r: &CorpusRecord| -> i32 {
+            let p = Position::from_fen(&r.fen).expect("valid FEN");
+            let stm = crate::eval::evaluate(&p);
             match p.side_to_move() {
-                crate::piece::Color::White => stm_score,
-                crate::piece::Color::Black => -stm_score,
+                Color::White => stm,
+                Color::Black => -stm,
             }
         };
 
-        let k = fit_k(&recs, &static_eval_closure);
+        // Closure B — the qsearch-at-tune-time alternative (NOT pinned).
+        // A per-call QSearcher is wasteful but fine for a ≤16-entry test.
+        let qsearch_closure = |r: &CorpusRecord| -> i32 {
+            let p = Position::from_fen(&r.fen).expect("valid FEN");
+            QSearcher::new().eval_white(&p)
+        };
+
+        let k_static = fit_k(&recs, &static_closure);
+        let k_qsearch = fit_k(&recs, &qsearch_closure);
+
         assert!(
-            k.is_finite(),
-            "fit_k with static_eval_white closure must return finite K"
+            k_static.is_finite() && k_static > 0.0,
+            "fit_k via static_eval must be finite + positive; got {k_static}"
+        );
+        assert!(
+            k_qsearch.is_finite() && k_qsearch > 0.0,
+            "fit_k via qsearch must be finite + positive; got {k_qsearch}"
         );
 
-        let loss = logistic_loss(&recs, k, &static_eval_closure);
+        // The quiet-certificate predicts `static_eval ≈ qsearch` ⇒ both Ks
+        // should land in the same ball-park. Allow a generous 50% relative
+        // tolerance: a divergence beyond that suggests the quiet predicate
+        // (or this fixture) admits too many non-quiet positions.
+        let lo = k_static.min(k_qsearch);
+        let hi = k_static.max(k_qsearch);
         assert!(
-            loss.is_finite() && loss >= 0.0,
-            "logistic_loss with static_eval_white closure must be finite and non-negative"
+            hi <= 1.5 * lo,
+            "k_static={k_static:.4} vs k_qsearch={k_qsearch:.4} diverge > 50% \
+             — the quiet predicate is allowing non-quiet positions through"
         );
 
-        let obj = stratified_objective(&recs, k, &static_eval_closure);
+        let loss_static = logistic_loss(&recs, k_static, &static_closure);
         assert!(
-            obj.aggregate.is_finite(),
-            "stratified_objective aggregate must be finite"
+            loss_static.is_finite() && loss_static >= 0.0,
+            "logistic_loss must be finite + non-negative"
         );
+        let obj = stratified_objective(&recs, k_static, &static_closure);
+        assert!(obj.aggregate.is_finite());
     }
 
     // ---------------------------------------------------------------------------
@@ -613,6 +659,38 @@ mod tests {
         // functions cannot affect an already-computed CorpusRecord::strata
         // field (stored at build time). This invariant is structural; the
         // positive/negative fixtures above pin the predicate semantics.
+    }
+
+    // ---------------------------------------------------------------------------
+    // frozen_outpost_squares_byte_equals_live_at_m6f_snapshot
+    //
+    // The corpus stratum definition is a FROZEN snapshot of M6.F's
+    // `eval::tier1::outpost_squares`. At M6.F-snapshot time the frozen and
+    // live impls must agree byte-for-byte over every position; if they
+    // disagree NOW, the snapshot already drifted (the structural argument
+    // doesn't cover that backward direction — only "M6.H can't break a
+    // built record"). After M6.H this test will start failing on positions
+    // where the LIVE predicate has been re-tuned and the frozen snapshot
+    // intentionally lags; until then this is the equality pin.
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn frozen_outpost_squares_byte_equals_live_at_m6f_snapshot() {
+        use crate::bench::BENCH_POSITIONS;
+        use crate::eval::tier1;
+
+        for fen in BENCH_POSITIONS.iter() {
+            let pos = Position::from_fen(fen).expect("BENCH_POSITIONS parse");
+            for side in [Color::White, Color::Black] {
+                let frozen = frozen_outpost_squares(&pos, side);
+                let live = tier1::outpost_squares(&pos, side);
+                assert_eq!(
+                    frozen.0, live.0,
+                    "frozen outpost_squares ≠ live at M6.F snapshot \
+                     (fen={fen}, side={side:?}, frozen={:#x}, live={:#x})",
+                    frozen.0, live.0
+                );
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------

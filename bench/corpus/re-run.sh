@@ -11,6 +11,12 @@
 #   4) corpus build      — apply filter→quiet→dedup→cap→split → frozen bytes.
 #   5) corpus quality-gate — must PASS.
 #
+# Every reproducibility knob is READ FROM manifest.json — no shell-default
+# substitution for a knob that is pinned in the manifest. The vendored
+# bytes were produced with these exact knobs; re-running with different
+# knobs (different seed, games, workers, val_fraction, ...) produces a
+# DIFFERENT corpus, not the frozen one.
+#
 # Tooling: requires `zstd` to decompress Lichess `.pgn.zst` and (optionally)
 # `7z` for CCRL. Both are system tools, NOT Rust deps (R5).
 
@@ -19,23 +25,39 @@ set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN="${CORPUS_BIN:-corpus}"
 
-echo "corpus re-run: using binary '$BIN' against $DIR"
+# `manifest_field <name>` extracts a JSON number/string value for a top-level
+# scalar field. Trims whitespace, comma, and quote chars. Good enough for the
+# small set of pinned knobs (no nested-object collisions because every
+# matched key is a top-level scalar — `sources`/`depth_ladder` are arrays
+# which we don't read this way).
+manifest_field() {
+    grep -E "\"$1\"" "$DIR/manifest.json" | head -1 | tr -d ' ,"' | cut -d: -f2
+}
 
-# Re-read seeds + ladder from manifest.json (operator-readable JSON).
-SEED="$(grep -E '\"self_play_seed\"' "$DIR/manifest.json" | head -1 | tr -d ' ,' | cut -d: -f2)"
-SPLITS="$(grep -E '\"split_seed\"' "$DIR/manifest.json" | head -1 | tr -d ' ,' | cut -d: -f2)"
-echo "corpus re-run: seed=$SEED split_seed=$SPLITS"
+SEED="$(manifest_field self_play_seed)"
+GAMES="$(manifest_field games)"
+MAX_PLIES="$(manifest_field max_plies)"
+OPENING_RANDOM_PLIES="$(manifest_field opening_random_plies)"
+WORKERS="$(manifest_field workers)"
+SPLIT_SEED="$(manifest_field split_seed)"
+VAL_FRACTION="$(manifest_field val_fraction)"
+
+echo "corpus re-run: using binary '$BIN' against $DIR"
+echo "corpus re-run: seed=$SEED games=$GAMES workers=$WORKERS \
+max_plies=$MAX_PLIES opening_random_plies=$OPENING_RANDOM_PLIES \
+split_seed=$SPLIT_SEED val_fraction=$VAL_FRACTION"
 
 # (1) external staging: read manifest.sources and re-download each.
 # (Left as an operator step — the manifest pins URLs + SHA-256.)
 
 # (2) self-play (uses the manifest depth_ladder).
-"$BIN" selfplay --seed "$SEED" --games "${GAMES:-200}" --workers "${WORKERS:-4}" \
-    --out "$DIR"
+"$BIN" selfplay --seed "$SEED" --games "$GAMES" --workers "$WORKERS" \
+    --max-plies "$MAX_PLIES" --opening-random-plies "$OPENING_RANDOM_PLIES" \
+    --val-fraction "$VAL_FRACTION" --out "$DIR"
 
 # (3) Each PGN source: corpus ingest-pgn …
 # (4) Build the frozen corpus.
-"$BIN" build --in "$DIR" --split-seed "$SPLITS" --val-fraction "${VAL_FRACTION:-0.1}"
+"$BIN" build --in "$DIR" --split-seed "$SPLIT_SEED" --val-fraction "$VAL_FRACTION"
 
 # (5) Run the data-quality gate (must PASS).
 "$BIN" quality-gate --dir "$DIR"

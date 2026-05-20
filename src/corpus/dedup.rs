@@ -544,6 +544,43 @@ mod tests {
     }
 
     #[test]
+    fn dedup_spill_ceiling_is_inclusive() {
+        // Pin the spill-ceiling boundary: `max_spill_gb=0` (zero ceiling)
+        // MUST refuse to spill ANY data — i.e. the predicate fires on the
+        // first spill attempt (`total_spill > 0 > 0` is false, but
+        // `saturating_add` plus the `>` check catches the first batch).
+        //
+        // Concretely: force the spill path via `max_mem_mb=0`, set
+        // `max_spill_gb=0`. Even a single record's spill estimate is
+        // strictly positive, so `total_spill_bytes > 0` is true on the
+        // first spill ⇒ `CorpusError::QualityGate("…ceiling")`.
+        // This kills the `> ⇒ >=` mutation on the ceiling check.
+        let spill_dir =
+            std::env::temp_dir().join(format!("clawfish-dedup-ceiling-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&spill_dir);
+
+        let records = vec![
+            make_record("fen-a", Source::Ccrl, 1, 0),
+            make_record("fen-b", Source::Ccrl, 2, 0),
+        ];
+        let out = dedup_fen(records.into_iter(), &spill_dir, 0, 0);
+        let _ = fs::remove_dir_all(&spill_dir);
+        match out {
+            Err(CorpusError::QualityGate(msg)) => {
+                assert!(
+                    msg.contains("ceiling"),
+                    "spill-ceiling error must mention 'ceiling'; got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected QualityGate ceiling error, got {e:?}"),
+            Ok(out) => panic!(
+                "max_spill_gb=0 must reject the spill, but dedup returned {} records",
+                out.len()
+            ),
+        }
+    }
+
+    #[test]
     fn dedup_external_spill_matches_in_memory() {
         // Force the external-spill path by using max_mem_mb = 0 (any batch > 0 bytes triggers a spill).
         // We need a unique temp dir per test run.

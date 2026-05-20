@@ -233,6 +233,23 @@ fn check_adr0003_audit(records: &[CorpusRecord]) -> CheckResult {
     // Zurichess `c9` engine-score labels are REJECTED by construction (the
     // `Source` enum does not encode them); this audit is the load-bearing
     // defense that any out-of-list provenance fails the gate closed.
+    //
+    // **Must update audit when `Source` grows.** A 4th variant added to
+    // `Source` requires re-asserting it carries an ADR-0003-compliant label
+    // (original game outcome, never an engine score). The cardinality pin
+    // below enumerates the three accepted variants by name; the compiler
+    // forces the developer to revisit this audit when `Source` changes.
+    let accept_list = [Source::SelfPlay, Source::Ccrl, Source::LichessOpen];
+    // `assert_eq!`, NOT `debug_assert_eq!`: this is the operator-facing
+    // landing gate at release-mode `corpus quality-gate`. Compiling it out
+    // would let a future `Source` variant slip past the audit in release.
+    assert_eq!(
+        accept_list.len(),
+        3,
+        "ADR-0003 accept-list pinned at 3 variants — adding a Source variant \
+         requires updating the audit and re-running the label-provenance review"
+    );
+
     let mut by_source: BTreeMap<u8, u64> = BTreeMap::new();
     let mut bad: Vec<u8> = Vec::new();
     for r in records {
@@ -497,7 +514,12 @@ mod tests {
             validation_fraction: 0.2,
             sources: Vec::<SourceEntry>::new(),
             self_play_seed: 42,
+            games: 0,
+            max_plies: 400,
+            opening_random_plies: 8,
+            workers: 1,
             split_seed: 7,
+            val_fraction: 0.2,
             depth_ladder: vec![(4, 1)],
             corpus_sha256,
         };
@@ -510,12 +532,14 @@ mod tests {
     fn adr0003_audit_rejects_zurichess_c9_fixture() {
         // The on-disk `Source` enum cannot encode Zurichess, but the audit
         // is the load-bearing defense for "any out-of-accept-list source
-        // fails the gate closed." We simulate the rejection through the
-        // by-construction guarantee: a Zurichess record CANNOT exist in
-        // `[CorpusRecord]` because no Source variant maps to it. This test
-        // therefore asserts the structural rejection: only the three
-        // accept-listed Source variants can ever be constructed, and the
-        // audit's PASS detail mentions the rejection by name.
+        // fails the gate closed." Two-layer defense:
+        //
+        //   (a) **Physical:** the on-disk frame cannot carry an unrecognized
+        //       source byte — `Source::from_u8(b) == None` for any
+        //       `b >= 3`, and `store::decode_block` rejects the whole frame.
+        //   (b) **Programmatic:** the audit's `accept_list` cardinality pin
+        //       forces a developer adding a 4th `Source` variant to update
+        //       this test (and the audit).
         let r = audit_records(&[]);
         assert!(r.passed, "empty corpus passes the audit (vacuously)");
         assert!(r.must_pass);
@@ -525,16 +549,63 @@ mod tests {
             r.detail
         );
 
-        // Defensive: count the on-disk-representable variants. If a future
-        // commit adds an engine-score-labeled Source variant the audit must
-        // be re-considered — this test fails loudly to force that review.
-        // We pin the accept-list size at 3 (SelfPlay, Ccrl, LichessOpen).
+        // Layer (a): physical defense — `Source::from_u8(3)` is `None`, so
+        // an out-of-list source byte cannot be decoded from disk.
+        assert_eq!(
+            Source::from_u8(3),
+            None,
+            "Source::from_u8(3) must be None — physical defense against \
+             a future Zurichess (or other engine-score-labeled) source byte"
+        );
+        for b in 3u8..=255 {
+            assert_eq!(
+                Source::from_u8(b),
+                None,
+                "Source::from_u8({b}) must be None — no out-of-list bytes accepted"
+            );
+        }
+
+        // Layer (a) end-to-end: hand-craft a synthetic shard block whose
+        // source byte is 3 (out-of-list) and assert `scan_valid_blocks`
+        // rejects the frame wholesale (no records leak through into a
+        // `CorpusRecord` the audit would ever see).
+        let td = TempDir::new("adr-zurichess");
+        let shard = td.path().join("shard.bin");
+        // Build a normal valid block, then flip its single source byte.
+        let r0 = rec(&startpos(), Label::Draw, Source::SelfPlay, 42, 10);
+        crate::corpus::store::append_block(&shard, 42, &[r0]).unwrap();
+        let mut bytes = std::fs::read(&shard).unwrap();
+        // The source byte sits at the second per-record byte (after label).
+        // Find a byte == Source::SelfPlay.as_u8() (0) just after a Label byte
+        // and flip it to 3. Easier: locate the FEN bytes + label and patch.
+        // We know the record layout starts at HEADER_LEN (20) bytes into the
+        // payload: u16 fen_len, fen bytes, label, source, ply, depth_rung, strata.
+        // Patch source byte: at offset 20 (HEADER_LEN) + 2 + fen_len + 1.
+        let header_len = 20usize;
+        let fen_len = u16::from_le_bytes(
+            bytes[header_len..header_len + 2]
+                .try_into()
+                .expect("frame header has 2-byte fen_len"),
+        ) as usize;
+        let source_off = header_len + 2 + fen_len + 1;
+        bytes[source_off] = 3; // out-of-list source byte
+        std::fs::write(&shard, &bytes).unwrap();
+        let (blocks, _valid_len) = crate::corpus::store::scan_valid_blocks(&shard).expect("scan");
+        assert!(
+            blocks.is_empty(),
+            "a block with an out-of-list source byte must be rejected wholesale \
+             by the CRC-protected frame (no `CorpusRecord` ever materializes \
+             — the audit's input is empty by construction)"
+        );
+
+        // Layer (b): pin the accept-list cardinality. Adding a 4th `Source`
+        // variant trips this assertion, forcing the audit to be re-reviewed.
         let accept_list = [Source::SelfPlay, Source::Ccrl, Source::LichessOpen];
         assert_eq!(
             accept_list.len(),
             3,
             "ADR-0003 accept-list is pinned at 3 variants — adding a Source \
-             requires updating the audit"
+             requires updating the audit and re-running the label-provenance review"
         );
     }
 

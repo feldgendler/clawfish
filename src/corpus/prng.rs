@@ -71,6 +71,9 @@ mod tests {
 
     #[test]
     fn prng_seed_zero_first_three_words_golden() {
+        // First three `next_u64()` outputs from `Prng::new(0)` (which
+        // performs ONE constructor mix step before these reads). These
+        // are post-construction-step outputs, not the bare initial state.
         // IDENTICAL literals to elo_iterate::prng::tests — a transcription
         // divergence between the two SplitMix64 copies fails here.
         let mut rng = Prng::new(0);

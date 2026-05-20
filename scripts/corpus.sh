@@ -1,5 +1,12 @@
 #!/usr/bin/env sh
-# scripts/corpus.sh — operator-facing wrapper around the `corpus` binary.
+# scripts/corpus.sh — OPERATOR FRESH-BUILD wrapper around the `corpus` binary.
+#
+# This script is for **building a new corpus from scratch** with operator-chosen
+# knobs (or env-var overrides). For **byte-identical reproduction of the
+# vendored `bench/corpus/` artifact**, run `bench/corpus/re-run.sh` instead —
+# that script reads every reproducibility knob from `manifest.json` (no
+# shell-default substitution), so the bytes it produces match the committed
+# corpus_sha256.
 #
 # Stages the canonical M6.G pipeline:
 #   1) cargo build --release --bin corpus   (compile once; reused for steps 2–5)
@@ -10,19 +17,22 @@
 #   6) corpus quality-gate                   (the M6.G landing gate)
 #
 # POSIX-sh-compatible. Inputs are env vars (defaults below); outputs land
-# in $OUT_DIR. The committed re-run.sh that `corpus build` writes to
-# bench/corpus/ is the per-frozen-corpus operator script; this wrapper is
-# the build-time helper.
+# in $OUT_DIR.
 
 set -eu
 
 OUT_DIR="${OUT_DIR:-bench/corpus}"
-SEED="${SEED:-3221225677}"  # 0xC0FFEE_0D in decimal
-GAMES="${GAMES:-200}"
-WORKERS="${WORKERS:-4}"
+# Default seed matches the vendored bench/corpus/manifest.json (0xC0FFEE).
+# Override via env to build a different corpus; the vendored artifact is
+# byte-reproducible only via bench/corpus/re-run.sh (which reads all knobs
+# from manifest.json).
+SEED="${SEED:-12648430}"  # 0xC0FFEE in decimal
+GAMES="${GAMES:-12}"
+WORKERS="${WORKERS:-1}"
 VAL_FRACTION="${VAL_FRACTION:-0.1}"
 SPLIT_SEED="${SPLIT_SEED:-7}"
-MAX_PLIES="${MAX_PLIES:-200}"
+MAX_PLIES="${MAX_PLIES:-400}"
+OPENING_RANDOM_PLIES="${OPENING_RANDOM_PLIES:-8}"
 BUCKETS="${BUCKETS:-100,200,400,600}"
 
 # Stamp the engine commit into the manifest (operator step — keeps the
@@ -47,6 +57,7 @@ echo "corpus.sh: running deterministic self-play (seed=$SEED games=$GAMES worker
     --workers "$WORKERS" \
     --out "$OUT_DIR" \
     --max-plies "$MAX_PLIES" \
+    --opening-random-plies "$OPENING_RANDOM_PLIES" \
     --val-fraction "$VAL_FRACTION"
 
 # (4) PGN ingestion: operator-driven. Uncomment + adapt to stage raw

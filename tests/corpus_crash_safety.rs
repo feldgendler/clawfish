@@ -198,55 +198,19 @@ fn crash_kill_after_first_game_resumes_to_uninterrupted_corpus() {
     // (b) zero partial-game labels post-resume.
     assert_no_partial_games(crash_dir.path());
 
-    // (c) the resumed corpus covers every expected game_id exactly once.
-    // The §3.5 idempotency contract: pre-crash durable games are
-    // preserved; post-resume new games fill in the rest. We do NOT
-    // require FEN-byte equality with the uninterrupted reference run
-    // here — the engine reuses one `AlphaBetaMover` (and thus one TT)
-    // across games per worker, so a fresh-searcher resume produces
-    // different (still deterministic-per-(seed,depth,searcher_state))
-    // game continuations after the first crash. That divergence is
-    // a property of the SEARCHER state, not of the corpus pipeline;
-    // the data-quality contract M6.G commits to is "zero partial
-    // labels + every expected game_id present," which this asserts.
+    // (c) The §3.5 R3 contract: "resumed run bit-identical to an
+    // uninterrupted run modulo the one lost in-flight game." With
+    // `--workers 1` (this test) AND the fresh-searcher-per-game invariant
+    // (`AlphaBetaMover::new()` per game in `selfplay::run`, the R3 fix),
+    // the qualifier collapses to "bit-identical": the in-flight game is
+    // re-emitted on resume from its deterministic substream seed,
+    // producing the identical record sequence. Multiset equality on the
+    // full shard pins this contract.
     let resumed_records = shard_records(crash_dir.path());
-    let resumed_game_ids: std::collections::BTreeSet<u64> =
-        resumed_records.iter().map(|r| r.0).collect();
-    let ref_game_ids: std::collections::BTreeSet<u64> = ref_records.iter().map(|r| r.0).collect();
     assert_eq!(
-        resumed_game_ids, ref_game_ids,
-        "resumed corpus must cover the same set of game_ids as the reference run"
-    );
-    // Each game_id present exactly once (no doubled re-emit).
-    let mut counts: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-    for (gid, _, _, _) in &resumed_records {
-        *counts.entry(*gid).or_default() += 1;
-    }
-    // (Same-game records share game_id; we just ensured no game_id appears
-    // in two blocks via `assert_no_partial_games`. So "exactly once" here
-    // means "the same number of records as the reference" only when the
-    // searcher state matched — which it doesn't post-crash. Skip the
-    // count-equality check; the no-duplicate-game-id check above is the
-    // genuine §3.5 idempotency invariant.)
-    let _ = counts;
-
-    // Sanity: at least the pre-crash games' records match byte-for-byte
-    // (game 0 was committed before SIGKILL, so its records ARE in the
-    // reference run and the worker-state-agnostic substream-seed makes
-    // game 0's play identical across both runs).
-    let pre_crash_ids: std::collections::BTreeSet<u64> = (0..blocks_before_kill as u64).collect();
-    let resumed_pre_crash: Vec<&(u64, u32, String, u8)> = resumed_records
-        .iter()
-        .filter(|r| pre_crash_ids.contains(&r.0))
-        .collect();
-    let ref_pre_crash: Vec<&(u64, u32, String, u8)> = ref_records
-        .iter()
-        .filter(|r| pre_crash_ids.contains(&r.0))
-        .collect();
-    assert_eq!(
-        resumed_pre_crash, ref_pre_crash,
-        "pre-crash durable games must match the reference byte-for-byte \
-         (substream-seed determinism for game_id < blocks_before_kill)"
+        resumed_records, ref_records,
+        "resumed corpus must match the uninterrupted reference shard byte-for-byte \
+         (workers=1 + fresh-searcher-per-game ⇒ R3 collapses to bit-identical)"
     );
 }
 
@@ -311,16 +275,19 @@ fn crash_kill_at_randomized_offsets_emits_zero_partial() {
         assert!(status.success());
         assert_no_partial_games(crash_dir.path());
 
-        // Set-equality on game_ids: the §3.5 idempotency contract says
-        // every expected game_id is present exactly once, with zero
-        // partial labels. We do NOT assert FEN-byte equality (see the
-        // searcher-state note on `crash_kill_after_first_game_resumes_*`).
-        let resumed = shard_records(crash_dir.path());
-        let resumed_ids: std::collections::BTreeSet<u64> = resumed.iter().map(|r| r.0).collect();
-        let ref_ids: std::collections::BTreeSet<u64> = ref_records.iter().map(|r| r.0).collect();
+        // Multiset byte equality: same parameters as the fast variant
+        // (`--workers 1` + fresh-searcher-per-game) ⇒ the R3 contract
+        // collapses to bit-identical (modulo the one in-flight game which
+        // is re-emitted on resume from its deterministic seed). A FEN-level
+        // resume bug that preserves game_id integrity would slip past a
+        // set-equality assertion; multiset equality catches it.
+        let mut resumed = shard_records(crash_dir.path());
+        let mut reference = ref_records.clone();
+        resumed.sort();
+        reference.sort();
         assert_eq!(
-            resumed_ids, ref_ids,
-            "variant={variant} offset_ms={offset_ms}: resumed corpus covers the same game_ids"
+            resumed, reference,
+            "variant={variant} offset_ms={offset_ms}: resumed corpus byte-multiset matches uninterrupted reference"
         );
         let _ = shard; // bind to silence warning
     }

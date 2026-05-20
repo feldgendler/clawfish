@@ -193,13 +193,14 @@ mod tests {
     /// val game, assert the FEN-leakage ratio is computed and reported.
     #[test]
     fn fen_leakage_ratio_reported_le_tau() {
-        // We need at least one game in each split. Use a seed and val_fraction
-        // that we know routes game 0 and game 1 to different splits. Try
-        // several seeds until we get that. (Test infrastructure: avoid
-        // depending on a specific hash value.)
+        // We need at least one game in each split under the SAME seed
+        // we'll use for `split_by_game` — otherwise the routing the
+        // pair-finder predicts and the split's own hashing disagree, and
+        // the FEN we plant in the "train" game might land in val (or
+        // vice versa). Use seed=999 in both calls.
         const SHARED_FEN: &str = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1";
 
-        let (train_game, val_game) = find_split_pair(0.5, 0, 10);
+        let (train_game, val_game) = find_split_pair(0.5, 999, 10);
 
         // The shared FEN appears in both a train game and a val game (simulating
         // a common opening transposition).
