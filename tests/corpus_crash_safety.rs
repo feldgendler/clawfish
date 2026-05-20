@@ -164,12 +164,19 @@ fn crash_kill_after_first_game_resumes_to_uninterrupted_corpus() {
     assert!(!ref_records.is_empty(), "reference shard must be non-empty");
 
     // Crash run: spawn `corpus selfplay`, wait until ≥ 1 game is durable,
-    // SIGKILL, then re-spawn (same seed/games/out) to resume.
+    // SIGKILL, then re-spawn (same seed/games/out) to resume. The 60s
+    // deadline is monotonic-time (Rust's `Instant` on macOS does not
+    // advance during system suspend), so closing the laptop lid mid-run
+    // does not consume budget; the slack is to cover the debug-binary
+    // depth-4 selfplay cost (3 games × 40 plies × per-move search) under
+    // any plausible concurrent system load. M6.G's original 20s was
+    // borderline even on a clean machine; bumping to 60s removes the
+    // brittleness without weakening the contract.
     let crash_dir = TempDir::new("crash");
     let shard = crash_dir.path().join("shard.bin");
 
     let mut child = spawn_selfplay(crash_dir.path(), seed, games, workers, max_plies);
-    let blocks_before_kill = wait_for_blocks(&shard, 1, Duration::from_secs(20));
+    let blocks_before_kill = wait_for_blocks(&shard, 1, Duration::from_secs(60));
     assert!(
         blocks_before_kill >= 1,
         "expected ≥ 1 durable block before SIGKILL; got {blocks_before_kill}"
