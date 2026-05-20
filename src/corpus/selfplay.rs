@@ -904,10 +904,12 @@ mod tests {
         );
     }
 
-    fn synth_book() -> super::super::openings::Book {
+    fn synth_book(name: &str) -> super::super::openings::Book {
         // 3 hand-picked principled openings; sufficient for the
-        // STRATUM_BOOK_OPENING tag-and-seed test below.
-        let dir = std::env::temp_dir().join("clawfish-selfplay-book");
+        // STRATUM_BOOK_OPENING tag-and-seed test below. Per-test unique
+        // dir to avoid cargo-test's parallel-execution race when two
+        // book-using tests share `clawfish-selfplay-book`.
+        let dir = std::env::temp_dir().join(format!("clawfish-selfplay-book-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("book.epd");
@@ -927,7 +929,7 @@ mod tests {
         let mut q = QSearcher::new();
         let stop = Arc::new(AtomicBool::new(false));
         let mut rng = Prng::new(substream_seed(0xB00C, 1));
-        let book = synth_book();
+        let book = synth_book("frac-one");
         let g = play_one_game(
             &mut s,
             &mut q,
@@ -959,7 +961,7 @@ mod tests {
         let mut q = QSearcher::new();
         let stop = Arc::new(AtomicBool::new(false));
         let mut rng = Prng::new(substream_seed(0xB00C, 2));
-        let book = synth_book();
+        let book = synth_book("frac-zero");
         let g = play_one_game(
             &mut s,
             &mut q,
