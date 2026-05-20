@@ -85,14 +85,25 @@ elif [ -n "$OPENING_BOOK" ]; then
     echo "corpus.sh: WARNING: OPENING_BOOK=$OPENING_BOOK not found — running without book"
 fi
 
+# Background-priority launcher. On macOS, `taskpolicy -c background` sets the
+# process to the Background QoS class — biases work onto E-cores and reduces
+# thermal pressure, so the UI / foreground apps stay responsive during a
+# long campaign. `nice -n 19` is BSD-level (yields under contention) but
+# does not affect QoS; both are applied for belt-and-suspenders.
+# `taskpolicy` is macOS-only; on Linux we fall through to plain `nice`.
+LAUNCH_PREFIX="nice -n 19"
+if command -v taskpolicy >/dev/null 2>&1; then
+    LAUNCH_PREFIX="taskpolicy -c background $LAUNCH_PREFIX"
+fi
+
 if [ -n "$GAMES" ]; then
     echo "corpus.sh: running deterministic self-play (seed=$SEED games=$GAMES workers=$WORKERS)"
-    # shellcheck disable=SC2086 # word-split SELFPLAY_ARGS intentionally
-    "$CORPUS_BIN" selfplay --games "$GAMES" $SELFPLAY_ARGS
+    # shellcheck disable=SC2086 # word-split SELFPLAY_ARGS / LAUNCH_PREFIX intentionally
+    $LAUNCH_PREFIX "$CORPUS_BIN" selfplay --games "$GAMES" $SELFPLAY_ARGS
 else
     echo "corpus.sh: running unbounded deterministic self-play (seed=$SEED workers=$WORKERS) — Ctrl-C to stop"
     # shellcheck disable=SC2086
-    "$CORPUS_BIN" selfplay $SELFPLAY_ARGS
+    $LAUNCH_PREFIX "$CORPUS_BIN" selfplay $SELFPLAY_ARGS
 fi
 
 # (4) PGN ingestion: operator-driven. Uncomment + adapt to stage raw
