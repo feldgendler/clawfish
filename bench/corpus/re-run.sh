@@ -41,19 +41,30 @@ OPENING_RANDOM_PLIES="$(manifest_field opening_random_plies)"
 WORKERS="$(manifest_field workers)"
 SPLIT_SEED="$(manifest_field split_seed)"
 VAL_FRACTION="$(manifest_field val_fraction)"
+OPENING_BOOK="$(manifest_field opening_book_path)"
+BOOK_FRACTION="$(manifest_field book_fraction)"
 
 echo "corpus re-run: using binary '$BIN' against $DIR"
 echo "corpus re-run: seed=$SEED games=$GAMES workers=$WORKERS \
 max_plies=$MAX_PLIES opening_random_plies=$OPENING_RANDOM_PLIES \
-split_seed=$SPLIT_SEED val_fraction=$VAL_FRACTION"
+split_seed=$SPLIT_SEED val_fraction=$VAL_FRACTION \
+opening_book=${OPENING_BOOK:-<none>} book_fraction=${BOOK_FRACTION:-0}"
 
 # (1) external staging: read manifest.sources and re-download each.
 # (Left as an operator step — the manifest pins URLs + SHA-256.)
 
-# (2) self-play (uses the manifest depth_ladder).
-"$BIN" selfplay --seed "$SEED" --games "$GAMES" --workers "$WORKERS" \
-    --max-plies "$MAX_PLIES" --opening-random-plies "$OPENING_RANDOM_PLIES" \
-    --val-fraction "$VAL_FRACTION" --out "$DIR"
+# (2) self-play (uses the manifest depth_ladder + opening book if pinned).
+if [ -n "$OPENING_BOOK" ]; then
+    "$BIN" selfplay --seed "$SEED" --games "$GAMES" --workers "$WORKERS" \
+        --max-plies "$MAX_PLIES" --opening-random-plies "$OPENING_RANDOM_PLIES" \
+        --val-fraction "$VAL_FRACTION" \
+        --opening-book "$OPENING_BOOK" --book-fraction "$BOOK_FRACTION" \
+        --out "$DIR"
+else
+    "$BIN" selfplay --seed "$SEED" --games "$GAMES" --workers "$WORKERS" \
+        --max-plies "$MAX_PLIES" --opening-random-plies "$OPENING_RANDOM_PLIES" \
+        --val-fraction "$VAL_FRACTION" --out "$DIR"
+fi
 
 # (3) Each PGN source: corpus ingest-pgn …
 # (4) Build the frozen corpus.

@@ -240,6 +240,9 @@ Flags:
         split_seed: 0,
         val_fraction: 0.0,
         depth_ladder: ladder,
+        opening_book_path: None,
+        opening_book_sha256: None,
+        book_fraction: 0.0,
         corpus_sha256: String::new(),
     };
     write_manifest(&out, &manifest).map_err(|e| format!("write_manifest: {e}"))?;
@@ -257,7 +260,8 @@ fn cmd_selfplay(argv: &[String]) -> Result<ExitCode, String> {
     if args.has("help") {
         eprintln!(
             "corpus selfplay --seed <u64> [--games <N>] --workers <N> --out <dir> \\
-                [--max-plies <N>] [--opening-random-plies <N>] [--val-fraction <f>]
+                [--max-plies <N>] [--opening-random-plies <N>] [--val-fraction <f>] \\
+                [--opening-book <path>] [--book-fraction <f>]
 
 Run a deterministic fixed-depth self-play campaign. Uses the calibrated
 depth ladder from <out>/manifest.json if present, else falls back to
@@ -269,7 +273,16 @@ Ctrl-C / SIGTERM when satisfied — R2 guarantees zero partial labels).
 With --games <N>, the campaign caps at game N-1 (matching R1's
 idempotent resume — repeated runs with the same seed and a larger
 --games extend the corpus). The manifest records the ACTUAL durable
-game count at exit, so re-run.sh reproduces what you have."
+game count at exit, so re-run.sh reproduces what you have.
+
+--opening-book <path>: a CC0 EPD file of opening positions (default:
+bench/data/openings.epd if vendored, else none). Each game flips a
+seeded coin with weight --book-fraction (default 0.5 when a book is
+loaded, 0.0 otherwise) to decide book-seeded vs random-walk-from-
+startpos. Book-seeded records are tagged STRATUM_BOOK_OPENING in
+their strata bitset so M6.H can stratify the held-out objective by
+opening provenance and the outer simplex can move the ratio (the
+meta-tunable axis of the corpus-mixture search)."
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -295,6 +308,31 @@ game count at exit, so re-run.sh reproduces what you have."
         }
     };
 
+    // Opening book (optional). `--opening-book` overrides; otherwise we
+    // try `bench/data/openings.epd` and fall back to None if absent. A
+    // present book defaults `--book-fraction` to 0.5 (mix at parity).
+    let opening_book_path = args.get("opening-book").map(PathBuf::from).or_else(|| {
+        let default = PathBuf::from("bench/data/openings.epd");
+        if default.exists() {
+            Some(default)
+        } else {
+            None
+        }
+    });
+    let book = match &opening_book_path {
+        Some(p) => Some(std::sync::Arc::new(
+            clawfish::corpus::openings::Book::load_epd(p)
+                .map_err(|e| format!("load opening book {}: {e}", p.display()))?,
+        )),
+        None => None,
+    };
+    let book_fraction = args.parse_f64("book-fraction", if book.is_some() { 0.5 } else { 0.0 })?;
+    if book.is_none() && book_fraction > 0.0 {
+        return Err(
+            "--book-fraction > 0 but no opening book loaded (pass --opening-book <path>)".into(),
+        );
+    }
+
     let cfg = SelfPlayConfig {
         seed,
         games,
@@ -304,6 +342,8 @@ game count at exit, so re-run.sh reproduces what you have."
         max_plies,
         out_dir: out.clone(),
         val_fraction,
+        book: book.clone(),
+        book_fraction,
     };
     let stop = Arc::new(AtomicBool::new(false));
     install_signal_handler(Arc::clone(&stop));
@@ -347,6 +387,11 @@ game count at exit, so re-run.sh reproduces what you have."
         m.opening_random_plies = opening_random_plies;
         m.workers = workers as u32;
         m.val_fraction = val_fraction;
+        m.opening_book_path = opening_book_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        m.opening_book_sha256 = book.as_ref().map(|b| b.sha256().to_owned());
+        m.book_fraction = book_fraction;
         write_manifest(&out, &m).map_err(|e| format!("update selfplay knobs: {e}"))?;
     }
     Ok(ExitCode::SUCCESS)
@@ -595,6 +640,16 @@ corpus to <out>/train.bin + <out>/val.bin + manifest.json + filter_spec.txt
             .as_ref()
             .map(|m| m.depth_ladder.clone())
             .unwrap_or_else(|| vec![(4, 1)]),
+        opening_book_path: existing_manifest
+            .as_ref()
+            .and_then(|m| m.opening_book_path.clone()),
+        opening_book_sha256: existing_manifest
+            .as_ref()
+            .and_then(|m| m.opening_book_sha256.clone()),
+        book_fraction: existing_manifest
+            .as_ref()
+            .map(|m| m.book_fraction)
+            .unwrap_or(0.0),
         corpus_sha256: corpus_digest.clone(),
     };
     write_manifest(&out, &manifest).map_err(|e| format!("write_manifest: {e}"))?;
@@ -692,19 +747,30 @@ OPENING_RANDOM_PLIES="$(manifest_field opening_random_plies)"
 WORKERS="$(manifest_field workers)"
 SPLIT_SEED="$(manifest_field split_seed)"
 VAL_FRACTION="$(manifest_field val_fraction)"
+OPENING_BOOK="$(manifest_field opening_book_path)"
+BOOK_FRACTION="$(manifest_field book_fraction)"
 
 echo "corpus re-run: using binary '$BIN' against $DIR"
 echo "corpus re-run: seed=$SEED games=$GAMES workers=$WORKERS \
 max_plies=$MAX_PLIES opening_random_plies=$OPENING_RANDOM_PLIES \
-split_seed=$SPLIT_SEED val_fraction=$VAL_FRACTION"
+split_seed=$SPLIT_SEED val_fraction=$VAL_FRACTION \
+opening_book=${OPENING_BOOK:-<none>} book_fraction=${BOOK_FRACTION:-0}"
 
 # (1) external staging: read manifest.sources and re-download each.
 # (Left as an operator step — the manifest pins URLs + SHA-256.)
 
-# (2) self-play (uses the manifest depth_ladder).
-"$BIN" selfplay --seed "$SEED" --games "$GAMES" --workers "$WORKERS" \
-    --max-plies "$MAX_PLIES" --opening-random-plies "$OPENING_RANDOM_PLIES" \
-    --val-fraction "$VAL_FRACTION" --out "$DIR"
+# (2) self-play (uses the manifest depth_ladder + opening book if pinned).
+if [ -n "$OPENING_BOOK" ]; then
+    "$BIN" selfplay --seed "$SEED" --games "$GAMES" --workers "$WORKERS" \
+        --max-plies "$MAX_PLIES" --opening-random-plies "$OPENING_RANDOM_PLIES" \
+        --val-fraction "$VAL_FRACTION" \
+        --opening-book "$OPENING_BOOK" --book-fraction "$BOOK_FRACTION" \
+        --out "$DIR"
+else
+    "$BIN" selfplay --seed "$SEED" --games "$GAMES" --workers "$WORKERS" \
+        --max-plies "$MAX_PLIES" --opening-random-plies "$OPENING_RANDOM_PLIES" \
+        --val-fraction "$VAL_FRACTION" --out "$DIR"
+fi
 
 # (3) Each PGN source: corpus ingest-pgn …
 # (4) Build the frozen corpus.

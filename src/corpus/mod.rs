@@ -16,6 +16,7 @@ pub mod dedup;
 pub mod filter;
 pub mod manifest;
 pub mod objective;
+pub mod openings;
 pub mod pgn;
 pub mod prng;
 pub mod quality_gate;
@@ -153,6 +154,12 @@ pub const DEPTH_RUNG_EXTERNAL: u8 = 0xFF;
 pub const STRATUM_OUTPOST: u8 = 1 << 0;
 /// Endgame stratum: phase-tag below the mop-up threshold.
 pub const STRATUM_ENDGAME: u8 = 1 << 1;
+/// Opening-source stratum: set when the game started from a vendored
+/// opening-book FEN, unset when from startpos + random plies. The
+/// `book_fraction` knob is the M6.H meta-tunable axis; this bit lets
+/// M6.H's stratified objective separate book-distribution from random-
+/// distribution loss when picking the optimal mix.
+pub const STRATUM_BOOK_OPENING: u8 = 1 << 2;
 
 /// One labeled quiet position. `fen` is the canonical `Position::to_fen()`.
 /// `label` is the ORIGINAL game outcome (never an engine score). `game_id`

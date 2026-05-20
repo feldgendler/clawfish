@@ -112,6 +112,10 @@ pub struct StratObjective {
     pub outpost: f64,
     /// Loss restricted to `STRATUM_ENDGAME` records.
     pub endgame: f64,
+    /// Loss restricted to `STRATUM_BOOK_OPENING` records (the M6.H
+    /// meta-tunable stratum — book-seeded games carry this bit so the
+    /// outer simplex can compare against the unset complement).
+    pub book_opening: f64,
 }
 
 /// Frozen-snapshot blind-spot strata bits for a position (computed once at
@@ -245,11 +249,18 @@ pub fn stratified_objective(
         .collect();
     let endgame = logistic_loss_refs(&endgame_recs, k, score);
 
+    let book_recs: Vec<&CorpusRecord> = val
+        .iter()
+        .filter(|r| r.strata & super::STRATUM_BOOK_OPENING != 0)
+        .collect();
+    let book_opening = logistic_loss_refs(&book_recs, k, score);
+
     StratObjective {
         aggregate,
         per_depth_rung,
         outpost,
         endgame,
+        book_opening,
     }
 }
 

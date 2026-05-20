@@ -241,6 +241,17 @@ pub struct Manifest {
     /// Calibrated R-TC depth-ladder rungs `(depth, weight)`, written here so
     /// `corpus rerun` reproduces the empirically-anchored sampling.
     pub depth_ladder: Vec<(u8, u32)>,
+    /// Optional vendored opening-book path (relative to repo root) used
+    /// at self-play time. `None` when no book is configured (every game
+    /// starts from startpos + random walk).
+    pub opening_book_path: Option<String>,
+    /// SHA-256 (lowercase hex) of the opening-book bytes — pinned so a
+    /// re-run detects upstream-drift on the vendored book.
+    pub opening_book_sha256: Option<String>,
+    /// Per-game seeded coin-flip weight for book-seeded vs random-seeded
+    /// opening. Range `[0.0, 1.0]`. The M6.H **meta-tunable** axis of
+    /// the bi-level corpus-mixture search (ADR-0035 §9 / plan §3.8).
+    pub book_fraction: f64,
     /// SHA-256 (lowercase hex) of the frozen corpus bytes themselves. The
     /// reproducibility check (quality gate) re-derives this from disk and
     /// fails if the digest drifts.
@@ -341,6 +352,23 @@ fn write_manifest_json(m: &Manifest) -> String {
         out.push('\n');
     }
     out.push_str("  ],\n");
+    // Opening-book provenance — fields are *omitted* (not `null`-valued)
+    // when no book is loaded, because the JSON parser doesn't recognize a
+    // bare `null` token (one-shot reader, only the value shapes we emit).
+    if let Some(p) = &m.opening_book_path {
+        out.push_str("  \"opening_book_path\": ");
+        write_json_string(&mut out, p);
+        out.push_str(",\n");
+    }
+    if let Some(s) = &m.opening_book_sha256 {
+        out.push_str("  \"opening_book_sha256\": ");
+        write_json_string(&mut out, s);
+        out.push_str(",\n");
+    }
+    out.push_str(&format!(
+        "  \"book_fraction\": {},\n",
+        format_f64(m.book_fraction)
+    ));
     out.push_str("  \"corpus_sha256\": ");
     write_json_string(&mut out, &m.corpus_sha256);
     out.push('\n');
@@ -702,6 +730,12 @@ fn parse_manifest_json(src: &str) -> Result<Manifest, CorpusError> {
         }
     };
 
+    // Opening-book fields (added at the book+book_fraction landing).
+    // Older manifests round-trip as None / 0.0.
+    let opening_book_path = optional_str(&top, "opening_book_path").map(str::to_owned);
+    let opening_book_sha256 = optional_str(&top, "opening_book_sha256").map(str::to_owned);
+    let book_fraction = optional_f64(&top, "book_fraction").unwrap_or(0.0);
+
     Ok(Manifest {
         schema_version,
         created_at,
@@ -717,6 +751,9 @@ fn parse_manifest_json(src: &str) -> Result<Manifest, CorpusError> {
         split_seed,
         val_fraction,
         depth_ladder,
+        opening_book_path,
+        opening_book_sha256,
+        book_fraction,
         corpus_sha256,
     })
 }
@@ -734,6 +771,12 @@ fn optional_u32(top: &[(String, JsonVal)], key: &str) -> Option<u32> {
 fn optional_f64(top: &[(String, JsonVal)], key: &str) -> Option<f64> {
     let v = top.iter().find(|(k, _)| k == key).map(|(_, v)| v)?;
     require_f64(v, key).ok()
+}
+
+/// Optional string field — `null` or absent → `None`, otherwise the string.
+fn optional_str<'a>(top: &'a [(String, JsonVal)], key: &str) -> Option<&'a str> {
+    let v = top.iter().find(|(k, _)| k == key).map(|(_, v)| v)?;
+    require_str(v, key).ok()
 }
 
 // ── Public I/O ────────────────────────────────────────────────────────────────
@@ -867,6 +910,11 @@ mod tests {
             split_seed: 98_765_432_109_876,
             val_fraction: 0.1,
             depth_ladder: vec![(4, 1), (6, 1), (8, 1), (10, 1)],
+            opening_book_path: Some("bench/data/openings.epd".to_owned()),
+            opening_book_sha256: Some(
+                "dc91f225bc93e7ec091095bf8264595da33d36b9d3ac97ddd2dd54bc3a094fa4".to_owned(),
+            ),
+            book_fraction: 0.5,
             corpus_sha256: "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
                 .to_owned(),
         };

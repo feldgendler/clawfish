@@ -20,12 +20,15 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::Duration;
 
 use super::objective::strata_for;
+use super::openings::Book;
 use super::prng::{Prng, substream_seed};
 use super::quiet::{is_quiet, static_eval_white};
 use super::store::{
     Checkpoint, append_block, read_checkpoint, scan_valid_blocks, write_checkpoint,
 };
-use super::{CorpusError, CorpusRecord, HIGH_SCORE_CP, Label, OPENING_SKIP_PLIES};
+use super::{
+    CorpusError, CorpusRecord, HIGH_SCORE_CP, Label, OPENING_SKIP_PLIES, STRATUM_BOOK_OPENING,
+};
 use crate::search::{
     AlphaBetaMover, QSearcher, Search, SearchContext, SearchLimits, SearchResult, TimeCaps,
 };
@@ -44,7 +47,8 @@ pub struct SelfPlayConfig {
     pub workers: usize,
     /// `(depth, weight)` rungs; weights = deployment mixed-TC profile.
     pub depth_ladder: Vec<(u8, u32)>,
-    /// Seeded-random opening plies from startpos (diversification).
+    /// Seeded-random plies added *after* the opening seed (book FEN or
+    /// startpos) for intra-seed decorrelation.
     pub opening_random_plies: u32,
     /// Max half-moves before adjudicating an over-long game.
     pub max_plies: u32,
@@ -52,6 +56,16 @@ pub struct SelfPlayConfig {
     pub out_dir: PathBuf,
     /// Fraction of games routed to the held-out self-play validation set.
     pub val_fraction: f64,
+    /// Optional vendored opening book (CC0 `2moves_v1.epd`). When
+    /// `Some`, each game flips a seeded coin with weight `book_fraction`
+    /// to choose book-seeded vs random-seeded; when `None`, every game
+    /// starts from startpos. Shared via `Arc` so all workers reuse the
+    /// in-RAM positions without cloning.
+    pub book: Option<Arc<Book>>,
+    /// Per-game seeded coin-flip weight for book-seeded vs random-seeded
+    /// opening. Range `[0.0, 1.0]`; ignored when `book` is `None`. The
+    /// M6.H **meta-tunable** axis (ADR-0035 §9 / plan §3.8).
+    pub book_fraction: f64,
 }
 
 /// Self-play campaign outcome counters.
@@ -190,10 +204,28 @@ fn search_best_move(
 
 /// Outcome of `play_one_game`: a completed game's transactional record, or
 /// `None` if interrupted in-flight (R2: contributes ZERO records).
+/// Per-game seeded coin flip threshold for book vs random opening (R-bit-
+/// granularity). 32-bit scale is plenty for any plausible `book_fraction`
+/// resolution and avoids floating-point bias at the extremes.
+const COIN_FLIP_SCALE: u64 = 1 << 32;
+
+fn book_seeded_this_game(book_fraction: f64, rng: &mut Prng) -> bool {
+    if book_fraction <= 0.0 {
+        return false;
+    }
+    if book_fraction >= 1.0 {
+        return true;
+    }
+    let threshold = (book_fraction * (COIN_FLIP_SCALE as f64)) as u64;
+    rng.below(COIN_FLIP_SCALE) < threshold
+}
+
 #[allow(clippy::too_many_arguments)] // play/quiet searchers + per-game knobs is what it is
 fn play_one_game(
     searcher: &mut AlphaBetaMover,
     qsearcher: &mut QSearcher,
+    book: Option<&Book>,
+    book_fraction: f64,
     game_id: u64,
     depth: u8,
     opening_random_plies: u32,
@@ -201,13 +233,24 @@ fn play_one_game(
     rng: &mut Prng,
     stop: &Arc<AtomicBool>,
 ) -> Option<GameRecord> {
-    let mut pos = Position::starting_position();
+    // Per-game seeded coin flip: book FEN seed vs startpos. The flip
+    // consumes one rng draw before any opening-walk plies so the same
+    // (seed, game_id, book_fraction) always produces the same assignment.
+    let is_book_game = book
+        .as_ref()
+        .map(|_| book_seeded_this_game(book_fraction, rng))
+        .unwrap_or(false);
+    let mut pos = match (is_book_game, book) {
+        (true, Some(b)) => *b.sample(rng),
+        _ => Position::starting_position(),
+    };
     let mut history = vec![pos.zobrist()];
     let mut ply: u32 = 0;
 
-    // Seeded-random opening plies (diversification). Reject a seed that
-    // reaches an early game-over inside the opening: replay from startpos
-    // is impossible (the opening is fixed by the rng draw), so a dead
+    // Seeded-random opening plies (diversification) appended AFTER the
+    // opening seed (book FEN or startpos). Reject a seed that reaches an
+    // early game-over inside the opening: replay from startpos is
+    // impossible (the opening is fixed by the rng draw), so a dead
     // opening just yields a short game — we treat the natural terminal as
     // the result rather than discarding (still a valid game-result label,
     // just rare). The plan's "reject seeds reaching early game-over" is
@@ -257,7 +300,10 @@ fn play_one_game(
             if se.abs() <= HIGH_SCORE_CP {
                 let qs = qsearcher.eval_white(&pos);
                 if is_quiet(&pos, se, qs) {
-                    let strata = strata_for(&pos);
+                    let mut strata = strata_for(&pos);
+                    if is_book_game {
+                        strata |= STRATUM_BOOK_OPENING;
+                    }
                     emitted.push((pos.to_fen(), ply, strata));
                 }
             }
@@ -421,6 +467,8 @@ pub fn run(cfg: &SelfPlayConfig, stop: &AtomicBool) -> Result<SelfPlayStats, Cor
     let base_seed = cfg.seed;
     let opening = cfg.opening_random_plies;
     let max_plies = cfg.max_plies;
+    let book_ref: Option<&Book> = cfg.book.as_deref();
+    let book_fraction = cfg.book_fraction;
     let shard_path_ref = &shard_path;
     let ckpt_path_ref = &ckpt_path;
     let present_ref = &present;
@@ -492,6 +540,8 @@ pub fn run(cfg: &SelfPlayConfig, stop: &AtomicBool) -> Result<SelfPlayStats, Cor
                         match play_one_game(
                             &mut searcher,
                             &mut qsearcher,
+                            book_ref,
+                            book_fraction,
                             i,
                             depth,
                             opening,
@@ -578,6 +628,8 @@ mod tests {
             max_plies: 40,
             out_dir: out,
             val_fraction: 0.2,
+            book: None,
+            book_fraction: 0.0,
         }
     }
 
@@ -616,8 +668,8 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let mut ra = Prng::new(substream_seed(123, 5));
         let mut rb = Prng::new(substream_seed(123, 5));
-        let a = play_one_game(&mut sa, &mut qa, 5, 3, 4, 60, &mut ra, &stop).unwrap();
-        let b = play_one_game(&mut sb, &mut qb, 5, 3, 4, 60, &mut rb, &stop).unwrap();
+        let a = play_one_game(&mut sa, &mut qa, None, 0.0, 5, 3, 4, 60, &mut ra, &stop).unwrap();
+        let b = play_one_game(&mut sb, &mut qb, None, 0.0, 5, 3, 4, 60, &mut rb, &stop).unwrap();
         assert_eq!(
             a, b,
             "same seed + depth ⇒ bit-identical game (fixed-depth determinism)"
@@ -650,6 +702,8 @@ mod tests {
         let _ = play_one_game(
             &mut warm,
             &mut warm_q,
+            None,
+            0.0,
             0,
             depth,
             opening,
@@ -662,6 +716,8 @@ mod tests {
         let g_warm = play_one_game(
             &mut warm,
             &mut warm_q,
+            None,
+            0.0,
             game_id,
             depth,
             opening,
@@ -678,6 +734,8 @@ mod tests {
         let g_cold = play_one_game(
             &mut cold,
             &mut cold_q,
+            None,
+            0.0,
             game_id,
             depth,
             opening,
@@ -797,6 +855,8 @@ mod tests {
         let g = play_one_game(
             &mut s,
             &mut q,
+            None,
+            0.0,
             1,
             2,
             4,
@@ -815,6 +875,113 @@ mod tests {
         );
     }
 
+    // ── Opening book + STRATUM_BOOK_OPENING ─────────────────────────────
+
+    /// `book_seeded_this_game` is the seeded coin-flip primitive. Pin its
+    /// boundary behavior so a later edit doesn't silently bias the mix.
+    #[test]
+    fn coin_flip_extremes_and_determinism() {
+        let mut rng = Prng::new(42);
+        assert!(!book_seeded_this_game(0.0, &mut rng), "0.0 ⇒ never book");
+        let mut rng = Prng::new(42);
+        assert!(book_seeded_this_game(1.0, &mut rng), "1.0 ⇒ always book");
+        // Same seed → same flip (determinism).
+        let mut a = Prng::new(0xC0FFEE);
+        let mut b = Prng::new(0xC0FFEE);
+        assert_eq!(
+            book_seeded_this_game(0.5, &mut a),
+            book_seeded_this_game(0.5, &mut b)
+        );
+        // 0.5 over a few hundred draws — roughly balanced.
+        let mut rng = Prng::new(7);
+        let n = 2000;
+        let book = (0..n)
+            .filter(|_| book_seeded_this_game(0.5, &mut rng))
+            .count();
+        assert!(
+            (700..=1300).contains(&book),
+            "0.5 should pick ~half of {n}; got {book}"
+        );
+    }
+
+    fn synth_book() -> super::super::openings::Book {
+        // 3 hand-picked principled openings; sufficient for the
+        // STRATUM_BOOK_OPENING tag-and-seed test below.
+        let dir = std::env::temp_dir().join("clawfish-selfplay-book");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("book.epd");
+        std::fs::write(
+            &p,
+            "rnbqkbnr/pp1ppppp/2p5/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2\n\
+             rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2\n\
+             rnbqkbnr/ppp1pppp/8/3p4/3P4/8/PPP1PPPP/RNBQKBNR w KQkq - 0 2\n",
+        )
+        .unwrap();
+        super::super::openings::Book::load_epd(&p).expect("synth book loads")
+    }
+
+    #[test]
+    fn book_fraction_one_tags_every_record_with_stratum_book_opening() {
+        let mut s = AlphaBetaMover::new();
+        let mut q = QSearcher::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut rng = Prng::new(substream_seed(0xB00C, 1));
+        let book = synth_book();
+        let g = play_one_game(
+            &mut s,
+            &mut q,
+            Some(&book),
+            1.0,
+            1,
+            3,
+            2,
+            60,
+            &mut rng,
+            &stop,
+        )
+        .expect("book-seeded game completes");
+        // The game may emit zero records on a shallow run; we assert the
+        // strata-tag invariant on every emitted record.
+        for r in &g.records {
+            assert!(
+                r.strata & STRATUM_BOOK_OPENING != 0,
+                "book_fraction=1.0 ⇒ every record carries STRATUM_BOOK_OPENING"
+            );
+        }
+    }
+
+    #[test]
+    fn book_fraction_zero_with_book_loaded_still_never_tags() {
+        // Even with a book provided, book_fraction=0.0 must yield no
+        // book-seeded games (and thus no STRATUM_BOOK_OPENING records).
+        let mut s = AlphaBetaMover::new();
+        let mut q = QSearcher::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut rng = Prng::new(substream_seed(0xB00C, 2));
+        let book = synth_book();
+        let g = play_one_game(
+            &mut s,
+            &mut q,
+            Some(&book),
+            0.0,
+            2,
+            3,
+            2,
+            60,
+            &mut rng,
+            &stop,
+        )
+        .expect("game completes");
+        for r in &g.records {
+            assert_eq!(
+                r.strata & STRATUM_BOOK_OPENING,
+                0,
+                "book_fraction=0.0 ⇒ no record carries STRATUM_BOOK_OPENING"
+            );
+        }
+    }
+
     // ── Interrupt: zero records ─────────────────────────────────────────
 
     #[test]
@@ -825,7 +992,7 @@ mod tests {
         // wholesale: ZERO records (R2).
         let stop = Arc::new(AtomicBool::new(true));
         let mut rng = Prng::new(substream_seed(1, 1));
-        let g = play_one_game(&mut s, &mut q, 1, 4, 4, 80, &mut rng, &stop);
+        let g = play_one_game(&mut s, &mut q, None, 0.0, 1, 4, 4, 80, &mut rng, &stop);
         assert!(
             g.is_none(),
             "a stop-aborted in-flight game contributes ZERO records"

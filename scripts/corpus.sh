@@ -52,6 +52,13 @@ SPLIT_SEED="${SPLIT_SEED:-7}"
 MAX_PLIES="${MAX_PLIES:-400}"
 OPENING_RANDOM_PLIES="${OPENING_RANDOM_PLIES:-8}"
 BUCKETS="${BUCKETS:-100,200,400,600}"
+# Opening book + mix ratio. OPENING_BOOK="" disables the book; the default
+# uses the vendored bench/data/openings.epd (CC0, 40457 positions). The
+# BOOK_FRACTION is the per-game coin-flip weight for book-seeded games —
+# 0.5 mixes book and random-walk openings at parity (M6.H's outer simplex
+# can tune it; see bench/openings.md / ADR-0035 §4).
+OPENING_BOOK="${OPENING_BOOK:-bench/data/openings.epd}"
+BOOK_FRACTION="${BOOK_FRACTION:-0.5}"
 
 # Stamp the engine commit into the manifest (operator step — keeps the
 # Rust binary free of a `git` subprocess dep; R5/dependency-hygiene).
@@ -68,25 +75,24 @@ mkdir -p "$OUT_DIR"
 echo "corpus.sh: calibrating R-TC depth ladder (buckets=$BUCKETS)"
 "$CORPUS_BIN" calibrate-ladder --buckets "$BUCKETS" --out "$OUT_DIR"
 
+SELFPLAY_ARGS="--seed $SEED --workers $WORKERS --out $OUT_DIR \
+--max-plies $MAX_PLIES --opening-random-plies $OPENING_RANDOM_PLIES \
+--val-fraction $VAL_FRACTION"
+if [ -n "$OPENING_BOOK" ] && [ -f "$OPENING_BOOK" ]; then
+    SELFPLAY_ARGS="$SELFPLAY_ARGS --opening-book $OPENING_BOOK --book-fraction $BOOK_FRACTION"
+    echo "corpus.sh: opening book = $OPENING_BOOK (book_fraction=$BOOK_FRACTION)"
+elif [ -n "$OPENING_BOOK" ]; then
+    echo "corpus.sh: WARNING: OPENING_BOOK=$OPENING_BOOK not found — running without book"
+fi
+
 if [ -n "$GAMES" ]; then
     echo "corpus.sh: running deterministic self-play (seed=$SEED games=$GAMES workers=$WORKERS)"
-    "$CORPUS_BIN" selfplay \
-        --seed "$SEED" \
-        --games "$GAMES" \
-        --workers "$WORKERS" \
-        --out "$OUT_DIR" \
-        --max-plies "$MAX_PLIES" \
-        --opening-random-plies "$OPENING_RANDOM_PLIES" \
-        --val-fraction "$VAL_FRACTION"
+    # shellcheck disable=SC2086 # word-split SELFPLAY_ARGS intentionally
+    "$CORPUS_BIN" selfplay --games "$GAMES" $SELFPLAY_ARGS
 else
     echo "corpus.sh: running unbounded deterministic self-play (seed=$SEED workers=$WORKERS) — Ctrl-C to stop"
-    "$CORPUS_BIN" selfplay \
-        --seed "$SEED" \
-        --workers "$WORKERS" \
-        --out "$OUT_DIR" \
-        --max-plies "$MAX_PLIES" \
-        --opening-random-plies "$OPENING_RANDOM_PLIES" \
-        --val-fraction "$VAL_FRACTION"
+    # shellcheck disable=SC2086
+    "$CORPUS_BIN" selfplay $SELFPLAY_ARGS
 fi
 
 # (4) PGN ingestion: operator-driven. Uncomment + adapt to stage raw

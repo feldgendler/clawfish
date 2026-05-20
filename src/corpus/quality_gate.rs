@@ -521,6 +521,9 @@ mod tests {
             split_seed: 7,
             val_fraction: 0.2,
             depth_ladder: vec![(4, 1)],
+            opening_book_path: None,
+            opening_book_sha256: None,
+            book_fraction: 0.0,
             corpus_sha256,
         };
         write_manifest(dir, &m).unwrap();
