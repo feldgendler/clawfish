@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 # scripts/corpus.sh — OPERATOR FRESH-BUILD wrapper around the `corpus` binary.
 #
 # This script is for **building (or extending) a corpus** with operator-chosen

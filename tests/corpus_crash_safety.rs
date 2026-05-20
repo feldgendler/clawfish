@@ -153,12 +153,16 @@ fn assert_no_partial_games(dir: &Path) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Fast default variant — one deterministic SIGKILL, then resume.
-// will be replaced by the per-game-file variant in M6.G per-game-file
-// rewrite; see docs/plans/m6.g-per-game-files.md §8.2.
+// Legacy single-shard crash-safety test (pre-M6.G architecture). Superseded
+// by `crash_kill_k4_resumes_to_uninterrupted_corpus_per_game_file` which
+// exercises the new per-game-file path at K=4 with stricter byte-equality.
+// Kept for historical-bisect value but `#[ignore]`d because it shares the
+// test binary with 8 other parallel corpus tests and its 60s
+// wait-for-first-block deadline is brittle under that contention.
 // ──────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "legacy single-shard variant — superseded; run explicitly via --ignored"]
 fn crash_kill_after_first_game_resumes_to_uninterrupted_corpus() {
     let seed = 42u64;
     let games = 3u64;
