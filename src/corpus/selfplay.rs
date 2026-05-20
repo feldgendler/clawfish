@@ -19,12 +19,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::Duration;
 
+use super::objective::strata_for;
 use super::prng::{Prng, substream_seed};
+use super::quiet::{is_quiet, static_eval_white};
 use super::store::{
     Checkpoint, append_block, read_checkpoint, scan_valid_blocks, write_checkpoint,
 };
-use super::{CorpusError, CorpusRecord, Label, OPENING_SKIP_PLIES};
-use crate::search::{AlphaBetaMover, Search, SearchContext, SearchLimits, SearchResult, TimeCaps};
+use super::{CorpusError, CorpusRecord, HIGH_SCORE_CP, Label, OPENING_SKIP_PLIES};
+use crate::search::{
+    AlphaBetaMover, QSearcher, Search, SearchContext, SearchLimits, SearchResult, TimeCaps,
+};
 use crate::search::{is_fifty_move_draw, is_repetition};
 use crate::{Color, MoveList, PieceKind, Position, generate_moves, in_check};
 
@@ -186,8 +190,10 @@ fn search_best_move(
 
 /// Outcome of `play_one_game`: a completed game's transactional record, or
 /// `None` if interrupted in-flight (R2: contributes ZERO records).
+#[allow(clippy::too_many_arguments)] // play/quiet searchers + per-game knobs is what it is
 fn play_one_game(
     searcher: &mut AlphaBetaMover,
+    qsearcher: &mut QSearcher,
     game_id: u64,
     depth: u8,
     opening_random_plies: u32,
@@ -223,10 +229,10 @@ fn play_one_game(
     }
 
     let mut records: Vec<CorpusRecord> = Vec::new();
-    // Index, into `records`, of each emitted position so the final label
-    // can be back-filled once the game terminates. We store positions
-    // first with a placeholder label, then rewrite all of them.
-    let mut emitted_fens: Vec<(String, u32)> = Vec::new();
+    // Each emitted entry has its strata bit pre-tagged at emit time so the
+    // shard carries quiet-certified, build-ready records. Label is back-
+    // filled once the game terminates.
+    let mut emitted: Vec<(String, u32, u8)> = Vec::new();
 
     let label = loop {
         if stop.load(Ordering::Relaxed) {
@@ -240,10 +246,21 @@ fn play_one_game(
             // max_plies adjudication-as-draw.
             break Label::Draw;
         }
-        // Emit EVERY position with ply >= OPENING_SKIP_PLIES (two-pass: no
-        // quiet filtering here — `build` does that later).
-        if ply >= OPENING_SKIP_PLIES {
-            emitted_fens.push((pos.to_fen(), ply));
+        // Inline per-position filter (replaces the old build-pass loop):
+        // ply ≥ OPENING_SKIP_PLIES ∧ !in_check ∧ |static_eval| ≤ HIGH_SCORE_CP
+        // ∧ quiet predicate ⇒ admitted; strata pre-tagged. Yields a shard
+        // that is already build-ready — every run of the script contributes
+        // to the usable, prepared, labeled corpus. (Cross-game work — dedup,
+        // per-game cap, train/val split — stays in `build` by definition.)
+        if ply >= OPENING_SKIP_PLIES && !in_check(&pos) {
+            let se = static_eval_white(&pos);
+            if se.abs() <= HIGH_SCORE_CP {
+                let qs = qsearcher.eval_white(&pos);
+                if is_quiet(&pos, se, qs) {
+                    let strata = strata_for(&pos);
+                    emitted.push((pos.to_fen(), ply, strata));
+                }
+            }
         }
         // No legal move would have been caught by `game_result`; a None
         // here means a stop-abort raced the loop guard — drop the game.
@@ -253,7 +270,7 @@ fn play_one_game(
         ply += 1;
     };
 
-    for (fen, p) in emitted_fens {
+    for (fen, p, strata) in emitted {
         records.push(CorpusRecord {
             fen,
             label,
@@ -261,7 +278,7 @@ fn play_one_game(
             game_id,
             ply: p,
             depth_rung: depth,
-            strata: 0,
+            strata,
         });
     }
 
@@ -464,11 +481,17 @@ pub fn run(cfg: &SelfPlayConfig, stop: &AtomicBool) -> Result<SelfPlayStats, Cor
                         // Fresh searcher per game (R3 bit-identical-resume:
                         // post-crash games must not depend on the TT state
                         // accumulated by prior games on the warm worker; a
-                        // cold-start resume would otherwise diverge). Also
-                        // improves self-play decorrelation (research §2.4/§5).
+                        // cold-start resume would otherwise diverge). Same
+                        // R3-analog discipline applies to the QSearcher —
+                        // qsearch consults the TT (M5.F qsearch-in-TT), so
+                        // a TT-warmed QSearcher would couple game N's
+                        // quiet check to game N-1. Allocate both fresh.
+                        // Also improves self-play decorrelation (research §2.4/§5).
                         let mut searcher = AlphaBetaMover::new();
+                        let mut qsearcher = QSearcher::new();
                         match play_one_game(
                             &mut searcher,
+                            &mut qsearcher,
                             i,
                             depth,
                             opening,
@@ -588,19 +611,20 @@ mod tests {
     fn same_seed_same_game_bit_identical() {
         let mut sa = AlphaBetaMover::new();
         let mut sb = AlphaBetaMover::new();
+        let mut qa = QSearcher::new();
+        let mut qb = QSearcher::new();
         let stop = Arc::new(AtomicBool::new(false));
         let mut ra = Prng::new(substream_seed(123, 5));
         let mut rb = Prng::new(substream_seed(123, 5));
-        let a = play_one_game(&mut sa, 5, 3, 4, 60, &mut ra, &stop).unwrap();
-        let b = play_one_game(&mut sb, 5, 3, 4, 60, &mut rb, &stop).unwrap();
+        let a = play_one_game(&mut sa, &mut qa, 5, 3, 4, 60, &mut ra, &stop).unwrap();
+        let b = play_one_game(&mut sb, &mut qb, 5, 3, 4, 60, &mut rb, &stop).unwrap();
         assert_eq!(
             a, b,
             "same seed + depth ⇒ bit-identical game (fixed-depth determinism)"
         );
-        assert!(
-            !a.records.is_empty(),
-            "the game must emit at least one post-opening-skip position"
-        );
+        // Inline filter is aggressive (in-check + |eval|≤600 + quiet); a short
+        // shallow game may yield zero admitted records. The determinism
+        // invariant is the load-bearing assertion above.
     }
 
     #[test]
@@ -616,12 +640,16 @@ mod tests {
         let opening: u32 = 4;
         let max_plies: u32 = 60;
 
-        // Warm searcher: play a prior game first to populate TT/history.
+        // Warm searcher + QSearcher: play a prior game first to populate
+        // TT/history on both (the R3 analog now applies to the QSearcher too
+        // because qsearch consults the TT — M5.F qsearch-in-TT).
         let mut warm = AlphaBetaMover::new();
+        let mut warm_q = QSearcher::new();
         let stop = Arc::new(AtomicBool::new(false));
         let mut rng_warmup = Prng::new(substream_seed(123, 0));
         let _ = play_one_game(
             &mut warm,
+            &mut warm_q,
             0,
             depth,
             opening,
@@ -633,6 +661,7 @@ mod tests {
         let mut rng_warm = Prng::new(substream_seed(123, game_id));
         let g_warm = play_one_game(
             &mut warm,
+            &mut warm_q,
             game_id,
             depth,
             opening,
@@ -642,11 +671,13 @@ mod tests {
         )
         .expect("warm-searcher game completes");
 
-        // Cold searcher: same game_id, fresh `AlphaBetaMover`.
+        // Cold searcher + QSearcher: same game_id, fresh state on both.
         let mut cold = AlphaBetaMover::new();
+        let mut cold_q = QSearcher::new();
         let mut rng_cold = Prng::new(substream_seed(123, game_id));
         let g_cold = play_one_game(
             &mut cold,
+            &mut cold_q,
             game_id,
             depth,
             opening,
@@ -756,13 +787,24 @@ mod tests {
         // A game forced to hit max_plies adjudicates as a draw and still
         // emits its post-opening-skip positions.
         let mut s = AlphaBetaMover::new();
+        let mut q = QSearcher::new();
         let stop = Arc::new(AtomicBool::new(false));
         let mut rng = Prng::new(substream_seed(7, 1));
         // max_plies just above the opening skip ⇒ a few emitted positions
-        // then a forced draw adjudication.
-        let g = play_one_game(&mut s, 1, 2, 4, OPENING_SKIP_PLIES + 3, &mut rng, &stop)
-            .expect("max-plies game still completes (draw adjudication)");
-        assert!(!g.records.is_empty());
+        // then a forced draw adjudication. (The inline filter may drop some
+        // — in-check / non-quiet / |eval|>HIGH — but the label-correctness
+        // contract is what we assert.)
+        let g = play_one_game(
+            &mut s,
+            &mut q,
+            1,
+            2,
+            4,
+            OPENING_SKIP_PLIES + 3,
+            &mut rng,
+            &stop,
+        )
+        .expect("max-plies game still completes (draw adjudication)");
         assert!(
             g.records.iter().all(|r| r.label == Label::Draw),
             "max-plies adjudication labels every emitted position a draw"
@@ -778,11 +820,12 @@ mod tests {
     #[test]
     fn interrupted_game_emits_zero_records() {
         let mut s = AlphaBetaMover::new();
+        let mut q = QSearcher::new();
         // stop already set before the game starts ⇒ the game is dropped
         // wholesale: ZERO records (R2).
         let stop = Arc::new(AtomicBool::new(true));
         let mut rng = Prng::new(substream_seed(1, 1));
-        let g = play_one_game(&mut s, 1, 4, 4, 80, &mut rng, &stop);
+        let g = play_one_game(&mut s, &mut q, 1, 4, 4, 80, &mut rng, &stop);
         assert!(
             g.is_none(),
             "a stop-aborted in-flight game contributes ZERO records"

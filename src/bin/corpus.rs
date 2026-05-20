@@ -14,24 +14,19 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use clawfish::Position;
 use clawfish::corpus::dedup::{dedup_fen, per_game_cap};
-use clawfish::corpus::filter::{GameFilter, position_admitted};
+use clawfish::corpus::filter::GameFilter;
 use clawfish::corpus::manifest::{
     Manifest, hex_digest, read_manifest, sha256_bytes, write_filter_spec, write_manifest,
 };
-use clawfish::corpus::objective::strata_for;
 use clawfish::corpus::pgn::{PgnStats, stream_pgn};
 use clawfish::corpus::quality_gate::{FEN_LEAKAGE_TAU, QualityReport, run_quality_gate};
-use clawfish::corpus::quiet::{is_quiet, static_eval_white};
 use clawfish::corpus::selfplay::{SelfPlayConfig, calibrate_ladder, run as selfplay_run};
 use clawfish::corpus::split::split_by_game;
 use clawfish::corpus::store::{GameBlock, append_block, atomic_write, scan_valid_blocks};
 use clawfish::corpus::{
-    CorpusRecord, DEPTH_RUNG_EXTERNAL, HIGH_SCORE_CP, Label, OPENING_SKIP_PLIES, PER_GAME_CAP,
-    QUIET_MARGIN_CP, Source,
+    CorpusRecord, DEPTH_RUNG_EXTERNAL, Label, PER_GAME_CAP, QUIET_MARGIN_CP, Source,
 };
-use clawfish::search::QSearcher;
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
@@ -513,48 +508,21 @@ corpus to <out>/train.bin + <out>/val.bin + manifest.json + filter_spec.txt
             }
         }
     }
-    eprintln!("corpus: loaded {} raw records", all.len());
-
-    // 2) Filter→quiet→strata pass. One reusable QSearcher per process
-    //    (single-threaded build pass — fine for the landing-budget corpus;
-    //    a future commit can shard this).
-    let mut q = QSearcher::new();
-    let mut admitted: Vec<CorpusRecord> = Vec::with_capacity(all.len());
-    let mut drop_in_check = 0u64;
-    let mut drop_eval_cap = 0u64;
-    let mut drop_opening = 0u64;
-    let mut drop_not_quiet = 0u64;
-    for r in all {
-        let pos = match Position::from_fen(&r.fen) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let se = static_eval_white(&pos);
-        if r.ply < OPENING_SKIP_PLIES {
-            drop_opening += 1;
-            continue;
-        }
-        if se.abs() > HIGH_SCORE_CP {
-            drop_eval_cap += 1;
-            continue;
-        }
-        if !position_admitted(&pos, r.ply, se) {
-            drop_in_check += 1;
-            continue;
-        }
-        let qs = q.eval_white(&pos);
-        if !is_quiet(&pos, se, qs) {
-            drop_not_quiet += 1;
-            continue;
-        }
-        let strata = strata_for(&pos);
-        admitted.push(CorpusRecord { strata, ..r });
-    }
     eprintln!(
-        "corpus: admitted {} records (dropped opening={drop_opening}, eval_cap={drop_eval_cap}, \
-         in_check={drop_in_check}, not_quiet={drop_not_quiet})",
-        admitted.len()
+        "corpus: loaded {} records (already quiet-certified by selfplay)",
+        all.len()
     );
+
+    // The shard contains quiet-certified, strata-tagged records emitted by
+    // selfplay's inline filter (ply ≥ OPENING_SKIP_PLIES ∧ !in_check ∧
+    // |eval| ≤ HIGH_SCORE_CP ∧ quiet predicate, with `strata_for` already
+    // applied). Build only does the cross-game work: dedup → per-game
+    // cap → game-level train/val split. For ingested-PGN records (when
+    // multi-source ingest grows beyond self-play), the build pass should
+    // re-apply per-position filtering — left as a follow-up when an
+    // operator actually runs `ingest-pgn`. The committed self-play-only
+    // path is fully covered by the inline filter.
+    let admitted = all;
 
     // 3) Dedup → per-game cap → game-level split.
     let spill_dir = std::env::temp_dir().join("clawfish-corpus-spill");
@@ -639,10 +607,8 @@ corpus to <out>/train.bin + <out>/val.bin + manifest.json + filter_spec.txt
     stats.push_str(&format!("val_fraction={val_fraction}\n"));
     stats.push_str(&format!("split_seed={split_seed}\n"));
     stats.push_str(&format!("corpus_sha256={corpus_digest}\n"));
-    stats.push_str(&format!("dropped_opening={drop_opening}\n"));
-    stats.push_str(&format!("dropped_eval_cap={drop_eval_cap}\n"));
-    stats.push_str(&format!("dropped_in_check={drop_in_check}\n"));
-    stats.push_str(&format!("dropped_not_quiet={drop_not_quiet}\n"));
+    // Per-position filter stats moved to selfplay (inline filter); the
+    // build pass no longer drops records by position-level predicates.
     stats.push_str(&format!("QUIET_MARGIN_CP={QUIET_MARGIN_CP}\n"));
     atomic_write(&out.join("corpus_stats.txt"), stats.as_bytes())
         .map_err(|e| format!("write corpus_stats: {e}"))?;

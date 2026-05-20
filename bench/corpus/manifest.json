@@ -1,23 +1,23 @@
 {
   "schema_version": 1,
-  "created_at": "2026-05-19T23:28:20Z",
-  "engine_commit": "unknown",
+  "created_at": "2026-05-20T00:42:45Z",
+  "engine_commit": "25ab7643a1f706638dfc3579b528e1d1e3172e8e",
   "total_positions": 20,
   "validation_fraction": 0.10000000000000001,
   "sources": [
   ],
   "self_play_seed": 12648430,
-  "games": 12,
+  "games": 2,
   "max_plies": 400,
   "opening_random_plies": 8,
   "workers": 1,
   "split_seed": 7,
   "val_fraction": 0.10000000000000001,
   "depth_ladder": [
-    {"depth": 8, "weight": 1},
-    {"depth": 9, "weight": 1},
     {"depth": 10, "weight": 1},
-    {"depth": 10, "weight": 1}
+    {"depth": 10, "weight": 1},
+    {"depth": 11, "weight": 1},
+    {"depth": 12, "weight": 1}
   ],
-  "corpus_sha256": "c03f5aa99dcf20bcedb69801c1633b8c34e8e85c1880528be4e62a0ef0f50e60"
+  "corpus_sha256": "949955d2ebd60d9605f770e3a1be84b1410829565a29c61053adb39a3b6af8f8"
 }
