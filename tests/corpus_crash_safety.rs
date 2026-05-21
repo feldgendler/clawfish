@@ -15,7 +15,7 @@ use clawfish::corpus::store::scan_valid_blocks;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// `target/debug/corpus` path (provided by Cargo).
 fn corpus_bin() -> &'static str {
@@ -62,19 +62,31 @@ fn spawn_selfplay(out: &Path, seed: u64, games: u64, workers: usize, max_plies: 
         .expect("spawn corpus selfplay")
 }
 
-/// Wait until the shard contains at least `min_games` durable game blocks,
-/// or `deadline` elapses. Returns the number of blocks present at exit.
-fn wait_for_blocks(shard: &Path, min_games: usize, deadline: Duration) -> usize {
-    let start = Instant::now();
+/// Wait until the shard contains at least `min_games` durable game blocks.
+///
+/// Polls indefinitely — there is no wall-clock deadline. Terminates only when
+/// one of two events occurs:
+///   1. The shard reaches `min_games` blocks (success — returns the count).
+///   2. The child process exits before reaching `min_games` (failure — panics
+///      with diagnostics).
+///
+/// This makes the test hardware-independent: a slow CI runner just takes
+/// longer to reach the target, and we never confuse "runner slow" with
+/// "binary broken" the way a fixed `Duration` deadline did.
+fn wait_for_blocks(shard: &Path, child: &mut Child, min_games: usize) -> usize {
     loop {
         if let Ok((blocks, _)) = scan_valid_blocks(shard)
             && blocks.len() >= min_games
         {
             return blocks.len();
         }
-        if start.elapsed() >= deadline {
+        // Child died before producing the expected blocks — real failure.
+        if let Some(status) = child.try_wait().expect("try_wait on selfplay child") {
             let count = scan_valid_blocks(shard).map(|(b, _)| b.len()).unwrap_or(0);
-            return count;
+            panic!(
+                "selfplay child exited before producing {min_games} block(s) \
+                 (exit status: {status:?}, blocks present: {count})"
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -201,7 +213,7 @@ fn crash_kill_after_first_game_resumes_to_uninterrupted_corpus() {
     let shard = crash_dir.path().join("shard.bin");
 
     let mut child = spawn_selfplay(crash_dir.path(), seed, games, workers, max_plies);
-    let blocks_before_kill = wait_for_blocks(&shard, 1, Duration::from_secs(60));
+    let blocks_before_kill = wait_for_blocks(&shard, &mut child, 1);
     assert!(
         blocks_before_kill >= 1,
         "expected ≥ 1 durable block before SIGKILL; got {blocks_before_kill}"
@@ -389,7 +401,7 @@ fn crash_kill_k4_resumes_to_uninterrupted_corpus_per_game_file() {
     let crash_dir = TempDir::new("pgf-crash-k4");
     let shard = crash_dir.path().join("shard.bin");
     let mut child = spawn_selfplay(crash_dir.path(), seed, games, workers, max_plies);
-    let blocks_before_kill = wait_for_blocks(&shard, 1, std::time::Duration::from_secs(90));
+    let blocks_before_kill = wait_for_blocks(&shard, &mut child, 1);
     assert!(
         blocks_before_kill >= 1,
         "expected ≥ 1 durable block before SIGKILL; got {blocks_before_kill}"
@@ -581,7 +593,7 @@ fn worker_crash_only_loses_in_flight_games() {
     let crash_dir = TempDir::new("wc-crash");
     let shard = crash_dir.path().join("shard.bin");
     let mut child = spawn_selfplay(crash_dir.path(), seed, games, workers, max_plies);
-    let blocks = wait_for_blocks(&shard, 2, std::time::Duration::from_secs(90));
+    let blocks = wait_for_blocks(&shard, &mut child, 2);
     assert!(blocks >= 1, "expected ≥ 1 block before kill; got {blocks}");
     sigkill(&child);
     let _ = child.wait();
