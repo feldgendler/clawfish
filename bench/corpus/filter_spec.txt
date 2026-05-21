@@ -1,9 +1,0 @@
-# Corpus filter specification (M6.G↔M6.H contract surface)
-# Do not edit — regenerate by re-running the corpus extraction pipeline.
-#
-# Quiet predicate: |static_eval - qsearch_score| <= QUIET_MARGIN_CP
-# All scores in centipawns (side-to-move relative).
-QUIET_MARGIN_CP=30
-OPENING_SKIP_PLIES=8
-HIGH_SCORE_CP=600
-PER_GAME_CAP=10

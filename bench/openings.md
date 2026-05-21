@@ -1,10 +1,14 @@
 # Vendored opening book — `bench/data/openings.epd`
 
 A 40,457-position opening EPD vendored as the M6.G/M6.H opening-seed
-source. Mixed with seeded-random startpos walks at a configurable
-`book_fraction` ratio per `scripts/corpus.sh` / the `corpus selfplay`
-CLI. The mix ratio is a **meta-tunable** of the M6.H bi-level corpus-
-mixture search (the outer-simplex axis ADR-0035 §9 / plan §3.8).
+source. Consumed by an `OpeningMode::Book` self-play campaign (every
+record tagged `Source::SelfPlayOnBook`); the complementary
+`OpeningMode::Random` campaign starts every game from `startpos +
+opening_random_plies` random plies and tags records
+`Source::SelfPlayOffBook`. The operator runs one campaign per regime
+and grows the two corpora independently. The book / off-book
+proportion is a **training-time per-source reweighting** axis at M6.H
+(ADR-0035 §10), no longer a corpus-generation knob.
 
 ## Provenance
 

@@ -471,7 +471,7 @@ mod tests {
                     } else {
                         Label::Draw
                     },
-                    Source::SelfPlay,
+                    Source::SelfPlayOffBook,
                     game_id,
                     p,
                 )

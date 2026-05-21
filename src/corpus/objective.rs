@@ -112,15 +112,17 @@ pub struct StratObjective {
     pub outpost: f64,
     /// Loss restricted to `STRATUM_ENDGAME` records.
     pub endgame: f64,
-    /// Loss restricted to `STRATUM_BOOK_OPENING` records (the M6.H
-    /// meta-tunable stratum — book-seeded games carry this bit so the
-    /// outer simplex can compare against the unset complement).
-    pub book_opening: f64,
-    /// `(source_byte, loss)` — per-source held-out loss. The corpus-mix
-    /// (self-play vs CCRL vs Lichess) ratio is another M6.H meta-tunable
-    /// axis (ADR-0035 §9 / plan §3.8); this entry lets the outer simplex
-    /// read the per-source signal and move the mix accordingly. Sorted
-    /// by source byte for stable iteration.
+    /// `(source_byte, loss)` — per-source held-out loss. The four-way
+    /// corpus-mix (SelfPlayOnBook / SelfPlayOffBook / Ccrl / LichessOpen)
+    /// is an M6.H meta-tunable axis (ADR-0035 §10); this entry lets the
+    /// outer simplex read the per-source signal and move the mix
+    /// accordingly. Sorted by source byte for stable iteration.
+    ///
+    /// The book / off-book proportion that was previously a corpus-
+    /// generation knob (`book_fraction`) lives here too — `SelfPlayOnBook`
+    /// records contribute to one byte, `SelfPlayOffBook` to another, and
+    /// reweighting between them is the same mechanism as reweighting
+    /// CCRL vs Lichess.
     pub per_source: Vec<(u8, f64)>,
 }
 
@@ -255,13 +257,9 @@ pub fn stratified_objective(
         .collect();
     let endgame = logistic_loss_refs(&endgame_recs, k, score);
 
-    let book_recs: Vec<&CorpusRecord> = val
-        .iter()
-        .filter(|r| r.strata & super::STRATUM_BOOK_OPENING != 0)
-        .collect();
-    let book_opening = logistic_loss_refs(&book_recs, k, score);
-
-    // Per-source loss (M6.H corpus-mix meta-tunable axis).
+    // Per-source loss (M6.H corpus-mix meta-tunable axis). The book vs
+    // off-book proportion is read from this vector — `SelfPlayOnBook`
+    // and `SelfPlayOffBook` are distinct source bytes.
     let mut source_bytes: Vec<u8> = val.iter().map(|r| r.source.as_u8()).collect();
     source_bytes.sort_unstable();
     source_bytes.dedup();
@@ -279,7 +277,6 @@ pub fn stratified_objective(
         per_depth_rung,
         outpost,
         endgame,
-        book_opening,
         per_source,
     }
 }
@@ -331,7 +328,7 @@ mod tests {
         CorpusRecord {
             fen: fen.to_string(),
             label,
-            source: Source::SelfPlay,
+            source: Source::SelfPlayOffBook,
             game_id: score_cp as u64, // repurposed as score carrier for tests
             ply: 10,
             depth_rung,
@@ -437,7 +434,7 @@ mod tests {
                 CorpusRecord {
                     fen: fen.to_string(),
                     label,
-                    source: Source::SelfPlay,
+                    source: Source::SelfPlayOffBook,
                     game_id: i as u64,
                     ply: 10,
                     depth_rung: DEPTH_RUNG_EXTERNAL,

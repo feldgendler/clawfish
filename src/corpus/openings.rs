@@ -1,12 +1,12 @@
 //! Vendored opening-book reader (CC0 `2moves_v1.epd`, `bench/data/openings.epd`).
 //!
-//! Provides random sampling of opening positions for self-play. Mixed
-//! with seeded-random startpos walks at a configurable `book_fraction`
-//! ratio — the **meta-tunable** axis of the M6.H bi-level corpus-mixture
-//! search (ADR-0035 §9 / plan §3.8). Each record emitted from a
-//! book-seeded game carries `STRATUM_BOOK_OPENING` in its strata
-//! bitset so M6.H can compute per-stratum held-out loss and the outer
-//! simplex can move the ratio.
+//! Provides random sampling of opening positions for self-play. The book
+//! is consumed by an `OpeningMode::Book` self-play campaign (every record
+//! tagged `Source::SelfPlayOnBook`); the complementary `OpeningMode::
+//! Random` campaign starts every game from `startpos + opening_random_
+//! plies` random plies and tags records `Source::SelfPlayOffBook`. The
+//! book / off-book proportion is a training-time per-source reweighting
+//! axis at M6.H (ADR-0035 §10), no longer a corpus-generation knob.
 //!
 //! Format: one 6-field FEN per line. Whole-file SHA-256 is recorded in
 //! the manifest (`opening_book_sha256`) so the reproducibility re-run

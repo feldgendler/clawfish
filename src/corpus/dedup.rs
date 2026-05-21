@@ -491,10 +491,10 @@ mod tests {
         // The survivor must always be the one with the smallest dedup_key.
         let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
         // dedup_key = (source.as_u8(), game_id, ply)
-        // SelfPlay=0, Ccrl=1, LichessOpen=2
-        let r_min = make_record(fen, Source::SelfPlay, 1, 8); // key = (0,1,8) ← min
-        let r_mid = make_record(fen, Source::Ccrl, 1, 8); // key = (1,1,8)
-        let r_max = make_record(fen, Source::LichessOpen, 5, 9); // key = (2,5,9)
+        // SelfPlayOnBook=0, SelfPlayOffBook=1, Ccrl=2, LichessOpen=3
+        let r_min = make_record(fen, Source::SelfPlayOnBook, 1, 8); // key = (0,1,8) ← min
+        let r_mid = make_record(fen, Source::Ccrl, 1, 8); // key = (2,1,8)
+        let r_max = make_record(fen, Source::LichessOpen, 5, 9); // key = (3,5,9)
 
         let orderings: &[&[CorpusRecord]] = &[
             &[r_min.clone(), r_mid.clone(), r_max.clone()],
@@ -647,7 +647,7 @@ mod tests {
                 for p in 0..records_per_game as u32 {
                     records.push(make_record(
                         &format!("fen-{g}-{p}"),
-                        Source::SelfPlay,
+                        Source::SelfPlayOffBook,
                         g,
                         p,
                     ));
@@ -691,9 +691,10 @@ mod tests {
             let mut records: Vec<CorpusRecord> = Vec::new();
             for f in 0..n_fens as u64 {
                 for d in 0..dup_factor as u64 {
-                    let src = match (f + d) % 3 {
-                        0 => Source::SelfPlay,
-                        1 => Source::Ccrl,
+                    let src = match (f + d) % 4 {
+                        0 => Source::SelfPlayOnBook,
+                        1 => Source::SelfPlayOffBook,
+                        2 => Source::Ccrl,
                         _ => Source::LichessOpen,
                     };
                     records.push(make_record(

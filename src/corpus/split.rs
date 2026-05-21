@@ -116,7 +116,7 @@ mod tests {
         CorpusRecord {
             fen: fen.to_string(),
             label: Label::Draw,
-            source: Source::SelfPlay,
+            source: Source::SelfPlayOffBook,
             game_id,
             ply: 10,
             depth_rung: DEPTH_RUNG_EXTERNAL,

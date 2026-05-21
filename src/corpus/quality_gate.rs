@@ -229,24 +229,32 @@ fn check_dedup_ratios(records: &[CorpusRecord]) -> CheckResult {
 // ── Check 4: ADR-0003 label-provenance audit (MUST PASS) ────────────────────
 
 fn check_adr0003_audit(records: &[CorpusRecord]) -> CheckResult {
-    // Accept-list: SelfPlay (own result), CCRL (Result-tag), Lichess (Result-tag).
-    // Zurichess `c9` engine-score labels are REJECTED by construction (the
-    // `Source` enum does not encode them); this audit is the load-bearing
-    // defense that any out-of-list provenance fails the gate closed.
+    // Accept-list: SelfPlayOnBook (own result, book-seeded opening),
+    // SelfPlayOffBook (own result, startpos + random plies), CCRL
+    // (Result-tag), Lichess (Result-tag). Zurichess `c9` engine-score
+    // labels are REJECTED by construction (the `Source` enum does not
+    // encode them); this audit is the load-bearing defense that any
+    // out-of-list provenance fails the gate closed.
     //
-    // **Must update audit when `Source` grows.** A 4th variant added to
-    // `Source` requires re-asserting it carries an ADR-0003-compliant label
-    // (original game outcome, never an engine score). The cardinality pin
-    // below enumerates the three accepted variants by name; the compiler
-    // forces the developer to revisit this audit when `Source` changes.
-    let accept_list = [Source::SelfPlay, Source::Ccrl, Source::LichessOpen];
+    // **Must update audit when `Source` grows.** A 5th variant added to
+    // `Source` requires re-asserting it carries an ADR-0003-compliant
+    // label (original game outcome, never an engine score). The
+    // cardinality pin below enumerates every accepted variant by name;
+    // the compiler forces the developer to revisit this audit when
+    // `Source` changes.
+    let accept_list = [
+        Source::SelfPlayOnBook,
+        Source::SelfPlayOffBook,
+        Source::Ccrl,
+        Source::LichessOpen,
+    ];
     // `assert_eq!`, NOT `debug_assert_eq!`: this is the operator-facing
     // landing gate at release-mode `corpus quality-gate`. Compiling it out
     // would let a future `Source` variant slip past the audit in release.
     assert_eq!(
         accept_list.len(),
-        3,
-        "ADR-0003 accept-list pinned at 3 variants — adding a Source variant \
+        4,
+        "ADR-0003 accept-list pinned at 4 variants — adding a Source variant \
          requires updating the audit and re-running the label-provenance review"
     );
 
@@ -256,7 +264,7 @@ fn check_adr0003_audit(records: &[CorpusRecord]) -> CheckResult {
         *by_source.entry(r.source.as_u8()).or_default() += 1;
         if !matches!(
             r.source,
-            Source::SelfPlay | Source::Ccrl | Source::LichessOpen
+            Source::SelfPlayOnBook | Source::SelfPlayOffBook | Source::Ccrl | Source::LichessOpen
         ) {
             bad.push(r.source.as_u8());
         }
@@ -272,9 +280,9 @@ fn check_adr0003_audit(records: &[CorpusRecord]) -> CheckResult {
             passed: true,
             must_pass: true,
             detail: format!(
-                "PASS — accept-list = {{SelfPlay, Ccrl, LichessOpen}}; \
-                 Zurichess c9 engine-score labels REJECTED (intentionally absent \
-                 from `Source`); per-source counts: {{{counts}}}"
+                "PASS — accept-list = {{SelfPlayOnBook, SelfPlayOffBook, Ccrl, \
+                 LichessOpen}}; Zurichess c9 engine-score labels REJECTED \
+                 (intentionally absent from `Source`); per-source counts: {{{counts}}}"
             ),
         }
     } else {
@@ -553,7 +561,7 @@ mod tests {
             depth_ladder: vec![(4, 1)],
             opening_book_path: None,
             opening_book_sha256: None,
-            book_fraction: 0.0,
+            opening_mode: None,
             corpus_sha256,
         };
         write_manifest(dir, &m).unwrap();
@@ -569,9 +577,9 @@ mod tests {
         //
         //   (a) **Physical:** the on-disk frame cannot carry an unrecognized
         //       source byte — `Source::from_u8(b) == None` for any
-        //       `b >= 3`, and `store::decode_block` rejects the whole frame.
+        //       `b >= 4`, and `store::decode_block` rejects the whole frame.
         //   (b) **Programmatic:** the audit's `accept_list` cardinality pin
-        //       forces a developer adding a 4th `Source` variant to update
+        //       forces a developer adding a 5th `Source` variant to update
         //       this test (and the audit).
         let r = audit_records(&[]);
         assert!(r.passed, "empty corpus passes the audit (vacuously)");
@@ -582,15 +590,16 @@ mod tests {
             r.detail
         );
 
-        // Layer (a): physical defense — `Source::from_u8(3)` is `None`, so
-        // an out-of-list source byte cannot be decoded from disk.
+        // Layer (a): physical defense — `Source::from_u8(4)` is `None`, so
+        // an out-of-list source byte cannot be decoded from disk. (Bytes
+        // 0..=3 are the four accept-listed variants.)
         assert_eq!(
-            Source::from_u8(3),
+            Source::from_u8(4),
             None,
-            "Source::from_u8(3) must be None — physical defense against \
+            "Source::from_u8(4) must be None — physical defense against \
              a future Zurichess (or other engine-score-labeled) source byte"
         );
-        for b in 3u8..=255 {
+        for b in 4u8..=255 {
             assert_eq!(
                 Source::from_u8(b),
                 None,
@@ -605,15 +614,15 @@ mod tests {
         let td = TempDir::new("adr-zurichess");
         let shard = td.path().join("shard.bin");
         // Build a normal valid block, then flip its single source byte.
-        let r0 = rec(&startpos(), Label::Draw, Source::SelfPlay, 42, 10);
+        let r0 = rec(&startpos(), Label::Draw, Source::SelfPlayOnBook, 42, 10);
         crate::corpus::store::append_block(&shard, 42, &[r0]).unwrap();
         let mut bytes = std::fs::read(&shard).unwrap();
         // The source byte sits at the second per-record byte (after label).
-        // Find a byte == Source::SelfPlay.as_u8() (0) just after a Label byte
-        // and flip it to 3. Easier: locate the FEN bytes + label and patch.
-        // We know the record layout starts at HEADER_LEN (20) bytes into the
-        // payload: u16 fen_len, fen bytes, label, source, ply, depth_rung, strata.
-        // Patch source byte: at offset 20 (HEADER_LEN) + 2 + fen_len + 1.
+        // Locate the FEN bytes + label and patch the source byte to an
+        // out-of-list value (4 — first byte past the four accept-listed
+        // variants). The record layout starts at HEADER_LEN (20) bytes
+        // into the payload: u16 fen_len, fen bytes, label, source, ply,
+        // depth_rung, strata. Source-byte offset = 20 + 2 + fen_len + 1.
         let header_len = 20usize;
         let fen_len = u16::from_le_bytes(
             bytes[header_len..header_len + 2]
@@ -621,7 +630,7 @@ mod tests {
                 .expect("frame header has 2-byte fen_len"),
         ) as usize;
         let source_off = header_len + 2 + fen_len + 1;
-        bytes[source_off] = 3; // out-of-list source byte
+        bytes[source_off] = 4; // out-of-list source byte
         std::fs::write(&shard, &bytes).unwrap();
         let (blocks, _valid_len) = crate::corpus::store::scan_valid_blocks(&shard).expect("scan");
         assert!(
@@ -631,13 +640,19 @@ mod tests {
              — the audit's input is empty by construction)"
         );
 
-        // Layer (b): pin the accept-list cardinality. Adding a 4th `Source`
-        // variant trips this assertion, forcing the audit to be re-reviewed.
-        let accept_list = [Source::SelfPlay, Source::Ccrl, Source::LichessOpen];
+        // Layer (b): pin the accept-list cardinality. Adding a 5th
+        // `Source` variant trips this assertion, forcing the audit to be
+        // re-reviewed.
+        let accept_list = [
+            Source::SelfPlayOnBook,
+            Source::SelfPlayOffBook,
+            Source::Ccrl,
+            Source::LichessOpen,
+        ];
         assert_eq!(
             accept_list.len(),
-            3,
-            "ADR-0003 accept-list is pinned at 3 variants — adding a Source \
+            4,
+            "ADR-0003 accept-list is pinned at 4 variants — adding a Source \
              requires updating the audit and re-running the label-provenance review"
         );
     }
@@ -649,7 +664,7 @@ mod tests {
         let recs = vec![
             rec(&startpos(), Label::WhiteWin, Source::Ccrl, 1, 10),
             rec(&startpos(), Label::Draw, Source::LichessOpen, 2, 10),
-            rec(&startpos(), Label::BlackWin, Source::SelfPlay, 3, 10),
+            rec(&startpos(), Label::BlackWin, Source::SelfPlayOffBook, 3, 10),
         ];
         let r = audit_records(&recs);
         assert!(
@@ -666,9 +681,9 @@ mod tests {
     fn reproducibility_rerun_byte_identical() {
         let td = TempDir::new("repro");
         let recs = vec![
-            rec(&startpos(), Label::WhiteWin, Source::SelfPlay, 1, 8),
-            rec(&startpos(), Label::Draw, Source::SelfPlay, 1, 9),
-            rec(&startpos(), Label::Draw, Source::SelfPlay, 2, 10),
+            rec(&startpos(), Label::WhiteWin, Source::SelfPlayOffBook, 1, 8),
+            rec(&startpos(), Label::Draw, Source::SelfPlayOffBook, 1, 9),
+            rec(&startpos(), Label::Draw, Source::SelfPlayOffBook, 2, 10),
         ];
         let digest = write_corpus(td.path(), &recs, None);
         write_test_manifest(td.path(), recs.len() as u64, digest.clone());
@@ -729,11 +744,11 @@ mod tests {
     fn heldout_integrity_detects_game_leak() {
         // Train and val share game_id=1 → game-leak → FAIL.
         let train = vec![
-            rec("fen-a", Label::Draw, Source::SelfPlay, 1, 10),
-            rec("fen-b", Label::Draw, Source::SelfPlay, 1, 11),
-            rec("fen-c", Label::Draw, Source::SelfPlay, 2, 10),
+            rec("fen-a", Label::Draw, Source::SelfPlayOffBook, 1, 10),
+            rec("fen-b", Label::Draw, Source::SelfPlayOffBook, 1, 11),
+            rec("fen-c", Label::Draw, Source::SelfPlayOffBook, 2, 10),
         ];
-        let val = vec![rec("fen-d", Label::Draw, Source::SelfPlay, 1, 12)];
+        let val = vec![rec("fen-d", Label::Draw, Source::SelfPlayOffBook, 1, 12)];
         let res = check_heldout_split_integrity(&train, &val);
         assert!(!res.passed, "game-leak must FAIL: {}", res.detail);
         assert!(res.must_pass);
@@ -741,12 +756,12 @@ mod tests {
 
         // Game-disjoint, no FEN leak → PASS.
         let train_ok = vec![
-            rec("fen-train-1", Label::Draw, Source::SelfPlay, 1, 10),
-            rec("fen-train-2", Label::Draw, Source::SelfPlay, 2, 10),
+            rec("fen-train-1", Label::Draw, Source::SelfPlayOffBook, 1, 10),
+            rec("fen-train-2", Label::Draw, Source::SelfPlayOffBook, 2, 10),
         ];
         let val_ok = vec![
-            rec("fen-val-1", Label::Draw, Source::SelfPlay, 3, 10),
-            rec("fen-val-2", Label::Draw, Source::SelfPlay, 4, 10),
+            rec("fen-val-1", Label::Draw, Source::SelfPlayOffBook, 3, 10),
+            rec("fen-val-2", Label::Draw, Source::SelfPlayOffBook, 4, 10),
         ];
         let res_ok = check_heldout_split_integrity(&train_ok, &val_ok);
         assert!(res_ok.passed, "clean split must PASS: {}", res_ok.detail);
@@ -757,10 +772,10 @@ mod tests {
     #[test]
     fn decisive_draw_balance_bounds() {
         let recs = vec![
-            rec(&startpos(), Label::WhiteWin, Source::SelfPlay, 1, 10),
-            rec(&startpos(), Label::WhiteWin, Source::SelfPlay, 1, 11),
-            rec(&startpos(), Label::Draw, Source::SelfPlay, 2, 10),
-            rec(&startpos(), Label::BlackWin, Source::SelfPlay, 3, 10),
+            rec(&startpos(), Label::WhiteWin, Source::SelfPlayOffBook, 1, 10),
+            rec(&startpos(), Label::WhiteWin, Source::SelfPlayOffBook, 1, 11),
+            rec(&startpos(), Label::Draw, Source::SelfPlayOffBook, 2, 10),
+            rec(&startpos(), Label::BlackWin, Source::SelfPlayOffBook, 3, 10),
         ];
         let r = check_decisive_draw_balance(&recs);
         assert!(r.passed, "recorded-only check is always PASS");
@@ -774,7 +789,7 @@ mod tests {
     #[test]
     fn coverage_stats_recorded() {
         let recs = vec![
-            rec(&startpos(), Label::WhiteWin, Source::SelfPlay, 1, 10),
+            rec(&startpos(), Label::WhiteWin, Source::SelfPlayOffBook, 1, 10),
             rec(&startpos(), Label::Draw, Source::Ccrl, 2, 10),
             rec(&startpos(), Label::BlackWin, Source::LichessOpen, 3, 10),
         ];
@@ -790,9 +805,9 @@ mod tests {
     fn dedup_ratios_recorded() {
         // Two distinct FENs across three records: one duplicate.
         let recs = vec![
-            rec("fen-a", Label::Draw, Source::SelfPlay, 1, 10),
-            rec("fen-a", Label::Draw, Source::SelfPlay, 1, 11),
-            rec("fen-b", Label::Draw, Source::SelfPlay, 2, 10),
+            rec("fen-a", Label::Draw, Source::SelfPlayOffBook, 1, 10),
+            rec("fen-a", Label::Draw, Source::SelfPlayOffBook, 1, 11),
+            rec("fen-b", Label::Draw, Source::SelfPlayOffBook, 2, 10),
         ];
         let r = check_dedup_ratios(&recs);
         assert!(r.passed && !r.must_pass);
@@ -815,10 +830,10 @@ mod tests {
         let fen_b = "8/8/8/8/8/8/8/K6k w - - 0 1";
         let fen_c = "8/8/8/8/8/8/8/1k5K w - - 0 1";
         let train = vec![
-            rec(fen_a, Label::WhiteWin, Source::SelfPlay, 1, 8),
-            rec(fen_b, Label::Draw, Source::SelfPlay, 2, 10),
+            rec(fen_a, Label::WhiteWin, Source::SelfPlayOffBook, 1, 8),
+            rec(fen_b, Label::Draw, Source::SelfPlayOffBook, 2, 10),
         ];
-        let val = vec![rec(fen_c, Label::BlackWin, Source::SelfPlay, 3, 10)];
+        let val = vec![rec(fen_c, Label::BlackWin, Source::SelfPlayOffBook, 3, 10)];
         let digest = write_corpus(td.path(), &train, Some(&val));
         write_test_manifest(td.path(), 3, digest);
         let r = run_quality_gate(td.path()).unwrap();

@@ -242,16 +242,16 @@ pub struct Manifest {
     /// `corpus rerun` reproduces the empirically-anchored sampling.
     pub depth_ladder: Vec<(u8, u32)>,
     /// Optional vendored opening-book path (relative to repo root) used
-    /// at self-play time. `None` when no book is configured (every game
-    /// starts from startpos + random walk).
+    /// at self-play time. `Some` only when `opening_mode = Some("book")`.
     pub opening_book_path: Option<String>,
     /// SHA-256 (lowercase hex) of the opening-book bytes — pinned so a
     /// re-run detects upstream-drift on the vendored book.
     pub opening_book_sha256: Option<String>,
-    /// Per-game seeded coin-flip weight for book-seeded vs random-seeded
-    /// opening. Range `[0.0, 1.0]`. The M6.H **meta-tunable** axis of
-    /// the bi-level corpus-mixture search (ADR-0035 §9 / plan §3.8).
-    pub book_fraction: f64,
+    /// Opening regime the self-play campaign ran in (`"book"` or
+    /// `"random"`). `None` on a not-yet-run / calibrate-ladder-only
+    /// manifest stub. The on-book / off-book proportion is reweighted at
+    /// M6.H via per-source loss; one corpus per regime (ADR-0035 §10).
+    pub opening_mode: Option<String>,
     /// SHA-256 (lowercase hex) of the frozen corpus bytes themselves. The
     /// reproducibility check (quality gate) re-derives this from disk and
     /// fails if the digest drifts.
@@ -365,10 +365,11 @@ fn write_manifest_json(m: &Manifest) -> String {
         write_json_string(&mut out, s);
         out.push_str(",\n");
     }
-    out.push_str(&format!(
-        "  \"book_fraction\": {},\n",
-        format_f64(m.book_fraction)
-    ));
+    if let Some(mode) = &m.opening_mode {
+        out.push_str("  \"opening_mode\": ");
+        write_json_string(&mut out, mode);
+        out.push_str(",\n");
+    }
     out.push_str("  \"corpus_sha256\": ");
     write_json_string(&mut out, &m.corpus_sha256);
     out.push('\n');
@@ -730,11 +731,13 @@ fn parse_manifest_json(src: &str) -> Result<Manifest, CorpusError> {
         }
     };
 
-    // Opening-book fields (added at the book+book_fraction landing).
-    // Older manifests round-trip as None / 0.0.
+    // Opening-book + opening-mode fields. `opening_mode` is `None` on a
+    // calibrate-ladder-only stub or any older manifest pre-dating the
+    // four-source taxonomy; the rerun script defaults to `random` in
+    // that case.
     let opening_book_path = optional_str(&top, "opening_book_path").map(str::to_owned);
     let opening_book_sha256 = optional_str(&top, "opening_book_sha256").map(str::to_owned);
-    let book_fraction = optional_f64(&top, "book_fraction").unwrap_or(0.0);
+    let opening_mode = optional_str(&top, "opening_mode").map(str::to_owned);
 
     Ok(Manifest {
         schema_version,
@@ -753,7 +756,7 @@ fn parse_manifest_json(src: &str) -> Result<Manifest, CorpusError> {
         depth_ladder,
         opening_book_path,
         opening_book_sha256,
-        book_fraction,
+        opening_mode,
         corpus_sha256,
     })
 }
@@ -914,7 +917,7 @@ mod tests {
             opening_book_sha256: Some(
                 "dc91f225bc93e7ec091095bf8264595da33d36b9d3ac97ddd2dd54bc3a094fa4".to_owned(),
             ),
-            book_fraction: 0.5,
+            opening_mode: Some("book".to_owned()),
             corpus_sha256: "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
                 .to_owned(),
         };

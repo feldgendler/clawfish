@@ -431,7 +431,7 @@ pub struct ConsumerStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::corpus::selfplay::SelfPlayConfig;
+    use crate::corpus::selfplay::{OpeningMode, SelfPlayConfig};
     use crate::corpus::store::{encode_block, scan_valid_blocks};
     use crate::corpus::{CorpusRecord, Label, Source};
     use std::path::PathBuf;
@@ -470,8 +470,8 @@ mod tests {
             max_plies: 40,
             out_dir: out,
             val_fraction: 0.0,
+            opening_mode: OpeningMode::Random,
             book: None,
-            book_fraction: 0.0,
             poll_interval_ms: Some(1), // fast polling for tests
             split_seed: 7,
             cap_positions: None,
@@ -482,7 +482,7 @@ mod tests {
         CorpusRecord {
             fen: fen.to_string(),
             label: Label::Draw,
-            source: Source::SelfPlay,
+            source: Source::SelfPlayOffBook,
             game_id,
             ply: 0,
             depth_rung: 2,

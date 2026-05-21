@@ -1,6 +1,0 @@
-train_records=30
-val_records=0
-val_fraction=0.1
-split_seed=7
-corpus_sha256=8e16417af02f386c1cac2780af3ac51d085ef4a139e13b4acf9329e242f18421
-QUIET_MARGIN_CP=30

@@ -51,11 +51,15 @@ results — are out of scope: they leak the labeling engine's eval-design
 bias into clawfish's tuned weights, which is the ADR-0003 spirit
 constraint applied to *data*.
 
-The `Source` enum in `src/corpus/mod.rs` enumerates exactly the three
-permitted provenances: `SelfPlay`, `Ccrl`, `LichessOpen`. The on-disk
-frame's source byte (`Source::as_u8`) physically cannot encode anything
-else — `Source::from_u8(b)` returns `None` for `b ≥ 3` and
-`store::decode_block` rejects such frames wholesale.
+The `Source` enum in `src/corpus/mod.rs` enumerates exactly the four
+permitted provenances: `SelfPlayOnBook`, `SelfPlayOffBook`, `Ccrl`,
+`LichessOpen`. The on-disk frame's source byte (`Source::as_u8`)
+physically cannot encode anything else — `Source::from_u8(b)` returns
+`None` for `b ≥ 4` and `store::decode_block` rejects such frames
+wholesale. (Self-play is split into two source variants by opening
+regime — book-seeded vs. startpos + random plies — so the book / off-
+book mix is a training-time per-source reweighting axis at M6.H rather
+than a corpus-generation knob. See §10.)
 
 ### 2. ADR-0003 label-provenance audit verdict: Zurichess `c9` REJECTED
 
@@ -71,11 +75,11 @@ exact label-source bias §1 prohibits. The audit's verdict on Zurichess
 Programmatic defense (in `quality_gate::check_adr0003_audit`): three
 layers — (a) the `Source` enum intentionally omits Zurichess; (b)
 `Source::from_u8` rejects unrecognized bytes; (c) the audit pins
-`accept_list.len() == 3` and enumerates `[SelfPlay, Ccrl, LichessOpen]`
-explicitly, so any future addition forces both the audit logic and the
-audit's own test to update. The `adr0003_audit_rejects_zurichess_c9_fixture`
-test asserts all three. The audit is one of the three must-PASS
-data-quality gate checks.
+`accept_list.len() == 4` and enumerates `[SelfPlayOnBook,
+SelfPlayOffBook, Ccrl, LichessOpen]` explicitly, so any future addition
+forces both the audit logic and the audit's own test to update. The
+`adr0003_audit_rejects_zurichess_c9_fixture` test asserts all three.
+The audit is one of the three must-PASS data-quality gate checks.
 
 ### 3. Source mixture + R5 staging
 
@@ -297,6 +301,58 @@ descope — the parser + filter + `re-run.sh` infra is complete and the
 manifest pins how to extend it." An operator with download budget runs
 `scripts/corpus.sh` (or `re-run.sh` after staging) to extend the
 artifact with CCRL/Lichess slices.
+
+### 10. Four-source taxonomy + opening regime as a per-campaign choice (post-tag amendment)
+
+The original ADR §1/§3 enumerated three `Source` variants (`SelfPlay` /
+`Ccrl` / `LichessOpen`) and treated the book / off-book opening mix as
+an in-campaign coin flip parameterized by `book_fraction`. The
+amendment removes `book_fraction` and splits `SelfPlay` into two
+variants by **opening regime**:
+
+| Source variant | Opening seeded from | Operator campaign |
+|---|---|---|
+| `SelfPlayOnBook` | Sampled FEN from the vendored CC0 opening book | `corpus selfplay --opening-mode=book` |
+| `SelfPlayOffBook` | `startpos + opening_random_plies` random plies | `corpus selfplay --opening-mode=random` |
+| `Ccrl` | External CCRL PGN | `corpus ingest-pgn --source=ccrl` |
+| `LichessOpen` | External band-filtered Lichess PGN | `corpus ingest-pgn --source=lichess` |
+
+Each self-play campaign runs one regime end-to-end and every committed
+record carries that regime's `Source` variant. The operator runs one
+campaign per regime and extends each independently.
+
+The on-book / off-book proportion is **a training-time per-source
+reweighting axis** in M6.H's bi-level optimizer, identical mechanism
+to the CCRL / Lichess proportion: the outer simplex moves the
+`StratObjective::per_source` weights and the inner Texel refits at
+each meta-tunable evaluation. No mix happens at corpus-build time.
+The four-way per-source loss vector is the M6.H meta-tunable axis;
+the only generation-time decision is "how many records of each
+provenance do I have on disk?", which the operator addresses by
+running the relevant campaign for longer.
+
+This collapses what was a corpus-generation knob (`book_fraction`,
+irreversible without regeneration) into a per-source reweighting (free
+at training time on a frozen corpus). Symmetry: all four sources are
+treated identically by the outer optimizer.
+
+Wire-format change: the source-byte assignment is
+`SelfPlayOnBook = 0`, `SelfPlayOffBook = 1`, `Ccrl = 2`,
+`LichessOpen = 3`. Older shard.bin files written before this
+amendment (which used `SelfPlay = 0`, `Ccrl = 1`, `LichessOpen = 2`)
+are incompatible and are not migrated — the M6.H corpus will be
+generated fresh under the four-source taxonomy.
+
+The frozen `STRATUM_BOOK_OPENING` stratum bit on `CorpusRecord::strata`
+is removed by the same amendment (bit 2 is reserved). Book vs.
+off-book provenance is now strictly the source byte; the stratum bit
+became redundant.
+
+The `manifest.json` `book_fraction` field is replaced by
+`opening_mode: Option<String>` (`"book"` / `"random"` / absent for
+calibrate-ladder-only stubs). `bench/corpus/re-run.sh` reads
+`opening_mode` from the manifest and passes the matching
+`--opening-mode` flag to `corpus selfplay`.
 
 ## Consequences
 

@@ -58,8 +58,8 @@ Flags:
                     preferred, ~3x slower per worker, UI stays responsive).
 
 Most knobs are env vars: OUT_DIR, SEED, GAMES, WORKERS, VAL_FRACTION,
-SPLIT_SEED, MAX_PLIES, OPENING_RANDOM_PLIES, BUCKETS, OPENING_BOOK,
-BOOK_FRACTION, CORPUS_BIN. See the file header for details.
+SPLIT_SEED, MAX_PLIES, OPENING_RANDOM_PLIES, BUCKETS, OPENING_MODE,
+OPENING_BOOK, CORPUS_BIN. See the file header for details.
 USAGE
             exit 0
             ;;
@@ -87,13 +87,19 @@ SPLIT_SEED="${SPLIT_SEED:-7}"
 MAX_PLIES="${MAX_PLIES:-400}"
 OPENING_RANDOM_PLIES="${OPENING_RANDOM_PLIES:-8}"
 BUCKETS="${BUCKETS:-100,200,400,600}"
-# Opening book + mix ratio. OPENING_BOOK="" disables the book; the default
-# uses the vendored bench/data/openings.epd (CC0, 40457 positions). The
-# BOOK_FRACTION is the per-game coin-flip weight for book-seeded games —
-# 0.5 mixes book and random-walk openings at parity (M6.H's outer simplex
-# can tune it; see bench/openings.md / ADR-0035 §4).
+# Opening regime: `book` seeds every game from a position in the
+# vendored opening book (records tagged Source::SelfPlayOnBook). `random`
+# seeds every game from startpos + OPENING_RANDOM_PLIES random plies
+# (records tagged Source::SelfPlayOffBook). One campaign per regime; the
+# operator runs each invocation against its own OUT_DIR and grows the
+# two corpora independently. The on-book / off-book proportion is a
+# training-time per-source reweighting at M6.H, no longer a generation
+# knob (ADR-0035 §10).
+#
+# OPENING_BOOK is only consulted when OPENING_MODE=book; default points
+# at the vendored bench/data/openings.epd (CC0, 40457 positions).
+OPENING_MODE="${OPENING_MODE:-random}"
 OPENING_BOOK="${OPENING_BOOK:-bench/data/openings.epd}"
-BOOK_FRACTION="${BOOK_FRACTION:-0.5}"
 
 # Stamp the engine commit into the manifest (operator step — keeps the
 # Rust binary free of a `git` subprocess dep; R5/dependency-hygiene).
@@ -112,13 +118,24 @@ echo "corpus.sh: calibrating R-TC depth ladder (buckets=$BUCKETS)"
 
 SELFPLAY_ARGS="--seed $SEED --workers $WORKERS --out $OUT_DIR \
 --max-plies $MAX_PLIES --opening-random-plies $OPENING_RANDOM_PLIES \
---val-fraction $VAL_FRACTION"
-if [ -n "$OPENING_BOOK" ] && [ -f "$OPENING_BOOK" ]; then
-    SELFPLAY_ARGS="$SELFPLAY_ARGS --opening-book $OPENING_BOOK --book-fraction $BOOK_FRACTION"
-    echo "corpus.sh: opening book = $OPENING_BOOK (book_fraction=$BOOK_FRACTION)"
-elif [ -n "$OPENING_BOOK" ]; then
-    echo "corpus.sh: WARNING: OPENING_BOOK=$OPENING_BOOK not found — running without book"
-fi
+--val-fraction $VAL_FRACTION --opening-mode $OPENING_MODE"
+case "$OPENING_MODE" in
+    book)
+        if [ -z "$OPENING_BOOK" ] || [ ! -f "$OPENING_BOOK" ]; then
+            echo "corpus.sh: ERROR: OPENING_MODE=book but OPENING_BOOK=$OPENING_BOOK is missing"
+            exit 2
+        fi
+        SELFPLAY_ARGS="$SELFPLAY_ARGS --opening-book $OPENING_BOOK"
+        echo "corpus.sh: opening regime = book (book=$OPENING_BOOK)"
+        ;;
+    random)
+        echo "corpus.sh: opening regime = random (startpos + $OPENING_RANDOM_PLIES random plies)"
+        ;;
+    *)
+        echo "corpus.sh: ERROR: OPENING_MODE=$OPENING_MODE must be 'book' or 'random'"
+        exit 2
+        ;;
+esac
 
 # Background-priority launcher (gated on the --no-background flag). On
 # macOS, `taskpolicy -c background` sets the process to the Background QoS

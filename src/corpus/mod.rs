@@ -114,10 +114,23 @@ impl Label {
 /// Zurichess is intentionally absent: its `quiet-labeled.epd` `c9` labels
 /// are Stockfish-080916 played-game results, not original outcomes
 /// (research §3) → REJECTED by the audit.
+///
+/// Self-play is split into two variants by **opening regime**:
+/// `SelfPlayOnBook` (games seeded from a vendored opening book FEN) and
+/// `SelfPlayOffBook` (games seeded from the startpos + random plies). The
+/// split lets the M6.H bi-level optimizer treat the book / off-book
+/// proportion as a training-time per-source reweighting axis (identical
+/// mechanism to the CCRL / Lichess proportions) instead of a corpus-
+/// generation knob. Both variants are original game-result-labeled; the
+/// audit accepts all four sources.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub enum Source {
-    /// clawfish-vs-clawfish deterministic self-play (original game result).
-    SelfPlay,
+    /// clawfish-vs-clawfish deterministic self-play, opening seeded from a
+    /// vendored opening-book FEN (original game result).
+    SelfPlayOnBook,
+    /// clawfish-vs-clawfish deterministic self-play, opening seeded from
+    /// startpos + random plies (original game result).
+    SelfPlayOffBook,
     /// CCRL PGN snapshot (original game result; embedded engine evals ignored).
     Ccrl,
     /// Lichess open-database PGN (original game result).
@@ -128,18 +141,20 @@ impl Source {
     /// On-disk tag byte (store.rs frame). Stable: never renumber.
     pub fn as_u8(self) -> u8 {
         match self {
-            Source::SelfPlay => 0,
-            Source::Ccrl => 1,
-            Source::LichessOpen => 2,
+            Source::SelfPlayOnBook => 0,
+            Source::SelfPlayOffBook => 1,
+            Source::Ccrl => 2,
+            Source::LichessOpen => 3,
         }
     }
 
     /// Inverse of [`Source::as_u8`].
     pub fn from_u8(b: u8) -> Option<Source> {
         match b {
-            0 => Some(Source::SelfPlay),
-            1 => Some(Source::Ccrl),
-            2 => Some(Source::LichessOpen),
+            0 => Some(Source::SelfPlayOnBook),
+            1 => Some(Source::SelfPlayOffBook),
+            2 => Some(Source::Ccrl),
+            3 => Some(Source::LichessOpen),
             _ => None,
         }
     }
@@ -157,12 +172,11 @@ pub const DEPTH_RUNG_EXTERNAL: u8 = 0xFF;
 pub const STRATUM_OUTPOST: u8 = 1 << 0;
 /// Endgame stratum: phase-tag below the mop-up threshold.
 pub const STRATUM_ENDGAME: u8 = 1 << 1;
-/// Opening-source stratum: set when the game started from a vendored
-/// opening-book FEN, unset when from startpos + random plies. The
-/// `book_fraction` knob is the M6.H meta-tunable axis; this bit lets
-/// M6.H's stratified objective separate book-distribution from random-
-/// distribution loss when picking the optimal mix.
-pub const STRATUM_BOOK_OPENING: u8 = 1 << 2;
+// (Bit 2 reserved — previously `STRATUM_BOOK_OPENING`. Book / off-book
+// provenance is now a per-`Source` distinction (`SelfPlayOnBook` vs
+// `SelfPlayOffBook`), readable through `StratObjective::per_source`. The
+// dedicated stratum bit became redundant and was removed when the four-
+// source taxonomy landed.)
 
 /// One labeled quiet position. `fen` is the canonical `Position::to_fen()`.
 /// `label` is the ORIGINAL game outcome (never an engine score). `game_id`
@@ -267,7 +281,12 @@ mod tests {
         for l in [Label::WhiteWin, Label::Draw, Label::BlackWin] {
             assert_eq!(Label::from_u8(l.as_u8()), Some(l));
         }
-        for s in [Source::SelfPlay, Source::Ccrl, Source::LichessOpen] {
+        for s in [
+            Source::SelfPlayOnBook,
+            Source::SelfPlayOffBook,
+            Source::Ccrl,
+            Source::LichessOpen,
+        ] {
             assert_eq!(Source::from_u8(s.as_u8()), Some(s));
         }
         assert_eq!(Label::from_u8(3), None);
@@ -299,7 +318,8 @@ mod tests {
             depth_rung: DEPTH_RUNG_EXTERNAL,
             strata: 0,
         };
-        assert!(r(Source::SelfPlay, 5, 9).dedup_key() < r(Source::Ccrl, 0, 0).dedup_key());
+        assert!(r(Source::SelfPlayOnBook, 5, 9).dedup_key() < r(Source::Ccrl, 0, 0).dedup_key());
+        assert!(r(Source::SelfPlayOffBook, 5, 9).dedup_key() < r(Source::Ccrl, 0, 0).dedup_key());
         assert!(r(Source::Ccrl, 2, 9).dedup_key() < r(Source::Ccrl, 3, 0).dedup_key());
         assert!(r(Source::Ccrl, 2, 4).dedup_key() < r(Source::Ccrl, 2, 5).dedup_key());
     }

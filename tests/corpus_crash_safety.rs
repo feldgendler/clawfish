@@ -49,6 +49,7 @@ impl Drop for TempDir {
 fn spawn_selfplay(out: &Path, seed: u64, games: u64, workers: usize, max_plies: u32) -> Child {
     Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", &seed.to_string()])
         .args(["--games", &games.to_string()])
         .args(["--workers", &workers.to_string()])
@@ -96,6 +97,7 @@ fn wait_for_blocks(shard: &Path, child: &mut Child, min_games: usize) -> usize {
 fn run_selfplay(out: &Path, seed: u64, games: u64, workers: usize, max_plies: u32) {
     let status = Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", &seed.to_string()])
         .args(["--games", &games.to_string()])
         .args(["--workers", &workers.to_string()])
@@ -186,6 +188,7 @@ fn crash_kill_after_first_game_resumes_to_uninterrupted_corpus() {
     let ref_dir = TempDir::new("ref");
     let status = Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", &seed.to_string()])
         .args(["--games", &games.to_string()])
         .args(["--workers", &workers.to_string()])
@@ -227,6 +230,7 @@ fn crash_kill_after_first_game_resumes_to_uninterrupted_corpus() {
     // Resume: same seed/games/out.
     let status = Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", &seed.to_string()])
         .args(["--games", &games.to_string()])
         .args(["--workers", &workers.to_string()])
@@ -276,6 +280,7 @@ fn crash_kill_at_randomized_offsets_emits_zero_partial() {
     let ref_dir = TempDir::new("ref-heavy");
     let status = Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", &seed.to_string()])
         .args(["--games", &games.to_string()])
         .args(["--workers", &workers.to_string()])
@@ -306,6 +311,7 @@ fn crash_kill_at_randomized_offsets_emits_zero_partial() {
         // Resume.
         let status = Command::new(corpus_bin())
             .arg("selfplay")
+            .args(["--opening-mode", "random"])
             .args(["--seed", &seed.to_string()])
             .args(["--games", &games.to_string()])
             .args(["--workers", &workers.to_string()])
@@ -382,6 +388,7 @@ fn crash_kill_k4_resumes_to_uninterrupted_corpus_per_game_file() {
     let ref_dir = TempDir::new("pgf-ref-k4");
     let status = Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", &seed.to_string()])
         .args(["--games", &games.to_string()])
         .args(["--workers", &workers.to_string()])
@@ -413,6 +420,7 @@ fn crash_kill_k4_resumes_to_uninterrupted_corpus_per_game_file() {
     // Resume.
     let status = Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", &seed.to_string()])
         .args(["--games", &games.to_string()])
         .args(["--workers", &workers.to_string()])
@@ -449,6 +457,7 @@ fn ghost_pending_self_heal_on_resume() {
     // Complete run.
     let status = Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", &seed.to_string()])
         .args(["--games", &games.to_string()])
         .args(["--workers", &workers.to_string()])
@@ -473,6 +482,7 @@ fn ghost_pending_self_heal_on_resume() {
     // Re-run: resume must clean the ghost and not double-commit game 0.
     let status = Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", &seed.to_string()])
         .args(["--games", &games.to_string()])
         .args(["--workers", &workers.to_string()])
@@ -523,7 +533,7 @@ fn ghost_pending_empty_post_dedup_below_ckpt_self_heal_on_resume() {
         ply: 0,
         fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
         label: clawfish::corpus::Label::Draw,
-        source: clawfish::corpus::Source::SelfPlay,
+        source: clawfish::corpus::Source::SelfPlayOffBook,
         depth_rung: 0,
         strata: 0,
     };
@@ -545,6 +555,7 @@ fn ghost_pending_empty_post_dedup_below_ckpt_self_heal_on_resume() {
     // Run a fresh selfplay; resume must self-heal the ghost.
     let status = Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", "11"])
         .args(["--games", "8"])
         .args(["--workers", "1"])
@@ -576,6 +587,7 @@ fn worker_crash_only_loses_in_flight_games() {
     let ref_dir = TempDir::new("wc-ref");
     let status = Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", &seed.to_string()])
         .args(["--games", &games.to_string()])
         .args(["--workers", &workers.to_string()])
@@ -602,6 +614,7 @@ fn worker_crash_only_loses_in_flight_games() {
     // Resume.
     let status = Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", &seed.to_string()])
         .args(["--games", &games.to_string()])
         .args(["--workers", &workers.to_string()])
@@ -677,6 +690,7 @@ fn oversized_pending_file_is_fatal_on_resume_and_at_write() {
     // A selfplay run into this dir should detect the oversize file and fail.
     let status = Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", "1"])
         .args(["--games", "1"])
         .args(["--workers", "1"])
@@ -768,6 +782,7 @@ fn old_checkpoint_magic_is_rejected_as_missing() {
     // shard is non-empty for the post-condition check below.
     let status = Command::new(corpus_bin())
         .arg("selfplay")
+        .args(["--opening-mode", "random"])
         .args(["--seed", "7"])
         .args(["--games", "10"])
         .args(["--workers", "1"])

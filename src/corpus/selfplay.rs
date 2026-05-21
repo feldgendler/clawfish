@@ -27,14 +27,41 @@ use super::pending::write_pending;
 use super::prng::{Prng, substream_seed};
 use super::quiet::{is_quiet, static_eval_white};
 use super::store::encode_block;
-use super::{
-    CorpusError, CorpusRecord, HIGH_SCORE_CP, Label, OPENING_SKIP_PLIES, STRATUM_BOOK_OPENING,
-};
+use super::{CorpusError, CorpusRecord, HIGH_SCORE_CP, Label, OPENING_SKIP_PLIES, Source};
 use crate::search::{
     AlphaBetaMover, QSearcher, Search, SearchContext, SearchLimits, SearchResult, TimeCaps,
 };
 use crate::search::{is_fifty_move_draw, is_repetition};
 use crate::{Color, MoveList, PieceKind, Position, generate_moves, in_check};
+
+/// Opening regime for a self-play campaign. A campaign is constrained to
+/// a single regime end-to-end so every game it commits is tagged with the
+/// matching `Source` variant. The M6.H bi-level optimizer reweights
+/// between on-book and off-book corpora at training time via the per-
+/// source loss in `StratObjective`; the operator runs one campaign per
+/// regime and grows each independently.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OpeningMode {
+    /// Seed every game from a sampled position in the vendored opening
+    /// book. Records emit `Source::SelfPlayOnBook`. Requires `book =
+    /// Some(_)` in `SelfPlayConfig`; an empty book is a configuration
+    /// error caught at the CLI.
+    Book,
+    /// Seed every game from `startpos + opening_random_plies` random
+    /// plies. Records emit `Source::SelfPlayOffBook`. Ignores the
+    /// `book` field even when one is loaded.
+    Random,
+}
+
+impl OpeningMode {
+    /// `Source` variant every record from a campaign in this mode carries.
+    pub fn source(self) -> Source {
+        match self {
+            OpeningMode::Book => Source::SelfPlayOnBook,
+            OpeningMode::Random => Source::SelfPlayOffBook,
+        }
+    }
+}
 
 /// Self-play campaign config. `depth_ladder` rungs come from
 /// `corpus calibrate-ladder` (empirically-anchored, NOT plan literals).
@@ -57,16 +84,16 @@ pub struct SelfPlayConfig {
     pub out_dir: PathBuf,
     /// Fraction of games routed to the held-out self-play validation set.
     pub val_fraction: f64,
-    /// Optional vendored opening book (CC0 `2moves_v1.epd`). When
-    /// `Some`, each game flips a seeded coin with weight `book_fraction`
-    /// to choose book-seeded vs random-seeded; when `None`, every game
-    /// starts from startpos. Shared via `Arc` so all workers reuse the
+    /// Opening regime — every game in the campaign uses this regime, and
+    /// every committed record carries `opening_mode.source()`. Replaces
+    /// the previous per-game `book_fraction` coin-flip; the book vs off-
+    /// book mix is now a training-time reweighting axis over two distinct
+    /// corpora (ADR-0035 §10).
+    pub opening_mode: OpeningMode,
+    /// Vendored opening book — required when `opening_mode = Book`,
+    /// ignored otherwise. Shared via `Arc` so all workers reuse the
     /// in-RAM positions without cloning.
     pub book: Option<Arc<Book>>,
-    /// Per-game seeded coin-flip weight for book-seeded vs random-seeded
-    /// opening. Range `[0.0, 1.0]`; ignored when `book` is `None`. The
-    /// M6.H **meta-tunable** axis (ADR-0035 §9 / plan §3.8).
-    pub book_fraction: f64,
     /// Consumer poll interval override (ms). `None` ⇒ use the default
     /// `POLL_INTERVAL_MS` constant. Overridable per `cfg` so tests can
     /// drive a fast poll without sleeping 10 ms per iteration. Has no
@@ -238,28 +265,12 @@ fn search_best_move(
 
 /// Outcome of `play_one_game`: a completed game's transactional record, or
 /// `None` if interrupted in-flight (R2: contributes ZERO records).
-/// Per-game seeded coin flip threshold for book vs random opening (R-bit-
-/// granularity). 32-bit scale is plenty for any plausible `book_fraction`
-/// resolution and avoids floating-point bias at the extremes.
-const COIN_FLIP_SCALE: u64 = 1 << 32;
-
-fn book_seeded_this_game(book_fraction: f64, rng: &mut Prng) -> bool {
-    if book_fraction <= 0.0 {
-        return false;
-    }
-    if book_fraction >= 1.0 {
-        return true;
-    }
-    let threshold = (book_fraction * (COIN_FLIP_SCALE as f64)) as u64;
-    rng.below(COIN_FLIP_SCALE) < threshold
-}
-
 #[allow(clippy::too_many_arguments)] // play/quiet searchers + per-game knobs is what it is
 fn play_one_game(
     searcher: &mut AlphaBetaMover,
     qsearcher: &mut QSearcher,
     book: Option<&Book>,
-    book_fraction: f64,
+    opening_mode: OpeningMode,
     game_id: u64,
     depth: u8,
     opening_random_plies: u32,
@@ -267,16 +278,15 @@ fn play_one_game(
     rng: &mut Prng,
     stop: &Arc<AtomicBool>,
 ) -> Option<GameRecord> {
-    // Per-game seeded coin flip: book FEN seed vs startpos. The flip
-    // consumes one rng draw before any opening-walk plies so the same
-    // (seed, game_id, book_fraction) always produces the same assignment.
-    let is_book_game = book
-        .as_ref()
-        .map(|_| book_seeded_this_game(book_fraction, rng))
-        .unwrap_or(false);
-    let mut pos = match (is_book_game, book) {
-        (true, Some(b)) => *b.sample(rng),
-        _ => Position::starting_position(),
+    // Opening seed: `Book` mode samples from the vendored book (which
+    // MUST be loaded — the CLI rejects `Book + book = None` before we
+    // reach here); `Random` mode starts from the startpos. Every record
+    // emitted by this call is tagged with `opening_mode.source()`.
+    let mut pos = match opening_mode {
+        OpeningMode::Book => *book
+            .expect("OpeningMode::Book requires book = Some(_) (CLI invariant)")
+            .sample(rng),
+        OpeningMode::Random => Position::starting_position(),
     };
     let mut history = vec![pos.zobrist()];
     let mut ply: u32 = 0;
@@ -334,11 +344,7 @@ fn play_one_game(
             if se.abs() <= HIGH_SCORE_CP {
                 let qs = qsearcher.eval_white(&pos);
                 if is_quiet(&pos, se, qs) {
-                    let mut strata = strata_for(&pos);
-                    if is_book_game {
-                        strata |= STRATUM_BOOK_OPENING;
-                    }
-                    emitted.push((pos.to_fen(), ply, strata));
+                    emitted.push((pos.to_fen(), ply, strata_for(&pos)));
                 }
             }
         }
@@ -350,11 +356,12 @@ fn play_one_game(
         ply += 1;
     };
 
+    let source = opening_mode.source();
     for (fen, p, strata) in emitted {
         records.push(CorpusRecord {
             fen,
             label,
-            source: super::Source::SelfPlay,
+            source,
             game_id,
             ply: p,
             depth_rung: depth,
@@ -542,7 +549,7 @@ fn worker_loop(
             &mut searcher,
             &mut qsearcher,
             book_ref,
-            cfg.book_fraction,
+            cfg.opening_mode,
             game_id,
             depth,
             cfg.opening_random_plies,
@@ -741,8 +748,8 @@ mod tests {
             max_plies: 40,
             out_dir: out,
             val_fraction: 0.2,
+            opening_mode: OpeningMode::Random,
             book: None,
-            book_fraction: 0.0,
             poll_interval_ms: None,
             split_seed: 7,
             cap_positions: None,
@@ -784,8 +791,32 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let mut ra = Prng::new(substream_seed(123, 5));
         let mut rb = Prng::new(substream_seed(123, 5));
-        let a = play_one_game(&mut sa, &mut qa, None, 0.0, 5, 3, 4, 60, &mut ra, &stop).unwrap();
-        let b = play_one_game(&mut sb, &mut qb, None, 0.0, 5, 3, 4, 60, &mut rb, &stop).unwrap();
+        let a = play_one_game(
+            &mut sa,
+            &mut qa,
+            None,
+            OpeningMode::Random,
+            5,
+            3,
+            4,
+            60,
+            &mut ra,
+            &stop,
+        )
+        .unwrap();
+        let b = play_one_game(
+            &mut sb,
+            &mut qb,
+            None,
+            OpeningMode::Random,
+            5,
+            3,
+            4,
+            60,
+            &mut rb,
+            &stop,
+        )
+        .unwrap();
         assert_eq!(
             a, b,
             "same seed + depth ⇒ bit-identical game (fixed-depth determinism)"
@@ -819,7 +850,7 @@ mod tests {
             &mut warm,
             &mut warm_q,
             None,
-            0.0,
+            OpeningMode::Random,
             0,
             depth,
             opening,
@@ -833,7 +864,7 @@ mod tests {
             &mut warm,
             &mut warm_q,
             None,
-            0.0,
+            OpeningMode::Random,
             game_id,
             depth,
             opening,
@@ -851,7 +882,7 @@ mod tests {
             &mut cold,
             &mut cold_q,
             None,
-            0.0,
+            OpeningMode::Random,
             game_id,
             depth,
             opening,
@@ -972,7 +1003,7 @@ mod tests {
             &mut s,
             &mut q,
             None,
-            0.0,
+            OpeningMode::Random,
             1,
             2,
             4,
@@ -991,40 +1022,12 @@ mod tests {
         );
     }
 
-    // ── Opening book + STRATUM_BOOK_OPENING ─────────────────────────────
-
-    /// `book_seeded_this_game` is the seeded coin-flip primitive. Pin its
-    /// boundary behavior so a later edit doesn't silently bias the mix.
-    #[test]
-    fn coin_flip_extremes_and_determinism() {
-        let mut rng = Prng::new(42);
-        assert!(!book_seeded_this_game(0.0, &mut rng), "0.0 ⇒ never book");
-        let mut rng = Prng::new(42);
-        assert!(book_seeded_this_game(1.0, &mut rng), "1.0 ⇒ always book");
-        // Same seed → same flip (determinism).
-        let mut a = Prng::new(0xC0FFEE);
-        let mut b = Prng::new(0xC0FFEE);
-        assert_eq!(
-            book_seeded_this_game(0.5, &mut a),
-            book_seeded_this_game(0.5, &mut b)
-        );
-        // 0.5 over a few hundred draws — roughly balanced.
-        let mut rng = Prng::new(7);
-        let n = 2000;
-        let book = (0..n)
-            .filter(|_| book_seeded_this_game(0.5, &mut rng))
-            .count();
-        assert!(
-            (700..=1300).contains(&book),
-            "0.5 should pick ~half of {n}; got {book}"
-        );
-    }
+    // ── OpeningMode + per-source tagging ────────────────────────────────
 
     fn synth_book(name: &str) -> super::super::openings::Book {
-        // 3 hand-picked principled openings; sufficient for the
-        // STRATUM_BOOK_OPENING tag-and-seed test below. Per-test unique
-        // dir to avoid cargo-test's parallel-execution race when two
-        // book-using tests share `clawfish-selfplay-book`.
+        // 3 hand-picked principled openings; sufficient for the OpeningMode
+        // tagging tests below. Per-test unique dir to avoid cargo-test's
+        // parallel-execution race when two book-using tests share a path.
         let dir = std::env::temp_dir().join(format!("clawfish-selfplay-book-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1040,17 +1043,25 @@ mod tests {
     }
 
     #[test]
-    fn book_fraction_one_tags_every_record_with_stratum_book_opening() {
+    fn opening_mode_source_matches_enum_variant() {
+        // Lock the OpeningMode → Source mapping. Re-tagging the on-disk
+        // taxonomy without updating this test will trip the assertion.
+        assert_eq!(OpeningMode::Book.source(), Source::SelfPlayOnBook);
+        assert_eq!(OpeningMode::Random.source(), Source::SelfPlayOffBook);
+    }
+
+    #[test]
+    fn opening_mode_book_tags_records_as_on_book() {
         let mut s = AlphaBetaMover::new();
         let mut q = QSearcher::new();
         let stop = Arc::new(AtomicBool::new(false));
         let mut rng = Prng::new(substream_seed(0xB00C, 1));
-        let book = synth_book("frac-one");
+        let book = synth_book("mode-book");
         let g = play_one_game(
             &mut s,
             &mut q,
             Some(&book),
-            1.0,
+            OpeningMode::Book,
             1,
             3,
             2,
@@ -1060,29 +1071,30 @@ mod tests {
         )
         .expect("book-seeded game completes");
         // The game may emit zero records on a shallow run; we assert the
-        // strata-tag invariant on every emitted record.
+        // source-tag invariant on every emitted record.
         for r in &g.records {
-            assert!(
-                r.strata & STRATUM_BOOK_OPENING != 0,
-                "book_fraction=1.0 ⇒ every record carries STRATUM_BOOK_OPENING"
+            assert_eq!(
+                r.source,
+                Source::SelfPlayOnBook,
+                "OpeningMode::Book ⇒ every record carries Source::SelfPlayOnBook"
             );
         }
     }
 
     #[test]
-    fn book_fraction_zero_with_book_loaded_still_never_tags() {
-        // Even with a book provided, book_fraction=0.0 must yield no
-        // book-seeded games (and thus no STRATUM_BOOK_OPENING records).
+    fn opening_mode_random_tags_records_as_off_book() {
+        // Even with a book PROVIDED, OpeningMode::Random ignores it and
+        // every record carries Source::SelfPlayOffBook.
         let mut s = AlphaBetaMover::new();
         let mut q = QSearcher::new();
         let stop = Arc::new(AtomicBool::new(false));
         let mut rng = Prng::new(substream_seed(0xB00C, 2));
-        let book = synth_book("frac-zero");
+        let book = synth_book("mode-random");
         let g = play_one_game(
             &mut s,
             &mut q,
             Some(&book),
-            0.0,
+            OpeningMode::Random,
             2,
             3,
             2,
@@ -1093,9 +1105,9 @@ mod tests {
         .expect("game completes");
         for r in &g.records {
             assert_eq!(
-                r.strata & STRATUM_BOOK_OPENING,
-                0,
-                "book_fraction=0.0 ⇒ no record carries STRATUM_BOOK_OPENING"
+                r.source,
+                Source::SelfPlayOffBook,
+                "OpeningMode::Random ⇒ every record carries Source::SelfPlayOffBook"
             );
         }
     }
@@ -1110,7 +1122,18 @@ mod tests {
         // wholesale: ZERO records (R2).
         let stop = Arc::new(AtomicBool::new(true));
         let mut rng = Prng::new(substream_seed(1, 1));
-        let g = play_one_game(&mut s, &mut q, None, 0.0, 1, 4, 4, 80, &mut rng, &stop);
+        let g = play_one_game(
+            &mut s,
+            &mut q,
+            None,
+            OpeningMode::Random,
+            1,
+            4,
+            4,
+            80,
+            &mut rng,
+            &stop,
+        );
         assert!(
             g.is_none(),
             "a stop-aborted in-flight game contributes ZERO records"

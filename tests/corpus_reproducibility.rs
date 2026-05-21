@@ -89,6 +89,7 @@ fn rerun_byte_identical() {
         // selfplay
         let mut sp = Command::new(corpus_bin());
         sp.arg("selfplay")
+            .args(["--opening-mode", "random"])
             .args(["--seed", seed])
             .args(["--games", games])
             .args(["--workers", workers])
@@ -164,6 +165,7 @@ fn rerun_byte_identical_across_k() {
         let out = td.0.clone();
         let mut sp = Command::new(corpus_bin());
         sp.arg("selfplay")
+            .args(["--opening-mode", "random"])
             .args(["--seed", seed])
             .args(["--games", games])
             .args(["--workers", &k.to_string()])
