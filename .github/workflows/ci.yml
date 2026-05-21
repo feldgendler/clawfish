@@ -3,7 +3,15 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - 'docs/**'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - 'docs/**'
   workflow_dispatch:
 
 # Cancel in-progress runs for the same ref on PR branches; let main runs
@@ -71,6 +79,11 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      # --ignore-run-fail so coverage still reports if a test fails (e.g.
-      # an in-flight Linux portability issue) — coverage is informational.
-      - run: cargo llvm-cov --locked --summary-only --ignore-run-fail
+      # `--lib` only: the 1848 lib unit tests give ~93% line coverage.
+      # Heavy corpus integration tests (corpus_per_game_file, crash_safety,
+      # reproducibility) under coverage instrumentation took ~36 of ~40 min
+      # of wallclock — disproportionate cost for marginal coverage delta
+      # (they exercise cross-module orchestration over code already covered
+      # by lib unit tests). They still run in the `test` job above.
+      # `--ignore-run-fail` keeps coverage informational rather than gating.
+      - run: cargo llvm-cov --lib --locked --summary-only --ignore-run-fail
