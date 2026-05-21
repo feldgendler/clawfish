@@ -15,10 +15,12 @@ fuzz/artifacts/
 # outside the repo entirely and don't need a gitignore rule.)
 /config.json
 
-# M6.G corpus bytes: gitignored (operator-materialized via re-run.sh from
-# the manifest's pinned knobs). The committed manifest + filter_spec + the
-# vendored opening book are sufficient for byte-identical reproduction; the
-# bytes themselves can be hundreds of MB at M6.H scale and grow without
+# M6.G/M6.H corpus bytes: gitignored (operator-materialized via re-run.sh
+# from the manifest's pinned knobs + on-demand `corpus fetch` of CCRL /
+# Lichess sources). The committed manifest + filter_spec + the vendored
+# opening book are sufficient for byte-identical reproduction; the bytes
+# themselves can grow to hundreds of MB (M6.G self-play) or low GB once
+# M6.H ingestion lands and pulls in external PGN sources, all without
 # meaningful git delta, so we don't track them. Future hosting (GitHub
 # release asset / S3 / sister-repo) will let consumers download a frozen
 # canonical artifact instead of re-running re-run.sh. See ADR-0035 §8.

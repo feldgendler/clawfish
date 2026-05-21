@@ -11,7 +11,7 @@
 - **Attacker-weight scheme: per-kind multiplier × king-zone-attacked squares, summed to an index, looked up in a SafetyTable S-curve.** CPW's Fruit-lineage approach. The SafetyTable from CPW-Engine (reproduced in §6) is the one citable non-source-repo numeric set; it matches the Glaurung/Stockfish generation parameters and is the default recommended here.
 - **Pawn-shield: check only the three files of the castled king (king-file ± 1); two rank tiers (rank 2 bonus SHIELD_1 > rank 3 bonus SHIELD_2); no bonus otherwise.** Cacheable in pawn hash by mask; king-position gates the lookup at eval time (outside the cache). Open/semi-open files carry a separate MG-only penalty.
 - **Transfer-risk verdict: HIGH.** Literature-default king safety weights are the single most likely transfer failure among all M6 phases, on top of the three-phase "co-calibrated-elsewhere ≠ transfers here" law. See §8 for the full decomposition.
-- **Recommended landing strategy: ship score-neutral (all weights → M6.H), same pattern as M6.C and M6.D.** Rationale in §8. The infrastructure (zone bitboard, attacker counting, pawn-shield mask) ships live at zero weight; M6.H joint Texel derives live weights. This avoids M6.D's costly per-component screen-ladder campaign for a term that is expected to need reshaping.
+- **Recommended landing strategy: ship score-neutral (all weights → M6.I), same pattern as M6.C and M6.D.** Rationale in §8. The infrastructure (zone bitboard, attacker counting, pawn-shield mask) ships live at zero weight; M6.I joint Texel derives live weights. This avoids M6.D's costly per-component screen-ladder campaign for a term that is expected to need reshaping.
 
 ---
 
@@ -414,7 +414,7 @@ if attacker_count < 2 || !attacking_side_has_queen {
 }
 let attack_penalty_mg = SAFETY_TABLE[attack_units.min(99) as usize];
 // EG weight near 0 per tapering policy
-let attack_penalty_eg = 0;  // or a small fraction — M6.H will tune this
+let attack_penalty_eg = 0;  // or a small fraction — M6.I will tune this
 ```
 
 ### Pawn-shield values
@@ -423,7 +423,7 @@ let attack_penalty_eg = 0;  // or a small fraction — M6.H will tune this
 - SHIELD_2 (rank 3 pawn): recommended starting value **+5 MG, +3 EG** (half of SHIELD_1; penalized for having advanced).
 - Applied per file (3 files × per-rank check); activated only when king is on castled-side files (f/g/h or a/b/c for White).
 
-These values are the lowest-risk starting point (small magnitude, low double-count risk). M6.H Texel re-derives.
+These values are the lowest-risk starting point (small magnitude, low double-count risk). M6.I Texel re-derives.
 
 ### Open/semi-open file penalties
 
@@ -485,7 +485,7 @@ The overlap magnitude:
 - Adding SHIELD_1 = +10 per pawn on top → ~+13 MG bonus for the same position.
 - This is mild because CONN's rank-2 bonus is small (3 cp) and the shield check is more specific (only when castled), so the overlap is bounded.
 
-**Assessment:** Low-severity overlap with CONN. The pawn-shield term is genuinely more specific (file+rank+castled gating) than CONN (rank-only connectivity). They measure different aspects of the same pawn cluster. However, when M6.H re-calibrates CONN and the pawn-shield simultaneously, the CONN rank-2/3 values and the shield bonuses will absorb into a joint solution that decorrelates them.
+**Assessment:** Low-severity overlap with CONN. The pawn-shield term is genuinely more specific (file+rank+castled gating) than CONN (rank-only connectivity). They measure different aspects of the same pawn cluster. However, when M6.I re-calibrates CONN and the pawn-shield simultaneously, the CONN rank-2/3 values and the shield bonuses will absorb into a joint solution that decorrelates them.
 
 ### Interaction with M6.C passed-pawn term
 
@@ -556,13 +556,13 @@ The coupling means the M6.B CONN-only "interaction-immune subset" finding does n
 
 Rationale:
 
-1. **Three precedents say literature defaults fail.** M6.C and M6.D both deployed the full contingency ladder (per-component screen, co-scale probe) and found no positive interaction-immune subset. The cost was a multi-campaign SPRT exercise that discovered the answer "defer to M6.H." Starting at score-neutral skips that cost.
+1. **Three precedents say literature defaults fail.** M6.C and M6.D both deployed the full contingency ladder (per-component screen, co-scale probe) and found no positive interaction-immune subset. The cost was a multi-campaign SPRT exercise that discovered the answer "defer to M6.I." Starting at score-neutral skips that cost.
 
 2. **King safety is the noisiest term.** The per-component screen ladder would need to run at mixed-TC (not single-TC) because king safety signals are TC-dependent. Mixed-TC screens are ~5× as expensive as single-TC. The M6.D screen ran single-TC at 10+0.1; applying the same approach here would be cheaper but less diagnostic for a TC-sensitive term.
 
-3. **M6.H joint Texel is the right vehicle.** King safety, pawn shield, and mobility-area weights are all coupled through the same attack-bitboard infrastructure. The joint Texel pass can optimize them simultaneously against the same PeSTO-PST baseline. Shipping any subset live before that pass means the pass must work around a partially-baked starting point.
+3. **M6.I joint Texel is the right vehicle.** King safety, pawn shield, and mobility-area weights are all coupled through the same attack-bitboard infrastructure. The joint Texel pass can optimize them simultaneously against the same PeSTO-PST baseline. Shipping any subset live before that pass means the pass must work around a partially-baked starting point.
 
-4. **Infrastructure ships live regardless.** Zone computation, attacker counting, SafetyTable lookup, pawn-shield bitboard population, open-file detection — all of these are code that M6.H's Texel pass reads directly. Zeroing weights does not remove the code; it sets the multipliers to zero. This is identical to M6.C/M6.D's `score-neutral from the start` pattern.
+4. **Infrastructure ships live regardless.** Zone computation, attacker counting, SafetyTable lookup, pawn-shield bitboard population, open-file detection — all of these are code that M6.I's Texel pass reads directly. Zeroing weights does not remove the code; it sets the multipliers to zero. This is identical to M6.C/M6.D's `score-neutral from the start` pattern.
 
 ### If the plan changes to "attempt live weights" (contingency ladder)
 
@@ -593,13 +593,13 @@ Note: the open-file penalties (Stage 1) are the most likely positive component b
 
 ## §9 — Open questions and flagged ambiguities
 
-1. **The exact SHIELD_1 and SHIELD_2 values in CPW-Engine** are referenced in source code but not published numerically outside the source repo. The recommended starting values (+10/+5 for SHIELD_1/SHIELD_2) are center-of-literature estimates, not CPW-Engine exact values. M6.H Texel will supersede them.
+1. **The exact SHIELD_1 and SHIELD_2 values in CPW-Engine** are referenced in source code but not published numerically outside the source repo. The recommended starting values (+10/+5 for SHIELD_1/SHIELD_2) are center-of-literature estimates, not CPW-Engine exact values. M6.I Texel will supersede them.
 
 2. **Whether the SafetyTable should be applied as a full 500-cp penalty or scaled by the tapered phase.** The CPW-Engine applies it without phase scaling; the recommended approach is MG-weight-1.0 / EG-weight-0 via the tapered pair, which achieves the same result at full phase and smoothly decays at low phase — consistent with the project's tapered-eval framework.
 
-3. **Attacker-count gating: ≥2 attackers AND has queen vs. ≥2 attackers alone.** The CPW-Engine requires a queen on the attacking side; the Fruit/CPW King Safety page discusses the ≥2 attackers rule without the queen constraint. Both are citable. The queen constraint is more conservative (fewer positions trigger king-safety evaluation); recommend including it at M6.E for safety, then removing it if M6.H Texel shows it's over-restrictive.
+3. **Attacker-count gating: ≥2 attackers AND has queen vs. ≥2 attackers alone.** The CPW-Engine requires a queen on the attacking side; the Fruit/CPW King Safety page discusses the ≥2 attackers rule without the queen constraint. Both are citable. The queen constraint is more conservative (fewer positions trigger king-safety evaluation); recommend including it at M6.E for safety, then removing it if M6.I Texel shows it's over-restrictive.
 
-4. **Pawn-storm omission as a known gap.** The omission is deliberate (§3 rationale) but means the engine will not penalize an advancing enemy pawn wave toward a weak pawn shield until the enemy pawns actually break through (at which point the open-file penalty fires). This is a known strategic blind spot at M6.E; the expected correction is through M6.H Texel on the pawn-structure (passed-pawn advancement bonus) terms.
+4. **Pawn-storm omission as a known gap.** The omission is deliberate (§3 rationale) but means the engine will not penalize an advancing enemy pawn wave toward a weak pawn shield until the enemy pawns actually break through (at which point the open-file penalty fires). This is a known strategic blind spot at M6.E; the expected correction is through M6.I Texel on the pawn-structure (passed-pawn advancement bonus) terms.
 
 ---
 

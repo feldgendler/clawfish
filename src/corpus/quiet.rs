@@ -1,4 +1,4 @@
-//! The pinned quiet predicate (M6.G↔M6.H interface contract).
+//! The pinned quiet predicate (M6.G↔M6.I interface contract).
 //!
 //! `QUIET ⟺ !in_check(pos) ∧ |static_eval_white − qsearch_white| <
 //! QUIET_MARGIN_CP`. `static_eval_white` = white-POV `eval::evaluate`;
@@ -45,7 +45,7 @@ mod tests {
     use crate::search::QSearcher;
 
     // -----------------------------------------------------------------------
-    // interface_constants_golden — pins the M6.G↔M6.H contract values
+    // interface_constants_golden — pins the M6.G↔M6.I contract values
     // -----------------------------------------------------------------------
     #[test]
     fn interface_constants_golden() {

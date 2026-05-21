@@ -19,7 +19,7 @@ use super::{CorpusError, CorpusRecord, Label, Source};
 use crate::Position;
 
 /// FEN-leakage ratio ceiling for held-out integrity. Pinned in
-/// `filter_spec.txt` as the M6.G↔M6.H contract surface. Opening-transposition
+/// `filter_spec.txt` as the M6.G↔M6.I contract surface. Opening-transposition
 /// leakage is unavoidable; this is a sanity ceiling, not a zero.
 pub const FEN_LEAKAGE_TAU: f64 = 0.05;
 

@@ -2,7 +2,7 @@
 //! semi-open file, endgame draw-scaling. White-perspective. Computed live in
 //! `evaluate_core` (not pawn-only ⇒ never cached — the ADR-0033 §6 class).
 //! All additive weights zeroed + scale ≡ identity at ship (score-neutral,
-//! ADR-0034 §2) — term math live, M6.H-ready.
+//! ADR-0034 §2) — term math live, M6.I-ready.
 
 use crate::bitboard::{self, Bitboard};
 use crate::eval::data::{
@@ -108,7 +108,7 @@ pub(crate) fn rook_file_term_white(pos: &Position) -> (i32, i32) {
 /// Returns the draw-scale **numerator** out of `EG_SCALE_DEN` (identity =
 /// `EG_SCALE_DEN`). `evaluate_core` applies `blended * scale / EG_SCALE_DEN`.
 /// All scale tunables = `EG_SCALE_DEN` at ship ⇒ returns `EG_SCALE_DEN`
-/// for every input (identity — byte-identical to M6.E). M6.H-ready.
+/// for every input (identity — byte-identical to M6.E). M6.I-ready.
 pub(crate) fn endgame_scale(pos: &Position) -> i32 {
     let mut scale = EG_SCALE_DEN;
     if is_ocb_with_pawns(pos) {
@@ -277,7 +277,7 @@ mod tests {
     /// nor 50-move conditions fire. The halfmove_clock in both FENs is 0 (stated
     /// in the fixture comment so the scale-equality assertion is not on a moving
     /// target). At zeroed weights both terms are (0,0) trivially; the test is
-    /// structural — it pins the sign convention and becomes discriminating at M6.H.
+    /// structural — it pins the sign convention and becomes discriminating at M6.I.
     ///
     /// Mirror: White Ka1 + Ra7, Black Kh8 ↔ White Ka8 + Ra2, Black Kh1 (exact
     /// rank/color flip). Both have halfmove_clock=0.
@@ -296,7 +296,7 @@ mod tests {
             (op_mg_w, op_eg_w),
             (-op_mg_b, -op_eg_b),
             "color-mirror must negate outpost (mg, eg); \
-             trivially GREEN at zeroed weights, load-bearing at M6.H"
+             trivially GREEN at zeroed weights, load-bearing at M6.I"
         );
 
         let (rf_mg_w, rf_eg_w) = rook_file_term_white(&pos_w);
@@ -305,7 +305,7 @@ mod tests {
             (rf_mg_w, rf_eg_w),
             (-rf_mg_b, -rf_eg_b),
             "color-mirror must negate rook-file (mg, eg); \
-             trivially GREEN at zeroed weights, load-bearing at M6.H"
+             trivially GREEN at zeroed weights, load-bearing at M6.I"
         );
 
         assert_eq!(
@@ -401,14 +401,14 @@ mod tests {
     /// 1. Rank arithmetic (weight-free, REAL pin): pins `sq.rank()` values for
     ///    boundary squares so the `(3..=5)` gate is unambiguous, plus the
     ///    out-of-band table entries `OUTPOST_*[0..2,6..7] == 0`.
-    /// 2. Term-level gate exclusion (**M6.H-dormant for gate correctness, NOT a
+    /// 2. Term-level gate exclusion (**M6.I-dormant for gate correctness, NOT a
     ///    live discriminator** — corrected per test-suite review pass 2): a
     ///    pawn-supported unchallengeable knight on rel-rank 2 / 6 produces
     ///    `(0,0)` from `outpost_term_white` — but this does **not** verify the
     ///    gate, because out-of-band table entries are pinned `0` (level 1
     ///    above), so removing/widening the `(3..=5)` gate still yields
     ///    `0 · anything = (0,0)`. The check passes against BOTH a correct impl
-    ///    and a gate-absent impl, now AND post-M6.H (out-of-band entries stay
+    ///    and a gate-absent impl, now AND post-M6.I (out-of-band entries stay
     ///    zeroed by design). The gate's correctness rests on the plan §3
     ///    design invariant (the span-complement is a valid hole test only in
     ///    the enemy half) + the bench byte-identity landing gate — NOT this
@@ -423,7 +423,7 @@ mod tests {
     ///   f/h pawns (unchallengeable). Past the outpost band.
     ///
     /// TDD state: GREEN against stub. Level-1 assertions are the real
-    /// weight-free pins; the level-2 term checks are M6.H-dormant for gate
+    /// weight-free pins; the level-2 term checks are M6.I-dormant for gate
     /// correctness (documented, per above).
     #[test]
     fn outpost_rank_gate_structural() {
@@ -468,7 +468,7 @@ mod tests {
 
         // Term-level gate check: rel-rank 2 — White Ne3 supported by d2+f2, no
         // black d/f pawns (unchallengeable). Gate (3..=5) must exclude Ne3 from
-        // scoring ⇒ outpost_term_white == (0,0) regardless of M6.H weights.
+        // scoring ⇒ outpost_term_white == (0,0) regardless of M6.I weights.
         // d2: file=3, rank=1 attacks e3 (shift_north_east). ✓
         // f2: file=5, rank=1 attacks e3 (shift_north_west). ✓
         // Black king on a8. No black d/f pawns → unchallengeable.
@@ -477,7 +477,7 @@ mod tests {
             outpost_term_white(&pos_rr2),
             (0, 0),
             "rel-rank 2 (Ne3 pawn-supported/unchallengeable): outpost_term_white == (0,0). \
-             M6.H-dormant for gate correctness — out-of-band table entries are pinned 0 \
+             M6.I-dormant for gate correctness — out-of-band table entries are pinned 0 \
              above, so this passes with or without the (3..=5) gate; documents the fixture"
         );
 
@@ -492,7 +492,7 @@ mod tests {
             outpost_term_white(&pos_rr6),
             (0, 0),
             "rel-rank 6 (Ng7 pawn-supported/unchallengeable): outpost_term_white == (0,0). \
-             M6.H-dormant for gate correctness — see the rel-rank-2 assertion note; \
+             M6.I-dormant for gate correctness — see the rel-rank-2 assertion note; \
              the gate rests on the plan §3 design invariant + the bench gate, not this test"
         );
     }
@@ -500,7 +500,7 @@ mod tests {
     /// Symbolic outpost value test: a known outpost configuration yields the
     /// expected value derived from `eval::data` constants (not from calling the
     /// term and asserting self-equality). Covers **rel-rank 3, 4, AND 5** to
-    /// bound both gate boundaries for M6.H-revalidation.
+    /// bound both gate boundaries for M6.I-revalidation.
     ///
     /// Fixture:
     ///   White Ng4 (file=6, rank=3, rel-rank 3 for White) supported by f3+h3,
@@ -513,12 +513,12 @@ mod tests {
     /// Expected mg = OUTPOST_KNIGHT_MG[3] + OUTPOST_KNIGHT_MG[4] + OUTPOST_BISHOP_MG[5]
     ///   (re-derived from `eval::data`).
     ///
-    /// **M6.H-dormant:** at the shipped zeroed config both expected and actual
-    /// are (0, 0). The test auto-revalidates when M6.H sets non-zero weights,
+    /// **M6.I-dormant:** at the shipped zeroed config both expected and actual
+    /// are (0, 0). The test auto-revalidates when M6.I sets non-zero weights,
     /// at which point rr3 and rr5 become discriminating lower/upper gate bounds.
     ///
     /// TDD state: GREEN against stub (both expected and actual are (0, 0) at
-    /// zeroed config — M6.H-dormant-by-construction).
+    /// zeroed config — M6.I-dormant-by-construction).
     #[test]
     fn outpost_value_symbolic_from_data() {
         // FEN: 4k3/8/2B5/1P1N4/2P1P1N1/5P1P/8/4K3 w - - 0 1
@@ -541,7 +541,7 @@ mod tests {
              (OUTPOST_KNIGHT_MG[3]+OUTPOST_KNIGHT_MG[4]+OUTPOST_BISHOP_MG[5], \
               OUTPOST_KNIGHT_EG[3]+OUTPOST_KNIGHT_EG[4]+OUTPOST_BISHOP_EG[5]) \
              = ({expected_mg},{expected_eg}); covers rr 3+4+5 gate boundaries; \
-             M6.H-dormant: both are 0 at zeroed config, discriminating after M6.H"
+             M6.I-dormant: both are 0 at zeroed config, discriminating after M6.I"
         );
     }
 
@@ -551,7 +551,7 @@ mod tests {
     ///
     /// This guards the `7 - rank` mirror in `relative_rank(Black, sq)`.
     ///
-    /// **M6.H-dormant:** both expected and actual are 0 at zeroed config.
+    /// **M6.I-dormant:** both expected and actual are 0 at zeroed config.
     ///
     /// TDD state: GREEN against stub (both are (0,0) at zeroed config).
     #[test]
@@ -574,7 +574,7 @@ mod tests {
             (expected_mg, expected_eg),
             "Black outpost on d4 (rel-rank 4) must contribute \
              (-OUTPOST_KNIGHT_MG[4], -OUTPOST_KNIGHT_EG[4]) = ({expected_mg},{expected_eg}); \
-             M6.H-dormant at zeroed config"
+             M6.I-dormant at zeroed config"
         );
     }
 
@@ -620,8 +620,8 @@ mod tests {
     /// absent, enemy pawn present) → scores ROOK_SEMI_OPEN_FILE_*; rook with
     /// own pawn on file → scores 0. Values re-derived from `eval::data`.
     ///
-    /// **M6.H-dormant:** all rook-file constants are 0 at ship. The test
-    /// auto-revalidates when M6.H sets non-zero values.
+    /// **M6.I-dormant:** all rook-file constants are 0 at ship. The test
+    /// auto-revalidates when M6.I sets non-zero values.
     ///
     /// Fixture: White Ra1 (a-file: no pawns → open), White Rc1 (c-file: no
     /// white pawn, Black pawn c7 → semi-open), White Re1 (e-file: White
@@ -631,7 +631,7 @@ mod tests {
     /// Rc1), re-derived from eval::data.
     ///
     /// TDD state: GREEN against stub (all constants 0, stub returns (0,0),
-    /// expected is (0,0)) — M6.H-dormant.
+    /// expected is (0,0)) — M6.I-dormant.
     #[test]
     fn rook_open_vs_semi_open_precedence() {
         // Ra1: a-file, no pawns at all → open.
@@ -681,7 +681,7 @@ mod tests {
             "rook_file_term_white: Ra1(open)+Rc1(semi-open)+Re1(blocked) → \
              (ROOK_OPEN_FILE_MG+ROOK_SEMI_OPEN_FILE_MG, \
               ROOK_OPEN_FILE_EG+ROOK_SEMI_OPEN_FILE_EG) = ({expected_mg},{expected_eg}); \
-             M6.H-dormant at zeroed config"
+             M6.I-dormant at zeroed config"
         );
     }
 
@@ -908,8 +908,8 @@ mod tests {
     /// No queens, no rooks (OCB condition), no pawnless trigger. hmc=0 (no
     /// 50-move trigger). Only the OCB-with-pawns condition is active.
     ///
-    /// **M6.H-dormant:** at ship OCB_WITH_PAWNS_SCALE == EG_SCALE_DEN so the
-    /// result is EG_SCALE_DEN. After M6.H sets OCB_WITH_PAWNS_SCALE < DEN,
+    /// **M6.I-dormant:** at ship OCB_WITH_PAWNS_SCALE == EG_SCALE_DEN so the
+    /// result is EG_SCALE_DEN. After M6.I sets OCB_WITH_PAWNS_SCALE < DEN,
     /// this fixture returns the tuned scale (discriminating).
     ///
     /// TDD state: GREEN against stub (stub returns EG_SCALE_DEN; expected also
@@ -923,7 +923,7 @@ mod tests {
             expected,
             "OCB-with-pawns position → endgame_scale must be \
              min(OCB_WITH_PAWNS_SCALE, DEN) = {expected}; \
-             M6.H-dormant (equals DEN at ship since OCB_WITH_PAWNS_SCALE==DEN)"
+             M6.I-dormant (equals DEN at ship since OCB_WITH_PAWNS_SCALE==DEN)"
         );
     }
 
@@ -934,8 +934,8 @@ mod tests {
     /// zero rooks, KNN cannot force mate → pawnless-drawish fires. No OCB
     /// (no bishops), hmc=0 (no 50-move trigger). Only the pawnless condition.
     ///
-    /// **M6.H-dormant:** at ship PAWNLESS_DRAW_SCALE == EG_SCALE_DEN so the
-    /// result is EG_SCALE_DEN. After M6.H, this fixture returns the tuned scale.
+    /// **M6.I-dormant:** at ship PAWNLESS_DRAW_SCALE == EG_SCALE_DEN so the
+    /// result is EG_SCALE_DEN. After M6.I, this fixture returns the tuned scale.
     ///
     /// TDD state: GREEN against stub (stub returns EG_SCALE_DEN; expected also
     /// equals EG_SCALE_DEN at ship because PAWNLESS_DRAW_SCALE==DEN).
@@ -948,7 +948,7 @@ mod tests {
             expected,
             "pawnless-drawish (KNNvK) position → endgame_scale must be \
              min(PAWNLESS_DRAW_SCALE, DEN) = {expected}; \
-             M6.H-dormant (equals DEN at ship since PAWNLESS_DRAW_SCALE==DEN)"
+             M6.I-dormant (equals DEN at ship since PAWNLESS_DRAW_SCALE==DEN)"
         );
     }
 
@@ -964,8 +964,8 @@ mod tests {
     ///   tapered = EG_SCALE_DEN - (EG_SCALE_DEN - FIFTY_MOVE_FLOOR) * prog / span
     ///   expected = clamp(tapered, 0, EG_SCALE_DEN).min(EG_SCALE_DEN)
     ///
-    /// **M6.H-dormant:** at ship FIFTY_MOVE_FLOOR == EG_SCALE_DEN so
-    /// (DEN - DEN)*prog/span == 0 → tapered == DEN → expected == DEN. After M6.H
+    /// **M6.I-dormant:** at ship FIFTY_MOVE_FLOOR == EG_SCALE_DEN so
+    /// (DEN - DEN)*prog/span == 0 → tapered == DEN → expected == DEN. After M6.I
     /// sets FIFTY_MOVE_FLOOR < DEN, this fixture returns a value < DEN (discriminating).
     ///
     /// TDD state: GREEN against stub (stub returns EG_SCALE_DEN; expected also
@@ -981,7 +981,7 @@ mod tests {
             endgame_scale(&high_hmc),
             expected,
             "high halfmove-clock (hmc=90) → endgame_scale must be {expected} \
-             (taper formula re-derived from eval::data); M6.H-dormant: equals \
+             (taper formula re-derived from eval::data); M6.I-dormant: equals \
              DEN at ship since FIFTY_MOVE_FLOOR==EG_SCALE_DEN"
         );
     }
@@ -992,7 +992,7 @@ mod tests {
     /// `eval::data` — pins the formula independent of shipped config.
     ///
     /// Tests a *hypothetical* FLOOR < DEN (e.g., floor=16) to make the ramp
-    /// non-flat — the M6.H-realistic case. Does not call `endgame_scale`.
+    /// non-flat — the M6.I-realistic case. Does not call `endgame_scale`.
     ///
     /// TDD state: GREEN against stub — pure arithmetic, does not call any fn.
     #[test]
@@ -1055,16 +1055,16 @@ mod tests {
     // field-poking — so `king_square`/material counts assume a well-formed
     // position (exactly one king per side).
     //
-    // M6.H-dormant-by-construction: at ship every scale tunable ==
+    // M6.I-dormant-by-construction: at ship every scale tunable ==
     // EG_SCALE_DEN so the bound holds trivially for all inputs regardless of
-    // taper/clamp correctness. This proptest is the M6.H-revalidation pin
-    // (auto-discriminates the instant M6.H sets a tunable < DEN), NOT a live
+    // taper/clamp correctness. This proptest is the M6.I-revalidation pin
+    // (auto-discriminates the instant M6.I sets a tunable < DEN), NOT a live
     // correctness signal. The now-meaningful taper pin is
     // `endgame_scale_fifty_move_ramp_structural` (pure arithmetic,
     // config-independent).
     //
     // TDD state: GREEN against stub (stub returns EG_SCALE_DEN which satisfies
-    // 0 <= EG_SCALE_DEN <= EG_SCALE_DEN). M6.H-dormant.
+    // 0 <= EG_SCALE_DEN <= EG_SCALE_DEN). M6.I-dormant.
     proptest! {
         #[test]
         fn endgame_scale_never_exceeds_den(

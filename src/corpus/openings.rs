@@ -6,7 +6,7 @@
 //! Random` campaign starts every game from `startpos + opening_random_
 //! plies` random plies and tags records `Source::SelfPlayOffBook`. The
 //! book / off-book proportion is a training-time per-source reweighting
-//! axis at M6.H (ADR-0035 §10), no longer a corpus-generation knob.
+//! axis at M6.I (ADR-0035 §10), no longer a corpus-generation knob.
 //!
 //! Format: one 6-field FEN per line. Whole-file SHA-256 is recorded in
 //! the manifest (`opening_book_sha256`) so the reproducibility re-run

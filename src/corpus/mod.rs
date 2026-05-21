@@ -7,7 +7,7 @@
 //! the additive, behavior-neutral `search::quiescence_eval_white` seam) —
 //! so no bench, no SPRT, no Elo claim. The gate is data-quality checks.
 //!
-//! Consumed by M6.H (Texel tuning), the tuning-backlog "PST co-tuning"
+//! Consumed by M6.I (Texel tuning), the tuning-backlog "PST co-tuning"
 //! Arm B, future SPSA campaigns, and M10 NNUE data-prep. See
 //! `docs/plans/m6.g.md`, `docs/research/m6-corpus-construction.md`,
 //! and ADR-0035.
@@ -31,15 +31,15 @@ pub mod store;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
-// Pinned M6.G↔M6.H interface contract.
+// Pinned M6.G↔M6.I interface contract.
 //
 // These constants ARE the interface: the corpus is built against them and
-// M6.H must read the same values from `filter_spec.txt`. Changing one is a
+// M6.I must read the same values from `filter_spec.txt`. Changing one is a
 // contract break, not a tweak. Provenance: research §11 (recommended
 // predicate) — `!in_check ∧ |static_eval − qsearch| < QUIET_MARGIN_CP`,
 // opening-ply skip, |eval| cutoff, per-game cap. Predicate B was chosen
 // precisely so static_eval ≈ qsearch within the margin, which is what lets
-// M6.H tune on `static_eval_white` directly (no qsearch at tune time).
+// M6.I tune on `static_eval_white` directly (no qsearch at tune time).
 // ---------------------------------------------------------------------------
 
 /// A position is non-quiet if `|static_eval − qsearch| ≥` this (centipawns).
@@ -118,7 +118,7 @@ impl Label {
 /// Self-play is split into two variants by **opening regime**:
 /// `SelfPlayOnBook` (games seeded from a vendored opening book FEN) and
 /// `SelfPlayOffBook` (games seeded from the startpos + random plies). The
-/// split lets the M6.H bi-level optimizer treat the book / off-book
+/// split lets the M6.I bi-level optimizer treat the book / off-book
 /// proportion as a training-time per-source reweighting axis (identical
 /// mechanism to the CCRL / Lichess proportions) instead of a corpus-
 /// generation knob. Both variants are original game-result-labeled; the
@@ -165,7 +165,7 @@ impl Source {
 pub const DEPTH_RUNG_EXTERNAL: u8 = 0xFF;
 
 // Blind-spot stratum membership bits (frozen at corpus-build time; never a
-// live `eval::tier1` call — closes the M6.H re-tune circularity). Reused by
+// live `eval::tier1` call — closes the M6.I re-tune circularity). Reused by
 // the stratified objective.
 
 /// STS theme #3 ("Knight Outposts") corpus-context analogue stratum.
@@ -295,8 +295,8 @@ mod tests {
 
     #[test]
     fn pinned_interface_constants_golden() {
-        // The M6.G↔M6.H interface contract. A change here is a contract
-        // break — M6.H reads these from filter_spec.txt. Pinned so an
+        // The M6.G↔M6.I interface contract. A change here is a contract
+        // break — M6.I reads these from filter_spec.txt. Pinned so an
         // accidental edit fails the test, not silently re-defines the corpus.
         assert_eq!(QUIET_MARGIN_CP, 30);
         assert_eq!(OPENING_SKIP_PLIES, 8);

@@ -1,8 +1,8 @@
 //! Stratified selection objective (research §1.2/§6.4). DEFINITION +
-//! computable harness only — the bi-level mixture *selection* runs in M6.H
+//! computable harness only — the bi-level mixture *selection* runs in M6.I
 //! (it needs the inner Texel).
 //!
-//! Pinned M6.G↔M6.H interface: a quiet-certified position is scored by
+//! Pinned M6.G↔M6.I interface: a quiet-certified position is scored by
 //! `quiet::static_eval_white` (NOT qsearch at tune time) — Predicate B was
 //! chosen precisely so `static_eval ≈ qsearch` within `QUIET_MARGIN_CP`,
 //! resolving research §2.5's open question. Texel `K` fit once over the
@@ -10,7 +10,7 @@
 //! `STRATUM_OUTPOST` (STS theme #3 corpus-context analogue) +
 //! `STRATUM_ENDGAME`; the outpost stratum is a FROZEN snapshot stored in
 //! `CorpusRecord::strata` (never a live `eval::tier1` call — closes the
-//! M6.H re-tune circularity).
+//! M6.I re-tune circularity).
 //!
 //! Implemented by the M6.G `objective` coder slice per
 //! `docs/plans/m6.g.md` §3.8.
@@ -36,9 +36,9 @@ const MOP_UP_PHASE_MAX: u8 = 5;
 //
 // This is a FROZEN COPY of the algorithm from `eval::tier1::outpost_squares`
 // + the rank gate from `eval::tier1::outpost_term_white`, snapshotted at
-// M6.F (2026-05-19). M6.H must NOT change this snapshot — the stratum is
+// M6.F (2026-05-19). M6.I must NOT change this snapshot — the stratum is
 // fixed at corpus-build time. If the live outpost predicate in eval::tier1
-// is later re-tuned by M6.H, `strata_for` must still reflect the M6.F
+// is later re-tuned by M6.I, `strata_for` must still reflect the M6.F
 // corpus-build semantics, not the new eval semantics.
 //
 // Correctness note from CLAUDE.md / ADR-0034: the front-span-complement
@@ -114,7 +114,7 @@ pub struct StratObjective {
     pub endgame: f64,
     /// `(source_byte, loss)` — per-source held-out loss. The four-way
     /// corpus-mix (SelfPlayOnBook / SelfPlayOffBook / Ccrl / LichessOpen)
-    /// is an M6.H meta-tunable axis (ADR-0035 §10); this entry lets the
+    /// is an M6.I meta-tunable axis (ADR-0035 §10); this entry lets the
     /// outer simplex read the per-source signal and move the mix
     /// accordingly. Sorted by source byte for stable iteration.
     ///
@@ -257,7 +257,7 @@ pub fn stratified_objective(
         .collect();
     let endgame = logistic_loss_refs(&endgame_recs, k, score);
 
-    // Per-source loss (M6.H corpus-mix meta-tunable axis). The book vs
+    // Per-source loss (M6.I corpus-mix meta-tunable axis). The book vs
     // off-book proportion is read from this vector — `SelfPlayOnBook`
     // and `SelfPlayOffBook` are distinct source bytes.
     let mut source_bytes: Vec<u8> = val.iter().map(|r| r.source.as_u8()).collect();
@@ -696,8 +696,8 @@ mod tests {
     // `eval::tier1::outpost_squares`. At M6.F-snapshot time the frozen and
     // live impls must agree byte-for-byte over every position; if they
     // disagree NOW, the snapshot already drifted (the structural argument
-    // doesn't cover that backward direction — only "M6.H can't break a
-    // built record"). After M6.H this test will start failing on positions
+    // doesn't cover that backward direction — only "M6.I can't break a
+    // built record"). After M6.I this test will start failing on positions
     // where the LIVE predicate has been re-tuned and the frozen snapshot
     // intentionally lags; until then this is the equality pin.
     // ---------------------------------------------------------------------------

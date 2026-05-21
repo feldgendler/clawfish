@@ -334,7 +334,7 @@ pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
 // **Shipped config: ALL Tier-1 additive weights ZEROED; ALL endgame-scale
 // tunables = EG_SCALE_DEN (identity).** Score-neutral inert landing per the
 // M6.C/M6.D/M6.E precedent (ADR-0034 §2); the full term math is live and
-// M6.H-ready; M6.H joint Texel re-derives the entire weight/coefficient set.
+// M6.I-ready; M6.I joint Texel re-derives the entire weight/coefficient set.
 //
 // Inert-identity construction:
 //   - Additive terms: weight = 0 ⇒ term ≡ (0, 0).
@@ -343,7 +343,7 @@ pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
 //     in i32. ⇒ evaluate byte-identical to M6.E ⇒ bench 1213649 / depth-4
 //     90591 byte-for-byte. ADR-0034 §2.
 //
-// **Literature defaults (M6.H starting point, recorded verbatim):**
+// **Literature defaults (M6.I starting point, recorded verbatim):**
 //
 // Outpost per-kind per-relative-rank MG/EG bonuses. Relative rank 0..7; only
 // ranks 3..=5 (chess ranks 4–6) are scored (the classic outpost band). Values
@@ -365,7 +365,7 @@ pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
 //
 // EG_SCALE_DEN = 64: a STRUCTURAL fixed-point denominator (NOT a tunable —
 // the PASSED_KDIST_CAP structural-constant precedent). Keeps the per-position
-// scale a known per-position constant that folds into the M6.H cached feature
+// scale a known per-position constant that folds into the M6.I cached feature
 // mask, preserving optimizer linearity (ADR-0034 §4 / §8).
 // FIFTY_MOVE_TAPER_FROM = 80: structural onset (not tuned — it is the
 // semantically correct onset for 50-move proximity; tuning it would change the
@@ -378,7 +378,7 @@ pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
 // Outpost — per-kind, per-relative-rank MG/EG (rel-rank 0..7; predicate gates
 // rel-rank ∈ 3..=5 i.e. chess ranks 4–6 so out-of-band entries never index).
 /// Knight outpost bonus, middlegame, indexed by relative rank (0..7). Zeroed
-/// (M6.H re-derives); literature defaults ~[0,0,0,18,28,16,0,0].
+/// (M6.I re-derives); literature defaults ~[0,0,0,18,28,16,0,0].
 // Used from tier1.rs; #[allow] covers the stub-slice gap until impl is wired.
 #[allow(dead_code)]
 pub(crate) const OUTPOST_KNIGHT_MG: [i32; 8] = [0; 8]; // lit ~[0,0,0,18,28,16,0,0]
@@ -410,11 +410,11 @@ pub(crate) const ROOK_SEMI_OPEN_FILE_EG: i32 = 0; // lit   5
 /// Every scale tunable at ship = EG_SCALE_DEN ⇒ scale ≡ identity.
 #[allow(dead_code)]
 pub(crate) const EG_SCALE_DEN: i32 = 64; // structural (not tuned)
-/// OCB-with-pawns draw-scale numerator. M6.H tunable; identity value =
+/// OCB-with-pawns draw-scale numerator. M6.I tunable; identity value =
 /// EG_SCALE_DEN. Shipped = EG_SCALE_DEN (identity); literature ~32 (0.5×DEN).
 #[allow(dead_code)]
 pub(crate) const OCB_WITH_PAWNS_SCALE: i32 = 64; // = DEN ⇒ identity; lit ~32 (0.5)
-/// Pawnless drawish endgame scale numerator. M6.H tunable; identity =
+/// Pawnless drawish endgame scale numerator. M6.I tunable; identity =
 /// EG_SCALE_DEN. Shipped = EG_SCALE_DEN (identity); literature ~8 (0.125×DEN).
 #[allow(dead_code)]
 pub(crate) const PAWNLESS_DRAW_SCALE: i32 = 64; // = DEN ⇒ identity; lit ~8
@@ -422,7 +422,7 @@ pub(crate) const PAWNLESS_DRAW_SCALE: i32 = 64; // = DEN ⇒ identity; lit ~8
 /// (semantically correct onset; tuning changes meaning, not magnitude).
 #[allow(dead_code)]
 pub(crate) const FIFTY_MOVE_TAPER_FROM: i32 = 80; // structural onset (halfmoves)
-/// 50-move taper floor: scale value at halfmove 100. M6.H tunable; identity =
+/// 50-move taper floor: scale value at halfmove 100. M6.I tunable; identity =
 /// EG_SCALE_DEN. Shipped = EG_SCALE_DEN (identity, ramp flat); lit ~16 (0.25).
 #[allow(dead_code)]
 pub(crate) const FIFTY_MOVE_FLOOR: i32 = 64; // = DEN ⇒ identity; lit ~16

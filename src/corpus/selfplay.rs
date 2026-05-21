@@ -36,7 +36,7 @@ use crate::{Color, MoveList, PieceKind, Position, generate_moves, in_check};
 
 /// Opening regime for a self-play campaign. A campaign is constrained to
 /// a single regime end-to-end so every game it commits is tagged with the
-/// matching `Source` variant. The M6.H bi-level optimizer reweights
+/// matching `Source` variant. The M6.I bi-level optimizer reweights
 /// between on-book and off-book corpora at training time via the per-
 /// source loss in `StratObjective`; the operator runs one campaign per
 /// regime and grows each independently.

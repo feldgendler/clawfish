@@ -93,7 +93,7 @@ BUCKETS="${BUCKETS:-100,200,400,600}"
 # (records tagged Source::SelfPlayOffBook). One campaign per regime; the
 # operator runs each invocation against its own OUT_DIR and grows the
 # two corpora independently. The on-book / off-book proportion is a
-# training-time per-source reweighting at M6.H, no longer a generation
+# training-time per-source reweighting at M6.I, no longer a generation
 # knob (ADR-0035 §10).
 #
 # OPENING_BOOK is only consulted when OPENING_MODE=book; default points

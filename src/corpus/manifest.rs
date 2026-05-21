@@ -3,7 +3,7 @@
 //! ## Frozen-artifact contract
 //!
 //! The manifest is the bytes consumers freeze on.  It records every source
-//! file's path, byte-count, and SHA-256 digest so a consumer (M6.H tuner)
+//! file's path, byte-count, and SHA-256 digest so a consumer (M6.I tuner)
 //! can verify the corpus it reads is the one that was produced. The R-TC
 //! reproducibility contract adds the campaign seeds + depth ladder + the
 //! corpus-bytes digest so the quality gate can re-verify the on-disk
@@ -199,7 +199,7 @@ pub struct SourceEntry {
 
 /// Corpus manifest: the frozen-artifact provenance record.
 ///
-/// Written alongside the corpus by the extraction pipeline and read by M6.H
+/// Written alongside the corpus by the extraction pipeline and read by M6.I
 /// to verify it is consuming the correct corpus snapshot. The R-TC
 /// reproducibility contract pins `self_play_seed` + `split_seed` +
 /// `depth_ladder` + `corpus_sha256`, so the data-quality gate can re-derive
@@ -250,7 +250,7 @@ pub struct Manifest {
     /// Opening regime the self-play campaign ran in (`"book"` or
     /// `"random"`). `None` on a not-yet-run / calibrate-ladder-only
     /// manifest stub. The on-book / off-book proportion is reweighted at
-    /// M6.H via per-source loss; one corpus per regime (ADR-0035 §10).
+    /// M6.I via per-source loss; one corpus per regime (ADR-0035 §10).
     pub opening_mode: Option<String>,
     /// SHA-256 (lowercase hex) of the frozen corpus bytes themselves. The
     /// reproducibility check (quality gate) re-derives this from disk and
@@ -808,12 +808,12 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, CorpusError> {
 
 /// Write `dir/filter_spec.txt` echoing the pinned filtering constants.
 ///
-/// This is the M6.G↔M6.H contract surface: M6.H reads this file to confirm
+/// This is the M6.G↔M6.I contract surface: M6.I reads this file to confirm
 /// it is consuming a corpus built with compatible filtering parameters.
 /// The quiet-predicate description is included so the file is self-documenting.
 pub fn write_filter_spec(dir: &Path) -> Result<(), CorpusError> {
     let content = format!(
-        "# Corpus filter specification (M6.G↔M6.H contract surface)\n\
+        "# Corpus filter specification (M6.G↔M6.I contract surface)\n\
          # Do not edit — regenerate by re-running the corpus extraction pipeline.\n\
          #\n\
          # Quiet predicate: |static_eval - qsearch_score| <= QUIET_MARGIN_CP\n\

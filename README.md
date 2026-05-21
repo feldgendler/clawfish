@@ -12,10 +12,12 @@ at mixed time control, single-threaded on Apple Silicon (200-game estimate at
 the M6.B measurement point). The engine implements a hand-crafted classical
 evaluation; NNUE is a planned future milestone, not yet present.
 
-**Roadmap: M6 in progress.** Classical-eval infrastructure is complete; the
-next milestone (M6.H) jointly Texel-tunes its cumulative parameter set on a
-self-play corpus. Parallel search (M9) and NNUE evaluation (M10) follow. See
-[`docs/roadmap.md`](docs/roadmap.md) for the full plan.
+**Roadmap: M6 in progress.** Classical-eval infrastructure (M6.A–F) is
+complete and corpus data-infra (M6.G) is landed; next come M6.H (robust
+on-demand Lichess/CCRL ingestion — data infra) and then M6.I, which jointly
+Texel-tunes the cumulative parameter set on the M6.G corpus. Parallel search
+(M9) and NNUE evaluation (M10) follow. See [`docs/roadmap.md`](docs/roadmap.md)
+for the full plan.
 
 ### Tier goals
 

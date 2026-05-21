@@ -10,12 +10,12 @@ the M5.E "correctness gate, not SPRT" precedent applied to data).
 
 M6.A–F landed the cumulative HCE eval surface (tapered eval + bishop pair
 + pawn structure infra + passed pawns + piece mobility + king safety +
-Tier-1 features). M6.H is the single joint-Texel pass over that surface
-against a baseline tag of `M6.F`. M6.H consumes a **reusable
+Tier-1 features). M6.I is the single joint-Texel pass over that surface
+against a baseline tag of `M6.F`. M6.I consumes a **reusable
 game-result-labeled quiet-position corpus**, which is also a precondition
 of three other downstream consumers: the tuning-backlog "PST co-tuning"
 Arm B, future SPSA campaigns, and M10 NNUE data-prep. M6.G is the corpus
-phase that decouples the corpus from M6.H's tuning loop — its own
+phase that decouples the corpus from M6.I's tuning loop — its own
 sub-milestone because the corpus has distinct *data* failure modes
 (label-provenance leakage, decisive/draw imbalance, opening
 over-representation, held-out contamination, non-reproducible
@@ -24,7 +24,7 @@ acquisition) and a *data-quality gate*, not an SPRT.
 Binding inputs:
 
 - `docs/plans/m6.g.md` (the implementation plan; the §3.1 pinned
-  constants are the M6.G↔M6.H interface contract).
+  constants are the M6.G↔M6.I interface contract).
 - `docs/research/m6-corpus-construction.md` (prior art — Texel recipe,
   quiet-position predicates, source surveys, the **load-bearing Zurichess
   `c9` label-provenance finding** the ADR-0003 audit codifies).
@@ -58,7 +58,7 @@ physically cannot encode anything else — `Source::from_u8(b)` returns
 `None` for `b ≥ 4` and `store::decode_block` rejects such frames
 wholesale. (Self-play is split into two source variants by opening
 regime — book-seeded vs. startpos + random plies — so the book / off-
-book mix is a training-time per-source reweighting axis at M6.H rather
+book mix is a training-time per-source reweighting axis at M6.I rather
 than a corpus-generation knob. See §10.)
 
 ### 2. ADR-0003 label-provenance audit verdict: Zurichess `c9` REJECTED
@@ -97,10 +97,10 @@ external DBs** (multi-GB files are not git-vendor-appropriate); the
 manifest pins their URLs + SHA-256 + acquisition date for the
 re-derivability recipe.
 
-### 4. M6.G↔M6.H interface contract (the pinned constants)
+### 4. M6.G↔M6.I interface contract (the pinned constants)
 
 The §3.1 module-level constants in `src/corpus/mod.rs` ARE the contract
-M6.H reads from `bench/corpus/filter_spec.txt`:
+M6.I reads from `bench/corpus/filter_spec.txt`:
 
 | Constant | Value | Role |
 |---|---|---|
@@ -109,7 +109,7 @@ M6.H reads from `bench/corpus/filter_spec.txt`:
 | `HIGH_SCORE_CP` | 600 | Records dropped for `|eval| > 600` (resignation regime) |
 | `PER_GAME_CAP` | 10 | At most this many retained positions per source game |
 
-The pinned **score function** for M6.H Texel: a quiet-certified position
+The pinned **score function** for M6.I Texel: a quiet-certified position
 is scored by `corpus::quiet::static_eval_white` (= `evaluate` with the
 White-POV flip), NOT qsearch — the quiet certificate makes
 `static_eval ≈ qsearch` within `QUIET_MARGIN_CP` by construction.
@@ -118,7 +118,7 @@ time.
 
 The **frozen** outpost-stratum predicate (`objective::frozen_outpost_squares`)
 is a code-level snapshot of `eval::tier1::outpost_squares` taken at
-M6.F-snapshot time. M6.H must NOT redirect to the live impl — re-tuning
+M6.F-snapshot time. M6.I must NOT redirect to the live impl — re-tuning
 M6.F's outpost weights would otherwise drift the stratum definition
 beneath the held-out objective (circularity). The
 `frozen_outpost_squares_byte_equals_live_at_m6f_snapshot` test pins the
@@ -162,7 +162,7 @@ clause *explicitly* permits "fixed-shallow-depth stratified across
 their effective depths (ADR-0021 §4's node-TC rejection is scoped to
 cross-version SPRT comparability and does NOT forbid fixed-depth /
 fixed-nodes for corpus generation — one fixed build, not a version
-comparison)." VirtualClock remains binding on the M6.H SPRT (M6.H's
+comparison)." VirtualClock remains binding on the M6.I SPRT (M6.I's
 concern, not M6.G's).
 
 **Fresh searcher per game (R3 bit-identical-resume):** each worker
@@ -235,7 +235,7 @@ the header of each documents the distinction.
 
 **Post-tag amendment (the corpus bytes are gitignored).** The original
 ADR §8 + the plan §1 committed to "consumers freeze on bytes" — but
-that contract only fit a tens-of-MB artifact. At M6.H production scale
+that contract only fit a tens-of-MB artifact. At M6.I production scale
 (1.5–3 M records ≈ 100–300 MB, plus raw external sources at multi-GB)
 git is the wrong tool: GitHub's 100 MB hard file cap, pack-inflation
 across nightly regenerations, and useless diff/blame on binary push
@@ -259,11 +259,11 @@ Reproducibility properties under the amendment:
 | `corpus_sha256` | Verifiable post-build | The manifest's recorded digest is checked by `corpus quality-gate`'s `reproducibility_rerun_match`; mismatch means the recipe drifted. |
 
 **Future hosting (deferred, not in scope for this commit).** Re-running
-re-run.sh costs CPU-days at M6.H scale — burning that on every
+re-run.sh costs CPU-days at M6.I scale — burning that on every
 consumer wanting to reproduce the Texel tune is wasteful. A future
 follow-up (separate ADR or hosting-decision note) will pick a canonical
 host for the frozen artifact bytes: GitHub Release asset on the `M6.G`
-/ `M6.H` tag, S3-style bucket with the manifest's `corpus_sha256` as
+/ `M6.I` tag, S3-style bucket with the manifest's `corpus_sha256` as
 the key, or sister-repo `clawfish-corpus`. Consumers download the
 bytes + sha256-verify against the manifest; the manifest stays the
 truth source. Until that lands, the operator's local materialized
@@ -279,7 +279,7 @@ git-committed bytes).
 ### 9. Disposition — data-quality gate (NOT SPRT); committed artifact is self-play-dominant
 
 The M6.G "tag" is a **frozen-corpus-artifact reference, not an SPRT
-engine baseline.** M6.H's SPRT baseline remains the `M6.F` features
+engine baseline.** M6.I's SPRT baseline remains the `M6.F` features
 tag. `evaluate` / search are unchanged across M6.G — the only engine
 touch is the additive `pub fn search::quiescence_eval_white` /
 `QSearcher` seam, which leaves negamax / qsearch / the deterministic
@@ -322,11 +322,11 @@ record carries that regime's `Source` variant. The operator runs one
 campaign per regime and extends each independently.
 
 The on-book / off-book proportion is **a training-time per-source
-reweighting axis** in M6.H's bi-level optimizer, identical mechanism
+reweighting axis** in M6.I's bi-level optimizer, identical mechanism
 to the CCRL / Lichess proportion: the outer simplex moves the
 `StratObjective::per_source` weights and the inner Texel refits at
 each meta-tunable evaluation. No mix happens at corpus-build time.
-The four-way per-source loss vector is the M6.H meta-tunable axis;
+The four-way per-source loss vector is the M6.I meta-tunable axis;
 the only generation-time decision is "how many records of each
 provenance do I have on disk?", which the operator addresses by
 running the relevant campaign for longer.
@@ -340,7 +340,7 @@ Wire-format change: the source-byte assignment is
 `SelfPlayOnBook = 0`, `SelfPlayOffBook = 1`, `Ccrl = 2`,
 `LichessOpen = 3`. Older shard.bin files written before this
 amendment (which used `SelfPlay = 0`, `Ccrl = 1`, `LichessOpen = 2`)
-are incompatible and are not migrated — the M6.H corpus will be
+are incompatible and are not migrated — the M6.I corpus will be
 generated fresh under the four-source taxonomy.
 
 The frozen `STRATUM_BOOK_OPENING` stratum bit on `CorpusRecord::strata`
@@ -354,15 +354,30 @@ calibrate-ladder-only stubs). `bench/corpus/re-run.sh` reads
 `opening_mode` from the manifest and passes the matching
 `--opening-mode` flag to `corpus selfplay`.
 
+### 11. Forward-pointer to M6.H — robust on-demand Lichess/CCRL ingestion (post-tag amendment, 2026-05-21)
+
+Beyond the four-source taxonomy of §10, an additional M6 sub-phase **M6.H** was inserted between the corpus infra (M6.G) and the Texel pass (M6.I) to add **on-demand network-layer fetching** of the external sources (`Source::Ccrl`, `Source::LichessOpen`). Pre-amendment, external PGNs were operator-staged into `target/corpus-raw/` and ingested via `corpus ingest-pgn` against already-on-disk files; M6.H adds a `corpus fetch --source={ccrl,lichess}` subcommand + `corpus::fetch` library module that streams from public mirrors with early-termination, in-RAM resume, and infinite-backoff retry — so M6.I's bi-level learning-curve driver can call M6.H as a synchronous "give me N more positions" primitive instead of requiring pre-staged multi-GB downloads.
+
+Design summary (full scope detail in `docs/roadmap.md` §M6 M6.H scope detail):
+
+- **Pure-Rust deps** (`ureq`, `zstd`, `zip`) — no `7z` support, no system-tool subprocess for the fetcher. Self-play continues to use the existing `corpus selfplay` campaign.
+- **Streaming + early termination.** The pipeline `HTTP → decompress → stream_pgn → filter → ingest into pgn-shard.bin` is driven by M6.I's `positions_ingested >= target` check. Dropping the reader closes the connection; for a 250K-position request against a Lichess monthly dump, only ~5–10% of the file is downloaded.
+- **In-RAM resume via `ResumableHttpReader<R: Read>`.** Custom `Read` impl tracks `bytes_received` and transparently retries on transient TCP failure with `Range: bytes=N-`. The `zstd::Decoder` instance stays alive across retries — zero re-decompression cost on a network blip.
+- **No `.partial` file on disk** — the corpus shard is the persistent state; full-process restart re-streams from byte 0 and the shard's dedup absorbs already-ingested games as no-ops.
+- **R1/R2 reuse**: `corpus fetch` writes into the same `pgn-shard.bin` log via the same CRC-framed per-game append-block + atomic-rename discipline as `corpus ingest-pgn` and `corpus selfplay`. Interrupted games leak zero records, by construction (M6.G §6 atomic-block contract).
+- **No engine touch** — same M6.G discipline. Bench unchanged by construction.
+
+M6.H lands with its own ADR (forthcoming at landing time) and its own milestone retrospective. This entry is the forward-pointer in ADR-0035 so a reader looking at the corpus infra ADR sees that the data-acquisition layer exists.
+
 ## Consequences
 
-- M6.H is unblocked: a `bench/corpus/` artifact (with a pinned interface
+- M6.I is unblocked: a `bench/corpus/` artifact (with a pinned interface
   contract + a frozen-bytes reproducibility guarantee + a passing
-  data-quality gate) is consumable by the M6.H tuner.
+  data-quality gate) is consumable by the M6.I tuner.
 - The tuning-backlog "PST co-tuning" Arm B, future SPSA campaigns, and
   M10 NNUE data-prep have a stable contract surface
   (`manifest.json` + `filter_spec.txt` + the binary shard format).
-- The committed artifact is small (self-play-dominant). M6.H's
+- The committed artifact is small (self-play-dominant). M6.I's
   effective corpus size in the joint-Texel pass depends on the operator
   extending the artifact via `scripts/corpus.sh` before the tune.
 - The R-TC depth ladder is dev-machine-local. A re-run on different
@@ -372,7 +387,7 @@ calibrate-ladder-only stubs). `bench/corpus/re-run.sh` reads
 - The `cmd_build` no-cleanup of `pgn-shard.bin` after build is a
   documented latent issue for the multi-PGN-ingest workflow (not
   exercised by the committed artifact) — operator-handled until the
-  workflow is exercised in M6.H corpus extension.
+  workflow is exercised in M6.I corpus extension.
 
 ## Alternatives considered
 
@@ -383,7 +398,7 @@ calibrate-ladder-only stubs). `bench/corpus/re-run.sh` reads
   the plan's "vendored data file in `bench/`" wording. At landing the
   *full filtered* artifact was vendored (compact post-filter); raw DBs
   weren't. **Subsequently amended (§8 post-tag amendment): the bytes
-  are gitignored, only the manifest + recipe stay in git** — at M6.H
+  are gitignored, only the manifest + recipe stay in git** — at M6.I
   production scale (100–300 MB filtered, multi-GB raw) git is the
   wrong tool, and the manifest captures all reproducibility-load-
   bearing state regardless of where the bytes live. Future hosting
@@ -413,7 +428,7 @@ calibrate-ladder-only stubs). `bench/corpus/re-run.sh` reads
 - ADR-0021 — `docs/decisions/0021-virtual-clock-uci-option.md` §4
   (the cross-version-SPRT scoping the §5 R4 deviation argues against).
 - ADR-0031 / ADR-0032 / ADR-0033 / ADR-0034 — the M6.A–F cumulative HCE
-  surface the M6.H consumer tunes against.
+  surface the M6.I consumer tunes against.
 - `docs/plans/m6.g.md` — the implementation plan (§3.1 pinned interface
   constants; §3.5 R-TC + R4 + R3; §3.6 store frame; §6 quality gate).
 - `docs/research/m6-corpus-construction.md` — binding prior art

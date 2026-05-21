@@ -16,7 +16,7 @@ this note is the design-space record the plan references.
 - **Half-isolani** (isolated on only one adjacent file) — out of scope for M6.B.
 - **Weights (literature center).** MG −10, EG −20. CPW: isolated penalties are
   larger than backward penalties. Spread across surveyed engines is wide
-  (−5…−20); M6.H Texel tune resolves.
+  (−5…−20); M6.I Texel tune resolves.
 
 ### 1.2 Doubled pawn
 
@@ -76,7 +76,7 @@ wBackward    = (stops & bAttacks & ~wAttackSpans) >> 8
 | 6 | +40 | +55 |
 | 7 | +70 | +95 |
 
-(approximate literature-center; M6.H tunes)
+(approximate literature-center; M6.I tunes)
 
 **Shipped indexing reconciliation.** The implemented `CONN_MG`/`CONN_EG` in
 `src/eval/data.rs` are indexed by **0-based LERF rank index**, not chess rank:
@@ -85,7 +85,7 @@ wBackward    = (stops & bAttacks & ~wAttackSpans) >> 8
 a home-rank pawn formation is not yet a structural asset; the bonus accrues as
 the phalanx advances). This shifts the table above one chess rank deeper than
 its "Rank (white)" labels suggest. Not a correctness concern: ADR-0032 §6 sets
-no normative values (Texel-tuned in M6.H) and the tests pin the shipped
+no normative values (Texel-tuned in M6.I) and the tests pin the shipped
 constants directly. The labels above are the literature-center magnitudes; the
 shipped table is the LERF-indexed embedding of them.
 
@@ -205,7 +205,7 @@ changes with piece density get an MG/EG split" — pawn weaknesses are canonical
 | Connected | rank-scaled +3/+5 … +70/+95 | (see §1.4 table) | per pawn, by rank |
 | Passed | — | — | detection only (bonus M6.C) |
 
-Center-of-literature values; M6.H Texel tune is the primary calibration.
+Center-of-literature values; M6.I Texel tune is the primary calibration.
 
 **Provenance caveat (added post-M6.B, from the subset-screen finding).**
 These four values are **not from one co-calibrated source** — they are a
@@ -221,7 +221,7 @@ catastrophic double-count, because ISO and CONN measure the *same
 connectivity axis* with opposite sign and mismatched shape. An `(ISO+CONN)/2`
 co-scale probe recovers ~+204 of that (pure over-magnitude) but **plateaus
 at ≈0** — a global multiplier cannot fix a wrong-*shape* double-count.
-**M6.B ships CONN-only**; M6.H must **reshape** (re-attach CONN's modulation
+**M6.B ships CONN-only**; M6.I must **reshape** (re-attach CONN's modulation
 context + decorrelate the axis via joint Texel), not merely rescale. The
 literature's standing position (Texel's method; CPW Automated Tuning) is that
 eval terms are jointly fit *because* they overlap — never independently

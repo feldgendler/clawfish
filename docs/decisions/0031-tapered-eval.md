@@ -57,7 +57,7 @@ The `static_eval_white()` accessor is preserved with an identical signature for 
 
 **Predicate.** A side has the bishop pair when its bishops occupy both color complexes — i.e., `(bishops & LIGHT_SQUARES).any() && (bishops & DARK_SQUARES).any()`. This is a necessary and sufficient condition for possessing bishops on opposite colors.
 
-**Bonus.** MG +30 cp / EG +50 cp per side that has the pair (literature defaults from CPW Bishop Pair article; subject to M6.H Texel tuning). `bishop_pair_term_white(pos, value)` returns `+value` if only White has the pair, `−value` if only Black has it, `0` otherwise (including the symmetric case at the start where both sides have it). The bishop-pair addend is folded into the pre-blend `mg` and `eg` before the divide:
+**Bonus.** MG +30 cp / EG +50 cp per side that has the pair (literature defaults from CPW Bishop Pair article; subject to M6.I Texel tuning). `bishop_pair_term_white(pos, value)` returns `+value` if only White has the pair, `−value` if only Black has it, `0` otherwise (including the symmetric case at the start where both sides have it). The bishop-pair addend is folded into the pre-blend `mg` and `eg` before the divide:
 
 ```
 blended = ((mg + bp_mg) · phase + (eg + bp_eg) · (24 − phase)) / 24

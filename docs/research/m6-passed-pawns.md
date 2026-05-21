@@ -65,7 +65,7 @@ The "free path" column becomes the path-clear bonus (§3). The base column is
 the always-applied rank bonus, and the free-path column replaces it when the
 path is fully clear. One open question: MadChess uses a different EG pawn PST
 than M6.A's PeSTO values, so the +170 EG at rank 7 was calibrated against a
-different PST baseline — the absolute magnitudes may need rescaling in M6.H
+different PST baseline — the absolute magnitudes may need rescaling in M6.I
 Texel.
 
 ### 1.3 Indexing
@@ -151,14 +151,14 @@ A simple linear scale `rank_factor = rel_rank / 7` or `{0,0,1,2,3,4,5,6}` is
 the minimal coherent choice. Without rank scaling the tropism is untapered across
 advancement — it fires equally for a rank-2 and a rank-7 passer.
 
-**Open question (flag for M6.H):** The exact coefficient (5 cp/step vs 7/step vs
+**Open question (flag for M6.I):** The exact coefficient (5 cp/step vs 7/step vs
 rank-scaled variants) is **not sourced from a single co-calibrated table** in the
 accessible literature. CPW King Pawn Tropism describes the concept qualitatively
 (with the 6:3:2 ratio for Bobby/Demoschach), but gives no concrete per-step cp
 value for a modern tapered engine. MadChess 3.0 uses a per-passer-constant
 "King Escorted Passed Pawn: 11 cp" rather than a distance-proportional formula.
 Recommend implementing the distance-proportional formula with placeholder
-coefficients (5 own, 7 enemy, rank-scaled) and treating these as M6.H Texel
+coefficients (5 own, 7 enemy, rank-scaled) and treating these as M6.I Texel
 inputs.
 
 ## 3. Path-clear / path-blocked discriminator (Q3)
@@ -217,7 +217,7 @@ threat is an EG feature.
 
 **Recommendation:** Apply the MadChess delta column as the path-clear bonus (above
 the base rank bonus), and apply −(delta) as the path-blocked penalty, both EG-only
-or heavily EG-weighted. MG bonus/penalty of zero is a defensible start; M6.H
+or heavily EG-weighted. MG bonus/penalty of zero is a defensible start; M6.I
 Texel adjusts.
 
 ### 3.4 Bitboard implementation note
@@ -257,7 +257,7 @@ unlikely to produce the catastrophic −100 Elo of M6.B. The risk is over-weight
 king urgency, not a sign-flipping contradiction.
 
 **Risk mitigation:** start with the MadChess rank-bonus + path tables (coherent
-source), add small king-distance coefficients as an additive term with M6.H
+source), add small king-distance coefficients as an additive term with M6.I
 Texel flagged, and run SPRT per-term if the combined result is suspicious.
 
 ### 4.2 Overlap with existing M6.A–B eval terms
@@ -278,7 +278,7 @@ receives both. This is additive stacking. Unlike the ISO×CONN case:
 
 CONN and passed-pawn bonus are **different facts** (connectivity vs opposition-free).
 A connected non-passer gets CONN only. An isolated passer gets passed-pawn bonus
-only (once ISO is re-introduced in M6.H with correct weights). Connected passer
+only (once ISO is re-introduced in M6.I with correct weights). Connected passer
 gets both — which is correct: it is both structurally connected and structurally
 free-running. This is the correct semantics, not a double-count.
 
@@ -302,13 +302,13 @@ free-running. This is the correct semantics, not a double-count.
 
 | Feature | Why deferrable | Destination |
 |---|---|---|
-| Candidate (half-)passers | Requires a recursive or approximate bitboard check; adds detection complexity; M6.C benefit/risk ratio is better without it | M6.H or later |
-| Connected-passer extra bonus | Requires identifying connected passer pairs; moderate complexity; additive on top of existing CONN + passed-rank | M6.H (Texel adjusts implicitly when CONN + passed-rank are jointly tuned) |
-| Protected-passer extra bonus | Modest complexity; "long-range" bonus for passed pawn defended by friendly pawn; overlaps with CONN for many cases | M6.H |
+| Candidate (half-)passers | Requires a recursive or approximate bitboard check; adds detection complexity; M6.C benefit/risk ratio is better without it | M6.I or later |
+| Connected-passer extra bonus | Requires identifying connected passer pairs; moderate complexity; additive on top of existing CONN + passed-rank | M6.I (Texel adjusts implicitly when CONN + passed-rank are jointly tuned) |
+| Protected-passer extra bonus | Modest complexity; "long-range" bonus for passed pawn defended by friendly pawn; overlaps with CONN for many cases | M6.I |
 | Unstoppable passer / Rule of the Square (static eval) | Search-interacting: "programs rely on search to solve all kinds of possible tactics" (CPW Unstoppable Passer). Static only gives a large bonus that can mislead shallow search. Explicitly fragile. | M8 or later; requires search extension or tablebase support |
 | Rook-behind-passer (Tarrasch rule) | Requires rook position info — cannot live in the pawn-hash evaluator; needs piece evaluator integration | M6.D (mobility) or dedicated piece-eval phase |
-| Passed-pawn blockade by own piece | Own piece blocking own passer is a strategic weakness but minor in strength gain; search handles it | M6.H candidate or defer |
-| Outside passed pawn extra bonus | Requires identifying leftmost/rightmost passer relative to all other pawns; king deflection logic | M6.H candidate |
+| Passed-pawn blockade by own piece | Own piece blocking own passer is a strategic weakness but minor in strength gain; search handles it | M6.I candidate or defer |
+| Outside passed pawn extra bonus | Requires identifying leftmost/rightmost passer relative to all other pawns; king deflection logic | M6.I candidate |
 | Pawn race / tempo-aware evaluation | STM-dependent; cannot be cached in pawn hash; requires careful interaction with search | M8 (post-tablebase) |
 
 None of these are required for a useful M6.C. The three M6.C components (rank
@@ -347,7 +347,7 @@ PASSED_FREE_EG_DELTA = [0, 0, 4, 16, 35, 63, 98, 141];  // = MadChess free - bas
 
 So: `passer_eg = PASSED_EG[rel_rank] + if path_clear { PASSED_FREE_EG_DELTA[rel_rank] } else if path_blocked_by_enemy { -PASSED_FREE_EG_DELTA[rel_rank] } else { 0 }`
 
-**King-distance term** (EG-only; placeholder coefficients for M6.H Texel):
+**King-distance term** (EG-only; placeholder coefficients for M6.I Texel):
 
 ```
 OWN_KING_BONUS_PER_STEP   = 5;   // per Chebyshev step closer to promo sq
@@ -365,7 +365,7 @@ eg_bonus -= rank_scale * ENEMY_KING_PENALTY_PER_STEP * (KING_DIST_CAP - enemy_di
 ```
 
 Note: king-distance coefficients (5 and 7) are not co-calibrated with the rank
-bonus table. Flag for M6.H Texel. Start small; the M6.B lesson is that
+bonus table. Flag for M6.I Texel. Start small; the M6.B lesson is that
 over-scaled independent terms cause cliffs.
 
 ## 9. Provenance summary

@@ -216,7 +216,7 @@ Flags:
     eprintln!("corpus: calibrated ladder = {ladder:?}");
 
     // Write the ladder + the pinned-interface constants to filter_spec.txt
-    // (the M6.G↔M6.H contract surface).
+    // (the M6.G↔M6.I contract surface).
     write_filter_spec(&out).map_err(|e| format!("write_filter_spec: {e}"))?;
     // Append the ladder, the FEN-leakage tau, and the bucket→depth mapping.
     let mut spec = fs::read_to_string(out.join("filter_spec.txt"))
@@ -290,7 +290,7 @@ provenance every record carries.
           random plies. Records ⇒ Source::SelfPlayOffBook. The
           opening book is ignored even if vendored.
 
-The on-book / off-book proportion that the M6.H bi-level optimizer
+The on-book / off-book proportion that the M6.I bi-level optimizer
 reweights at training time IS the per-source weight on the
 StratObjective; the operator grows the two corpora independently by
 running one campaign per mode."

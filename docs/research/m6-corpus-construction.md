@@ -101,7 +101,7 @@ Using non-quiet positions with static eval (instead of qsearch) introduces tacti
 - Over-sampling from a single game inflates effective corpus size without adding information.
 - A cap forces breadth over depth.
 
-### 2.5 Recommended predicate for M6.G↔M6.H interface contract
+### 2.5 Recommended predicate for M6.G↔M6.I interface contract
 
 **Recommendation: Predicate B** (`!in_check` AND `|static_eval − qsearch| < 30 cp`) applied during corpus construction, with:
 - Opening skip: first 8 plies (ply < 8 in 0-indexed half-move count from game start).
@@ -111,11 +111,11 @@ Using non-quiet positions with static eval (instead of qsearch) introduces tacti
 
 **Rationale:**
 - Predicate B is the most widely used and gives the strongest guarantee for pure static-eval tuning.
-- It pins the quiet definition against M6.H's tuner qsearch — a position that was quiet at corpus-construction time (static == qsearch at then-current weights) may not be quiet at M6.H time with different weights, but that drift is negligible for HCE weights in the ±200 cp range.
+- It pins the quiet definition against M6.I's tuner qsearch — a position that was quiet at corpus-construction time (static == qsearch at then-current weights) may not be quiet at M6.I time with different weights, but that drift is negligible for HCE weights in the ±200 cp range.
 - Predicate E (leaf of qsearch PV) is stronger but computationally expensive at scale and changes the position identity (the stored position may differ from the game position).
 - Predicate C (pgn-extract lookback) is cheaper and useful as a pre-filter on raw PGN before qsearch validation, but alone is not tight enough for static-eval-only tuning.
 
-**Open question:** The exact qsearch used at corpus-construction time vs M6.H tuner time. If M6.H uses qsearch on each position during tuning (as in the Leorik approach), Predicate A alone would suffice and the quiet-filter is a performance optimization. If M6.H uses static_eval directly (as in the Zurichess dataset approach, where quiet-labeled avoids per-position qsearch at tuning time), Predicate B is mandatory. The M6.H tuner ADR should resolve this; until it does, Predicate B is the conservative safe choice.
+**Open question:** The exact qsearch used at corpus-construction time vs M6.I tuner time. If M6.I uses qsearch on each position during tuning (as in the Leorik approach), Predicate A alone would suffice and the quiet-filter is a performance optimization. If M6.I uses static_eval directly (as in the Zurichess dataset approach, where quiet-labeled avoids per-position qsearch at tuning time), Predicate B is mandatory. The M6.I tuner ADR should resolve this; until it does, Predicate B is the conservative safe choice.
 
 ---
 
@@ -276,7 +276,7 @@ Commonly cited books for opening diversification: `UHO_Lichess_4852_v1`, `2moves
 The M6.G roadmap specifies "a held-out deployment-distributed self-play validation set." This means:
 - Generate self-play games with the same diversified opening book and TC as the training corpus.
 - Hold out a random fraction (10–20%) as a validation corpus.
-- **Never tune on it.** Use its MSE (logistic loss) as the tuning stopping criterion for M6.H.
+- **Never tune on it.** Use its MSE (logistic loss) as the tuning stopping criterion for M6.I.
 - The validation set must be sampled independently from the training set — separate games, not separate positions from the same games.
 
 ---
@@ -303,11 +303,11 @@ The Leorik devlog documents this explicitly: "I only update my best coefficients
 1. **Split at game level**: group all positions from each game, then assign games to train or validation.
 2. **Ratio**: 80% train / 20% validation (matching common practice — chess4j, LCZero standard dataset).
 3. **Separate the self-play validation set**: the "deployment-distributed" validation set is generated from separate self-play games, not split from the same run as training self-play.
-4. **Monitor training corpus MSE and validation MSE separately** during M6.H tuning; stop when validation MSE stops improving.
+4. **Monitor training corpus MSE and validation MSE separately** during M6.I tuning; stop when validation MSE stops improving.
 
 ### 6.4 Held-out logistic loss as stopping criterion
 
-The stopping criterion for M6.H should be: stop when the validation MSE (or equivalently, logistic loss — MSE on binary labels equals cross-entropy up to a constant when using game results) has not improved for a fixed number of iterations. This is the standard ML early-stopping criterion and avoids the M6.H risk of over-tuning to training noise.
+The stopping criterion for M6.I should be: stop when the validation MSE (or equivalently, logistic loss — MSE on binary labels equals cross-entropy up to a constant when using game results) has not improved for a fixed number of iterations. This is the standard ML early-stopping criterion and avoids the M6.I risk of over-tuning to training noise.
 
 ---
 
@@ -425,11 +425,11 @@ Multiple sources agree: position diversity is more important than raw count. [Ta
 
 - **Same-game split contamination.** Splitting at position level (not game level) puts positions from the same game in both train and validation, inflating validation performance. Always split at game level. (§6.2)
 
-- **Opening-ply skip too short.** If the skip is fewer than 8 plies, book-theory positions dominate and the tuner over-fits the opening. If too long (> 20 plies), you discard significant opening eval signal needed for M6.H. (§2.3)
+- **Opening-ply skip too short.** If the skip is fewer than 8 plies, book-theory positions dominate and the tuner over-fits the opening. If too long (> 20 plies), you discard significant opening eval signal needed for M6.I. (§2.3)
 
-- **K recomputation.** If corpus or eval change substantially between corpus construction and M6.H tuning, K must be recomputed. Recomputing K at the start of M6.H with the new eval weights is standard practice. (§1.3)
+- **K recomputation.** If corpus or eval change substantially between corpus construction and M6.I tuning, K must be recomputed. Recomputing K at the start of M6.I with the new eval weights is standard practice. (§1.3)
 
-- **Self-play distribution shift.** Validation self-play generated after M6.H weight updates will have a different distribution than training self-play generated before. The held-out set should be frozen after M6.G and never regenerated. (§6.2)
+- **Self-play distribution shift.** Validation self-play generated after M6.I weight updates will have a different distribution than training self-play generated before. The held-out set should be frozen after M6.G and never regenerated. (§6.2)
 
 - **Leorik engine-self-play bias.** Tuning on self-play data teaches the engine what positions its search tends to reach — which may reinforce existing weaknesses. Blending with external data (CCRL, Lichess) partially counters this. (§5.4)
 
@@ -451,7 +451,7 @@ Multiple sources agree: position diversity is more important than raw count. [Ta
 
 Zurichess `quiet.epd` positions may be used as **unlabeled position seeds** (to find interesting positions to generate self-play from), but the c9 labels must not be used.
 
-### Quiet predicate: M6.G↔M6.H interface contract
+### Quiet predicate: M6.G↔M6.I interface contract
 
 **Adopted predicate:**
 
@@ -466,7 +466,7 @@ With additional post-filters:
 - Per-game cap: at most 10 positions per source game (reservoir sample).
 - FEN exact-duplicate removal across the full corpus.
 
-This predicate is pinned as the M6.G↔M6.H interface. M6.H must use the same quiet definition when evaluating positions at tuning time (i.e., either call `static_eval` directly on positions pre-certified as quiet, or verify quietness before each static_eval call and skip non-quiet positions).
+This predicate is pinned as the M6.G↔M6.I interface. M6.I must use the same quiet definition when evaluating positions at tuning time (i.e., either call `static_eval` directly on positions pre-certified as quiet, or verify quietness before each static_eval call and skip non-quiet positions).
 
 ### Reproducibility artifacts (to commit to `bench/`)
 

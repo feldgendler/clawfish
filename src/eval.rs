@@ -329,7 +329,7 @@ fn evaluate_core(pos: &Position, pe: pawns::PawnEval) -> i32 {
     // (RFP/NMP/FFP input) nor the mop-up estimate (ADR-0032 §4; pinned by
     // `static_accessor_excludes_tier1` + `mop_up_addend_excludes_tier1_vs_m6e`
     // + `endgame_scale_excludes_static_accessor_vs_m6e`). Term math stays live;
-    // M6.H joint Texel re-derives the whole set.
+    // M6.I joint Texel re-derives the whole set.
     const TIER1_IN_EVAL: bool = true;
     let ((op_mg, op_eg), (rf_mg, rf_eg), scale) = if TIER1_IN_EVAL {
         (
@@ -1731,8 +1731,8 @@ mod tests {
     /// position (OCB requires no rooks or queens). The OCB-scale-vs-accessor
     /// exclusion is pinned by `endgame_scale_excludes_static_accessor_vs_m6e`.
     ///
-    /// At zeroed weights the non-zero-value discriminator is **M6.H-dormant**
-    /// (both PST-only and term values are 0) — auto-revalidates when M6.H sets
+    /// At zeroed weights the non-zero-value discriminator is **M6.I-dormant**
+    /// (both PST-only and term values are 0) — auto-revalidates when M6.I sets
     /// non-zero weights (the M6.E `static_accessor_excludes_king_safety`
     /// precedent verbatim in shape).
     ///
@@ -1816,7 +1816,7 @@ mod tests {
         assert!(
             pos.pieces_colored(Color::White, PieceKind::Rook).any(),
             "fixture invariant: white rook present (exercises `rook_file_term_white`; \
-             value discriminator is M6.H-dormant at zeroed weights)"
+             value discriminator is M6.I-dormant at zeroed weights)"
         );
         assert!(
             pos.king_square(Color::White).file() >= 5,
