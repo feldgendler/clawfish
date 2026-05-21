@@ -7,21 +7,17 @@
   "sources": [
   ],
   "self_play_seed": 12648430,
-  "games": 3,
+  "games": 203494,
   "max_plies": 400,
   "opening_random_plies": 8,
-  "workers": 1,
+  "workers": 10,
   "split_seed": 7,
   "val_fraction": 0.10000000000000001,
   "depth_ladder": [
-    {"depth": 10, "weight": 1},
-    {"depth": 10, "weight": 1},
-    {"depth": 11, "weight": 1},
-    {"depth": 12, "weight": 1}
+    {"depth": 4, "weight": 1}
   ],
   "opening_book_path": "bench/data/openings.epd",
   "opening_book_sha256": "dc91f225bc93e7ec091095bf8264595da33d36b9d3ac97ddd2dd54bc3a094fa4",
   "book_fraction": 0.5,
-  "corpus_sha256": "PENDING_REGENERATION",
-  "corpus_sha256_note": "PENDING_REGENERATION sentinel — operator must re-derive after the per-game-file rewrite lands; see ADR-0035 §8 / plan §10 / bench/corpus/re-run.sh"
+  "corpus_sha256": "PENDING_REGENERATION"
 }

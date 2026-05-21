@@ -244,6 +244,17 @@ pub fn consumer_loop(
                         write_checkpoint(&ckpt_path, &make_checkpoint(state.next_consume_id))?;
                         let _ = std::fs::remove_file(&pending_path);
                         stats.games_committed += 1;
+
+                        // Position-cap (cfg.cap_positions): signal stop when the
+                        // durable position count reaches the operator's target.
+                        // Workers see stop at their next iteration and exit;
+                        // their in-flight games are dropped (R2). The cap is on
+                        // post-dedup-cap committed positions across shard + val.
+                        if let Some(cap) = cfg.cap_positions
+                            && stats.positions_committed >= cap
+                        {
+                            stop.store(true, Ordering::Relaxed);
+                        }
                     }
                     _ => {
                         // Torn write: unlink + release for re-dispatch.
@@ -421,6 +432,7 @@ mod tests {
             book_fraction: 0.0,
             poll_interval_ms: Some(1), // fast polling for tests
             split_seed: 7,
+            cap_positions: None,
         }
     }
 

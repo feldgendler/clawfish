@@ -78,6 +78,13 @@ pub struct SelfPlayConfig {
     /// K-independent (the split depends only on the seed, not on worker
     /// scheduling). Pinned in the manifest for reproducibility.
     pub split_seed: u64,
+    /// Optional cap on TOTAL durable positions (shard.bin + val.bin combined).
+    /// When the consumer's `positions_committed` reaches or exceeds this cap,
+    /// it signals `stop`, the workers drain their last game, and the campaign
+    /// exits gracefully. Counted as the cap is in *positions* (not games),
+    /// because the operator's actual target is corpus size for Texel tuning,
+    /// and games-per-position varies. `None` ⇒ unbounded.
+    pub cap_positions: Option<u64>,
 }
 
 /// Self-play campaign outcome counters.
@@ -738,6 +745,7 @@ mod tests {
             book_fraction: 0.0,
             poll_interval_ms: None,
             split_seed: 7,
+            cap_positions: None,
         }
     }
 
