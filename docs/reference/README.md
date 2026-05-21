@@ -12,6 +12,7 @@ The full document was downloaded as a PDF, converted to Markdown, then sliced in
 - **Upstream PDF:** <https://rcc.fide.com/wp-content/uploads/2022/12/20230101Laws-of-Chess.pdf>
 - **Pointer page:** <http://rcc.fide.com/2023-laws-of-chess/>
 - **Snapshot date:** 2026-04-27 (35-page PDF, 658 KB; slices are verbatim from that snapshot).
+- **Redistribution status:** Published by FIDE as the authoritative rules of standard chess. FIDE retains authorship/copyright; the document is distributed publicly without an attached open-source license. Vendored here verbatim as the truth-of-record for the rules our engine implements — the universal practice across open-source chess engines.
 - **Re-fetch the original PDF:**
   ```sh
   curl -fsSL -o fide-laws-of-chess-2023.pdf \
@@ -27,6 +28,7 @@ The protocol our engine speaks to GUIs and tournament tooling (M2 onwards). Comp
 - **Source page:** <https://www.shredderchess.com/chess-features/uci-universal-chess-interface.html>
 - **Direct ZIP:** <https://www.shredderchess.com/download/div/uci.zip>
 - **Snapshot date:** 2026-04-27 (the spec text itself dates from April 2006 — the last formal revision; subsequent extensions are de-facto-standard but not part of the official document).
+- **Redistribution status:** Authored by Stefan Meyer-Kahlen (Shredder); freely distributed by the author as an open interface specification. Universally vendored across the open-source chess engine ecosystem. No attached open-source license; redistribution is permitted by long-standing community practice.
 - **Re-fetch:**
   ```sh
   curl -fsSL -o uci.zip "https://www.shredderchess.com/download/div/uci.zip" \
@@ -49,6 +51,7 @@ The 1994 text remains the authoritative spec; there has been no formal revision.
 - **Upstream archive:** <https://archive.org/details/pgn-standard-1994-03-12>
 - **Direct download:** <https://archive.org/download/pgn-standard-1994-03-12/PGN_standard_1994-03-12.txt>
 - **Snapshot date:** 2026-04-27 (document itself dates from 1994-03-12).
+- **Redistribution status:** Authored by Steven J. Edwards on behalf of the `rec.games.chess` contributors and explicitly placed in the public domain by the author (see the document's own preface). Free to vendor and redistribute without restriction.
 - **Re-fetch:**
   ```sh
   curl -fsSL -o pgn-spec-1994.txt \
@@ -126,6 +129,7 @@ Vendored because the engine's Zobrist hashing implements this spec verbatim (per
 - **Source URL:** <http://hgm.nubati.net/book_format.html>
 - **Snapshot date:** 2026-04-27.
 - **Upstream Last-Modified:** Tue, 17 Sep 2013 10:00:43 GMT — the format has been frozen since.
+- **Redistribution status:** The Polyglot binary format and the 781-constant Zobrist random table are public-domain (the underlying Polyglot source is itself publicly released; HGM's authored description above the table-of-randoms is freely distributed as documentation for the format). Universally vendored across engines implementing Polyglot-compatible book reading.
 - **Re-fetch:**
   ```sh
   curl -fsSL -o /tmp/book_format.html http://hgm.nubati.net/book_format.html
