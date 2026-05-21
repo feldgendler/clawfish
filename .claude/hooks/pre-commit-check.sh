@@ -2,7 +2,7 @@
 # Claude Code PreToolUse hook.
 # Intercepts `git commit` Bash invocations and verifies the commit is clean.
 #
-# Scope:
+# Scope (intentionally fast — the contract is "seconds, not minutes"):
 #   - `cargo fmt --all -- --check` whole-workspace (matches the CI step at
 #     .github/workflows/ci.yml exactly). Previously this hook ran a
 #     per-staged-file `rustfmt --check`; that scope can mask workspace-level
@@ -12,9 +12,15 @@
 #     form — adopting the CI-matching form closes the gap.
 #   - `cd fuzz && cargo fmt --all -- --check` for the fuzz workspace (also
 #     matches CI).
-#   - `cargo clippy` + `cargo test` are whole-crate, gated on `cargo check`
-#     first confirming the workspace compiles. If it doesn't (typically a
-#     parallel agent mid-edit), we skip with a note rather than block.
+#
+# Out of scope (run by CI + explicitly by the developer, not on every commit):
+#   - `cargo check`, `cargo clippy`, `cargo test` — these scale with the
+#     project (the test suite includes `tests/corpus_reproducibility.rs` and
+#     `tests/corpus_crash_safety.rs`, each ~60s; with `--all-targets` also
+#     compiling every bench + bin, total wallclock easily exceeds 5 min on
+#     warm cache, more on cold). CI runs these on every push; running them
+#     in the commit hook is duplicative and turns routine commits into
+#     multi-minute waits.
 #
 # Exits 2 with stderr to block the commit and surface output to the agent.
 
@@ -50,9 +56,6 @@ fail() {
 # what CI runs at .github/workflows/ci.yml. M5.H1 (commit 339fd7e) shipped
 # with 3 fmt violations in src/search.rs that CI flagged retroactively;
 # unconditional workspace fmt closes the gap.
-#
-# We DON'T gate this on the "no parallel-agent WIP" check used by clippy/test
-# below: rustfmt is deterministic, fast, and never blocks on uncommitted work.
 cargo fmt --all -- --check >&2 || fail "cargo fmt --all -- --check"
 
 # Fuzz workspace has its own Cargo.toml outside the root workspace; check it
@@ -61,21 +64,5 @@ if [ -d fuzz ]; then
   ( cd fuzz && cargo fmt --all -- --check ) >&2 || fail "cargo fmt --all -- --check (fuzz workspace)"
 fi
 
-# Run whole-crate clippy + tests only if the working tree exactly matches the staged set
-# (no unstaged tracked changes, no untracked files). Otherwise, parallel/in-flight work
-# may legitimately leave the workspace non-compiling or in TDD-red, and our commit
-# (which doesn't touch those scopes) shouldn't be blocked by it.
-if git diff --quiet 2>/dev/null \
-   && [ -z "$(git ls-files --others --exclude-standard 2>/dev/null)" ] \
-   && cargo check --locked --quiet --all-targets >/dev/null 2>&1; then
-  # --locked: use Cargo.lock exactly (matches CI).
-  # --all-targets on test: includes integration tests + benches (matches CI;
-  #   was missing in the old hook, which would have skipped tests/uci_integration.rs).
-  cargo clippy --locked --quiet --all-targets -- -D warnings >&2 || fail "cargo clippy"
-  cargo test --locked --quiet --all-targets >&2 || fail "cargo test"
-  echo "pre-commit hook: cargo fmt --all (+ fuzz) + clippy + tests green" >&2
-else
-  echo "pre-commit hook: cargo fmt --all clean; workspace has parallel/in-flight changes outside the staged set, skipping clippy + tests" >&2
-fi
-
+echo "pre-commit hook: cargo fmt --all (+ fuzz) clean" >&2
 exit 0
