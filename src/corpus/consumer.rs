@@ -44,6 +44,13 @@ pub struct ConsumerState {
     /// (empty-post-dedup games that left a checkpoint record but no block).
     /// Read-only after initialization.
     pub committed_ids_at_resume: HashSet<u64>,
+    /// Total durable positions across shard.bin + val.bin at resume time.
+    /// Seeded into `ConsumerStats::positions_committed` so the
+    /// `cap_positions` check sees the *cumulative* total, not just this
+    /// run's increment. Without this, a resume with `--cap-positions N`
+    /// would commit N MORE positions on top of whatever's already on
+    /// disk, blowing past the operator's target.
+    pub positions_at_resume: u64,
 }
 
 /// Resume the corpus run: reconstruct `ConsumerState` from durable shards,
@@ -69,10 +76,15 @@ pub fn resume(out_dir: &Path, pending_dir: &Path) -> Result<ConsumerState, Corpu
     }
 
     // Step 2: Rebuild fen_set + committed_ids from durable shards.
+    // Also tally positions_at_resume so the cap_positions check sees the
+    // cumulative total (resume invariance — Issue: 1.99M-on-disk + --cap=2M
+    // must commit only the 9 missing positions, not 2M more).
     let mut fen_set = HashSet::new();
     let mut committed_ids: HashSet<u64> = HashSet::new();
+    let mut positions_at_resume: u64 = 0;
     for block in shard_blocks.iter().chain(val_blocks.iter()) {
         committed_ids.insert(block.game_id);
+        positions_at_resume += block.records.len() as u64;
         for r in &block.records {
             fen_set.insert(r.fen.clone());
         }
@@ -116,6 +128,7 @@ pub fn resume(out_dir: &Path, pending_dir: &Path) -> Result<ConsumerState, Corpu
         next_consume_id,
         fen_set,
         committed_ids_at_resume: committed_ids,
+        positions_at_resume,
     })
 }
 
@@ -166,7 +179,17 @@ pub fn consumer_loop(
         state.next_consume_id,
     );
 
-    let mut stats = ConsumerStats::default();
+    // Seed positions_committed from the resumed durable count. Without
+    // this, --cap-positions on a resumed campaign would commit `cap` MORE
+    // positions on top of the existing corpus instead of capping at the
+    // cumulative total. The other stats (games_committed,
+    // games_empty_post_dedup, games_emitted, games_dropped_inflight) stay
+    // per-run because they describe THIS run's work; positions_committed
+    // is the one stat the cap is checked against.
+    let mut stats = ConsumerStats {
+        positions_committed: state.positions_at_resume,
+        ..ConsumerStats::default()
+    };
 
     loop {
         let next = state.next_consume_id;
@@ -227,8 +250,27 @@ pub fn consumer_loop(
                             .filter(|r| state.fen_set.insert(r.fen.clone()))
                             .collect();
 
-                        let capped =
+                        let mut capped =
                             inline_cap_dedup_survivors(deduped, cfg.split_seed, next, PER_GAME_CAP);
+
+                        // --cap-positions partial-commit: if the whole game's
+                        // records would push us over the operator's target,
+                        // keep only the first (cap − positions_committed)
+                        // records. The block is still well-formed CRC-framed;
+                        // downstream readers see a game with fewer records
+                        // than the uncapped twin — same as if PER_GAME_CAP
+                        // had been narrower for this specific game. Trailing
+                        // records are dropped (not deferred — in-order
+                        // commit makes per-game truncation the only way to
+                        // hit an exact target).
+                        if let Some(cap) = cfg.cap_positions
+                            && !capped.is_empty()
+                        {
+                            let room = cap.saturating_sub(stats.positions_committed);
+                            if (capped.len() as u64) > room {
+                                capped.truncate(room as usize);
+                            }
+                        }
 
                         if !capped.is_empty() {
                             let is_val = split_decision(cfg.split_seed, next, cfg.val_fraction);
@@ -459,6 +501,7 @@ mod tests {
             next_consume_id: next,
             fen_set: HashSet::new(),
             committed_ids_at_resume: HashSet::new(),
+            positions_at_resume: 0,
         }
     }
 
@@ -741,6 +784,7 @@ mod tests {
             next_consume_id: 1, // starting past game 0
             fen_set: HashSet::new(),
             committed_ids_at_resume: [0].into_iter().collect(),
+            positions_at_resume: 0,
         };
         // Write game 1 so consumer has something to commit.
         write_pending_file(&pending_dir, 1, &[make_record(1, "unique w - - 0 1")]);
@@ -779,6 +823,7 @@ mod tests {
             next_consume_id: 3,
             fen_set: HashSet::new(),
             committed_ids_at_resume: HashSet::new(), // empty-post-dedup: no block in shard
+            positions_at_resume: 0,
         };
         write_pending_file(&pending_dir, 3, &[make_record(3, "fen-3 w - - 0 1")]);
 
@@ -912,6 +957,7 @@ mod tests {
             next_consume_id: 3,
             fen_set: HashSet::new(),
             committed_ids_at_resume: [3].into_iter().collect(),
+            positions_at_resume: 0,
         };
         // No pending file for game 3.
         assert!(

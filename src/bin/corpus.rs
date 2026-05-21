@@ -1001,10 +1001,14 @@ fn cmd_truncate(argv: &[String]) -> Result<ExitCode, String> {
         eprintln!(
             "corpus truncate --out <dir> --cap-positions <N>
 
-Truncate `shard.bin` and `val.bin` in <dir> to retain only the longest
-game_id prefix whose total post-dedup-cap position count is ≤ N. The
-truncation is on a per-game-block boundary (no torn blocks); the
-resulting corpus is a deterministic prefix of the original.
+Truncate `shard.bin` and `val.bin` in <dir> to exactly N positions
+(or as close as the block sizes allow). The largest game_id prefix
+whose total position count is ≤ N is kept whole; if N falls
+mid-game, the boundary game's block is re-encoded with only the
+first (N − cumulative) records and appended in place. The resulting
+corpus has exactly N positions (or, on an edge case where the cap
+lands precisely on a game boundary, exactly N positions with no
+partial game). All retained blocks remain CRC-framed and decodable.
 
 `pending/` is left untouched (the operator typically `rm -rf`s it
 before truncating to ensure no in-flight games persist into the
@@ -1018,47 +1022,47 @@ truncated artifact)."
         return Err("--cap-positions must be > 0".into());
     }
 
-    // Collect game blocks from both shard.bin and val.bin, tag each with
-    // its source file and byte-range, sort by game_id, and find the
-    // largest prefix whose position count ≤ cap. Both files are append-only
-    // CRC-framed per game; we can truncate at any block boundary.
+    // Collect game blocks from both shard.bin and val.bin, sort by
+    // game_id, find the largest whole-game prefix whose position count ≤
+    // cap, and (if cap falls mid-game) re-encode the boundary block with
+    // only the leading (cap − cumulative) records. Both files are
+    // append-only CRC-framed per game; we truncate at the boundary then
+    // append the partial block, if any.
     let shard_path = out.join("shard.bin");
     let val_path = out.join("val.bin");
-    let (shard_blocks, shard_valid_len) =
-        scan_valid_blocks(&shard_path).map_err(|e| format!("scan shard.bin: {e}"))?;
-    let (val_blocks, val_valid_len) =
-        scan_valid_blocks(&val_path).map_err(|e| format!("scan val.bin: {e}"))?;
+    // Scan-with-offsets: end-of-block byte position is taken directly from
+    // the scan, not reconstructed by re-encoding (the encoder is
+    // deterministic and round-trips perfectly, but using the scan offsets
+    // directly avoids any test-coverage gap on the round-trip and matches
+    // the truncate's "truncate at on-disk boundary" contract literally).
+    let (shard_blocks_off, shard_valid_len) =
+        clawfish::corpus::store::scan_valid_blocks_with_offsets(&shard_path)
+            .map_err(|e| format!("scan shard.bin: {e}"))?;
+    let (val_blocks_off, val_valid_len) =
+        clawfish::corpus::store::scan_valid_blocks_with_offsets(&val_path)
+            .map_err(|e| format!("scan val.bin: {e}"))?;
+    // Borrow the blocks separately (without consuming the offsets) so the
+    // boundary partial-game re-encode below can access block.records.
+    let shard_blocks: Vec<&GameBlock> = shard_blocks_off.iter().map(|(b, _)| b).collect();
+    let val_blocks: Vec<&GameBlock> = val_blocks_off.iter().map(|(b, _)| b).collect();
+    let shard_end_offsets: Vec<u64> = shard_blocks_off.iter().map(|(_, o)| *o).collect();
+    let val_end_offsets: Vec<u64> = val_blocks_off.iter().map(|(_, o)| *o).collect();
 
-    // Build (game_id, file_tag, byte_len, position_count) records.
+    // Build (game_id, file_tag, idx_into_file_blocks, position_count)
+    // records. idx is the position of the block within its file's
+    // shard_blocks/val_blocks; used for the boundary block's records
+    // vector and for the on-disk end-offset lookup.
     #[derive(Clone, Copy)]
     enum FileTag {
         Shard,
         Val,
     }
-    let mut tagged: Vec<(u64, FileTag, u64, u64)> = Vec::new();
-    let mut shard_offset: u64 = 0;
-    for b in &shard_blocks {
-        let block_bytes = clawfish::corpus::store::encode_block(b.game_id, &b.records);
-        let len = block_bytes.len() as u64;
-        tagged.push((
-            b.game_id,
-            FileTag::Shard,
-            shard_offset + len,
-            b.records.len() as u64,
-        ));
-        shard_offset += len;
+    let mut tagged: Vec<(u64, FileTag, usize, u64)> = Vec::new();
+    for (i, b) in shard_blocks.iter().enumerate() {
+        tagged.push((b.game_id, FileTag::Shard, i, b.records.len() as u64));
     }
-    let mut val_offset: u64 = 0;
-    for b in &val_blocks {
-        let block_bytes = clawfish::corpus::store::encode_block(b.game_id, &b.records);
-        let len = block_bytes.len() as u64;
-        tagged.push((
-            b.game_id,
-            FileTag::Val,
-            val_offset + len,
-            b.records.len() as u64,
-        ));
-        val_offset += len;
+    for (i, b) in val_blocks.iter().enumerate() {
+        tagged.push((b.game_id, FileTag::Val, i, b.records.len() as u64));
     }
     tagged.sort_by_key(|t| t.0);
 
@@ -1073,56 +1077,88 @@ truncated artifact)."
         total_positions_before
     );
 
-    // Walk in sorted game_id order; the cumulative position count crosses
-    // `cap` at some block — keep everything up to and INCLUDING that block
-    // if total ≤ cap, else stop one block earlier. The contract is
-    // "≤ cap", which is the precise stoppable boundary.
+    // Walk blocks in sorted game_id order. For each block:
+    //   - if cum + n_positions ≤ cap: keep whole block; advance the
+    //     respective file's keep_until offset to this block's end.
+    //   - else: this is the boundary block. Stop the walk; remember its
+    //     (file, idx, room = cap − cum) so we can re-encode the partial.
     let mut cum: u64 = 0;
     let mut shard_keep_until: u64 = 0;
     let mut val_keep_until: u64 = 0;
     let mut games_kept: u64 = 0;
-    for (_game_id, tag, end_offset, n_positions) in &tagged {
-        let next = cum + n_positions;
+    let mut partial: Option<(FileTag, usize, u64)> = None; // (file, block_idx, room)
+    for (_game_id, tag, idx, n_positions) in &tagged {
+        let next = cum + *n_positions;
         if next > cap {
+            let room = cap - cum;
+            if room > 0 {
+                partial = Some((*tag, *idx, room));
+            }
             break;
         }
         cum = next;
         games_kept += 1;
+        let end_off = match tag {
+            FileTag::Shard => shard_end_offsets[*idx],
+            FileTag::Val => val_end_offsets[*idx],
+        };
         match tag {
-            FileTag::Shard => shard_keep_until = *end_offset,
-            FileTag::Val => val_keep_until = *end_offset,
+            FileTag::Shard => shard_keep_until = end_off,
+            FileTag::Val => val_keep_until = end_off,
         }
     }
 
+    let partial_positions = partial.as_ref().map(|p| p.2).unwrap_or(0);
     eprintln!(
-        "corpus: truncate target: keep {} games, {} positions (≤ {} cap)",
-        games_kept, cum, cap
+        "corpus: truncate target: keep {} whole games + {} partial-game records = {} positions (cap {})",
+        games_kept,
+        partial_positions,
+        cum + partial_positions,
+        cap
     );
 
-    if shard_keep_until < shard_valid_len {
-        let f = fs::OpenOptions::new()
-            .write(true)
-            .open(&shard_path)
-            .map_err(|e| format!("open shard.bin: {e}"))?;
-        f.set_len(shard_keep_until)
-            .map_err(|e| format!("truncate shard.bin: {e}"))?;
-        f.sync_all().map_err(|e| format!("fsync shard.bin: {e}"))?;
+    // Whole-game truncation first. If a file isn't getting a partial
+    // appended below, we set its length to keep_until directly.
+    let truncate_file =
+        |path: &Path, current_len: u64, new_len: u64, label: &str| -> Result<(), String> {
+            if new_len < current_len {
+                let f = fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .map_err(|e| format!("open {label}: {e}"))?;
+                f.set_len(new_len)
+                    .map_err(|e| format!("truncate {label}: {e}"))?;
+                f.sync_all().map_err(|e| format!("fsync {label}: {e}"))?;
+                eprintln!(
+                    "corpus: {label} truncated {} → {} bytes",
+                    current_len, new_len
+                );
+            }
+            Ok(())
+        };
+    truncate_file(&shard_path, shard_valid_len, shard_keep_until, "shard.bin")?;
+    truncate_file(&val_path, val_valid_len, val_keep_until, "val.bin")?;
+
+    // Partial-game block: re-encode boundary block with first `room`
+    // records and append to its file. The block's game_id is preserved
+    // (so the dispatcher's gap-list logic sees it as already-played and
+    // doesn't re-dispatch it on resume).
+    if let Some((tag, idx, room)) = partial {
+        let (boundary_block, dest_path, label) = match tag {
+            FileTag::Shard => (&shard_blocks[idx], &shard_path, "shard.bin"),
+            FileTag::Val => (&val_blocks[idx], &val_path, "val.bin"),
+        };
+        let mut records = boundary_block.records.clone();
+        records.truncate(room as usize);
+        let partial_bytes = clawfish::corpus::store::encode_block(boundary_block.game_id, &records);
+        clawfish::corpus::store::append_raw_bytes(dest_path, &partial_bytes)
+            .map_err(|e| format!("append partial block to {label}: {e}"))?;
         eprintln!(
-            "corpus: shard.bin truncated {} → {} bytes",
-            shard_valid_len, shard_keep_until
-        );
-    }
-    if val_keep_until < val_valid_len {
-        let f = fs::OpenOptions::new()
-            .write(true)
-            .open(&val_path)
-            .map_err(|e| format!("open val.bin: {e}"))?;
-        f.set_len(val_keep_until)
-            .map_err(|e| format!("truncate val.bin: {e}"))?;
-        f.sync_all().map_err(|e| format!("fsync val.bin: {e}"))?;
-        eprintln!(
-            "corpus: val.bin truncated {} → {} bytes",
-            val_valid_len, val_keep_until
+            "corpus: {label} partial-game appended: game_id={} kept {}/{} records, {} bytes",
+            boundary_block.game_id,
+            room,
+            boundary_block.records.len(),
+            partial_bytes.len()
         );
     }
 

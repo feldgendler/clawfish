@@ -7,7 +7,7 @@
   "sources": [
   ],
   "self_play_seed": 12648430,
-  "games": 203494,
+  "games": 183261,
   "max_plies": 400,
   "opening_random_plies": 8,
   "workers": 10,

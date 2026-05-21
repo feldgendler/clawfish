@@ -234,6 +234,35 @@ pub fn scan_valid_blocks(path: &Path) -> Result<(Vec<GameBlock>, u64), CorpusErr
     Ok((blocks, valid_len))
 }
 
+/// As `scan_valid_blocks`, but also returns each block's end-offset within
+/// the file. Used by `corpus truncate` to truncate at exact on-disk block
+/// boundaries without relying on round-trip encoder equivalence (the
+/// encoder is deterministic, but tying offsets to a scan-time invariant is
+/// simpler and less brittle than re-encoding to recompute).
+pub fn scan_valid_blocks_with_offsets(
+    path: &Path,
+) -> Result<(Vec<(GameBlock, u64)>, u64), CorpusError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(e) => return Err(CorpusError::Io(e)),
+    };
+    let mut blocks: Vec<(GameBlock, u64)> = Vec::new();
+    let mut valid_len: u64 = 0;
+    let mut off = 0usize;
+    while off < bytes.len() {
+        match decode_block(&bytes[off..]) {
+            Some((block, consumed)) => {
+                off += consumed;
+                valid_len = off as u64;
+                blocks.push((block, valid_len));
+            }
+            None => break,
+        }
+    }
+    Ok((blocks, valid_len))
+}
+
 /// Truncate `path` to `valid_len` bytes, discarding any torn tail wholesale,
 /// then `fsync`. No-op if the file is already exactly that length.
 pub fn truncate_to_valid(path: &Path, valid_len: u64) -> Result<(), CorpusError> {
