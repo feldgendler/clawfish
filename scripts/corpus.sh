@@ -35,6 +35,41 @@
 
 set -eu
 
+# Flag parsing. The script is otherwise env-var-driven; this single flag
+# expresses an interactive choice ("am I about to leave this overnight?")
+# that maps poorly to an env var.
+BACKGROUND_QOS=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-background)
+            # Overnight / full-throughput mode: default QoS, default niceness.
+            # P-cores in play; UI gets sluggish.
+            BACKGROUND_QOS=0
+            shift
+            ;;
+        --help|-h)
+            cat <<'USAGE'
+Usage: scripts/corpus.sh [--no-background]
+
+Flags:
+  --no-background   Overnight mode: launch at default QoS + default niceness
+                    (P-cores allowed, full throughput, UI gets sluggish).
+                    Default: launch at background QoS + nice -n 19 (E-cores
+                    preferred, ~3x slower per worker, UI stays responsive).
+
+Most knobs are env vars: OUT_DIR, SEED, GAMES, WORKERS, VAL_FRACTION,
+SPLIT_SEED, MAX_PLIES, OPENING_RANDOM_PLIES, BUCKETS, OPENING_BOOK,
+BOOK_FRACTION, CORPUS_BIN. See the file header for details.
+USAGE
+            exit 0
+            ;;
+        *)
+            echo "corpus.sh: unknown argument: $1 (try --help)" >&2
+            exit 2
+            ;;
+    esac
+done
+
 OUT_DIR="${OUT_DIR:-bench/corpus}"
 # Default seed matches the vendored bench/corpus/manifest.json (0xC0FFEE).
 # Override via env to build a different corpus; the vendored artifact is
@@ -85,15 +120,21 @@ elif [ -n "$OPENING_BOOK" ]; then
     echo "corpus.sh: WARNING: OPENING_BOOK=$OPENING_BOOK not found — running without book"
 fi
 
-# Background-priority launcher. On macOS, `taskpolicy -c background` sets the
-# process to the Background QoS class — biases work onto E-cores and reduces
-# thermal pressure, so the UI / foreground apps stay responsive during a
-# long campaign. `nice -n 19` is BSD-level (yields under contention) but
-# does not affect QoS; both are applied for belt-and-suspenders.
-# `taskpolicy` is macOS-only; on Linux we fall through to plain `nice`.
-LAUNCH_PREFIX="nice -n 19"
-if command -v taskpolicy >/dev/null 2>&1; then
-    LAUNCH_PREFIX="taskpolicy -c background $LAUNCH_PREFIX"
+# Background-priority launcher (gated on the --no-background flag). On
+# macOS, `taskpolicy -c background` sets the process to the Background QoS
+# class — biases work onto E-cores and reduces thermal pressure, so the UI
+# stays responsive. `nice -n 19` is BSD-level (yields under contention) and
+# is applied alongside as belt-and-suspenders.
+# `taskpolicy` is macOS-only; on Linux only `nice -n 19` applies.
+LAUNCH_PREFIX=""
+if [ "$BACKGROUND_QOS" = "1" ]; then
+    LAUNCH_PREFIX="nice -n 19"
+    if command -v taskpolicy >/dev/null 2>&1; then
+        LAUNCH_PREFIX="taskpolicy -c background $LAUNCH_PREFIX"
+    fi
+    echo "corpus.sh: launching at background QoS (UI-friendly; pass --no-background for full throughput)"
+else
+    echo "corpus.sh: launching at default QoS — overnight / full-throughput mode (--no-background)"
 fi
 
 if [ -n "$GAMES" ]; then
