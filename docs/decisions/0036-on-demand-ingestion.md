@@ -191,6 +191,15 @@ early-termination byte bounds, drop+resume for both `.zst` and `.zip`,
 EOS-at-target, 404, HTML-rejection, byte-0-restart idempotence, stop). No SPRT,
 no Elo claim — bench unchanged by construction (no engine touch).
 
+### 7. M6.H2 amendment — full inline pipeline + usable-count target + `source_url` pin (2026-05-23)
+
+The M6.H2 lane refactor (ADR-0035 §12) changes the fetch / `ingest-pgn` contract:
+
+- **Full inline pipeline at ingest.** `corpus fetch` and `corpus ingest-pgn` now apply the SAME per-position pipeline as self-play BEFORE committing: opening-skip (`OPENING_SKIP_PLIES=8`) → drop in-check → `|static_eval| ≤ HIGH_SCORE_CP` → `is_quiet` (which needs both a static eval and a qsearch eval). The quiet check uses a per-call / one-shot `QSearcher` (single-threaded ingest, reused across games — NOT per-position-allocated, NOT in the `Rc`-shared `CallState`). This closes the build-era gap where ingested PGN was never per-position filtered.
+- **`target-positions` counts USABLE positions** (post quiet-filter → dedup → cap), not raw parsed positions. `LaneCommitter`'s exact truncation lands the lane on the target exactly. `FetchOutcome.positions_ingested` / `games_emitted` count usable-committed.
+- **Output is `lane.bin`** (was `pgn-shard.bin`); the per-lane `max_existing_game_id` scans `lane.bin` only (each lane's `game_id` space is private).
+- **`source_url` pinned in the lane manifest** for byte-re-derivability. Per the §1.6 resume-determinism carve-out (ADR-0035 §8 weaker / re-derivable tier): a *fresh uninterrupted* fetch from `source_url` reproduces `lane.bin` byte-for-byte; a *resumed* fetch is content/label-stable (same FEN+label multiset) but its `game_id` provenance tags are path-dependent.
+
 ## Consequences
 
 - M6.I's bi-level driver can call `stream_to_ingest(...)` as a synchronous

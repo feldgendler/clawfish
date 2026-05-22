@@ -1,16 +1,15 @@
-//! End-to-end reproducibility integration test for `bench/corpus/re-run.sh`.
+//! End-to-end reproducibility integration test for `corpus selfplay`.
 //!
-//! Asserts MF4: given a frozen `bench/corpus/manifest.json` (every
-//! reproducibility knob pinned), deleting the corpus shards and re-running
-//! the `re-run.sh` script produces BYTE-IDENTICAL `shard.bin` and `val.bin`
-//! files. This is the strong R5 / reproducibility-mandate guarantee for
-//! the self-play slice (no network needed; deterministic from seed +
-//! binary + the manifest knobs).
+//! Asserts MF4: given the pinned reproducibility knobs (seed, cap-seed, games,
+//! workers, max-plies, opening-random-plies), re-running `corpus selfplay`
+//! produces a BYTE-IDENTICAL `lane.bin` (M6.H2: flat per-lane corpus, no
+//! train/val split — that moves to M6.I, so there is no `val.bin`). This is the
+//! strong R5 / reproducibility-mandate guarantee for the self-play slice (no
+//! network needed; deterministic from seed + binary + the knobs).
 //!
-//! Heavy by nature (it runs the full self-play campaign + build pass); not
-//! `#[ignore]`d because the campaign is small (12 games) and the test is
-//! the most direct check of the reproducibility contract. Runs in <60s on
-//! the dev machine.
+//! Heavy by nature (it runs the full self-play campaign); not `#[ignore]`d
+//! because the campaign is small and the test is the most direct check of the
+//! reproducibility contract. Runs in <60s on the dev machine.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -66,27 +65,29 @@ fn run_step(name: &str, mut cmd: Command) {
     }
 }
 
-// will be updated to K=10 in M6.G per-game-file rewrite; see
-// docs/plans/m6.g-per-game-files.md §8.2.
 #[test]
 fn rerun_byte_identical() {
-    // Build a corpus from scratch in a temp dir using a fixed seed +
-    // workers=1 (so the on-disk byte order is deterministic). Then run
-    // the same pipeline a second time into a sibling dir and assert the
-    // produced shard.bin + val.bin are byte-identical between the two
-    // runs.
+    // Build a lane from scratch in a temp dir using a fixed seed + workers=1
+    // (so the on-disk byte order is deterministic). Then run the same campaign
+    // a second time into a sibling dir and assert the produced `lane.bin` is
+    // byte-identical between the two runs.
+    //
+    // M6.H2: the `corpus build` step is gone (dedup/cap moved inline into the
+    // consumer's `LaneCommitter`); `corpus selfplay` alone emits the build-ready
+    // `lane.bin`, then `corpus finalize` (re)writes the manifest / stats over it.
+    // There is no train/val split here (→ M6.I), so no `val.bin`. The
+    // byte-identity contract is on `lane.bin`, which `finalize` does NOT
+    // transform — so comparing `lane.bin` directly is correct after finalize.
     let seed = "12648430"; // 0xC0FFEE
     let games = "4"; // small — fast
     let workers = "1";
     let max_plies = "40";
     let opening_random_plies = "4";
-    let val_fraction = "0.25";
-    let split_seed = "7";
+    let cap_seed = "7";
 
     let mk_corpus = |label: &str| -> PathBuf {
         let td = TempDir::new(label);
         let out = td.0.clone();
-        // selfplay
         let mut sp = Command::new(corpus_bin());
         sp.arg("selfplay")
             .args(["--opening-mode", "random"])
@@ -95,23 +96,16 @@ fn rerun_byte_identical() {
             .args(["--workers", workers])
             .args(["--max-plies", max_plies])
             .args(["--opening-random-plies", opening_random_plies])
-            .args(["--val-fraction", val_fraction])
-            .args(["--split-seed", split_seed])
+            .args(["--cap-seed", cap_seed])
             .args(["--out", &out.display().to_string()]);
         run_step("selfplay", sp);
-        // build
-        let mut bd = Command::new(corpus_bin());
-        bd.arg("build")
-            .args(["--in", &out.display().to_string()])
-            .args(["--val-fraction", val_fraction])
-            .args(["--split-seed", split_seed]);
-        run_step("build", bd);
-        // Leak the TempDir into the returned path — we drop the outer one
-        // via the test's stack-scoped `td`. We must keep it alive for the
-        // duration of the test; clone the path and let `td` drop at the
-        // end of this closure. So instead — return the path AFTER moving
-        // the TempDir guard onto the heap via Box::leak. Simpler: forget
-        // the guard, clean up at end of test manually.
+        // finalize: writes the manifest/stats/re-run.sh over lane.bin without
+        // transforming the bytes (the M6.H2 build→finalize change).
+        let mut fin = Command::new(corpus_bin());
+        fin.arg("finalize")
+            .args(["--in", &out.display().to_string()]);
+        run_step("finalize", fin);
+        // Keep the dir alive for the duration of the test; clean up manually.
         std::mem::forget(td);
         out
     };
@@ -119,20 +113,13 @@ fn rerun_byte_identical() {
     let a = mk_corpus("a");
     let b = mk_corpus("b");
 
-    // Compute digests for shard.bin + val.bin from both runs.
-    let a_shard = sha256_file(&a.join("shard.bin")).expect("a/shard.bin");
-    let b_shard = sha256_file(&b.join("shard.bin")).expect("b/shard.bin");
-    let a_val = sha256_file(&a.join("val.bin")).expect("a/val.bin");
-    let b_val = sha256_file(&b.join("val.bin")).expect("b/val.bin");
+    let a_lane = sha256_file(&a.join("lane.bin")).expect("a/lane.bin");
+    let b_lane = sha256_file(&b.join("lane.bin")).expect("b/lane.bin");
 
     assert_eq!(
-        a_shard, b_shard,
-        "shard.bin must be byte-identical across re-runs \
+        a_lane, b_lane,
+        "lane.bin must be byte-identical across re-runs \
          (workers=1 + deterministic on-disk order ⇒ pure function of input multiset)"
-    );
-    assert_eq!(
-        a_val, b_val,
-        "val.bin must be byte-identical across re-runs"
     );
 
     // Manual cleanup (we leaked the TempDir guards).
@@ -145,20 +132,19 @@ fn rerun_byte_identical() {
 // #[ignore]d until the implementation phase lands.
 // ──────────────────────────────────────────────────────────────────────────
 
-/// K-invariance: K ∈ {1, 4, 10} all produce byte-identical shard.bin and
-/// val.bin for the same seed + split_seed.
+/// K-invariance: K ∈ {1, 4, 10} all produce a byte-identical `lane.bin` for the
+/// same seed + cap-seed.
 ///
-/// This is the strong form of the `k_independent_byte_identical` test in
-/// `tests/corpus_per_game_file.rs`, driven by the `selfplay` command alone
-/// (no `build` pass needed — the per-game-file consumer applies the full
-/// inline pipeline). The primary acceptance gate for the architecture.
+/// Driven by the `selfplay` command alone (the per-game-file consumer applies
+/// the full inline pipeline + the shared `LaneCommitter`). The primary
+/// acceptance gate for the architecture. M6.H2: no train/val split → no
+/// `val.bin`; compare `lane.bin` only.
 #[test]
 fn rerun_byte_identical_across_k() {
     let seed = "12648430"; // 0xC0FFEE
     let games = "6";
     let max_plies = "40";
-    let split_seed = "7";
-    let val_fraction = "0.25";
+    let cap_seed = "7";
 
     let run_for_k = |k: usize| -> PathBuf {
         let td = TempDir::new(&format!("k{k}"));
@@ -170,8 +156,7 @@ fn rerun_byte_identical_across_k() {
             .args(["--games", games])
             .args(["--workers", &k.to_string()])
             .args(["--max-plies", max_plies])
-            .args(["--val-fraction", val_fraction])
-            .args(["--split-seed", split_seed])
+            .args(["--cap-seed", cap_seed])
             .args(["--out", &out.display().to_string()]);
         let out_result = sp
             .stdin(Stdio::null())
@@ -183,6 +168,11 @@ fn rerun_byte_identical_across_k() {
             let stderr = String::from_utf8_lossy(&out_result.stderr);
             panic!("selfplay k={k} failed:\nstderr: {stderr}");
         }
+        // finalize: manifest/stats over lane.bin (no byte transform).
+        let mut fin = Command::new(corpus_bin());
+        fin.arg("finalize")
+            .args(["--in", &out.display().to_string()]);
+        run_step("finalize", fin);
         std::mem::forget(td);
         out
     };
@@ -190,19 +180,16 @@ fn rerun_byte_identical_across_k() {
     let ks: &[usize] = &[1, 4, 10];
     let dirs: Vec<PathBuf> = ks.iter().map(|&k| run_for_k(k)).collect();
 
-    let ref_shard = sha256_file(&dirs[0].join("shard.bin")).expect("k1/shard.bin");
-    let ref_val = sha256_file(&dirs[0].join("val.bin"));
+    let ref_lane = sha256_file(&dirs[0].join("lane.bin")).expect("k1/lane.bin");
 
     for (dir, &k) in dirs[1..].iter().zip(ks[1..].iter()) {
-        let shard = sha256_file(&dir.join("shard.bin"))
-            .unwrap_or_else(|| panic!("k={k}/shard.bin missing"));
+        let lane =
+            sha256_file(&dir.join("lane.bin")).unwrap_or_else(|| panic!("k={k}/lane.bin missing"));
         assert_eq!(
-            shard, ref_shard,
-            "K={k}: shard.bin must be byte-identical to K=1 \
+            lane, ref_lane,
+            "K={k}: lane.bin must be byte-identical to K=1 \
              (per-game-file reorder protocol ⇒ K-independent)"
         );
-        let val = sha256_file(&dir.join("val.bin"));
-        assert_eq!(val, ref_val, "K={k}: val.bin must be byte-identical to K=1");
     }
 
     // Manual cleanup.

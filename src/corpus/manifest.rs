@@ -197,25 +197,32 @@ pub struct SourceEntry {
     pub positions_extracted: u64,
 }
 
-/// Corpus manifest: the frozen-artifact provenance record.
+/// Corpus manifest: the frozen-artifact provenance record (schema v2, M6.H2).
 ///
-/// Written alongside the corpus by the extraction pipeline and read by M6.I
-/// to verify it is consuming the correct corpus snapshot. The R-TC
-/// reproducibility contract pins `self_play_seed` + `split_seed` +
-/// `depth_ladder` + `corpus_sha256`, so the data-quality gate can re-derive
-/// the bytes and check them against the digest recorded here.
+/// Written alongside one flat `lane.bin` by the lane generator (self-play /
+/// fetch / ingest-pgn) and read by M6.I to verify it is consuming the correct
+/// lane snapshot. The R-TC reproducibility contract pins `self_play_seed` +
+/// `cap_seed` + `depth_ladder` + `corpus_sha256`, so the data-quality gate can
+/// re-derive the bytes and check them against the digest recorded here.
+///
+/// **Schema v2 (M6.H2):** the train/val split moved to M6.I, so the
+/// `validation_fraction` / `val_fraction` / `train_positions` / `val_positions`
+/// fields are gone; `total_positions` now means usable positions in `lane.bin`.
+/// The reader tolerates schema-v1 manifests (it accepts `split_seed` as
+/// `cap_seed` and ignores `validation_fraction`); lanes are regenerated, not
+/// migrated (ADR-0035 §10/§12).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {
     /// Corpus schema version — bump when the format changes incompatibly.
+    /// `2` since M6.H2 (flat lanes, no split).
     pub schema_version: u32,
     /// ISO-8601 timestamp (UTC) of when the corpus was constructed.
     pub created_at: String,
     /// Git commit hash of the engine used for quiet-position extraction.
     pub engine_commit: String,
-    /// Total number of positions in the corpus.
+    /// Total usable positions in `lane.bin` (post quiet-filter → dedup → cap →
+    /// exact target). The split moved to M6.I, so this is the whole lane.
     pub total_positions: u64,
-    /// Fraction of positions held out for validation (0.0–1.0).
-    pub validation_fraction: f64,
     /// One entry per source file.
     pub sources: Vec<SourceEntry>,
     /// Self-play campaign base seed (R-TC: pairs with the depth ladder so
@@ -232,12 +239,23 @@ pub struct Manifest {
     /// but the build pass writes shards in `(game_id, ply)` order so worker
     /// count is byte-irrelevant — recorded here for full reproducibility audit).
     pub workers: u32,
-    /// Train/val game-level split seed (R3 reproducible split).
-    pub split_seed: u64,
-    /// Held-out validation fraction passed to `corpus build` (mirrors
-    /// `validation_fraction`; pinned separately so the re-run script reads
-    /// the exact build-time knob from one place).
-    pub val_fraction: f64,
+    /// M6.H2 per-game reservoir-cap seed (Knuth/Vitter Algorithm R per-game
+    /// sub-stream). On a schema-v1 manifest (no `cap_seed` key) the reader
+    /// defaults this to the v1 `split_seed` — the cap role the v1 `split_seed`
+    /// already played (the split role itself moved to M6.I).
+    pub cap_seed: u64,
+    /// M6.H2 pinned fetch source URL (CCRL/Lichess), recorded for byte-
+    /// re-derivability. `None` for self-play lanes / schema-v1 manifests.
+    pub source_url: Option<String>,
+    /// M6.H2 per-lane usable-position target (`--target`/`--cap-positions`).
+    /// `None` when the lane ran unbounded / on a schema-v1 manifest.
+    pub target_usable: Option<u64>,
+    /// Canonical lane-source tag — the load-bearing knob `re-run.sh` needs to
+    /// re-derive the lane. For a FETCH lane it is `"ccrl"` / `"lichess"` (it
+    /// selects the game-level filter AND `cmd_fetch`'s required `--source`); for
+    /// a self-play lane it is `"selfplay-on-book"` / `"selfplay-off-book"`.
+    /// `None` on a calibrate-ladder-only stub / schema-v1 manifest.
+    pub source: Option<String>,
     /// Calibrated R-TC depth-ladder rungs `(depth, weight)`, written here so
     /// `corpus rerun` reproduces the empirically-anchored sampling.
     pub depth_ladder: Vec<(u8, u32)>,
@@ -316,11 +334,6 @@ fn write_manifest_json(m: &Manifest) -> String {
     write_json_string(&mut out, &m.engine_commit);
     out.push_str(",\n");
     out.push_str(&format!("  \"total_positions\": {},\n", m.total_positions));
-    // f64 — write with enough precision for a fraction in [0, 1].
-    out.push_str(&format!(
-        "  \"validation_fraction\": {},\n",
-        format_f64(m.validation_fraction)
-    ));
     out.push_str("  \"sources\": [\n");
     for (i, entry) in m.sources.iter().enumerate() {
         write_source_entry(&mut out, entry, "    ");
@@ -338,11 +351,7 @@ fn write_manifest_json(m: &Manifest) -> String {
         m.opening_random_plies
     ));
     out.push_str(&format!("  \"workers\": {},\n", m.workers));
-    out.push_str(&format!("  \"split_seed\": {},\n", m.split_seed));
-    out.push_str(&format!(
-        "  \"val_fraction\": {},\n",
-        format_f64(m.val_fraction)
-    ));
+    out.push_str(&format!("  \"cap_seed\": {},\n", m.cap_seed));
     out.push_str("  \"depth_ladder\": [\n");
     for (i, (depth, weight)) in m.depth_ladder.iter().enumerate() {
         out.push_str(&format!("    {{\"depth\": {depth}, \"weight\": {weight}}}"));
@@ -370,35 +379,26 @@ fn write_manifest_json(m: &Manifest) -> String {
         write_json_string(&mut out, mode);
         out.push_str(",\n");
     }
+    // M6.H2 optional fields — omitted (not `null`-valued) when absent, matching
+    // the opening-book convention above (the parser doesn't recognize `null`).
+    if let Some(url) = &m.source_url {
+        out.push_str("  \"source_url\": ");
+        write_json_string(&mut out, url);
+        out.push_str(",\n");
+    }
+    if let Some(t) = &m.target_usable {
+        out.push_str(&format!("  \"target_usable\": {t},\n"));
+    }
+    if let Some(s) = &m.source {
+        out.push_str("  \"source\": ");
+        write_json_string(&mut out, s);
+        out.push_str(",\n");
+    }
     out.push_str("  \"corpus_sha256\": ");
     write_json_string(&mut out, &m.corpus_sha256);
     out.push('\n');
     out.push('}');
     out
-}
-
-/// Format an f64 for JSON: use enough decimal digits for an exact round-trip
-/// of the values we store (fractions in [0, 1] with up to ~15 sig figures).
-fn format_f64(v: f64) -> String {
-    // `{:.17}` gives enough precision for an exact IEEE-754 round-trip.  We
-    // strip trailing zeros (but keep at least one decimal digit) so that
-    // "0.10000000000000001" → "0.1" in the common case.
-    let raw = format!("{v:.17}");
-    // Strip trailing zeros after the decimal point.
-    if let Some(dot) = raw.find('.') {
-        let trimmed = raw.trim_end_matches('0');
-        // Ensure at least one digit after the decimal point.
-        if trimmed.ends_with('.') {
-            format!("{trimmed}0")
-        } else if trimmed.len() > dot {
-            trimmed.to_owned()
-        } else {
-            raw
-        }
-    } else {
-        // No decimal point — shouldn't happen for f64 formatted with .17
-        format!("{v:.1}")
-    }
 }
 
 // ── Minimal JSON parser ───────────────────────────────────────────────────────
@@ -645,15 +645,6 @@ fn require_u32(val: &JsonVal, field: &str) -> Result<u32, CorpusError> {
         .map_err(|_| CorpusError::Json(format!("field {field:?} value {v} overflows u32")))
 }
 
-fn require_f64(val: &JsonVal, field: &str) -> Result<f64, CorpusError> {
-    match val {
-        JsonVal::Num(n) => Ok(*n),
-        _ => Err(CorpusError::Json(format!(
-            "field {field:?} must be a number"
-        ))),
-    }
-}
-
 fn find_field<'a>(obj: &'a [(String, JsonVal)], key: &str) -> Result<&'a JsonVal, CorpusError> {
     obj.iter()
         .find(|(k, _)| k == key)
@@ -688,10 +679,6 @@ fn parse_manifest_json(src: &str) -> Result<Manifest, CorpusError> {
     let engine_commit =
         require_str(find_field(&top, "engine_commit")?, "engine_commit")?.to_owned();
     let total_positions = require_u64(find_field(&top, "total_positions")?, "total_positions")?;
-    let validation_fraction = require_f64(
-        find_field(&top, "validation_fraction")?,
-        "validation_fraction",
-    )?;
 
     let sources_val = find_field(&top, "sources")?;
     let sources = match sources_val {
@@ -712,16 +699,21 @@ fn parse_manifest_json(src: &str) -> Result<Manifest, CorpusError> {
     };
 
     let self_play_seed = require_u64(find_field(&top, "self_play_seed")?, "self_play_seed")?;
-    let split_seed = require_u64(find_field(&top, "split_seed")?, "split_seed")?;
+    // M6.H2: `cap_seed` is the v2 name for the reservoir-cap seed. A schema-v1
+    // manifest has no `cap_seed` key but does have `split_seed` (the cap role
+    // the v1 seed played); the v2 reader accepts `split_seed` as `cap_seed`.
+    let cap_seed = optional_u64(&top, "cap_seed")
+        .or_else(|| optional_u64(&top, "split_seed"))
+        .unwrap_or(0);
     // Reproducibility-contract knobs added after the initial schema:
-    // missing fields default to 0/`validation_fraction` so older manifests
-    // continue to round-trip. New manifests written by `cmd_selfplay` /
-    // `cmd_build` populate them with the actual run values.
+    // missing fields default to 0 so older manifests continue to round-trip.
+    // New manifests written by `cmd_selfplay` / `cmd_finalize` populate them
+    // with the actual run values. `validation_fraction` / `val_fraction` (v1)
+    // are ignored — the split moved to M6.I.
     let games = optional_u64(&top, "games").unwrap_or(0);
     let max_plies = optional_u32(&top, "max_plies").unwrap_or(0);
     let opening_random_plies = optional_u32(&top, "opening_random_plies").unwrap_or(0);
     let workers = optional_u32(&top, "workers").unwrap_or(0);
-    let val_fraction = optional_f64(&top, "val_fraction").unwrap_or(validation_fraction);
     let corpus_sha256 =
         require_str(find_field(&top, "corpus_sha256")?, "corpus_sha256")?.to_owned();
 
@@ -757,20 +749,26 @@ fn parse_manifest_json(src: &str) -> Result<Manifest, CorpusError> {
     let opening_book_sha256 = optional_str(&top, "opening_book_sha256").map(str::to_owned);
     let opening_mode = optional_str(&top, "opening_mode").map(str::to_owned);
 
+    // M6.H2 optional fields — absent on schema-v1 / self-play manifests.
+    let source_url = optional_str(&top, "source_url").map(str::to_owned);
+    let target_usable = optional_u64(&top, "target_usable");
+    let source = optional_str(&top, "source").map(str::to_owned);
+
     Ok(Manifest {
         schema_version,
         created_at,
         engine_commit,
         total_positions,
-        validation_fraction,
         sources,
         self_play_seed,
         games,
         max_plies,
         opening_random_plies,
         workers,
-        split_seed,
-        val_fraction,
+        cap_seed,
+        source_url,
+        target_usable,
+        source,
         depth_ladder,
         opening_book_path,
         opening_book_sha256,
@@ -787,11 +785,6 @@ fn optional_u64(top: &[(String, JsonVal)], key: &str) -> Option<u64> {
 fn optional_u32(top: &[(String, JsonVal)], key: &str) -> Option<u32> {
     let v = top.iter().find(|(k, _)| k == key).map(|(_, v)| v)?;
     require_u32(v, key).ok()
-}
-
-fn optional_f64(top: &[(String, JsonVal)], key: &str) -> Option<f64> {
-    let v = top.iter().find(|(k, _)| k == key).map(|(_, v)| v)?;
-    require_f64(v, key).ok()
 }
 
 /// Optional string field — `null` or absent → `None`, otherwise the string.
@@ -897,11 +890,10 @@ mod tests {
     #[test]
     fn manifest_json_roundtrip() {
         let manifest = Manifest {
-            schema_version: 1,
+            schema_version: 2,
             created_at: "2026-05-19T12:00:00Z".to_owned(),
             engine_commit: "1e8a410abc1234567890abcdef1234567890abcd".to_owned(),
             total_positions: 1_500_000,
-            validation_fraction: 0.1,
             sources: vec![
                 SourceEntry {
                     label: "ccrl-2022".to_owned(),
@@ -928,8 +920,10 @@ mod tests {
             max_plies: 400,
             opening_random_plies: 8,
             workers: 1,
-            split_seed: 98_765_432_109_876,
-            val_fraction: 0.1,
+            cap_seed: 55_555_555_555_555,
+            source_url: Some("https://ccrl.example/games.pgn.7z".to_owned()),
+            target_usable: Some(2_000_000),
+            source: Some("ccrl".to_owned()),
             depth_ladder: vec![(4, 1), (6, 1), (8, 1), (10, 1)],
             opening_book_path: Some("bench/data/openings.epd".to_owned()),
             opening_book_sha256: Some(
@@ -944,6 +938,35 @@ mod tests {
         write_manifest(dir.path(), &manifest).unwrap();
         let read_back = read_manifest(dir.path()).unwrap();
         assert_eq!(manifest, read_back);
+    }
+
+    /// A schema-v1 manifest (no `cap_seed`/`source_url`/`target_usable` keys)
+    /// must still parse: `cap_seed` defaults to `split_seed`, and the M6.H2
+    /// optionals default to `None`.
+    #[test]
+    fn manifest_schema_v1_defaults_cap_seed_to_split_seed() {
+        let v1 = "{\n\
+             \"schema_version\": 1,\n\
+             \"created_at\": \"2026-05-19T00:00:00Z\",\n\
+             \"engine_commit\": \"abc\",\n\
+             \"total_positions\": 100,\n\
+             \"validation_fraction\": 0.1,\n\
+             \"sources\": [],\n\
+             \"self_play_seed\": 42,\n\
+             \"split_seed\": 12345,\n\
+             \"depth_ladder\": [],\n\
+             \"corpus_sha256\": \"deadbeef\"\n\
+             }";
+        let dir = tempdir();
+        std::fs::write(dir.path().join("manifest.json"), v1).unwrap();
+        let m = read_manifest(dir.path()).unwrap();
+        assert_eq!(
+            m.cap_seed, 12345,
+            "schema-v1 cap_seed is read from the v1 `split_seed` key"
+        );
+        assert_eq!(m.source_url, None);
+        assert_eq!(m.target_usable, None);
+        assert_eq!(m.source, None);
     }
 
     // ── filter_spec echoes pinned constants ───────────────────────────────────

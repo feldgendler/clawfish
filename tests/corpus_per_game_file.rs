@@ -1,15 +1,12 @@
 //! Integration tests for the per-game-file architecture
 //! (`docs/plans/m6.g-per-game-files.md` §8.2 — `tests/corpus_per_game_file.rs`).
 //!
-//! All tests are `#[ignore]`d until the implementation phase lands (§4 of the
-//! plan). The test bodies are written against the future API; the `ignore`
-//! flag means they compile and are skipped by default.
-//!
 //! **Primary acceptance gate:** `k_independent_byte_identical` — K=1 vs K=10
-//! produce byte-identical `shard.bin` and `val.bin`. This is the property
-//! delivered by the per-game-file reorder protocol (every step is a
-//! deterministic function of `(seed, split_seed, game_id)`; K affects only
-//! completion timing, not commit order).
+//! produce a byte-identical flat `lane.bin`. This is the property delivered by
+//! the per-game-file reorder protocol (every step — per-lane dedup, per-game
+//! cap — is a deterministic function of `(seed, cap_seed, game_id)`; K affects
+//! only completion timing, not commit order). M6.H2: one flat `lane.bin` per
+//! lane, no train/val split (→ M6.I), so no `val.bin`.
 
 use clawfish::corpus::store::scan_valid_blocks;
 use std::path::{Path, PathBuf};
@@ -57,7 +54,7 @@ fn run_selfplay(out: &Path, seed: u64, games: u64, workers: usize, max_plies: u3
         .args(["--out", &out.display().to_string()])
         .args(["--max-plies", &max_plies.to_string()])
         .args(["--opening-mode", "random"])
-        .args(["--split-seed", "7"])
+        .args(["--cap-seed", "7"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -66,8 +63,8 @@ fn run_selfplay(out: &Path, seed: u64, games: u64, workers: usize, max_plies: u3
     assert!(status.success(), "selfplay must succeed");
 }
 
-fn shard_records_sorted(dir: &Path) -> Vec<(u64, u32, String, u8)> {
-    let (blocks, _) = scan_valid_blocks(&dir.join("shard.bin")).unwrap_or_default();
+fn lane_records_sorted(dir: &Path) -> Vec<(u64, u32, String, u8)> {
+    let (blocks, _) = scan_valid_blocks(&dir.join("lane.bin")).unwrap_or_default();
     let mut v: Vec<(u64, u32, String, u8)> = blocks
         .iter()
         .flat_map(|b| {
@@ -81,13 +78,13 @@ fn shard_records_sorted(dir: &Path) -> Vec<(u64, u32, String, u8)> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// §8.2 Integration tests (all ignored until implementation lands)
+// §8.2 Integration tests
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Out-of-order worker completions must commit in game_id order.
 ///
 /// Runs with K=4 workers where games inherently complete out of order
-/// (different depths per game) and asserts that `shard.bin` blocks appear
+/// (different depths per game) and asserts that `lane.bin` blocks appear
 /// in strict game_id order.
 #[test]
 fn out_of_order_completion_commits_in_game_id_order() {
@@ -97,26 +94,25 @@ fn out_of_order_completion_commits_in_game_id_order() {
     let workers = 4;
     run_selfplay(td.path(), seed, games, workers, 40);
 
-    let (blocks, _) = scan_valid_blocks(&td.path().join("shard.bin")).unwrap();
+    let (blocks, _) = scan_valid_blocks(&td.path().join("lane.bin")).unwrap();
     let ids: Vec<u64> = blocks.iter().map(|b| b.game_id).collect();
-    assert!(!ids.is_empty(), "shard must have at least one block");
-    // Blocks must appear in non-decreasing game_id order.
+    assert!(!ids.is_empty(), "lane must have at least one block");
+    // Blocks must appear in strictly-increasing game_id order.
     for w in ids.windows(2) {
         assert!(
             w[0] < w[1],
-            "shard blocks must be in strict game_id order; got {:?}",
+            "lane blocks must be in strict game_id order; got {:?}",
             ids
         );
     }
 }
 
-/// **Primary acceptance gate.** K=1 and K=10 produce byte-identical
-/// `shard.bin` and `val.bin`.
+/// **Primary acceptance gate.** K=1 and K=10 produce a byte-identical
+/// `lane.bin`.
 ///
 /// This is the central property of the per-game-file architecture: because
-/// every step (dedup, cap, split) is a deterministic function of
-/// `(seed, split_seed, game_id)`, the byte content of the output files is
-/// K-independent.
+/// every step (per-lane dedup, per-game cap) is a deterministic function of
+/// `(seed, cap_seed, game_id)`, the byte content of the lane is K-independent.
 #[test]
 fn k_independent_byte_identical() {
     let seed = 0xC0FFEE_u64;
@@ -128,24 +124,13 @@ fn k_independent_byte_identical() {
     run_selfplay(td1.path(), seed, games, 1, max_plies);
     run_selfplay(td10.path(), seed, games, 10, max_plies);
 
-    let k1_shard = sha256_file(&td1.path().join("shard.bin")).expect("k1/shard.bin");
-    let k10_shard = sha256_file(&td10.path().join("shard.bin")).expect("k10/shard.bin");
+    let k1_lane = sha256_file(&td1.path().join("lane.bin")).expect("k1/lane.bin");
+    let k10_lane = sha256_file(&td10.path().join("lane.bin")).expect("k10/lane.bin");
     assert_eq!(
-        k1_shard, k10_shard,
-        "K=1 and K=10 shard.bin must be byte-identical \
+        k1_lane, k10_lane,
+        "K=1 and K=10 lane.bin must be byte-identical \
          (per-game-file reorder protocol ⇒ K-independent)"
     );
-
-    // val.bin: both may be empty (small corpus + val_fraction=0), but
-    // if non-empty they must match.
-    if td1.path().join("val.bin").exists() || td10.path().join("val.bin").exists() {
-        let k1_val = sha256_file(&td1.path().join("val.bin"));
-        let k10_val = sha256_file(&td10.path().join("val.bin"));
-        assert_eq!(
-            k1_val, k10_val,
-            "K=1 and K=10 val.bin must be byte-identical"
-        );
-    }
 }
 
 /// Inline dedup is deterministic regardless of which K workers complete
@@ -167,70 +152,14 @@ fn inline_dedup_determinism_under_completion_permutation() {
         })
         .collect();
 
-    let reference = shard_records_sorted(dirs[0].path());
-    assert!(!reference.is_empty(), "reference corpus must be non-empty");
+    let reference = lane_records_sorted(dirs[0].path());
+    assert!(!reference.is_empty(), "reference lane must be non-empty");
 
     for (td, &k) in dirs[1..].iter().zip(ks[1..].iter()) {
-        let candidate = shard_records_sorted(td.path());
+        let candidate = lane_records_sorted(td.path());
         assert_eq!(
             candidate, reference,
             "K={k}: inline dedup must produce identical committed FEN set as K=1"
         );
     }
-}
-
-/// The per-game split coin flip is K-independent: the same `game_id` always
-/// routes to the same shard (train vs val) regardless of worker count.
-#[test]
-fn inline_split_determinism_per_game_coin_flip() {
-    // Use a split_seed and val_fraction that produce a non-trivial split.
-    // We can't pass --split-seed yet (the bin arg is added as part of the
-    // rewire), but the split_seed=7 default is fine here.
-    let seed = 0xFEED_FACE_u64;
-    let games = 12;
-    let max_plies = 40;
-
-    let td_k1 = TempDir::new("split-k1");
-    let td_k10 = TempDir::new("split-k10");
-
-    // Run with enough val_fraction to expect some val records.
-    let run_with_split = |out: &Path, workers: usize| {
-        let status = Command::new(corpus_bin())
-            .arg("selfplay")
-            .args(["--seed", &seed.to_string()])
-            .args(["--games", &games.to_string()])
-            .args(["--workers", &workers.to_string()])
-            .args(["--out", &out.display().to_string()])
-            .args(["--max-plies", &max_plies.to_string()])
-            .args(["--opening-mode", "random"])
-            .args(["--val-fraction", "0.3"])
-            .args(["--split-seed", "12345"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("spawn corpus selfplay");
-        assert!(
-            status.success(),
-            "selfplay must succeed for workers={workers}"
-        );
-    };
-
-    run_with_split(td_k1.path(), 1);
-    run_with_split(td_k10.path(), 10);
-
-    // Byte-identical shard.bin and val.bin.
-    let k1_shard = sha256_file(&td_k1.path().join("shard.bin")).expect("k1/shard.bin");
-    let k10_shard = sha256_file(&td_k10.path().join("shard.bin")).expect("k10/shard.bin");
-    assert_eq!(
-        k1_shard, k10_shard,
-        "split_seed=12345 val_fraction=0.3: K=1 and K=10 shard.bin must be byte-identical"
-    );
-
-    let k1_val = sha256_file(&td_k1.path().join("val.bin"));
-    let k10_val = sha256_file(&td_k10.path().join("val.bin"));
-    assert_eq!(
-        k1_val, k10_val,
-        "split_seed=12345 val_fraction=0.3: K=1 and K=10 val.bin must be byte-identical"
-    );
 }

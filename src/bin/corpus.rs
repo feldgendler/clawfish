@@ -1,10 +1,13 @@
-//! `corpus` — M6.G corpus-construction CLI driver.
+//! `corpus` — M6.G/M6.H2 corpus-lane-construction CLI driver.
 //!
-//! Subcommands: `calibrate-ladder`, `selfplay`, `ingest-pgn`, `build`,
-//! `quality-gate`, `export`, `rerun`. R5/R6/R7: streaming, all-cores
-//! workers, graceful SIGTERM/SIGINT, crash-safe via the per-game
-//! append-block log. Implemented in the M6.G integration slice per
-//! `docs/plans/m6.g.md` §2/§5.
+//! Subcommands: `calibrate-ladder`, `selfplay`, `ingest-pgn`, `fetch`,
+//! `finalize`, `quality-gate`, `export`, `rerun`, `truncate`. R5/R6/R7:
+//! streaming, all-cores workers, graceful SIGTERM/SIGINT, crash-safe via the
+//! per-game append-block log. M6.H2: each lane is an independent generator
+//! producing one flat build-ready `lane.bin` (no train/val split — that moves
+//! to M6.I); the build-era `corpus build` transform is replaced by the thin
+//! `corpus finalize` (manifest/stats/digest, no record transformation). See
+//! `docs/plans/m6.h2-corpus-lanes.md` §1.1/§1.2/§5, `docs/plans/m6.g.md`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -14,21 +17,25 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use clawfish::corpus::dedup::{dedup_fen, per_game_cap};
 use clawfish::corpus::filter::GameFilter;
 use clawfish::corpus::manifest::{
     Manifest, hex_digest, read_manifest, sha256_bytes, write_filter_spec, write_manifest,
 };
+use clawfish::corpus::objective::strata_for;
 use clawfish::corpus::pgn::{PgnStats, stream_pgn};
-use clawfish::corpus::quality_gate::{FEN_LEAKAGE_TAU, QualityReport, run_quality_gate};
+use clawfish::corpus::pipeline::LaneCommitter;
+use clawfish::corpus::quality_gate::{QualityReport, run_quality_gate};
+use clawfish::corpus::quiet::{is_quiet, static_eval_white};
 use clawfish::corpus::selfplay::{
     OpeningMode, SelfPlayConfig, calibrate_ladder, run as selfplay_run,
 };
-use clawfish::corpus::split::split_by_game;
-use clawfish::corpus::store::{GameBlock, append_block, atomic_write, scan_valid_blocks};
+use clawfish::corpus::store::{GameBlock, atomic_write, scan_valid_blocks};
 use clawfish::corpus::{
-    CorpusRecord, DEPTH_RUNG_EXTERNAL, Label, PER_GAME_CAP, QUIET_MARGIN_CP, Source,
+    CorpusRecord, DEPTH_RUNG_EXTERNAL, HIGH_SCORE_CP, Label, OPENING_SKIP_PLIES, QUIET_MARGIN_CP,
+    Source,
 };
+use clawfish::movegen::in_check;
+use clawfish::search::QSearcher;
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
@@ -47,7 +54,7 @@ fn main() -> ExitCode {
         "selfplay" => cmd_selfplay(rest),
         "ingest-pgn" => cmd_ingest_pgn(rest),
         "fetch" => cmd_fetch(rest),
-        "build" => cmd_build(rest),
+        "finalize" => cmd_finalize(rest),
         "quality-gate" => cmd_quality_gate(rest),
         "export" => cmd_export(rest),
         "rerun" => cmd_rerun(rest),
@@ -69,25 +76,30 @@ fn main() -> ExitCode {
 
 fn print_top_help() {
     eprintln!(
-        "corpus — M6.G corpus-construction CLI.
+        "corpus — M6.G/M6.H2 corpus-lane-construction CLI.
 
 Usage: corpus <subcommand> [options]
+
+Each lane is an INDEPENDENT generator producing one flat build-ready
+`lane.bin` (per-lane FEN dedup + per-game cap applied inline; no train/val
+split — that moves to M6.I).
 
 Subcommands:
   calibrate-ladder   Empirically measure the R-TC depth ladder from `bench` movetime
                      buckets and write it to filter_spec.txt + manifest.json.
   selfplay           Run a deterministic fixed-depth self-play campaign.
-                     Crash-safe (per-game append-block log + checkpoint).
-  ingest-pgn         Stream-parse an on-disk CCRL/Lichess PGN into the shard log.
-  fetch              Stream a CCRL/Lichess dump over HTTPS into the shard log
-                     (M6.H; needs the `corpus-fetch` build feature).
-  build              Apply filter → quiet → strata → dedup → cap → split;
-                     emit train+val shards, manifest.json, filter_spec.txt.
-  quality-gate       Run the six data-quality checks; exit 0 iff the gate passes.
-  export             Convert the binary shard log to human-greppable TSV.
-  rerun              Re-execute the stage→build→quality-gate flow from a manifest.
-  truncate           Truncate shard.bin + val.bin to ≤ --cap-positions on a per-game
-                     boundary; resets checkpoint.bin for a coherent resume.
+                     Crash-safe (per-game append-block log + checkpoint); emits lane.bin.
+  ingest-pgn         Stream-parse an on-disk CCRL/Lichess PGN through the full inline
+                     pipeline (skip8 + quiet + dedup + cap) into lane.bin.
+  fetch              Stream a CCRL/Lichess dump over HTTPS through the inline pipeline
+                     into lane.bin (M6.H; needs the `corpus-fetch` build feature).
+  finalize           Recompute corpus_sha256 over lane.bin; write/update manifest.json
+                     + filter_spec.txt + corpus_stats.txt + re-run.sh. No record transform.
+  quality-gate       Run the five data-quality checks; exit 0 iff the gate passes.
+  export             Convert lane.bin to human-greppable TSV.
+  rerun              Re-execute the generate→finalize→quality-gate flow from a manifest.
+  truncate           Truncate lane.bin to ≤ --cap-positions on a per-game boundary;
+                     resets checkpoint.bin for a coherent resume.
 
 Use `corpus <subcommand> --help` for details."
     );
@@ -142,11 +154,6 @@ impl Args {
     fn parse_usize(&self, key: &str, default: usize) -> Result<usize, String> {
         self.get(key)
             .map(|s| s.parse::<usize>().map_err(|e| format!("--{key}: {e}")))
-            .unwrap_or(Ok(default))
-    }
-    fn parse_f64(&self, key: &str, default: f64) -> Result<f64, String> {
-        self.get(key)
-            .map(|s| s.parse::<f64>().map_err(|e| format!("--{key}: {e}")))
             .unwrap_or(Ok(default))
     }
     fn has(&self, key: &str) -> bool {
@@ -221,32 +228,32 @@ Flags:
     // Write the ladder + the pinned-interface constants to filter_spec.txt
     // (the M6.G↔M6.I contract surface).
     write_filter_spec(&out).map_err(|e| format!("write_filter_spec: {e}"))?;
-    // Append the ladder, the FEN-leakage tau, and the bucket→depth mapping.
+    // Append the ladder + the bucket→depth mapping.
     let mut spec = fs::read_to_string(out.join("filter_spec.txt"))
         .map_err(|e| format!("read filter_spec.txt: {e}"))?;
     spec.push_str("# R-TC depth ladder (corpus calibrate-ladder).\n");
     for ((depth, weight), bucket) in ladder.iter().zip(buckets.iter()) {
         spec.push_str(&format!("DEPTH_RUNG_{bucket}MS={depth},{weight}\n"));
     }
-    spec.push_str(&format!("FEN_LEAKAGE_TAU={FEN_LEAKAGE_TAU}\n"));
     fs::write(out.join("filter_spec.txt"), spec).map_err(|e| format!("write filter_spec: {e}"))?;
 
     // Write a minimal manifest stub (no corpus bytes yet — just records the
     // calibration so a subsequent `selfplay` can refer to it).
     let manifest = Manifest {
-        schema_version: 1,
+        schema_version: 2,
         created_at: timestamp(),
         engine_commit: engine_commit(),
         total_positions: 0,
-        validation_fraction: 0.0,
         sources: Vec::new(),
         self_play_seed: 0,
         games: 0,
         max_plies: 0,
         opening_random_plies: 0,
         workers: 0,
-        split_seed: 0,
-        val_fraction: 0.0,
+        cap_seed: 0,
+        source_url: None,
+        target_usable: None,
+        source: None,
         depth_ladder: ladder,
         opening_book_path: None,
         opening_book_sha256: None,
@@ -269,13 +276,15 @@ fn cmd_selfplay(argv: &[String]) -> Result<ExitCode, String> {
         eprintln!(
             "corpus selfplay --seed <u64> --opening-mode <book|random> [--games <N>] \\
                 [--cap-positions <N>] --workers <N> --out <dir> \\
-                [--max-plies <N>] [--opening-random-plies <N>] [--val-fraction <f>] \\
-                [--opening-book <path>] [--split-seed <u64>]
+                [--max-plies <N>] [--opening-random-plies <N>] \\
+                [--opening-book <path>] [--cap-seed <u64>]
 
 Run a deterministic fixed-depth self-play campaign. Uses the calibrated
 depth ladder from <out>/manifest.json if present, else falls back to
 depth 4. Crash-safe (R1/R2/R3). SIGTERM/SIGINT triggers a graceful
-drop-in-flight + checkpoint flush.
+drop-in-flight + checkpoint flush. Emits one flat build-ready <out>/lane.bin
+(per-lane FEN dedup + per-game cap applied inline; no train/val split — that
+moves to M6.I).
 
 --games is OPTIONAL: omit it for an unbounded campaign (kill with
 Ctrl-C / SIGTERM when satisfied — R2 guarantees zero partial labels).
@@ -283,6 +292,10 @@ With --games <N>, the campaign caps at game N-1 (matching R1's
 idempotent resume — repeated runs with the same seed and a larger
 --games extend the corpus). The manifest records the ACTUAL durable
 game count at exit, so re-run.sh reproduces what you have.
+
+--cap-positions <N> counts USABLE (post quiet-filter → dedup → cap)
+positions; the committer's exact truncation lands lane.bin on N exactly.
+--cap-seed seeds the per-game reservoir cap (deterministic, K-independent).
 
 --opening-mode (REQUIRED): determines the opening regime AND the
 provenance every record carries.
@@ -309,7 +322,6 @@ running one campaign per mode."
     let workers = args.parse_usize("workers", num_workers_default())?;
     let max_plies = args.parse_u32("max-plies", 400)?;
     let opening_random_plies = args.parse_u32("opening-random-plies", 8)?;
-    let val_fraction = args.parse_f64("val-fraction", 0.1)?;
 
     // Pick up the depth ladder from a pre-existing manifest if present
     // (calibrate-ladder writes one). Empty ladder ⇒ selfplay defaults to a
@@ -365,11 +377,13 @@ running one campaign per mode."
         }
     };
 
-    let split_seed = args.parse_u64("split-seed", 7)?;
-    // --cap-positions <N>: graceful exit when durable positions reach N.
-    // Distinct from --games (a cap on dispatched game_ids) — the operator's
-    // real target for Texel tuning is corpus *size*, and games-per-position
-    // varies. Both caps can be set; whichever fires first wins.
+    let cap_seed = args.parse_u64("cap-seed", 7)?;
+    // --cap-positions <N>: graceful exit when durable USABLE positions reach N
+    // (post quiet-filter → dedup → cap). Distinct from --games (a cap on
+    // dispatched game_ids) — the operator's real target for Texel tuning is
+    // corpus *size*, and usable-positions-per-game varies. Both caps can be
+    // set; whichever fires first wins. The committer's exact truncation lands
+    // lane.bin on N exactly.
     let cap_positions = args
         .get("cap-positions")
         .map(|s| s.parse::<u64>())
@@ -383,11 +397,10 @@ running one campaign per mode."
         opening_random_plies,
         max_plies,
         out_dir: out.clone(),
-        val_fraction,
         opening_mode,
         book: book.clone(),
         poll_interval_ms: None,
-        split_seed,
+        cap_seed,
         cap_positions,
     };
     let stop = Arc::new(AtomicBool::new(false));
@@ -404,7 +417,7 @@ running one campaign per mode."
     };
     eprintln!(
         "corpus: starting self-play campaign seed={seed} games={games_display} \
-         workers={workers} depth_ladder={depth_ladder:?} val_fraction={val_fraction} \
+         workers={workers} depth_ladder={depth_ladder:?} cap_seed={cap_seed} \
          opening_mode={mode_display} out={}",
         out.display()
     );
@@ -417,36 +430,72 @@ running one campaign per mode."
 
     // Record the ACTUAL durable game count at exit (resume-safe across
     // SIGINT-killed runs and across multi-night accumulation). Scan the
-    // shard once at end; if absent fall back to this run's increment.
+    // lane once at end; if absent fall back to this run's increment.
     // `re-run.sh` reads this number from the manifest and passes it to
     // `corpus selfplay --games <N>` → resume + complete-to-N path that
-    // byte-reproduces the durable shard.
-    let games_durable = scan_valid_blocks(&out.join("shard.bin"))
+    // byte-reproduces the durable lane.
+    let games_durable = scan_valid_blocks(&out.join("lane.bin"))
         .map(|(blocks, _)| blocks.len() as u64)
         .unwrap_or(stats.games_committed);
 
-    // Pin every self-play knob into the manifest so a subsequent `build` +
+    // Pin every self-play knob into the manifest so a subsequent `finalize` +
     // `quality-gate` records them in the frozen artifact (the R-TC
     // reproducibility contract — `re-run.sh` reads each from manifest.json,
-    // no shell-default substitution for a pinned knob).
-    if let Ok(mut m) = read_manifest(&out) {
-        m.self_play_seed = seed;
-        m.games = games_durable;
-        m.max_plies = max_plies;
-        m.opening_random_plies = opening_random_plies;
-        m.workers = workers as u32;
-        m.val_fraction = val_fraction;
-        m.opening_book_path = opening_book_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned());
-        m.opening_book_sha256 = book.as_ref().map(|b| b.sha256().to_owned());
-        m.opening_mode = Some(match opening_mode {
-            OpeningMode::Book => "book".into(),
-            OpeningMode::Random => "random".into(),
-        });
-        write_manifest(&out, &m).map_err(|e| format!("update selfplay knobs: {e}"))?;
-    }
+    // no shell-default substitution for a pinned knob). The manifest may not
+    // exist yet (no prior `calibrate-ladder`), so start from any existing one
+    // or a stub and write it back unconditionally.
+    let mut m = read_manifest(&out).unwrap_or_else(|_| stub_manifest(depth_ladder.clone()));
+    m.self_play_seed = seed;
+    m.games = games_durable;
+    m.max_plies = max_plies;
+    m.opening_random_plies = opening_random_plies;
+    m.workers = workers as u32;
+    m.cap_seed = cap_seed;
+    m.target_usable = cap_positions;
+    m.opening_book_path = opening_book_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    m.opening_book_sha256 = book.as_ref().map(|b| b.sha256().to_owned());
+    m.opening_mode = Some(match opening_mode {
+        OpeningMode::Book => "book".into(),
+        OpeningMode::Random => "random".into(),
+    });
+    // Self-play lanes carry a source tag too (the four-source taxonomy) — it
+    // mirrors the record `Source`, so re-run.sh and the audit can read one
+    // canonical knob regardless of lane kind.
+    m.source = Some(match opening_mode {
+        OpeningMode::Book => "selfplay-on-book".into(),
+        OpeningMode::Random => "selfplay-off-book".into(),
+    });
+    write_manifest(&out, &m).map_err(|e| format!("update selfplay knobs: {e}"))?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// A fresh schema-v2 manifest stub (no corpus bytes; digest left for
+/// `finalize`). Used by `selfplay`/`fetch`/`ingest-pgn` when no prior manifest
+/// exists in the lane dir.
+fn stub_manifest(depth_ladder: Vec<(u8, u32)>) -> Manifest {
+    Manifest {
+        schema_version: 2,
+        created_at: timestamp(),
+        engine_commit: engine_commit(),
+        total_positions: 0,
+        sources: Vec::new(),
+        self_play_seed: 0,
+        games: 0,
+        max_plies: 0,
+        opening_random_plies: 0,
+        workers: 0,
+        cap_seed: 0,
+        source_url: None,
+        target_usable: None,
+        source: None,
+        depth_ladder,
+        opening_book_path: None,
+        opening_book_sha256: None,
+        opening_mode: None,
+        corpus_sha256: clawfish::corpus::quality_gate::CORPUS_SHA256_PENDING_SENTINEL.to_string(),
+    }
 }
 
 fn num_workers_default() -> usize {
@@ -455,19 +504,17 @@ fn num_workers_default() -> usize {
         .unwrap_or(4)
 }
 
-/// Largest `game_id` present across every shard in `dir` that an
-/// `ingest-pgn` invocation could collide with. Scans both `shard.bin`
-/// (self-play) and `pgn-shard.bin` (prior `ingest-pgn` runs) — missing
-/// files contribute 0, never an error (`scan_valid_blocks` returns
-/// `Ok((vec![], 0))` for a non-existent path).
+/// Largest `game_id` present in this lane's `lane.bin` that an `ingest-pgn`
+/// invocation could collide with (M6.H2: each lane lives in its own dir, so its
+/// `game_id` space is private — only `lane.bin` is scanned). A missing file
+/// contributes 0, never an error (`scan_valid_blocks` returns `Ok((vec![], 0))`
+/// for a non-existent path).
 fn max_existing_game_id(dir: &Path) -> u64 {
     let mut hi: u64 = 0;
-    for name in ["shard.bin", "pgn-shard.bin"] {
-        if let Ok((blocks, _)) = scan_valid_blocks(&dir.join(name))
-            && let Some(m) = blocks.iter().map(|b| b.game_id).max()
-        {
-            hi = hi.max(m);
-        }
+    if let Ok((blocks, _)) = scan_valid_blocks(&dir.join("lane.bin"))
+        && let Some(m) = blocks.iter().map(|b| b.game_id).max()
+    {
+        hi = hi.max(m);
     }
     hi
 }
@@ -478,20 +525,28 @@ fn cmd_ingest_pgn(argv: &[String]) -> Result<ExitCode, String> {
     let args = parse_args(argv);
     if args.has("help") {
         eprintln!(
-            "corpus ingest-pgn --path <pgn> --out <dir> [--source ccrl|lichess]
+            "corpus ingest-pgn --path <pgn> --out <dir> [--source ccrl|lichess] \\
+                [--target-positions N] [--cap-seed <u64>]
 
-Stream-parse a CCRL or Lichess PGN; apply `GameFilter::default()`;
-emit each accepted game as one CRC-framed block in <out>/pgn-shard.bin
-(separate from the self-play shard so the two streams remain
-distinguishable for the audit). The `--source` tag determines the
-provenance recorded on every emitted record."
+Stream-parse a local CCRL or Lichess PGN through the FULL inline pipeline —
+game-level admission (`GameFilter`), then per-position skip8 ∧ !in_check ∧
+|static_eval| ≤ HIGH_SCORE_CP ∧ is_quiet — then per-lane FEN dedup → per-game
+cap → exact target via the shared LaneCommitter, appending each surviving game
+as one CRC-framed block to <out>/lane.bin (the same build-ready discipline as
+`corpus fetch`). The `--source` tag determines the provenance recorded on every
+emitted record.
+
+--target-positions  Stop after this many NEW usable positions are appended
+                    (default: unbounded — ingest the whole file).
+--cap-seed          Per-game reservoir-cap seed (default 0)."
         );
         return Ok(ExitCode::SUCCESS);
     }
     let path = PathBuf::from(args.require("path")?);
     let out = PathBuf::from(args.require("out")?);
     fs::create_dir_all(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
-    let source = match args.get("source").unwrap_or("ccrl") {
+    let source_tag = args.get("source").unwrap_or("ccrl").to_string();
+    let source = match source_tag.as_str() {
         "ccrl" => Source::Ccrl,
         "lichess" => Source::LichessOpen,
         other => {
@@ -500,6 +555,8 @@ provenance recorded on every emitted record."
             ));
         }
     };
+    let target_positions = args.parse_u64("target-positions", u64::MAX)?;
+    let cap_seed = args.parse_u64("cap-seed", 0)?;
     // CCRL has no `[TimeControl]` tag (its TC is in `[Event]`), so it needs the
     // TC-relaxed filter; Lichess uses the default (TC-required) band filter.
     let filter = match source {
@@ -509,57 +566,97 @@ provenance recorded on every emitted record."
 
     let f = fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let r = BufReader::new(f);
-    let shard = out.join("pgn-shard.bin");
+    let lane = out.join("lane.bin");
 
-    // Reserve a game-id range for this PGN: start strictly above any
-    // existing game-id in BOTH the self-play shard AND any prior
-    // ingest-pgn shard. A second `ingest-pgn` invocation would otherwise
-    // collide with the first one's ids (which sat in `pgn-shard.bin`).
+    // Reserve a game-id range strictly above any existing game-id in this
+    // lane's lane.bin so re-runs / multiple ingests never collide. A one-shot
+    // LaneCommitter (single scan via `resume`) owns dedup → cap → exact target;
+    // a per-call QSearcher backs the inline quiet check (single-threaded).
     let base_id = max_existing_game_id(&out) + 1;
+    let target = (target_positions != u64::MAX).then_some(target_positions);
+    let (mut committer, _committed_ids) =
+        LaneCommitter::resume(&lane, cap_seed, target).map_err(|e| format!("resume lane: {e}"))?;
+    let mut qsearcher = QSearcher::new();
 
     let mut stats = PgnStats::default();
-    let shard_ref = shard.clone();
-    let mut on_game = move |gp: clawfish::corpus::pgn::GamePositions| {
-        // Game-level admission first (Termination / non-standard-start / length
-        // / TC / Elo). `positions.len()` = mainline plies + 1.
-        if !clawfish::corpus::filter::game_admitted(&gp.tags, gp.positions.len(), &filter) {
-            return;
-        }
-        let label = match gp.tags.result {
-            Some(l) => l,
-            None => return,
+    let mut usable_committed: u64 = 0;
+    let mut games_committed: u64 = 0;
+    {
+        let lane_ref = &lane;
+        let committer = &mut committer;
+        let qsearcher = &mut qsearcher;
+        let usable = &mut usable_committed;
+        let games = &mut games_committed;
+        let mut on_game = |gp: clawfish::corpus::pgn::GamePositions| {
+            // Stop once the usable target is met (exact truncation already landed
+            // the lane on `target`).
+            if committer.target_reached() {
+                return;
+            }
+            // Game-level admission first (Termination / non-standard-start /
+            // length / TC / Elo). `positions.len()` = mainline plies + 1.
+            if !clawfish::corpus::filter::game_admitted(&gp.tags, gp.positions.len(), &filter) {
+                return;
+            }
+            let Some(label) = gp.tags.result else {
+                return;
+            };
+            // Per-position inline pipeline (the build-ready certificate every
+            // lane shares): ply ≥ OPENING_SKIP_PLIES ∧ !in_check ∧ |static_eval|
+            // ≤ HIGH_SCORE_CP ∧ is_quiet. The committer then handles dedup → cap
+            // → exact target.
+            let recs: Vec<CorpusRecord> = gp
+                .positions
+                .into_iter()
+                .filter_map(|(pos, ply)| {
+                    if ply < OPENING_SKIP_PLIES || in_check(&pos) {
+                        return None;
+                    }
+                    let se = static_eval_white(&pos);
+                    if se.abs() > HIGH_SCORE_CP {
+                        return None;
+                    }
+                    let qs = qsearcher.eval_white(&pos);
+                    if !is_quiet(&pos, se, qs) {
+                        return None;
+                    }
+                    Some(CorpusRecord {
+                        fen: pos.to_fen(),
+                        label,
+                        source,
+                        game_id: gp.game_id,
+                        ply,
+                        depth_rung: DEPTH_RUNG_EXTERNAL,
+                        strata: strata_for(&pos),
+                    })
+                })
+                .collect();
+            if recs.is_empty() {
+                return;
+            }
+            match committer.commit_game(lane_ref, gp.game_id, recs) {
+                Ok(outcome) if outcome.usable_committed > 0 => {
+                    *usable += outcome.usable_committed;
+                    *games += 1;
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("corpus: commit_game failed for game {}: {e}", gp.game_id),
+            }
         };
-        let recs: Vec<CorpusRecord> = gp
-            .positions
-            .into_iter()
-            .map(|(pos, ply)| CorpusRecord {
-                fen: pos.to_fen(),
-                label,
-                source,
-                game_id: gp.game_id,
-                ply,
-                depth_rung: DEPTH_RUNG_EXTERNAL,
-                strata: 0,
-            })
-            .collect();
-        if !recs.is_empty()
-            && let Err(e) = append_block(&shard_ref, gp.game_id, &recs)
-        {
-            eprintln!("corpus: append_block failed for game {}: {e}", gp.game_id);
-        }
-    };
-
-    let next_id =
         stream_pgn(r, base_id, &mut on_game, &mut stats).map_err(|e| format!("stream_pgn: {e}"))?;
+    }
     eprintln!(
-        "corpus: PGN ingest done — games_seen={} emitted={} parse_failures={} \
-         no_result_dropped={} next_id={}",
-        stats.games_seen,
-        stats.games_emitted,
-        stats.parse_failures,
-        stats.no_result_dropped,
-        next_id
+        "corpus: PGN ingest done — games_seen={} parsed_emitted={} parse_failures={} \
+         no_result_dropped={} usable_committed={usable_committed} games_committed={games_committed}",
+        stats.games_seen, stats.games_emitted, stats.parse_failures, stats.no_result_dropped,
     );
+
+    // Pin the lane knobs into the manifest so `finalize` carries them.
+    let mut m = read_manifest(&out).unwrap_or_else(|_| stub_manifest(vec![(4, 1)]));
+    m.cap_seed = cap_seed;
+    m.target_usable = target;
+    m.source = Some(source_tag);
+    write_manifest(&out, &m).map_err(|e| format!("update ingest knobs: {e}"))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -573,28 +670,39 @@ fn cmd_fetch(argv: &[String]) -> Result<ExitCode, String> {
     if args.has("help") {
         eprintln!(
             "corpus fetch --source ccrl|lichess --out <dir> [--target-positions N]
-                   [--url <url>] [--lichess-month YYYY-MM]
+                   [--url <url>] [--lichess-month YYYY-MM] [--cap-seed <u64>]
 
-Stream a compressed PGN dump over HTTPS, decompress, apply
-`GameFilter::default()`, and append each accepted game as one CRC-framed
-block in <out>/pgn-shard.bin (the same path/discipline as `ingest-pgn`).
-Robust for unattended runs: in-RAM HTTP Range resume, a games-parsed stall
-watchdog, infinite exponential backoff, and content-validity gates.
+Stream a compressed PGN dump over HTTPS, decompress, run the FULL inline
+pipeline (game-level `GameFilter`, then per-position skip8 ∧ !in_check ∧
+|static_eval| ≤ HIGH_SCORE_CP ∧ is_quiet), then per-lane FEN dedup → per-game
+cap → exact target via the shared LaneCommitter, appending each surviving game
+as one CRC-framed block to <out>/lane.bin. Robust for unattended runs: in-RAM
+HTTP Range resume, a games-parsed stall watchdog, infinite exponential backoff,
+and content-validity gates.
 
 Supported URL extensions: .pgn.zst (streamed), .zip, .7z (downloaded to a
 temp file then parsed locally).
 
---target-positions  Stop after this many NEW positions are appended (default:
-                    unbounded — runs to end-of-stream).
+--target-positions  Stop after this many NEW USABLE positions (post quiet-filter
+                    → dedup → cap) are appended (default: unbounded — runs to
+                    end-of-stream). The committer's exact truncation lands
+                    lane.bin on N exactly.
 --url               Explicit dump URL. Lichess auto-constructs from
                     --lichess-month (default a pinned month) when omitted; CCRL
                     REQUIRES --url to an official CCRL .7z (the count-bearing
-                    filename isn't auto-constructible) — see docs/data-catalog.md."
+                    filename isn't auto-constructible) — see docs/data-catalog.md.
+                    The resolved URL is pinned into the lane manifest's source_url
+                    for byte-re-derivability.
+--cap-seed          Per-game reservoir-cap seed (default 0)."
         );
         return Ok(ExitCode::SUCCESS);
     }
 
-    let source = match args.require("source")? {
+    // Keep the resolved source string verbatim — it is the canonical lane tag
+    // persisted in the manifest and emitted as `fetch --source <tag>` in
+    // re-run.sh (it also selects the game-level filter below).
+    let source_tag = args.require("source")?.to_string();
+    let source = match source_tag.as_str() {
         "ccrl" => Source::Ccrl,
         "lichess" => Source::LichessOpen,
         other => {
@@ -604,7 +712,9 @@ temp file then parsed locally).
         }
     };
     let out = PathBuf::from(args.require("out")?);
+    fs::create_dir_all(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
     let target = args.parse_u64("target-positions", u64::MAX)?;
+    let cap_seed = args.parse_u64("cap-seed", 0)?;
 
     let lichess_month = match args.get("lichess-month") {
         Some(s) => Some(parse_year_month(s)?),
@@ -627,7 +737,10 @@ temp file then parsed locally).
         Source::Ccrl => clawfish::corpus::filter::ccrl_filter(),
         _ => GameFilter::default(),
     };
-    let cfg = FetchConfig::default();
+    let cfg = FetchConfig {
+        cap_seed,
+        ..FetchConfig::default()
+    };
 
     eprintln!("corpus: fetch {source:?} target={target} url={url}");
     let outcome = stream_to_ingest(source, &url, target, &out, &filter, &stop, &cfg)
@@ -640,6 +753,16 @@ temp file then parsed locally).
         outcome.terminated,
         outcome.next_game_id,
     );
+
+    // Pin the resolved source URL + the cap seed + the usable target into the
+    // lane manifest so `finalize` carries them (byte-re-derivability: a fresh
+    // uninterrupted fetch from `source_url` reproduces the lane — plan §1.6).
+    let mut m = read_manifest(&out).unwrap_or_else(|_| stub_manifest(vec![(4, 1)]));
+    m.source_url = Some(url);
+    m.cap_seed = cap_seed;
+    m.target_usable = (target != u64::MAX).then_some(target);
+    m.source = Some(source_tag);
+    write_manifest(&out, &m).map_err(|e| format!("update fetch knobs: {e}"))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -667,291 +790,204 @@ fn cmd_fetch(_argv: &[String]) -> Result<ExitCode, String> {
     )
 }
 
-// ─── build ─────────────────────────────────────────────────────────────────
+// ─── finalize ────────────────────────────────────────────────────────────────
 
-fn cmd_build(argv: &[String]) -> Result<ExitCode, String> {
+fn cmd_finalize(argv: &[String]) -> Result<ExitCode, String> {
     let args = parse_args(argv);
     if args.has("help") {
         eprintln!(
-            "corpus build --in <dir> [--out <dir>] [--val-fraction <f>] \\
-                [--split-seed <u64>] [--max-mem-mb <N>] [--max-spill-gb <N>]
+            "corpus finalize --in <lane-dir>
 
-Re-scan the input shard logs (self-play + PGN), apply the pinned
-filter→quiet→strata pipeline, run dedup→cap→split, and emit the frozen
-corpus to <out>/train.bin + <out>/val.bin + manifest.json + filter_spec.txt
-+ corpus_stats.txt. Default --out = --in."
+Finalize a lane directory: recompute corpus_sha256 over the (already
+build-ready) lane.bin, write/update manifest.json + filter_spec.txt +
+corpus_stats.txt, and write the per-lane re-run.sh. Does NO record
+transformation — the lane was made build-ready inline by selfplay / fetch /
+ingest-pgn (per-lane FEN dedup → per-game cap → exact target). M6.H2 replaces
+the build-era `corpus build` (whose dedup/cap/split transform is now inline)."
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let in_dir = PathBuf::from(args.require("in")?);
-    let out = match args.get("out") {
-        Some(s) => PathBuf::from(s),
-        None => in_dir.clone(),
-    };
-    fs::create_dir_all(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
-    let val_fraction = args.parse_f64("val-fraction", 0.1)?;
-    let split_seed = args.parse_u64("split-seed", 7)?;
-    let max_mem_mb = args.parse_u64("max-mem-mb", 512)?;
-    let max_spill_gb = args.parse_u64("max-spill-gb", 8)?;
-
-    // Load the pre-existing manifest's metadata (depth ladder, self-play
-    // seed) if available — `build` does not overwrite the calibration.
-    let existing_manifest = read_manifest(&in_dir).ok();
-
-    // 1) Read all shards into memory (R6 streaming would chunk this; the
-    //    landing-budget corpus is small enough to fit, and the dedup spill
-    //    handles the rest).
-    let mut all: Vec<CorpusRecord> = Vec::new();
-    for name in ["shard.bin", "pgn-shard.bin"] {
-        let p = in_dir.join(name);
-        if !p.exists() {
-            continue;
-        }
-        let (blocks, _) =
-            scan_valid_blocks(&p).map_err(|e| format!("scan {}: {e}", p.display()))?;
-        for b in blocks {
-            for r in b.records {
-                all.push(r);
-            }
-        }
-    }
-    eprintln!(
-        "corpus: loaded {} records (already quiet-certified by selfplay)",
-        all.len()
-    );
-
-    // The shard contains quiet-certified, strata-tagged records emitted by
-    // selfplay's inline filter (ply ≥ OPENING_SKIP_PLIES ∧ !in_check ∧
-    // |eval| ≤ HIGH_SCORE_CP ∧ quiet predicate, with `strata_for` already
-    // applied). Build only does the cross-game work: dedup → per-game
-    // cap → game-level train/val split. For ingested-PGN records (when
-    // multi-source ingest grows beyond self-play), the build pass should
-    // re-apply per-position filtering — left as a follow-up when an
-    // operator actually runs `ingest-pgn`. The committed self-play-only
-    // path is fully covered by the inline filter.
-    let admitted = all;
-
-    // 3) Dedup → per-game cap → game-level split.
-    let spill_dir = std::env::temp_dir().join("clawfish-corpus-spill");
-    let after_dedup = dedup_fen(admitted.into_iter(), &spill_dir, max_mem_mb, max_spill_gb)
-        .map_err(|e| format!("dedup_fen: {e}"))?;
-    eprintln!("corpus: after dedup_fen = {} records", after_dedup.len());
-    let after_cap = per_game_cap(after_dedup, PER_GAME_CAP, split_seed);
-    eprintln!(
-        "corpus: after per_game_cap(cap={PER_GAME_CAP}) = {} records",
-        after_cap.len()
-    );
-    let split = split_by_game(after_cap, val_fraction, split_seed);
-    let train_n = split.train.len();
-    let val_n = split.val.len();
-    eprintln!("corpus: split → train={train_n} val={val_n}");
-
-    // 4) Emit the frozen shards. Group by game_id so the on-disk frame is
-    //    one block per game (the §3.6 contract). When the val split is
-    //    empty (small corpus + low val_fraction) we still emit a zero-byte
-    //    val.bin so downstream tooling can scan it unconditionally — the
-    //    `scan_valid_blocks` path treats a missing file as empty too.
-    let train_path = out.join("train.bin");
-    let val_path = out.join("val.bin");
-    let _ = fs::remove_file(&train_path);
-    let _ = fs::remove_file(&val_path);
-    emit_records_per_game(&train_path, &split.train)?;
-    emit_records_per_game(&val_path, &split.val)?;
-    if !val_path.exists() {
-        fs::write(&val_path, b"").map_err(|e| format!("create empty val.bin: {e}"))?;
-    }
-    if !train_path.exists() {
-        fs::write(&train_path, b"").map_err(|e| format!("create empty train.bin: {e}"))?;
+    let dir = PathBuf::from(args.require("in")?);
+    let lane = dir.join("lane.bin");
+    if !lane.exists() {
+        return Err(format!(
+            "{}: no lane.bin to finalize — run selfplay / fetch / ingest-pgn first",
+            dir.display()
+        ));
     }
 
-    // 5) Compute the frozen-corpus SHA-256 = sha256(train ‖ val).
-    let mut bytes =
-        fs::read(&train_path).map_err(|e| format!("read {}: {e}", train_path.display()))?;
-    let val_bytes = fs::read(&val_path).map_err(|e| format!("read {}: {e}", val_path.display()))?;
-    bytes.extend_from_slice(&val_bytes);
+    // Recompute the lane digest over lane.bin as-is (no transform). Count usable
+    // positions from the same scan so the manifest's total_positions matches the
+    // bytes the digest covers.
+    let (blocks, _) = scan_valid_blocks(&lane).map_err(|e| format!("scan lane.bin: {e}"))?;
+    let total_positions: u64 = blocks.iter().map(|b| b.records.len() as u64).sum();
+    let bytes = fs::read(&lane).map_err(|e| format!("read {}: {e}", lane.display()))?;
     let corpus_digest = hex_digest(&sha256_bytes(&bytes));
 
-    // 6) Re-emit manifest.json with the post-build totals + digest. Every
-    //    reproducibility knob from `corpus selfplay` (recorded into the
-    //    manifest there) is carried through verbatim so `re-run.sh` reads
-    //    them all from one place.
-    let manifest = Manifest {
-        schema_version: 1,
-        created_at: timestamp(),
-        engine_commit: engine_commit(),
-        total_positions: (train_n + val_n) as u64,
-        validation_fraction: val_fraction,
-        sources: existing_manifest
-            .as_ref()
-            .map(|m| m.sources.clone())
-            .unwrap_or_default(),
-        self_play_seed: existing_manifest
-            .as_ref()
-            .map(|m| m.self_play_seed)
-            .unwrap_or(0),
-        games: existing_manifest.as_ref().map(|m| m.games).unwrap_or(0),
-        max_plies: existing_manifest.as_ref().map(|m| m.max_plies).unwrap_or(0),
-        opening_random_plies: existing_manifest
-            .as_ref()
-            .map(|m| m.opening_random_plies)
-            .unwrap_or(0),
-        workers: existing_manifest.as_ref().map(|m| m.workers).unwrap_or(0),
-        split_seed,
-        val_fraction,
-        depth_ladder: existing_manifest
-            .as_ref()
-            .map(|m| m.depth_ladder.clone())
-            .unwrap_or_else(|| vec![(4, 1)]),
-        opening_book_path: existing_manifest
-            .as_ref()
-            .and_then(|m| m.opening_book_path.clone()),
-        opening_book_sha256: existing_manifest
-            .as_ref()
-            .and_then(|m| m.opening_book_sha256.clone()),
-        opening_mode: existing_manifest
-            .as_ref()
-            .and_then(|m| m.opening_mode.clone()),
-        corpus_sha256: corpus_digest.clone(),
-    };
-    write_manifest(&out, &manifest).map_err(|e| format!("write_manifest: {e}"))?;
-    write_filter_spec(&out).map_err(|e| format!("write_filter_spec: {e}"))?;
+    // Carry every knob from the existing manifest (written by selfplay / fetch /
+    // ingest-pgn). If none exists, start from a stub.
+    let mut m = read_manifest(&dir).unwrap_or_else(|_| stub_manifest(vec![(4, 1)]));
+    m.schema_version = 2;
+    m.created_at = timestamp();
+    m.engine_commit = engine_commit();
+    m.total_positions = total_positions;
+    m.corpus_sha256 = corpus_digest.clone();
+    write_manifest(&dir, &m).map_err(|e| format!("write_manifest: {e}"))?;
+    write_filter_spec(&dir).map_err(|e| format!("write_filter_spec: {e}"))?;
 
     // Stats file — recorded knobs the gate / a reviewer can inspect.
     let mut stats = String::new();
-    stats.push_str(&format!("train_records={train_n}\n"));
-    stats.push_str(&format!("val_records={val_n}\n"));
-    stats.push_str(&format!("val_fraction={val_fraction}\n"));
-    stats.push_str(&format!("split_seed={split_seed}\n"));
+    stats.push_str(&format!("total_positions={total_positions}\n"));
+    stats.push_str(&format!("games={}\n", blocks.len()));
+    stats.push_str(&format!("cap_seed={}\n", m.cap_seed));
+    if let Some(t) = m.target_usable {
+        stats.push_str(&format!("target_usable={t}\n"));
+    }
+    if let Some(url) = &m.source_url {
+        stats.push_str(&format!("source_url={url}\n"));
+    }
     stats.push_str(&format!("corpus_sha256={corpus_digest}\n"));
-    // Per-position filter stats moved to selfplay (inline filter); the
-    // build pass no longer drops records by position-level predicates.
     stats.push_str(&format!("QUIET_MARGIN_CP={QUIET_MARGIN_CP}\n"));
-    atomic_write(&out.join("corpus_stats.txt"), stats.as_bytes())
+    atomic_write(&dir.join("corpus_stats.txt"), stats.as_bytes())
         .map_err(|e| format!("write corpus_stats: {e}"))?;
 
-    // Promote train.bin → shard.bin (the gate's `Layout::discover` reads
-    // `shard.bin` + `val.bin`). `fs::rename` overwrites the existing
-    // shard.bin atomically on POSIX — that is exactly what we want here:
-    // the raw input shard is replaced by the filtered/dedup'd output.
-    let _ = fs::remove_file(out.join("shard.bin"));
-    fs::rename(&train_path, out.join("shard.bin"))
-        .map_err(|e| format!("rename train.bin → shard.bin: {e}"))?;
-
-    // Write the re-run.sh template + its sister scripts (R5 staging).
-    write_rerun_script(&out)?;
+    write_rerun_script(&dir, &m)?;
 
     eprintln!(
-        "corpus: build complete — total={}, sha256={}",
-        train_n + val_n,
-        corpus_digest
+        "corpus: finalize complete — total_positions={total_positions}, games={}, sha256={corpus_digest}",
+        blocks.len()
     );
     Ok(ExitCode::SUCCESS)
 }
 
-fn emit_records_per_game(path: &Path, records: &[CorpusRecord]) -> Result<(), String> {
-    // Group by game_id (BTreeMap iteration is sorted ⇒ deterministic block
-    // order) and sort each game's records by ply. The on-disk shard is then
-    // a pure function of the input multiset, independent of worker
-    // scheduling — `corpus_sha256` reproduces regardless of `--workers`.
-    let mut by_game: BTreeMap<u64, Vec<CorpusRecord>> = BTreeMap::new();
-    for r in records {
-        by_game.entry(r.game_id).or_default().push(r.clone());
-    }
-    for (gid, recs) in &mut by_game {
-        recs.sort_by(|a, b| a.ply.cmp(&b.ply).then_with(|| a.fen.cmp(&b.fen)));
-        append_block(path, *gid, recs).map_err(|e| format!("append_block {gid}: {e}"))?;
-    }
-    Ok(())
-}
-
-fn write_rerun_script(dir: &Path) -> Result<(), String> {
-    let body = r#"#!/usr/bin/env bash
-# bench/corpus/re-run.sh — operator script to re-derive the corpus bytes.
-# Generated by `corpus build`.
+/// Write the per-lane `re-run.sh` (M6.H2). The lane type is read from the
+/// manifest: a non-empty `source_url` ⇒ a FETCH lane (`corpus fetch --url … &&
+/// finalize && quality-gate`); otherwise a SELF-PLAY lane (`corpus selfplay …
+/// --cap-seed … --cap-positions … && finalize && quality-gate`). No `corpus
+/// build` step, no `--val-fraction`/`--split-seed` (the split moved to M6.I).
+fn write_rerun_script(dir: &Path, manifest: &Manifest) -> Result<(), String> {
+    let cap_positions_arg = match manifest.target_usable {
+        Some(t) => format!(" --cap-positions {t}"),
+        None => String::new(),
+    };
+    let body = if let Some(url) = &manifest.source_url {
+        // FETCH lane. The source tag is load-bearing: `cmd_fetch` requires
+        // `--source` (it selects the CCRL-vs-Lichess game filter), and it is
+        // unrecoverable from anything else in the manifest. Fail loudly rather
+        // than emit a broken script.
+        let source = manifest.source.as_deref().ok_or_else(|| {
+            format!(
+                "{}: FETCH lane manifest has source_url but no `source` tag — \
+                 cannot generate a runnable re-run.sh (re-run `corpus fetch` to \
+                 repopulate the manifest)",
+                dir.display()
+            )
+        })?;
+        // Fetch reads `--target-positions` (NOT `--cap-positions`, which it
+        // silently ignores → an unbounded re-fetch). Emit the recorded target.
+        let target_arg = match manifest.target_usable {
+            Some(t) => format!(" --target-positions {t}"),
+            None => String::new(),
+        };
+        format!(
+            r#"#!/usr/bin/env bash
+# re-run.sh — operator script to re-derive this FETCH lane's lane.bin.
+# Generated by `corpus finalize` (M6.H2).
 #
-# Stages:
-#   1) (External) stage raw CCRL/Lichess PGNs into target/corpus-raw/ if any
-#      are listed in manifest.json. Re-derivability is the weaker contract
-#      for those slices (research §1 / plan §1) — re-download then ingest.
-#   2) corpus selfplay  — deterministic given (seed, depth_ladder, binary).
-#   3) corpus ingest-pgn — once per PGN listed in the manifest.
-#   4) corpus build      — apply filter→quiet→dedup→cap→split → frozen bytes.
-#   5) corpus quality-gate — must PASS.
+# A *fresh uninterrupted* fetch from the pinned source_url reproduces lane.bin
+# byte-for-byte (ADR-0036 / plan §1.6). A *resumed* fetch is content/label-
+# equivalent (same FEN+label multiset) but its game_id provenance tags may
+# shift — the pre-existing ADR-0035 §8 "weaker / re-derivable" external-source
+# tier. The re-run.sh checks nothing about upstream drift beyond what the fetch
+# content-validity gates enforce; an upstream URL change is an operator concern.
 #
-# Every reproducibility knob is READ FROM manifest.json — no shell-default
-# substitution for a knob that is pinned in the manifest. The vendored
-# bytes were produced with these exact knobs; re-running with different
-# knobs (different seed, games, workers, val_fraction, ...) produces a
-# DIFFERENT corpus, not the frozen one.
-#
-# Tooling: this re-run script's no-network on-disk staging path (operator
-# extracts archives, then `corpus ingest-pgn`) may use system `zstd`/`7z`.
-# `corpus fetch` itself needs NO system tools — it decompresses .pgn.zst/.zip/.7z
-# in-process via Rust deps (zstd / zip / sevenz-rust2, behind `corpus-fetch`).
+# `corpus fetch` decompresses .pgn.zst/.zip/.7z in-process (zstd / zip /
+# sevenz-rust2, behind the `corpus-fetch` build feature) — no system tools.
 
 set -eu
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-BIN="${CORPUS_BIN:-corpus}"
+BIN="${{CORPUS_BIN:-corpus}}"
+URL="{url}"
 
-# `manifest_field <name>` extracts a JSON number/string value for a top-level
-# scalar field. Trims whitespace, comma, and quote chars. Good enough for the
-# small set of pinned knobs (no nested-object collisions because every
-# matched key is a top-level scalar — `sources`/`depth_ladder` are arrays
-# which we don't read this way).
-manifest_field() {
+echo "corpus re-run (fetch lane): using binary '$BIN' against $DIR; url=$URL"
+
+# (1) Fetch the lane through the full inline pipeline → lane.bin.
+"$BIN" fetch --source {source} --url "$URL" --out "$DIR"{target_arg}
+
+# (2) Finalize: recompute corpus_sha256 + manifest/stats/re-run.sh.
+"$BIN" finalize --in "$DIR"
+
+# (3) Run the data-quality gate (must PASS).
+"$BIN" quality-gate --dir "$DIR"
+"#
+        )
+    } else {
+        // SELF-PLAY lane.
+        format!(
+            r#"#!/usr/bin/env bash
+# re-run.sh — operator script to re-derive this SELF-PLAY lane's lane.bin.
+# Generated by `corpus finalize` (M6.H2).
+#
+# Deterministic given (seed, cap_seed, games, workers, max_plies,
+# opening_random_plies, opening_mode, binary). Every reproducibility knob is
+# READ FROM manifest.json — no shell-default substitution for a pinned knob;
+# re-running with different knobs produces a DIFFERENT lane, not the frozen one.
+
+set -eu
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN="${{CORPUS_BIN:-corpus}}"
+
+# `manifest_field <name>` extracts a top-level JSON scalar (number/string).
+# Trims whitespace, comma, and quote chars.
+manifest_field() {{
     grep -E "\"$1\"" "$DIR/manifest.json" | head -1 | tr -d ' ,"' | cut -d: -f2
-}
+}}
 
 SEED="$(manifest_field self_play_seed)"
 GAMES="$(manifest_field games)"
 MAX_PLIES="$(manifest_field max_plies)"
 OPENING_RANDOM_PLIES="$(manifest_field opening_random_plies)"
 WORKERS="$(manifest_field workers)"
-SPLIT_SEED="$(manifest_field split_seed)"
-VAL_FRACTION="$(manifest_field val_fraction)"
+CAP_SEED="$(manifest_field cap_seed)"
 OPENING_BOOK="$(manifest_field opening_book_path)"
 OPENING_MODE="$(manifest_field opening_mode)"
 
-# Default to `random` when the manifest does not pin a mode — older
-# manifests pre-date the on-book / off-book taxonomy and only ever ran
-# the random regime.
+# Default to `random` when the manifest does not pin a mode.
 if [ -z "$OPENING_MODE" ]; then
     OPENING_MODE=random
 fi
 
-echo "corpus re-run: using binary '$BIN' against $DIR"
+echo "corpus re-run (self-play lane): using binary '$BIN' against $DIR"
 echo "corpus re-run: seed=$SEED games=$GAMES workers=$WORKERS \
 max_plies=$MAX_PLIES opening_random_plies=$OPENING_RANDOM_PLIES \
-split_seed=$SPLIT_SEED val_fraction=$VAL_FRACTION \
-opening_mode=$OPENING_MODE opening_book=${OPENING_BOOK:-<none>}"
+cap_seed=$CAP_SEED opening_mode=$OPENING_MODE opening_book=${{OPENING_BOOK:-<none>}}"
 
-# (1) external staging: read manifest.sources and re-download each.
-# (Left as an operator step — the manifest pins URLs + SHA-256.)
-
-# (2) self-play. The manifest's opening_mode pins which regime — book
-#     campaigns require an opening book; random campaigns ignore it.
+# (1) self-play through the full inline pipeline → lane.bin. The manifest's
+#     opening_mode pins which regime — book campaigns require an opening book.
 if [ "$OPENING_MODE" = "book" ]; then
     "$BIN" selfplay --seed "$SEED" --games "$GAMES" --workers "$WORKERS" \
         --max-plies "$MAX_PLIES" --opening-random-plies "$OPENING_RANDOM_PLIES" \
-        --val-fraction "$VAL_FRACTION" \
+        --cap-seed "$CAP_SEED"{cap_positions_arg} \
         --opening-mode book --opening-book "$OPENING_BOOK" \
         --out "$DIR"
 else
     "$BIN" selfplay --seed "$SEED" --games "$GAMES" --workers "$WORKERS" \
         --max-plies "$MAX_PLIES" --opening-random-plies "$OPENING_RANDOM_PLIES" \
-        --val-fraction "$VAL_FRACTION" \
+        --cap-seed "$CAP_SEED"{cap_positions_arg} \
         --opening-mode random \
         --out "$DIR"
 fi
 
-# (3) Each PGN source: corpus ingest-pgn …
-# (4) Build the frozen corpus.
-"$BIN" build --in "$DIR" --split-seed "$SPLIT_SEED" --val-fraction "$VAL_FRACTION"
+# (2) Finalize: recompute corpus_sha256 + manifest/stats/re-run.sh.
+"$BIN" finalize --in "$DIR"
 
-# (5) Run the data-quality gate (must PASS).
+# (3) Run the data-quality gate (must PASS).
 "$BIN" quality-gate --dir "$DIR"
-"#;
+"#
+        )
+    };
     let path = dir.join("re-run.sh");
     fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
     // Mark executable on Unix.
@@ -1013,8 +1049,9 @@ fn cmd_quality_gate(argv: &[String]) -> Result<ExitCode, String> {
         eprintln!(
             "corpus quality-gate --dir <dir>
 
-Run the six data-quality checks against the frozen corpus at <dir>.
-Exit 0 iff the gate passes (the three must-PASS checks all PASSed)."
+Run the five data-quality checks against the frozen lane at <dir>.
+Exit 0 iff the gate passes (the three must-PASS checks — ADR-0003
+audit, reproducibility re-run, per-lane dedup integrity — all PASSed)."
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -1048,10 +1085,10 @@ fn cmd_export(argv: &[String]) -> Result<ExitCode, String> {
         eprintln!(
             "corpus export --in <dir>
 
-Convert the on-disk binary shard log to TSV on stdout. Columns:
+Convert the lane's flat lane.bin to TSV on stdout. Columns:
 fen\\tlabel\\tsource\\tgame_id\\tply\\tdepth_rung\\tstrata.
 
-Reads <dir>/shard.bin + <dir>/val.bin + <dir>/pgn-shard.bin if present."
+Reads <dir>/lane.bin."
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -1061,11 +1098,8 @@ Reads <dir>/shard.bin + <dir>/val.bin + <dir>/pgn-shard.bin if present."
     writeln!(out, "fen\tlabel\tsource\tgame_id\tply\tdepth_rung\tstrata")
         .map_err(|e| format!("write tsv header: {e}"))?;
     let mut total = 0u64;
-    for name in ["shard.bin", "val.bin", "pgn-shard.bin"] {
-        let p = in_dir.join(name);
-        if !p.exists() {
-            continue;
-        }
+    let p = in_dir.join("lane.bin");
+    if p.exists() {
         let (blocks, _) =
             scan_valid_blocks(&p).map_err(|e| format!("scan {}: {e}", p.display()))?;
         for b in blocks {
@@ -1121,10 +1155,10 @@ fn cmd_rerun(argv: &[String]) -> Result<ExitCode, String> {
         eprintln!(
             "corpus rerun --manifest <path>
 
-Convenience wrapper: re-execute the stage→build→quality-gate flow
-documented in `bench/corpus/re-run.sh`. The vendored script is the
-operator-facing artifact; this subcommand simply prints a pointer
-to that script so a re-run is always traceable to a committed file."
+Convenience wrapper: re-execute the generate→finalize→quality-gate flow
+documented in the lane dir's `re-run.sh`. The script is the operator-facing
+artifact; this subcommand simply prints a pointer to it so a re-run is always
+traceable to a committed file."
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -1144,7 +1178,7 @@ to that script so a re-run is always traceable to a committed file."
         Ok(ExitCode::SUCCESS)
     } else {
         Err(format!(
-            "no re-run.sh found next to {}; re-run `corpus build` to regenerate",
+            "no re-run.sh found next to {}; re-run `corpus finalize` to regenerate",
             p.display()
         ))
     }
@@ -1158,14 +1192,14 @@ fn cmd_truncate(argv: &[String]) -> Result<ExitCode, String> {
         eprintln!(
             "corpus truncate --out <dir> --cap-positions <N>
 
-Truncate `shard.bin` and `val.bin` in <dir> to exactly N positions
-(or as close as the block sizes allow). The largest game_id prefix
-whose total position count is ≤ N is kept whole; if N falls
-mid-game, the boundary game's block is re-encoded with only the
-first (N − cumulative) records and appended in place. The resulting
-corpus has exactly N positions (or, on an edge case where the cap
-lands precisely on a game boundary, exactly N positions with no
-partial game). All retained blocks remain CRC-framed and decodable.
+Truncate `lane.bin` in <dir> to exactly N positions (or as close as the
+block sizes allow). The largest game_id prefix whose total position
+count is ≤ N is kept whole; if N falls mid-game, the boundary game's
+block is re-encoded with only the first (N − cumulative) records and
+appended in place. The resulting lane has exactly N positions (or, on an
+edge case where the cap lands precisely on a game boundary, exactly N
+positions with no partial game). All retained blocks remain CRC-framed
+and decodable.
 
 `pending/` is left untouched (the operator typically `rm -rf`s it
 before truncating to ensure no in-flight games persist into the
@@ -1179,93 +1213,53 @@ truncated artifact)."
         return Err("--cap-positions must be > 0".into());
     }
 
-    // Collect game blocks from both shard.bin and val.bin, sort by
-    // game_id, find the largest whole-game prefix whose position count ≤
-    // cap, and (if cap falls mid-game) re-encode the boundary block with
-    // only the leading (cap − cumulative) records. Both files are
-    // append-only CRC-framed per game; we truncate at the boundary then
-    // append the partial block, if any.
-    let shard_path = out.join("shard.bin");
-    let val_path = out.join("val.bin");
-    // Scan-with-offsets: end-of-block byte position is taken directly from
-    // the scan, not reconstructed by re-encoding (the encoder is
-    // deterministic and round-trips perfectly, but using the scan offsets
-    // directly avoids any test-coverage gap on the round-trip and matches
-    // the truncate's "truncate at on-disk boundary" contract literally).
-    let (shard_blocks_off, shard_valid_len) =
-        clawfish::corpus::store::scan_valid_blocks_with_offsets(&shard_path)
-            .map_err(|e| format!("scan shard.bin: {e}"))?;
-    let (val_blocks_off, val_valid_len) =
-        clawfish::corpus::store::scan_valid_blocks_with_offsets(&val_path)
-            .map_err(|e| format!("scan val.bin: {e}"))?;
-    // Borrow the blocks separately (without consuming the offsets) so the
-    // boundary partial-game re-encode below can access block.records.
-    let shard_blocks: Vec<&GameBlock> = shard_blocks_off.iter().map(|(b, _)| b).collect();
-    let val_blocks: Vec<&GameBlock> = val_blocks_off.iter().map(|(b, _)| b).collect();
-    let shard_end_offsets: Vec<u64> = shard_blocks_off.iter().map(|(_, o)| *o).collect();
-    let val_end_offsets: Vec<u64> = val_blocks_off.iter().map(|(_, o)| *o).collect();
+    // Scan lane.bin's game blocks (in game_id order), find the largest
+    // whole-game prefix whose position count ≤ cap, and (if cap falls mid-game)
+    // re-encode the boundary block with only the leading (cap − cumulative)
+    // records. The file is append-only CRC-framed per game; we truncate at the
+    // boundary then append the partial block, if any.
+    let lane_path = out.join("lane.bin");
+    // Scan-with-offsets: end-of-block byte position is taken directly from the
+    // scan, not reconstructed by re-encoding — matching the truncate's
+    // "truncate at on-disk boundary" contract literally.
+    let (blocks_off, valid_len) =
+        clawfish::corpus::store::scan_valid_blocks_with_offsets(&lane_path)
+            .map_err(|e| format!("scan lane.bin: {e}"))?;
+    let blocks: Vec<&GameBlock> = blocks_off.iter().map(|(b, _)| b).collect();
+    let end_offsets: Vec<u64> = blocks_off.iter().map(|(_, o)| *o).collect();
 
-    // Build (game_id, file_tag, idx_into_file_blocks, position_count)
-    // records. idx is the position of the block within its file's
-    // shard_blocks/val_blocks; used for the boundary block's records
-    // vector and for the on-disk end-offset lookup.
-    #[derive(Clone, Copy)]
-    enum FileTag {
-        Shard,
-        Val,
-    }
-    let mut tagged: Vec<(u64, FileTag, usize, u64)> = Vec::new();
-    for (i, b) in shard_blocks.iter().enumerate() {
-        tagged.push((b.game_id, FileTag::Shard, i, b.records.len() as u64));
-    }
-    for (i, b) in val_blocks.iter().enumerate() {
-        tagged.push((b.game_id, FileTag::Val, i, b.records.len() as u64));
-    }
-    tagged.sort_by_key(|t| t.0);
-
-    let total_positions_before: u64 = tagged.iter().map(|t| t.3).sum();
+    let total_positions_before: u64 = blocks.iter().map(|b| b.records.len() as u64).sum();
     eprintln!(
-        "corpus: before truncate: shard.bin={} bytes ({} games), val.bin={} bytes ({} games), \
-         total positions={}",
-        shard_valid_len,
-        shard_blocks.len(),
-        val_valid_len,
-        val_blocks.len(),
+        "corpus: before truncate: lane.bin={} bytes ({} games), total positions={}",
+        valid_len,
+        blocks.len(),
         total_positions_before
     );
 
-    // Walk blocks in sorted game_id order. For each block:
-    //   - if cum + n_positions ≤ cap: keep whole block; advance the
-    //     respective file's keep_until offset to this block's end.
-    //   - else: this is the boundary block. Stop the walk; remember its
-    //     (file, idx, room = cap − cum) so we can re-encode the partial.
+    // Walk blocks in (scan = game_id) order. For each block:
+    //   - if cum + n_positions ≤ cap: keep whole block; advance keep_until.
+    //   - else: this is the boundary block. Stop; remember its (idx, room =
+    //     cap − cum) so we can re-encode the partial.
     let mut cum: u64 = 0;
-    let mut shard_keep_until: u64 = 0;
-    let mut val_keep_until: u64 = 0;
+    let mut keep_until: u64 = 0;
     let mut games_kept: u64 = 0;
-    let mut partial: Option<(FileTag, usize, u64)> = None; // (file, block_idx, room)
-    for (_game_id, tag, idx, n_positions) in &tagged {
-        let next = cum + *n_positions;
+    let mut partial: Option<(usize, u64)> = None; // (block_idx, room)
+    for (idx, b) in blocks.iter().enumerate() {
+        let n_positions = b.records.len() as u64;
+        let next = cum + n_positions;
         if next > cap {
             let room = cap - cum;
             if room > 0 {
-                partial = Some((*tag, *idx, room));
+                partial = Some((idx, room));
             }
             break;
         }
         cum = next;
         games_kept += 1;
-        let end_off = match tag {
-            FileTag::Shard => shard_end_offsets[*idx],
-            FileTag::Val => val_end_offsets[*idx],
-        };
-        match tag {
-            FileTag::Shard => shard_keep_until = end_off,
-            FileTag::Val => val_keep_until = end_off,
-        }
+        keep_until = end_offsets[idx];
     }
 
-    let partial_positions = partial.as_ref().map(|p| p.2).unwrap_or(0);
+    let partial_positions = partial.as_ref().map(|p| p.1).unwrap_or(0);
     eprintln!(
         "corpus: truncate target: keep {} whole games + {} partial-game records = {} positions (cap {})",
         games_kept,
@@ -1274,44 +1268,31 @@ truncated artifact)."
         cap
     );
 
-    // Whole-game truncation first. If a file isn't getting a partial
-    // appended below, we set its length to keep_until directly.
-    let truncate_file =
-        |path: &Path, current_len: u64, new_len: u64, label: &str| -> Result<(), String> {
-            if new_len < current_len {
-                let f = fs::OpenOptions::new()
-                    .write(true)
-                    .open(path)
-                    .map_err(|e| format!("open {label}: {e}"))?;
-                f.set_len(new_len)
-                    .map_err(|e| format!("truncate {label}: {e}"))?;
-                f.sync_all().map_err(|e| format!("fsync {label}: {e}"))?;
-                eprintln!(
-                    "corpus: {label} truncated {} → {} bytes",
-                    current_len, new_len
-                );
-            }
-            Ok(())
-        };
-    truncate_file(&shard_path, shard_valid_len, shard_keep_until, "shard.bin")?;
-    truncate_file(&val_path, val_valid_len, val_keep_until, "val.bin")?;
+    // Whole-game truncation: set the file length to keep_until directly.
+    if keep_until < valid_len {
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(&lane_path)
+            .map_err(|e| format!("open lane.bin: {e}"))?;
+        f.set_len(keep_until)
+            .map_err(|e| format!("truncate lane.bin: {e}"))?;
+        f.sync_all().map_err(|e| format!("fsync lane.bin: {e}"))?;
+        eprintln!("corpus: lane.bin truncated {valid_len} → {keep_until} bytes");
+    }
 
-    // Partial-game block: re-encode boundary block with first `room`
-    // records and append to its file. The block's game_id is preserved
-    // (so the dispatcher's gap-list logic sees it as already-played and
-    // doesn't re-dispatch it on resume).
-    if let Some((tag, idx, room)) = partial {
-        let (boundary_block, dest_path, label) = match tag {
-            FileTag::Shard => (&shard_blocks[idx], &shard_path, "shard.bin"),
-            FileTag::Val => (&val_blocks[idx], &val_path, "val.bin"),
-        };
+    // Partial-game block: re-encode the boundary block with the first `room`
+    // records and append. The block's game_id is preserved (so the
+    // dispatcher's gap-list logic sees it as already-played and doesn't
+    // re-dispatch it on resume).
+    if let Some((idx, room)) = partial {
+        let boundary_block = &blocks[idx];
         let mut records = boundary_block.records.clone();
         records.truncate(room as usize);
         let partial_bytes = clawfish::corpus::store::encode_block(boundary_block.game_id, &records);
-        clawfish::corpus::store::append_raw_bytes(dest_path, &partial_bytes)
-            .map_err(|e| format!("append partial block to {label}: {e}"))?;
+        clawfish::corpus::store::append_raw_bytes(&lane_path, &partial_bytes)
+            .map_err(|e| format!("append partial block to lane.bin: {e}"))?;
         eprintln!(
-            "corpus: {label} partial-game appended: game_id={} kept {}/{} records, {} bytes",
+            "corpus: lane.bin partial-game appended: game_id={} kept {}/{} records, {} bytes",
             boundary_block.game_id,
             room,
             boundary_block.records.len(),
@@ -1319,14 +1300,14 @@ truncated artifact)."
         );
     }
 
-    // Reset the checkpoint so a future selfplay run resumes coherently
-    // with the truncated state (next_consume_id matches what survived).
-    // We delete it; the resume protocol will fall back to "scan shard +
-    // val, derive next_consume_id from max committed_id + 1".
+    // Reset the checkpoint so a future selfplay run resumes coherently with
+    // the truncated state (next_consume_id matches what survived). We delete
+    // it; the resume protocol falls back to "scan lane.bin, derive
+    // next_consume_id from max committed_id + 1".
     let ckpt = out.join("checkpoint.bin");
     if ckpt.exists() {
         let _ = fs::remove_file(&ckpt);
-        eprintln!("corpus: checkpoint.bin removed (resume will rebuild from shards)");
+        eprintln!("corpus: checkpoint.bin removed (resume will rebuild from lane.bin)");
     }
 
     Ok(ExitCode::SUCCESS)
@@ -1380,34 +1361,156 @@ mod tests {
     }
 
     #[test]
-    fn max_existing_game_id_picks_max_across_both_shards() {
-        // Self-play shard.bin has game_ids up to 42; pgn-shard.bin has
-        // game_ids up to 100. `max_existing_game_id` must return 100, so a
-        // subsequent `ingest-pgn` starts at 101 (no collision with the
-        // prior PGN ingest's range).
-        let td = TempDir::new("both-shards");
+    fn max_existing_game_id_picks_max_in_lane() {
+        // M6.H2: each lane lives in its own dir, so its game_id space is
+        // private — `max_existing_game_id` scans only this lane's lane.bin.
+        // A subsequent `ingest-pgn` into the SAME dir starts at max+1 (no
+        // collision with already-committed games).
+        let td = TempDir::new("lane");
         for gid in [10u64, 25, 42] {
-            append_block(&td.path().join("shard.bin"), gid, &[rec(gid, 0)]).unwrap();
-        }
-        for gid in [50u64, 75, 100] {
-            append_block(&td.path().join("pgn-shard.bin"), gid, &[rec(gid, 0)]).unwrap();
+            append_block(&td.path().join("lane.bin"), gid, &[rec(gid, 0)]).unwrap();
         }
         assert_eq!(
             max_existing_game_id(td.path()),
-            100,
-            "must scan pgn-shard.bin too — a 2nd ingest-pgn collides without this"
+            42,
+            "max game_id in lane.bin; a follow-on ingest reserves 43+"
         );
     }
 
     #[test]
-    fn cmd_ingest_pgn_base_id_includes_existing_pgn_shard() {
-        // Only pgn-shard.bin exists; max_existing_game_id reports the
-        // max from THERE (this is the case the bug-fix targets — a 2nd
-        // `ingest-pgn` invocation would re-use base_id 0 without this).
-        let td = TempDir::new("pgn-only");
+    fn cmd_ingest_pgn_base_id_reserves_above_lane_max() {
+        // A prior generator left games up to id 19 in lane.bin; a 2nd
+        // `ingest-pgn` into the same dir must start strictly above (base 20).
+        let td = TempDir::new("ingest-base");
         for gid in [3u64, 7, 19] {
-            append_block(&td.path().join("pgn-shard.bin"), gid, &[rec(gid, 0)]).unwrap();
+            append_block(&td.path().join("lane.bin"), gid, &[rec(gid, 0)]).unwrap();
         }
         assert_eq!(max_existing_game_id(td.path()), 19);
+    }
+
+    // ── re-run.sh generation ─────────────────────────────────────────────
+
+    /// A bare manifest with overridable lane-type fields for re-run.sh tests.
+    fn rerun_manifest() -> Manifest {
+        Manifest {
+            schema_version: 2,
+            created_at: "2026-05-22T00:00:00Z".into(),
+            engine_commit: "test".into(),
+            total_positions: 0,
+            sources: Vec::new(),
+            self_play_seed: 1,
+            games: 0,
+            max_plies: 400,
+            opening_random_plies: 8,
+            workers: 1,
+            cap_seed: 7,
+            source_url: None,
+            target_usable: None,
+            source: None,
+            depth_ladder: vec![(4, 1)],
+            opening_book_path: None,
+            opening_book_sha256: None,
+            opening_mode: None,
+            corpus_sha256: "deadbeef".into(),
+        }
+    }
+
+    #[test]
+    fn rerun_script_fetch_lane_emits_source_url_and_target_positions() {
+        // A FETCH lane's re-run.sh must invoke `corpus fetch` with the flags
+        // `cmd_fetch` actually reads: `--source` (required, selects the game
+        // filter), `--url`, `--target-positions` (NOT `--cap-positions`, which
+        // fetch silently ignores → an unbounded re-fetch), and `--out`.
+        let td = TempDir::new("rerun-fetch");
+        let mut m = rerun_manifest();
+        m.source_url = Some("https://ccrl.example/games.pgn.7z".into());
+        m.source = Some("ccrl".into());
+        m.target_usable = Some(2_000_000);
+
+        write_rerun_script(td.path(), &m).unwrap();
+        let script = std::fs::read_to_string(td.path().join("re-run.sh")).unwrap();
+
+        // Required fetch flags present.
+        assert!(
+            script.contains("--source ccrl"),
+            "fetch re-run.sh must pass --source (cmd_fetch requires it):\n{script}"
+        );
+        assert!(
+            script.contains("--url"),
+            "fetch re-run.sh must pass --url:\n{script}"
+        );
+        assert!(
+            script.contains("--target-positions 2000000"),
+            "fetch re-run.sh must pass --target-positions (the flag cmd_fetch reads):\n{script}"
+        );
+        assert!(
+            script.contains("--out"),
+            "fetch re-run.sh must pass --out:\n{script}"
+        );
+        // The wrong flag (cap-positions) is silently ignored by cmd_fetch and
+        // would run an UNBOUNDED re-fetch — it must NOT appear in a fetch lane.
+        assert!(
+            !script.contains("--cap-positions"),
+            "fetch re-run.sh must NOT use --cap-positions (cmd_fetch ignores it):\n{script}"
+        );
+
+        // Stronger check: the emitted `fetch` argv satisfies cmd_fetch's
+        // required flags (source + url + out all present on the fetch line).
+        let fetch_line = script
+            .lines()
+            .find(|l| l.contains("fetch --"))
+            .expect("re-run.sh has a `corpus fetch` line");
+        assert!(fetch_line.contains("--source"));
+        assert!(fetch_line.contains("--url"));
+        assert!(fetch_line.contains("--out"));
+    }
+
+    #[test]
+    fn rerun_script_fetch_lane_without_source_fails_loudly() {
+        // A FETCH lane (source_url set) but no `source` tag is unrecoverable —
+        // cmd_fetch requires --source. write_rerun_script must error, not emit
+        // a broken script that re-fetches without --source.
+        let td = TempDir::new("rerun-fetch-no-source");
+        let mut m = rerun_manifest();
+        m.source_url = Some("https://ccrl.example/games.pgn.7z".into());
+        m.source = None;
+        m.target_usable = Some(100);
+
+        let err = write_rerun_script(td.path(), &m)
+            .expect_err("missing source on a fetch lane must fail loudly");
+        assert!(err.contains("source"), "error must mention source: {err}");
+        assert!(
+            !td.path().join("re-run.sh").exists(),
+            "no script must be written when source is missing"
+        );
+    }
+
+    #[test]
+    fn rerun_script_selfplay_lane_emits_cap_positions_and_cap_seed() {
+        // A SELF-PLAY lane (no source_url) must use `--cap-positions` (the flag
+        // cmd_selfplay reads) and carry `--cap-seed`.
+        let td = TempDir::new("rerun-selfplay");
+        let mut m = rerun_manifest();
+        m.source_url = None;
+        m.source = Some("selfplay-off-book".into());
+        m.opening_mode = Some("random".into());
+        m.target_usable = Some(500_000);
+
+        write_rerun_script(td.path(), &m).unwrap();
+        let script = std::fs::read_to_string(td.path().join("re-run.sh")).unwrap();
+
+        assert!(
+            script.contains("--cap-positions 500000"),
+            "self-play re-run.sh must pass --cap-positions (cmd_selfplay reads it):\n{script}"
+        );
+        assert!(
+            script.contains("--cap-seed"),
+            "self-play re-run.sh must pass --cap-seed:\n{script}"
+        );
+        // A self-play lane never uses fetch's --target-positions flag.
+        assert!(
+            !script.contains("--target-positions"),
+            "self-play re-run.sh must NOT use --target-positions:\n{script}"
+        );
     }
 }

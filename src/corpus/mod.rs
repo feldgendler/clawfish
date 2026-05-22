@@ -1,19 +1,27 @@
-//! M6.G — reusable game-result-labeled quiet-position corpus.
+//! M6.G/M6.H2 — reusable game-result-labeled quiet-position corpus lanes.
 //!
 //! Data-infrastructure module: PGN ingestion + deterministic self-play
-//! generation + filtering + dedup + game-level train/val split + the
-//! stratified selection objective + a data-quality gate. No `evaluate` /
-//! `Position` / search **behavior** change (the only engine-crate touch is
-//! the additive, behavior-neutral `search::quiescence_eval_white` seam) —
-//! so no bench, no SPRT, no Elo claim. The gate is data-quality checks.
+//! generation + the per-lane inline pipeline (filter → quiet → strata →
+//! per-lane FEN dedup → per-game cap → exact target) + the stratified
+//! selection objective + a data-quality gate. No `evaluate` / `Position` /
+//! search **behavior** change (the only engine-crate touch is the additive,
+//! behavior-neutral `search::quiescence_eval_white` seam) — so no bench, no
+//! SPRT, no Elo claim. The gate is data-quality checks.
 //!
-//! Consumed by M6.I (Texel tuning), the tuning-backlog "PST co-tuning"
+//! **M6.H2 — flat independent lanes (ADR-0035 §12):** the four lanes
+//! (`SelfPlayOnBook`, `SelfPlayOffBook`, `Ccrl`, `LichessOpen`) are each an
+//! independent generator producing one flat `lane.bin` of build-ready labelled
+//! positions. There is NO train/val split at generation (→ M6.I) and NO
+//! cross-lane dedup (the same FEN may appear in up to four lanes, possibly with
+//! conflicting labels — accepted; the M6.I mixer reconciles).
+//!
+//! Consumed by M6.I (Texel tuning — reads four flat lane dirs and owns the
+//! inter-lane mix AND the train/val split), the tuning-backlog "PST co-tuning"
 //! Arm B, future SPSA campaigns, and M10 NNUE data-prep. See
-//! `docs/plans/m6.g.md`, `docs/research/m6-corpus-construction.md`,
-//! and ADR-0035.
+//! `docs/plans/m6.h2-corpus-lanes.md`, `docs/plans/m6.g.md`,
+//! `docs/research/m6-corpus-construction.md`, and ADR-0035.
 
 pub mod consumer;
-pub mod dedup;
 pub mod dispatcher;
 /// M6.H on-demand network fetcher (CCRL/Lichess). Gated behind the non-default
 /// `corpus-fetch` Cargo feature so the engine binary never links the HTTP /
@@ -27,25 +35,42 @@ pub mod objective;
 pub mod openings;
 pub mod pending;
 pub mod pgn;
+/// M6.H2 shared per-lane commit primitive (`LaneCommitter`): per-lane FEN
+/// dedup (first-seen-wins, no cross-lane dedup) → per-game reservoir cap →
+/// exact target truncation → CRC-block append. Both fetch and self-play route
+/// their commit through it so the two ingestion paths cannot diverge. See
+/// `docs/plans/m6.h2-corpus-lanes.md` §1.3.
+pub mod pipeline;
 pub mod prng;
 pub mod quality_gate;
 pub mod quiet;
 pub mod selfplay;
-pub mod split;
 pub mod store;
 
 use std::fmt;
 
 // ---------------------------------------------------------------------------
-// Pinned M6.G↔M6.I interface contract.
+// Pinned M6.G/M6.H2 ↔ M6.I interface contract.
 //
-// These constants ARE the interface: the corpus is built against them and
-// M6.I must read the same values from `filter_spec.txt`. Changing one is a
-// contract break, not a tweak. Provenance: research §11 (recommended
-// predicate) — `!in_check ∧ |static_eval − qsearch| < QUIET_MARGIN_CP`,
-// opening-ply skip, |eval| cutoff, per-game cap. Predicate B was chosen
-// precisely so static_eval ≈ qsearch within the margin, which is what lets
-// M6.I tune on `static_eval_white` directly (no qsearch at tune time).
+// These constants ARE the interface: each lane is built against them and M6.I
+// must read the same values from `filter_spec.txt`. Changing one is a contract
+// break, not a tweak. Provenance: research §11 (recommended predicate) —
+// `!in_check ∧ |static_eval − qsearch| < QUIET_MARGIN_CP`, opening-ply skip,
+// |eval| cutoff, per-game cap. Predicate B was chosen precisely so
+// static_eval ≈ qsearch within the margin, which is what lets M6.I tune on
+// `static_eval_white` directly (no qsearch at tune time).
+//
+// **M6.H2 contract (ADR-0035 §12):** each of the four lanes is a FLAT,
+// build-ready `lane.bin` produced by an independent generator that applies the
+// full inline pipeline (filter → quiet → strata → per-lane FEN dedup → per-game
+// cap → exact target). What M6.H2 hands M6.I:
+//   - FOUR flat lane dirs (`SelfPlayOnBook` / `SelfPlayOffBook` / `Ccrl` /
+//     `LichessOpen`), each one `lane.bin`. No train/val split at generation.
+//   - Per-lane FEN dedup only (first-seen-WITHIN-the-lane). There is NO
+//     cross-lane dedup: the same FEN may appear in up to four lanes, possibly
+//     with CONFLICTING labels — explicitly accepted.
+// M6.I owns the inter-lane MIX (per-source reweighting) AND the train/val
+// split (the conflicting-label reconciliation is the mixer's problem).
 // ---------------------------------------------------------------------------
 
 /// A position is non-quiet if `|static_eval − qsearch| ≥` this (centipawns).
@@ -186,10 +211,11 @@ pub const STRATUM_ENDGAME: u8 = 1 << 1;
 
 /// One labeled quiet position. `fen` is the canonical `Position::to_fen()`.
 /// `label` is the ORIGINAL game outcome (never an engine score). `game_id`
-/// is the game-level split key. `ply` is the 0-indexed half-move count from
-/// the game start (opening-skip + the dedup tie-break key). `depth_rung` is
-/// the R-TC self-play stratum (`DEPTH_RUNG_EXTERNAL` for PGN sources).
-/// `strata` is the frozen blind-spot bitset.
+/// is the per-lane arrival-order key (per-game cap reservoir sub-stream + the
+/// M6.I split key). `ply` is the 0-indexed half-move count from the game start
+/// (opening-skip + within-game arrival order). `depth_rung` is the R-TC
+/// self-play stratum (`DEPTH_RUNG_EXTERNAL` for PGN sources). `strata` is the
+/// frozen blind-spot bitset.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CorpusRecord {
     /// Canonical `Position::to_fen()`.
@@ -198,24 +224,16 @@ pub struct CorpusRecord {
     pub label: Label,
     /// Provenance (ADR-0003 audit input).
     pub source: Source,
-    /// Game-level train/val split key.
+    /// Per-lane arrival-order key (per-game reservoir-cap sub-stream + M6.I
+    /// split key).
     pub game_id: u64,
-    /// 0-indexed half-move count from game start (opening-skip + dedup tie-break).
+    /// 0-indexed half-move count from game start (opening-skip + within-game
+    /// arrival order for per-lane first-seen dedup).
     pub ply: u32,
     /// R-TC self-play depth stratum (`DEPTH_RUNG_EXTERNAL` for PGN sources).
     pub depth_rung: u8,
     /// Frozen blind-spot stratum bitset (`STRATUM_*`).
     pub strata: u8,
-}
-
-impl CorpusRecord {
-    /// Deterministic dedup tie-break key: among exact-FEN duplicates the
-    /// lexicographically-smallest `(source, game_id, ply)` survives — a
-    /// function of the input *multiset*, independent of shard/merge order
-    /// (the reproducibility-gate prerequisite).
-    pub fn dedup_key(&self) -> (u8, u64, u32) {
-        (self.source.as_u8(), self.game_id, self.ply)
-    }
 }
 
 /// Crate-wide corpus error.
@@ -311,22 +329,5 @@ mod tests {
         assert_eq!(DEPTH_RUNG_EXTERNAL, 0xFF);
         assert_eq!(STRATUM_OUTPOST, 1);
         assert_eq!(STRATUM_ENDGAME, 2);
-    }
-
-    #[test]
-    fn dedup_key_orders_by_source_then_game_then_ply() {
-        let r = |src, g, p| CorpusRecord {
-            fen: "x".into(),
-            label: Label::Draw,
-            source: src,
-            game_id: g,
-            ply: p,
-            depth_rung: DEPTH_RUNG_EXTERNAL,
-            strata: 0,
-        };
-        assert!(r(Source::SelfPlayOnBook, 5, 9).dedup_key() < r(Source::Ccrl, 0, 0).dedup_key());
-        assert!(r(Source::SelfPlayOffBook, 5, 9).dedup_key() < r(Source::Ccrl, 0, 0).dedup_key());
-        assert!(r(Source::Ccrl, 2, 9).dedup_key() < r(Source::Ccrl, 3, 0).dedup_key());
-        assert!(r(Source::Ccrl, 2, 4).dedup_key() < r(Source::Ccrl, 2, 5).dedup_key());
     }
 }

@@ -55,7 +55,7 @@ fn spawn_selfplay(out: &Path, seed: u64, games: u64, workers: usize, max_plies: 
         .args(["--workers", &workers.to_string()])
         .args(["--out", &out.display().to_string()])
         .args(["--max-plies", &max_plies.to_string()])
-        .args(["--split-seed", "7"])
+        .args(["--cap-seed", "7"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -63,27 +63,27 @@ fn spawn_selfplay(out: &Path, seed: u64, games: u64, workers: usize, max_plies: 
         .expect("spawn corpus selfplay")
 }
 
-/// Wait until the shard contains at least `min_games` durable game blocks.
+/// Wait until the lane contains at least `min_games` durable game blocks.
 ///
 /// Polls indefinitely — there is no wall-clock deadline. Terminates only when
 /// one of two events occurs:
-///   1. The shard reaches `min_games` blocks (success — returns the count).
+///   1. The lane reaches `min_games` blocks (success — returns the count).
 ///   2. The child process exits before reaching `min_games` (failure — panics
 ///      with diagnostics).
 ///
 /// This makes the test hardware-independent: a slow CI runner just takes
 /// longer to reach the target, and we never confuse "runner slow" with
 /// "binary broken" the way a fixed `Duration` deadline did.
-fn wait_for_blocks(shard: &Path, child: &mut Child, min_games: usize) -> usize {
+fn wait_for_blocks(lane: &Path, child: &mut Child, min_games: usize) -> usize {
     loop {
-        if let Ok((blocks, _)) = scan_valid_blocks(shard)
+        if let Ok((blocks, _)) = scan_valid_blocks(lane)
             && blocks.len() >= min_games
         {
             return blocks.len();
         }
         // Child died before producing the expected blocks — real failure.
         if let Some(status) = child.try_wait().expect("try_wait on selfplay child") {
-            let count = scan_valid_blocks(shard).map(|(b, _)| b.len()).unwrap_or(0);
+            let count = scan_valid_blocks(lane).map(|(b, _)| b.len()).unwrap_or(0);
             panic!(
                 "selfplay child exited before producing {min_games} block(s) \
                  (exit status: {status:?}, blocks present: {count})"
@@ -103,7 +103,7 @@ fn run_selfplay(out: &Path, seed: u64, games: u64, workers: usize, max_plies: u3
         .args(["--workers", &workers.to_string()])
         .args(["--out", &out.display().to_string()])
         .args(["--max-plies", &max_plies.to_string()])
-        .args(["--split-seed", "7"])
+        .args(["--cap-seed", "7"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -125,10 +125,10 @@ fn sigkill(child: &Child) {
     }
 }
 
-/// Read the shard's durable records as a canonical multiset key
+/// Read the lane's durable records as a canonical multiset key
 /// (sorted by (game_id, ply, fen) — ply already orders within a game).
-fn shard_records(dir: &Path) -> Vec<(u64, u32, String, u8)> {
-    let (blocks, _) = scan_valid_blocks(&dir.join("shard.bin")).unwrap_or_default();
+fn lane_records(dir: &Path) -> Vec<(u64, u32, String, u8)> {
+    let (blocks, _) = scan_valid_blocks(&dir.join("lane.bin")).unwrap_or_default();
     let mut v: Vec<(u64, u32, String, u8)> = blocks
         .iter()
         .flat_map(|b| {
@@ -141,10 +141,10 @@ fn shard_records(dir: &Path) -> Vec<(u64, u32, String, u8)> {
     v
 }
 
-/// Every game_id in the shard appears as exactly one block whose records
+/// Every game_id in the lane appears as exactly one block whose records
 /// are contiguous in ply (zero partial-game labels).
 fn assert_no_partial_games(dir: &Path) {
-    let (blocks, _) = scan_valid_blocks(&dir.join("shard.bin")).unwrap();
+    let (blocks, _) = scan_valid_blocks(&dir.join("lane.bin")).unwrap();
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for b in &blocks {
         // Every record in a block carries the same game_id (frame contract).
@@ -200,7 +200,7 @@ fn crash_kill_after_first_game_resumes_to_uninterrupted_corpus() {
         .status()
         .expect("ref run");
     assert!(status.success(), "reference selfplay must succeed");
-    let ref_records = shard_records(ref_dir.path());
+    let ref_records = lane_records(ref_dir.path());
     assert!(!ref_records.is_empty(), "reference shard must be non-empty");
 
     // Crash run: spawn `corpus selfplay`, wait until ≥ 1 game is durable,
@@ -213,10 +213,10 @@ fn crash_kill_after_first_game_resumes_to_uninterrupted_corpus() {
     // borderline even on a clean machine; bumping to 60s removes the
     // brittleness without weakening the contract.
     let crash_dir = TempDir::new("crash");
-    let shard = crash_dir.path().join("shard.bin");
+    let lane = crash_dir.path().join("lane.bin");
 
     let mut child = spawn_selfplay(crash_dir.path(), seed, games, workers, max_plies);
-    let blocks_before_kill = wait_for_blocks(&shard, &mut child, 1);
+    let blocks_before_kill = wait_for_blocks(&lane, &mut child, 1);
     assert!(
         blocks_before_kill >= 1,
         "expected ≥ 1 durable block before SIGKILL; got {blocks_before_kill}"
@@ -254,7 +254,7 @@ fn crash_kill_after_first_game_resumes_to_uninterrupted_corpus() {
     // re-emitted on resume from its deterministic substream seed,
     // producing the identical record sequence. Multiset equality on the
     // full shard pins this contract.
-    let resumed_records = shard_records(crash_dir.path());
+    let resumed_records = lane_records(crash_dir.path());
     assert_eq!(
         resumed_records, ref_records,
         "resumed corpus must match the uninterrupted reference shard byte-for-byte \
@@ -292,12 +292,12 @@ fn crash_kill_at_randomized_offsets_emits_zero_partial() {
         .status()
         .expect("ref run");
     assert!(status.success());
-    let ref_records = shard_records(ref_dir.path());
+    let ref_records = lane_records(ref_dir.path());
 
     // 16 distinct random kill offsets (in ms after spawn).
     for variant in 0..16u64 {
         let crash_dir = TempDir::new(&format!("heavy-{variant}"));
-        let shard = crash_dir.path().join("shard.bin");
+        let lane = crash_dir.path().join("lane.bin");
         // Pseudo-random offset in [50, 400] ms.
         let offset_ms = 50 + (variant * 17) % 350;
         let mut child = spawn_selfplay(crash_dir.path(), seed, games, workers, max_plies);
@@ -331,7 +331,7 @@ fn crash_kill_at_randomized_offsets_emits_zero_partial() {
         // is re-emitted on resume from its deterministic seed). A FEN-level
         // resume bug that preserves game_id integrity would slip past a
         // set-equality assertion; multiset equality catches it.
-        let mut resumed = shard_records(crash_dir.path());
+        let mut resumed = lane_records(crash_dir.path());
         let mut reference = ref_records.clone();
         resumed.sort();
         reference.sort();
@@ -339,7 +339,7 @@ fn crash_kill_at_randomized_offsets_emits_zero_partial() {
             resumed, reference,
             "variant={variant} offset_ms={offset_ms}: resumed corpus byte-multiset matches uninterrupted reference"
         );
-        let _ = shard; // bind to silence warning
+        let _ = lane; // bind to silence warning
     }
 
     // SIGSTOP / SIGCONT suspend pass: a long pause must NOT change the
@@ -359,7 +359,7 @@ fn crash_kill_at_randomized_offsets_emits_zero_partial() {
     }
     let status = child.wait().expect("suspended run completes");
     assert!(status.success());
-    let suspended = shard_records(suspend_dir.path());
+    let suspended = lane_records(suspend_dir.path());
     assert_eq!(
         suspended, ref_records,
         "SIGSTOP/SIGCONT must not affect the deterministic fixed-depth corpus"
@@ -394,21 +394,21 @@ fn crash_kill_k4_resumes_to_uninterrupted_corpus_per_game_file() {
         .args(["--workers", &workers.to_string()])
         .args(["--out", &ref_dir.path().display().to_string()])
         .args(["--max-plies", &max_plies.to_string()])
-        .args(["--split-seed", "7"])
+        .args(["--cap-seed", "7"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .status()
         .expect("ref run");
     assert!(status.success(), "reference selfplay must succeed");
-    let ref_records = shard_records(ref_dir.path());
+    let ref_records = lane_records(ref_dir.path());
     assert!(!ref_records.is_empty(), "reference shard must be non-empty");
 
     // Crash run.
     let crash_dir = TempDir::new("pgf-crash-k4");
-    let shard = crash_dir.path().join("shard.bin");
+    let lane = crash_dir.path().join("lane.bin");
     let mut child = spawn_selfplay(crash_dir.path(), seed, games, workers, max_plies);
-    let blocks_before_kill = wait_for_blocks(&shard, &mut child, 1);
+    let blocks_before_kill = wait_for_blocks(&lane, &mut child, 1);
     assert!(
         blocks_before_kill >= 1,
         "expected ≥ 1 durable block before SIGKILL; got {blocks_before_kill}"
@@ -426,7 +426,7 @@ fn crash_kill_k4_resumes_to_uninterrupted_corpus_per_game_file() {
         .args(["--workers", &workers.to_string()])
         .args(["--out", &crash_dir.path().display().to_string()])
         .args(["--max-plies", &max_plies.to_string()])
-        .args(["--split-seed", "7"])
+        .args(["--cap-seed", "7"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -435,7 +435,7 @@ fn crash_kill_k4_resumes_to_uninterrupted_corpus_per_game_file() {
     assert!(status.success(), "resumed selfplay must succeed");
     assert_no_partial_games(crash_dir.path());
 
-    let resumed_records = shard_records(crash_dir.path());
+    let resumed_records = lane_records(crash_dir.path());
     assert_eq!(
         resumed_records, ref_records,
         "K=4 resumed corpus must byte-equal the uninterrupted reference \
@@ -447,7 +447,7 @@ fn crash_kill_k4_resumes_to_uninterrupted_corpus_per_game_file() {
 #[test]
 fn ghost_pending_self_heal_on_resume() {
     // Plant a "ghost" pending file for a game that is already durably
-    // committed in shard.bin. The resume protocol must clean it.
+    // committed in lane.bin. The resume protocol must clean it.
     let seed = 77u64;
     let games = 3u64;
     let workers = 1usize;
@@ -469,7 +469,7 @@ fn ghost_pending_self_heal_on_resume() {
         .status()
         .expect("first run");
     assert!(status.success());
-    let ref_records = shard_records(td.path());
+    let ref_records = lane_records(td.path());
 
     // Plant a ghost pending file for game 0 (already committed).
     let pending_dir = td.path().join("pending");
@@ -499,7 +499,7 @@ fn ghost_pending_self_heal_on_resume() {
         !ghost.exists(),
         "ghost pending file must be cleaned on resume"
     );
-    let second_records = shard_records(td.path());
+    let second_records = lane_records(td.path());
     assert_eq!(
         second_records, ref_records,
         "ghost cleanup must not alter the committed record set"
@@ -561,7 +561,7 @@ fn ghost_pending_empty_post_dedup_below_ckpt_self_heal_on_resume() {
         .args(["--workers", "1"])
         .args(["--out", &td.path().display().to_string()])
         .args(["--max-plies", "40"])
-        .args(["--split-seed", "7"])
+        .args(["--cap-seed", "7"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -593,19 +593,19 @@ fn worker_crash_only_loses_in_flight_games() {
         .args(["--workers", &workers.to_string()])
         .args(["--out", &ref_dir.path().display().to_string()])
         .args(["--max-plies", &max_plies.to_string()])
-        .args(["--split-seed", "7"])
+        .args(["--cap-seed", "7"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .status()
         .expect("ref run");
     assert!(status.success());
-    let ref_records = shard_records(ref_dir.path());
+    let ref_records = lane_records(ref_dir.path());
 
     let crash_dir = TempDir::new("wc-crash");
-    let shard = crash_dir.path().join("shard.bin");
+    let lane = crash_dir.path().join("lane.bin");
     let mut child = spawn_selfplay(crash_dir.path(), seed, games, workers, max_plies);
-    let blocks = wait_for_blocks(&shard, &mut child, 2);
+    let blocks = wait_for_blocks(&lane, &mut child, 2);
     assert!(blocks >= 1, "expected ≥ 1 block before kill; got {blocks}");
     sigkill(&child);
     let _ = child.wait();
@@ -620,7 +620,7 @@ fn worker_crash_only_loses_in_flight_games() {
         .args(["--workers", &workers.to_string()])
         .args(["--out", &crash_dir.path().display().to_string()])
         .args(["--max-plies", &max_plies.to_string()])
-        .args(["--split-seed", "7"])
+        .args(["--cap-seed", "7"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -629,7 +629,7 @@ fn worker_crash_only_loses_in_flight_games() {
     assert!(status.success());
     assert_no_partial_games(crash_dir.path());
 
-    let resumed_records = shard_records(crash_dir.path());
+    let resumed_records = lane_records(crash_dir.path());
     assert_eq!(
         resumed_records, ref_records,
         "K=10 resumed corpus must byte-equal the uninterrupted reference"
@@ -651,7 +651,7 @@ fn worker_panic_releases_claim_via_guard_drop() {
     let games = 4u64;
     let workers = 2usize;
     run_selfplay(td.path(), seed, games, workers, 40);
-    let records = shard_records(td.path());
+    let records = lane_records(td.path());
     // At minimum, some games completed (the panic recovery would replay them).
     // We can't assert exact count without controlling when panics fire, but
     // we can assert no partial games.
@@ -720,7 +720,7 @@ fn torn_pending_file_is_rejected_and_replayed() {
     // Reference: uninterrupted.
     let ref_dir = TempDir::new("torn-ref");
     run_selfplay(ref_dir.path(), seed, games, workers, max_plies);
-    let ref_records = shard_records(ref_dir.path());
+    let ref_records = lane_records(ref_dir.path());
 
     // Setup: run the campaign, then plant a torn pending file for game 0.
     // The next resume should unlink it and replay game 0.
@@ -743,7 +743,7 @@ fn torn_pending_file_is_rejected_and_replayed() {
         !pending_dir.join(pending_filename(0)).exists(),
         "torn pending file must have been unlinked and replaced by the commit"
     );
-    let result_records = shard_records(td.path());
+    let result_records = lane_records(td.path());
     assert_eq!(
         result_records, ref_records,
         "after torn-file replay, corpus must equal the uninterrupted reference"
@@ -788,7 +788,7 @@ fn old_checkpoint_magic_is_rejected_as_missing() {
         .args(["--workers", "1"])
         .args(["--out", &td.path().display().to_string()])
         .args(["--max-plies", "40"])
-        .args(["--split-seed", "7"])
+        .args(["--cap-seed", "7"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -801,7 +801,7 @@ fn old_checkpoint_magic_is_rejected_as_missing() {
 
     // The run should have produced some records (fresh start). Use 10 games
     // at depth-default so the probability of zero quiet emissions is negligible.
-    let (blocks, _) = scan_valid_blocks(&td.path().join("shard.bin")).unwrap_or_default();
+    let (blocks, _) = scan_valid_blocks(&td.path().join("lane.bin")).unwrap_or_default();
     assert!(
         !blocks.is_empty(),
         "after rejecting CWK1 checkpoint, the fresh run should produce at least one block"
@@ -824,22 +824,22 @@ fn power_loss_simulation_strict_prefix_plus_replays() {
 
     let ref_dir = TempDir::new("powerloss-ref");
     run_selfplay(ref_dir.path(), seed, games, workers, max_plies);
-    let ref_records = shard_records(ref_dir.path());
+    let ref_records = lane_records(ref_dir.path());
     assert!(!ref_records.is_empty(), "reference must be non-empty");
 
     // For each prefix length of the reference shard, truncate and resume.
-    let shard_bytes = std::fs::read(ref_dir.path().join("shard.bin")).unwrap();
-    let total = shard_bytes.len();
+    let lane_bytes = std::fs::read(ref_dir.path().join("lane.bin")).unwrap();
+    let total = lane_bytes.len();
     // Sample 10 evenly-spaced cut points to keep runtime bounded.
     let step = (total / 10).max(1);
     for cut in (0..=total).step_by(step) {
         let td = TempDir::new(&format!("powerloss-cut{cut}"));
         // Write a truncated shard.
-        std::fs::write(td.path().join("shard.bin"), &shard_bytes[..cut]).unwrap();
+        std::fs::write(td.path().join("lane.bin"), &lane_bytes[..cut]).unwrap();
         // Resume.
         run_selfplay(td.path(), seed, games, workers, max_plies);
         assert_no_partial_games(td.path());
-        let resumed = shard_records(td.path());
+        let resumed = lane_records(td.path());
         assert_eq!(
             resumed, ref_records,
             "after power-loss at cut={cut}, resumed corpus must equal reference"

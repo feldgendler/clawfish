@@ -5,10 +5,22 @@ ingestion). See `docs/plans/m6.h.md`, ADR-0036, and ADR-0035 (corpus infra).
 
 `corpus fetch` streams a compressed PGN dump over HTTPS, decompresses
 (`.pgn.zst` streamed via `zstd`; `.zip` via `zip` and `.7z` via `sevenz_rust2`,
-both downloaded to a resumable temp file then parsed locally), filters with
+both downloaded to a resumable temp file then parsed locally), applies
 `GameFilter::default()` (WhiteElo/BlackElo ≥ 2000, Standard time-control,
-`Termination != Time forfeit/Abandoned`), and appends to `<out>/pgn-shard.bin`.
-The codec is chosen by the URL extension (`.pgn.zst` / `.zip` / `.7z`).
+`Termination != Time forfeit/Abandoned`) AND the full per-position inline
+pipeline (skip8 ∧ `!in_check` ∧ `|static_eval| ≤ HIGH_SCORE_CP` ∧ `is_quiet`),
+then per-lane FEN dedup → per-game cap → exact target via the shared
+`LaneCommitter`, appending each surviving game as one CRC block to
+`<out>/lane.bin` (the M6.H2 flat build-ready lane). The codec is chosen by the
+URL extension (`.pgn.zst` / `.zip` / `.7z`).
+
+**`--target-positions` counts USABLE positions** (post quiet-filter → dedup →
+cap), NOT raw parsed positions; the committer's exact truncation lands `lane.bin`
+on the target exactly. **`source_url` must be pinned in the lane manifest** (the
+resolved URL `corpus fetch` writes to `manifest.json`) — a *fresh uninterrupted*
+fetch from `source_url` re-derives `lane.bin` byte-for-byte (ADR-0035 §8/§12
+re-derivable tier; a resumed fetch is content/label-equivalent but its `game_id`
+provenance tags may shift).
 
 ## Lichess (human games) — `Source::LichessOpen`
 
@@ -70,4 +82,4 @@ Each fetch merges into `<out>/fetch-state.json` (per-URL `positions_contributed`
 `early_target` means the URL likely has more to give; `eos` means it drained.
 The M6.I bi-level driver consults this to decide whether to revisit a URL or
 move to the next. This file is gitignored (operator-local bookkeeping); the
-shard is the source of truth.
+lane (`lane.bin`) is the source of truth.

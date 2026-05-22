@@ -10,7 +10,7 @@
 //! scripted `F` — no `ureq`, no socket. The production opener (`http_opener`)
 //! constructs `F` from a `ureq::Agent`. See `docs/plans/m6.h.md` §5.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::{self, Read};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -69,6 +69,11 @@ pub struct CallState {
     pub max_appended_game_id: Cell<Option<u64>>,
     /// SIGINT / operator stop.
     pub stop: Arc<AtomicBool>,
+    /// A FATAL `commit_game` failure (disk full / I/O append error). Set by the
+    /// ingest closure; halts the parse like `stop`, but is classified as a
+    /// permanent abort so `stream_to_ingest` returns `Err` instead of silently
+    /// under-counting. `None` ⇒ no abort.
+    pub commit_abort: RefCell<Option<String>>,
 }
 
 impl CallState {
@@ -80,12 +85,27 @@ impl CallState {
             games_emitted: Cell::new(0),
             max_appended_game_id: Cell::new(None),
             stop,
+            commit_abort: RefCell::new(None),
         })
     }
 
     /// True once `positions_ingested >= target` (early-stop trigger).
     pub fn target_reached(&self) -> bool {
         self.target != 0 && self.positions_ingested.get() >= self.target
+    }
+
+    /// Record a fatal `commit_game` failure (first one wins) so the parse halts
+    /// and the attempt classifies as a permanent abort.
+    pub fn set_commit_abort(&self, msg: String) {
+        let mut slot = self.commit_abort.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(msg);
+        }
+    }
+
+    /// `true` iff a fatal `commit_game` failure was recorded.
+    pub fn commit_aborted(&self) -> bool {
+        self.commit_abort.borrow().is_some()
     }
 }
 
@@ -219,6 +239,12 @@ impl<R: Read, F: FnMut(u64) -> Result<R, ReconnectError>> ResumableHttpReader<R,
 impl<R: Read, F: FnMut(u64) -> Result<R, ReconnectError>> Read for ResumableHttpReader<R, F> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
+            // 0. Fatal commit-abort (disk full / I/O append error). Halt the
+            //    parse immediately; the classifier surfaces it as a permanent
+            //    abort (checked before `stop`, so the error isn't masked).
+            if self.call.commit_aborted() {
+                return Ok(0);
+            }
             // 1. Clean stop (SIGINT / operator). Classifier checks `stop` first,
             //    so the EOF reason is irrelevant here.
             if self.call.stop.load(std::sync::atomic::Ordering::Relaxed) {

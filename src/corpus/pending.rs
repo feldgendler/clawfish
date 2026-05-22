@@ -1,9 +1,11 @@
 //! Per-game reorder buffer: atomic write of a completed game block to
 //! `pending/game-{game_id:020}.bin` and scan of existing pending files.
 //!
-//! The consumer reads these in strict `game_id` order and applies the
-//! inline dedup → cap → split pipeline before appending to `shard.bin` /
-//! `val.bin`. The write side uses the standard tmp-then-rename idiom so a
+//! The consumer reads these in strict `game_id` order and routes the
+//! inline dedup → cap → exact-target pipeline through the shared
+//! `LaneCommitter` before appending to `lane.bin` (M6.H2: one flat per-lane
+//! corpus, no train/val split). The write side uses the standard
+//! tmp-then-rename idiom so a
 //! SIGKILL mid-write leaves only an orphaned `.tmp` that is cleaned at the
 //! next resume, never a corrupt pending file that the consumer would
 //! mis-process.

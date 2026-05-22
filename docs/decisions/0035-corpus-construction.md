@@ -369,6 +369,36 @@ Design summary (full scope detail in `docs/roadmap.md` §M6 M6.H scope detail):
 
 M6.H lands with its own ADR (forthcoming at landing time) and its own milestone retrospective. This entry is the forward-pointer in ADR-0035 so a reader looking at the corpus infra ADR sees that the data-acquisition layer exists.
 
+### 12. M6.H2 — flat independent lanes; build→finalize; per-lane dedup-integrity (2026-05-23)
+
+M6.H2 unifies the four `Source` lanes (`SelfPlayOnBook`, `SelfPlayOffBook`, `Ccrl`, `LichessOpen`) so each is an **independent generator** producing one FLAT list of build-ready labelled positions inline. It supersedes the §1/§3/§6 build-era split-at-generation design. Plan: `docs/plans/m6.h2-corpus-lanes.md`.
+
+**Flat independent lanes.**
+- Each lane lives in its own `--out <dir>` and produces a single flat `lane.bin` (the CRC-framed per-game-block `store.rs` format), plus `manifest.json` + `filter_spec.txt` + `corpus_stats.txt`.
+- Self-play writes `lane.bin` (was `shard.bin`); fetch / `ingest-pgn` write `lane.bin` (was `pgn-shard.bin`). There is no longer a per-dir `shard.bin`/`val.bin`/`pgn-shard.bin` triple.
+- The four lanes are never co-located. Each lane's `game_id` space is private, so resume / dedup reads exactly one file.
+
+**Inline pipeline at generation for all four lanes.**
+- Per-position filter: opening-skip (`OPENING_SKIP_PLIES=8`) → drop in-check → `|static_eval| ≤ HIGH_SCORE_CP (600)` → quiet filter (`is_quiet`, needs a static eval + a qsearch eval).
+- Then per-lane FEN dedup (first-seen-wins, WITHIN the lane only) → per-game reservoir cap (`PER_GAME_CAP=10`) → exact target truncation.
+- All three lanes' commit work routes through the shared `pipeline::LaneCommitter` so fetch and self-play CANNOT diverge. `ingest-pgn` (local-file PGN) constructs a one-shot `LaneCommitter` + its own `QSearcher` and applies the SAME filter, so it is build-ready too (closing the build-era gap where ingested PGN was never per-position filtered).
+
+**No split at generation (→ M6.I).** The train/val split moves to M6.I, which reads the four flat lane dirs and owns the inter-lane MIX + the split. `src/corpus/split.rs` is deleted.
+
+**No cross-lane dedup.** The same FEN may appear in up to four lanes, possibly with CONFLICTING labels — explicitly accepted. The M6.I mixer reconciles (per-source reweighting). ADR-0003's per-lane audit still passes (each lane's labels are original game outcomes).
+
+**`--target` / `--cap-positions` count USABLE positions** (post quiet-filter → dedup → cap) for BOTH fetch and self-play; the committer's exact truncation lands the lane on the target exactly (no overshoot). Per-lane target: 2M usable → 8M total.
+
+**`build` removed; `finalize` added.** `cmd_build`'s transform role (dedup/cap/split/merge) is now inline per lane. The thin `corpus finalize --in <lane-dir>` does only the surviving roles: recompute `corpus_sha256` over `lane.bin`; write/update `manifest.json` + `filter_spec.txt` + `corpus_stats.txt`; write the per-lane `re-run.sh`. NO record transformation.
+
+**Manifest schema v1 → v2.** The `validation_fraction` / `val_fraction` / `train_positions` / `val_positions` fields are gone; `total_positions` now means usable positions in `lane.bin`; `split_seed` is renamed `cap_seed` (the reservoir-cap role survives, the split role moves to M6.I). The reader tolerates schema-v1 manifests (accepts `split_seed` as `cap_seed`, ignores `validation_fraction`); lanes are regenerated, not migrated (the §10 precedent).
+
+**Gate must-PASS-set change (supersedes the §9 three-check set).** The three must-PASS checks change from {ADR-0003 label-provenance audit, reproducibility-rerun, **held-out-split integrity**} to {ADR-0003 audit, reproducibility-rerun, **per-lane dedup-integrity**}. The held-out check is gone with the split. `check_dedup_integrity` asserts, over `lane.bin`: zero exact-FEN dups (`unique_fens == total_records`) AND ≤ `PER_GAME_CAP` records per game — the load-bearing defense that every committed lane went through the `LaneCommitter`. The gate is now FIVE checks (coverage, decisive/draw balance, ADR-0003 audit, reproducibility-rerun, dedup-integrity); the standalone recorded `dedup_ratios` check was folded into `dedup_integrity`.
+
+**The M6.G ↔ M6.I contract handoff.** M6.H2 hands M6.I FOUR flat `lane.bin` dirs + the split/mix responsibility. M6.I reads four flat lanes, does the inter-lane mix AND the train/val split, and tunes on `static_eval_white` (the per-lane quiet certificate holds). M6.H2's tag is a frozen-lane-recipe reference, NOT an SPRT engine baseline; **M6.I's SPRT baseline stays `M6.F`** (unchanged). `evaluate` / search are untouched ⇒ bench stays `1213649` / d4 `90591` byte-for-byte.
+
+**Reproducibility class (unchanged from §8).** Self-play lanes are byte-identical across fresh re-runs and across worker-count K (deterministic from `seed` + `cap_seed` + the knobs). Fetch lanes: a *fresh uninterrupted* fetch from the pinned `source_url` is byte-identical; a *resumed* fetch is content/label-equivalent (same FEN+label multiset) but its `game_id` provenance tags may shift — the pre-existing §8 "weaker / re-derivable" external-source tier, NOT a regression from dropping `dedup_key`.
+
 ## Consequences
 
 - M6.I is unblocked: a `bench/corpus/` artifact (with a pinned interface

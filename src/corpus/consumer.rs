@@ -1,14 +1,21 @@
 //! Consumer thread: polls `pending/` for the next-expected game_id file in
-//! strict order, applies the inline dedup → per-game cap → split pipeline,
-//! and appends to `shard.bin` / `val.bin`.
+//! strict order, routes the inline dedup → per-game cap → exact-target
+//! pipeline through [`LaneCommitter`], and appends to `lane.bin` (M6.H2:
+//! flat per-lane corpus, no train/val split — that moves to M6.I).
 //!
-//! The consumer is the only writer to the shard files during a run. It
-//! maintains `next_consume_id` as the authoritative commit cursor, written
-//! to `checkpoint.bin` atomically after each game commit (the §2.6
-//! ordering: pending file written → shard append → checkpoint → pending
-//! unlink).
+//! The consumer is the only writer to `lane.bin` during a run. It maintains
+//! `next_consume_id` as the authoritative commit cursor, written to
+//! `checkpoint.bin` atomically after each game commit (the §2.6 ordering:
+//! pending file written → lane append → checkpoint → pending unlink).
 //!
-//! See `docs/plans/m6.g-per-game-files.md` §2.6/§4.3 for the full contract.
+//! Dedup / cap / target live in the shared [`LaneCommitter`] so the self-play
+//! and fetch lanes cannot diverge (plan §1.3/§1.5). The consumer's resume
+//! protocol builds the `fen_set` in its ONE scan of `lane.bin` and constructs
+//! the committer via [`LaneCommitter::from_parts`] — the committer never
+//! re-scans the lane.
+//!
+//! See `docs/plans/m6.g-per-game-files.md` §2.6/§4.3 (per-game-file protocol)
+//! and `docs/plans/m6.h2-corpus-lanes.md` §1.5 (the no-split refactor).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -16,15 +23,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::CorpusError;
-use super::CorpusRecord;
-use super::PER_GAME_CAP;
 use super::dispatcher::Dispatcher;
 use super::pending::{MAX_PENDING_BYTES, pending_filename, scan_pending};
-use super::prng::substream_seed;
+use super::pipeline::LaneCommitter;
 use super::selfplay::SelfPlayConfig;
 use super::store::{
-    Checkpoint, append_raw_bytes, decode_block, encode_block, read_checkpoint, scan_valid_blocks,
-    truncate_to_valid, write_checkpoint,
+    Checkpoint, decode_block, read_checkpoint, scan_valid_blocks, truncate_to_valid,
+    write_checkpoint,
 };
 
 /// Default consumer poll interval in milliseconds.
@@ -35,54 +40,55 @@ pub const POLL_INTERVAL_MS: u64 = 10;
 pub struct ConsumerState {
     /// The next game_id the consumer expects to find in `pending/`.
     pub next_consume_id: u64,
-    /// Global FEN dedup set; "first-seen wins" across all committed games.
-    /// Rebuilt from durable shards on resume.
+    /// Per-lane FEN dedup set; "first-seen wins" within the lane. Rebuilt
+    /// from `lane.bin` in the resume scan, then handed to the
+    /// [`LaneCommitter`] via [`LaneCommitter::from_parts`] (this is the
+    /// consumer's ONE scan — the committer does NOT re-read the lane).
     pub fen_set: HashSet<String>,
-    /// Game ids already committed to a durable shard, frozen at resume time.
+    /// Game ids already committed to `lane.bin`, frozen at resume time.
     /// Used by the skip-committed bypass (§2.6 step 2 / Blocker #1) to
-    /// advance past games that were committed without a shard block
+    /// advance past games that were committed without a lane block
     /// (empty-post-dedup games that left a checkpoint record but no block).
     /// Read-only after initialization.
     pub committed_ids_at_resume: HashSet<u64>,
-    /// Total durable positions across shard.bin + val.bin at resume time.
-    /// Seeded into `ConsumerStats::positions_committed` so the
-    /// `cap_positions` check sees the *cumulative* total, not just this
-    /// run's increment. Without this, a resume with `--cap-positions N`
-    /// would commit N MORE positions on top of whatever's already on
-    /// disk, blowing past the operator's target.
+    /// Total durable positions in `lane.bin` at resume time. Seeded into the
+    /// [`LaneCommitter`]'s committed count so the `cap_positions` target sees
+    /// the *cumulative* total, not just this run's increment. Without this, a
+    /// resume with `--cap-positions N` would commit N MORE positions on top of
+    /// whatever's already on disk, blowing past the operator's target.
     pub positions_at_resume: u64,
 }
 
-/// Resume the corpus run: reconstruct `ConsumerState` from durable shards,
-/// the checkpoint, and the pending directory.
+/// Resume the corpus run: reconstruct `ConsumerState` from the durable
+/// `lane.bin`, the checkpoint, and the pending directory.
 ///
-/// Implements §2.7 of `docs/plans/m6.g-per-game-files.md`:
-/// 1. Truncate torn shard tails.
-/// 2. Rebuild `fen_set` and `committed_ids` from durable shard blocks.
+/// Implements §2.7 of `docs/plans/m6.g-per-game-files.md`, adapted to the
+/// M6.H2 single-`lane.bin` layout (no train/val split):
+/// 1. Truncate the torn `lane.bin` tail.
+/// 2. Rebuild `fen_set` and `committed_ids` from durable lane blocks (the ONE
+///    scan; the `LaneCommitter` reuses this state via `from_parts`).
 /// 3. Read the checkpoint (if valid) for the authoritative `next_consume_id`.
 /// 4. Scan `pending/` for orphan `.tmp` cleanup and gap enumeration.
 /// 5. Ghost-pending self-heal: unlink pending files whose `game_id` is
 ///    already committed or below `ckpt.next_consume_id`.
 /// 6. Return `ConsumerState` ready for the consumer loop.
 pub fn resume(out_dir: &Path, pending_dir: &Path) -> Result<ConsumerState, CorpusError> {
-    // Step 1: Scan + truncate torn shard tails.
-    let (shard_blocks, shard_valid_len) = scan_valid_blocks(&out_dir.join("shard.bin"))?;
-    if shard_valid_len > 0 {
-        truncate_to_valid(&out_dir.join("shard.bin"), shard_valid_len)?;
-    }
-    let (val_blocks, val_valid_len) = scan_valid_blocks(&out_dir.join("val.bin"))?;
-    if val_valid_len > 0 {
-        truncate_to_valid(&out_dir.join("val.bin"), val_valid_len)?;
+    // Step 1: Scan + truncate the torn lane tail.
+    let lane_path = out_dir.join("lane.bin");
+    let (lane_blocks, lane_valid_len) = scan_valid_blocks(&lane_path)?;
+    if lane_valid_len > 0 {
+        truncate_to_valid(&lane_path, lane_valid_len)?;
     }
 
-    // Step 2: Rebuild fen_set + committed_ids from durable shards.
-    // Also tally positions_at_resume so the cap_positions check sees the
-    // cumulative total (resume invariance — Issue: 1.99M-on-disk + --cap=2M
-    // must commit only the 9 missing positions, not 2M more).
+    // Step 2: Rebuild fen_set + committed_ids from the durable lane.
+    // Also tally positions_at_resume so the target check sees the cumulative
+    // total (resume invariance — 1.99M-on-disk + --cap=2M must commit only the
+    // 0.01M missing positions, not 2M more). This is the ONE scan of lane.bin
+    // per process; the LaneCommitter is built from this state, not a re-scan.
     let mut fen_set = HashSet::new();
     let mut committed_ids: HashSet<u64> = HashSet::new();
     let mut positions_at_resume: u64 = 0;
-    for block in shard_blocks.iter().chain(val_blocks.iter()) {
+    for block in &lane_blocks {
         committed_ids.insert(block.game_id);
         positions_at_resume += block.records.len() as u64;
         for r in &block.records {
@@ -143,9 +149,10 @@ fn smallest_not_in(set: &HashSet<u64>) -> u64 {
 
 /// Run the consumer loop.
 ///
-/// Polls `pending/` for `state.next_consume_id`, applies the inline pipeline,
-/// appends to the appropriate shard (train or val), updates the checkpoint,
-/// and unlinks the pending file.
+/// Polls `pending/` for `state.next_consume_id`, routes the game's records
+/// through the [`LaneCommitter`] (per-lane dedup → per-game cap → exact target
+/// truncation → append to `lane.bin`), updates the checkpoint, and unlinks the
+/// pending file.
 ///
 /// The loop terminates when:
 /// - `state.next_consume_id >= cfg.games` (all games consumed), OR
@@ -164,8 +171,7 @@ pub fn consumer_loop(
     out_dir: &Path,
 ) -> Result<ConsumerStats, CorpusError> {
     let pending_dir = out_dir.join("pending");
-    let shard_path = out_dir.join("shard.bin");
-    let val_path = out_dir.join("val.bin");
+    let lane_path = out_dir.join("lane.bin");
     let ckpt_path = out_dir.join("checkpoint.bin");
     let poll_ms = cfg.poll_interval_ms.unwrap_or(POLL_INTERVAL_MS);
 
@@ -179,13 +185,24 @@ pub fn consumer_loop(
         state.next_consume_id,
     );
 
-    // Seed positions_committed from the resumed durable count. Without
-    // this, --cap-positions on a resumed campaign would commit `cap` MORE
-    // positions on top of the existing corpus instead of capping at the
-    // cumulative total. The other stats (games_committed,
+    // Build the LaneCommitter from the consumer's resume scan (the SINGLE scan
+    // of lane.bin — `from_parts`, not a re-scan). It owns dedup → cap → exact
+    // target truncation; seeded with the cumulative durable count so a resumed
+    // `--cap-positions` campaign lands on the operator's total, not `cap` MORE.
+    // The fen_set is moved into the committer (the consumer no longer touches
+    // it directly after this point).
+    let fen_set = std::mem::take(&mut state.fen_set);
+    let mut committer = LaneCommitter::from_parts(
+        fen_set,
+        state.positions_at_resume,
+        cfg.cap_seed,
+        cfg.cap_positions,
+    );
+
+    // positions_committed mirrors the committer's cumulative count (seeded
+    // from the resumed durable total). The other stats (games_committed,
     // games_empty_post_dedup, games_emitted, games_dropped_inflight) stay
-    // per-run because they describe THIS run's work; positions_committed
-    // is the one stat the cap is checked against.
+    // per-run because they describe THIS run's work.
     let mut stats = ConsumerStats {
         positions_committed: state.positions_at_resume,
         ..ConsumerStats::default()
@@ -243,42 +260,15 @@ pub fn consumer_loop(
                             )));
                         }
 
-                        // Happy path: inline dedup → cap → split.
-                        let deduped: Vec<CorpusRecord> = block
-                            .records
-                            .into_iter()
-                            .filter(|r| state.fen_set.insert(r.fen.clone()))
-                            .collect();
-
-                        let mut capped =
-                            inline_cap_dedup_survivors(deduped, cfg.split_seed, next, PER_GAME_CAP);
-
-                        // --cap-positions partial-commit: if the whole game's
-                        // records would push us over the operator's target,
-                        // keep only the first (cap − positions_committed)
-                        // records. The block is still well-formed CRC-framed;
-                        // downstream readers see a game with fewer records
-                        // than the uncapped twin — same as if PER_GAME_CAP
-                        // had been narrower for this specific game. Trailing
-                        // records are dropped (not deferred — in-order
-                        // commit makes per-game truncation the only way to
-                        // hit an exact target).
-                        if let Some(cap) = cfg.cap_positions
-                            && !capped.is_empty()
-                        {
-                            let room = cap.saturating_sub(stats.positions_committed);
-                            if (capped.len() as u64) > room {
-                                capped.truncate(room as usize);
-                            }
-                        }
-
-                        if !capped.is_empty() {
-                            let is_val = split_decision(cfg.split_seed, next, cfg.val_fraction);
-                            let dest = if is_val { &val_path } else { &shard_path };
-                            let encoded = encode_block(next, &capped);
-                            append_raw_bytes(dest, &encoded)?;
-                            stats.positions_committed += capped.len() as u64;
-                        } else {
+                        // Happy path: the LaneCommitter applies dedup → cap →
+                        // exact target truncation and appends one block to
+                        // lane.bin (or none, if every FEN was a dedup dup).
+                        // The lifecycle (checkpoint → unlink-pending) wraps the
+                        // call exactly as before; the dedup/cap/target logic is
+                        // now shared with fetch (plan §1.5).
+                        let outcome = committer.commit_game(&lane_path, next, block.records)?;
+                        stats.positions_committed = committer.committed();
+                        if outcome.empty_post_dedup {
                             stats.games_empty_post_dedup += 1;
                         }
 
@@ -287,14 +277,12 @@ pub fn consumer_loop(
                         let _ = std::fs::remove_file(&pending_path);
                         stats.games_committed += 1;
 
-                        // Position-cap (cfg.cap_positions): signal stop when the
-                        // durable position count reaches the operator's target.
-                        // Workers see stop at their next iteration and exit;
-                        // their in-flight games are dropped (R2). The cap is on
-                        // post-dedup-cap committed positions across shard + val.
-                        if let Some(cap) = cfg.cap_positions
-                            && stats.positions_committed >= cap
-                        {
+                        // Cap → stop side-effect (reviewer MEDIUM-2): the
+                        // committer's `target_reached()` is the signal, but the
+                        // consumer owns the action — set `stop` so workers drain
+                        // their in-flight game and exit (R2). Without this they
+                        // generate forever.
+                        if outcome.target_reached {
                             stop.store(true, Ordering::Relaxed);
                         }
                     }
@@ -330,47 +318,6 @@ pub fn consumer_loop(
     }
 
     Ok(stats)
-}
-
-/// Apply seeded reservoir cap to dedup-survivors.
-///
-/// `seed` = `split_seed`; per-game sub-stream is `substream_seed(seed, game_id)`.
-pub fn inline_cap_dedup_survivors(
-    records: Vec<CorpusRecord>,
-    seed: u64,
-    game_id: u64,
-    cap: usize,
-) -> Vec<CorpusRecord> {
-    use super::prng::Prng;
-
-    if cap == 0 || records.is_empty() {
-        return Vec::new();
-    }
-    if records.len() <= cap {
-        return records;
-    }
-
-    let game_seed = substream_seed(seed, game_id);
-    let mut rng = Prng::new(game_seed);
-
-    // Algorithm R reservoir sampling.
-    let mut reservoir: Vec<CorpusRecord> = records[..cap].to_vec();
-    for (k, record) in records[cap..].iter().enumerate() {
-        let j = rng.below((cap + k + 1) as u64) as usize;
-        if j < cap {
-            reservoir[j] = record.clone();
-        }
-    }
-    reservoir
-}
-
-/// Per-game val/train routing: returns `true` iff this game goes to val.
-///
-/// Matches `split::split_by_game` semantics: threshold in u64 space from
-/// `val_fraction * u64::MAX`; per-game hash = `substream_seed(split_seed, game_id)`.
-pub fn split_decision(split_seed: u64, game_id: u64, val_fraction: f64) -> bool {
-    let threshold = (val_fraction.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
-    substream_seed(split_seed, game_id) < threshold
 }
 
 /// Build a minimal CWK2 checkpoint carrying only the consume cursor.
@@ -424,7 +371,8 @@ pub struct ConsumerStats {
     /// Games that committed zero records (all FENs were dedup-duplicates or
     /// post-cap count was zero).
     pub games_empty_post_dedup: u64,
-    /// Total records appended to the shards after dedup + cap.
+    /// Total records appended to `lane.bin` after dedup + cap (cumulative,
+    /// including the resumed-from-disk count — mirrors `LaneCommitter::committed`).
     pub positions_committed: u64,
 }
 
@@ -469,11 +417,10 @@ mod tests {
             opening_random_plies: 0,
             max_plies: 40,
             out_dir: out,
-            val_fraction: 0.0,
             opening_mode: OpeningMode::Random,
             book: None,
             poll_interval_ms: Some(1), // fast polling for tests
-            split_seed: 7,
+            cap_seed: 7,
             cap_positions: None,
         }
     }
@@ -542,9 +489,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(stats.games_committed, 3);
-        let (blocks, _) = scan_valid_blocks(&td.0.join("shard.bin")).unwrap();
+        let (blocks, _) = scan_valid_blocks(&td.0.join("lane.bin")).unwrap();
         let ids: Vec<u64> = blocks.iter().map(|b| b.game_id).collect();
-        assert_eq!(ids, vec![0, 1, 2], "shard must be in game_id order");
+        assert_eq!(ids, vec![0, 1, 2], "lane must be in game_id order");
     }
 
     #[test]
@@ -574,7 +521,7 @@ mod tests {
         let mut state = make_state(0);
         consumer_loop(&cfg, &mut state, &dispatcher, alive, &stop, &td.0).unwrap();
 
-        let (blocks, _) = scan_valid_blocks(&td.0.join("shard.bin")).unwrap();
+        let (blocks, _) = scan_valid_blocks(&td.0.join("lane.bin")).unwrap();
         let ids: Vec<u64> = blocks.iter().map(|b| b.game_id).collect();
         assert_eq!(ids, vec![0, 1, 2, 3, 4]);
     }
@@ -683,40 +630,73 @@ mod tests {
         );
     }
 
-    #[test]
-    fn consumer_inline_split_routes_per_game_coin_flip() {
-        // With val_fraction=1.0, every game goes to val.bin; with 0.0, none.
-        let td_val = TempDir::new("split-val");
-        let pending_val = td_val.0.join("pending");
-        std::fs::create_dir_all(&pending_val).unwrap();
-        for id in 0..4 {
-            write_pending_file(
-                &pending_val,
-                id,
-                &[make_record(id, &format!("fen-{id} w - - 0 1"))],
-            );
-        }
-        let mut cfg_val = base_cfg(td_val.0.clone(), 4);
-        cfg_val.val_fraction = 1.0;
-        let d = Dispatcher::new(vec![], 4, 4);
-        for id in 0..4 {
-            d.notify_completed(id);
-        }
-        let alive = Arc::new(AtomicUsize::new(0));
-        let stop = AtomicBool::new(false);
-        let mut state = make_state(0);
-        consumer_loop(&cfg_val, &mut state, &d, alive, &stop, &td_val.0).unwrap();
+    // ── Cap → stop side-effect ───────────────────────────────────────────
 
-        // With val_fraction=1.0, shard.bin should have zero records.
-        let (train_blocks, _) = scan_valid_blocks(&td_val.0.join("shard.bin")).unwrap();
+    #[test]
+    fn consumer_cap_positions_sets_stop_and_lands_on_exact_count() {
+        // Reviewer MEDIUM-2: with cap_positions=Some(5), the committer's
+        // exact-target truncation lands the lane on EXACTLY 5 usable positions,
+        // AND the consumer sets `stop` once the cap is reached (so workers drain
+        // and exit instead of generating forever). Kills the mutant that deletes
+        // the `stop.store` in the `target_reached` branch.
+        let td = TempDir::new("cap-stop");
+        let pending_dir = td.0.join("pending");
+        std::fs::create_dir_all(&pending_dir).unwrap();
+
+        // Game 0: 3 unique FENs. Game 1: 4 unique FENs (boundary — only 5-3=2
+        // fit, cap_positions=5). Game 2: 3 unique FENs (must NOT be committed:
+        // the cap fired on game 1 and set stop). All FENs distinct so dedup
+        // drops nothing — the count is driven purely by the cap.
+        let g0: Vec<CorpusRecord> = (0..3)
+            .map(|i| make_record(0, &format!("g0-fen-{i} w - - 0 1")))
+            .collect();
+        let g1: Vec<CorpusRecord> = (0..4)
+            .map(|i| make_record(1, &format!("g1-fen-{i} w - - 0 1")))
+            .collect();
+        let g2: Vec<CorpusRecord> = (0..3)
+            .map(|i| make_record(2, &format!("g2-fen-{i} w - - 0 1")))
+            .collect();
+        write_pending_file(&pending_dir, 0, &g0);
+        write_pending_file(&pending_dir, 1, &g1);
+        write_pending_file(&pending_dir, 2, &g2);
+
+        let dispatcher = Dispatcher::new(vec![], 3, 3);
+        dispatcher.notify_completed(0);
+        dispatcher.notify_completed(1);
+        dispatcher.notify_completed(2);
+        let alive = Arc::new(AtomicUsize::new(0)); // workers done
+        let stop = AtomicBool::new(false);
+
+        let mut cfg = base_cfg(td.0.clone(), 3);
+        cfg.cap_positions = Some(5);
+        let mut state = make_state(0);
+        let stats = consumer_loop(
+            &cfg,
+            &mut state,
+            &dispatcher,
+            Arc::clone(&alive),
+            &stop,
+            &td.0,
+        )
+        .unwrap();
+
+        // (a) stop must be set once the cap was reached.
         assert!(
-            train_blocks.iter().flat_map(|b| b.records.iter()).count() == 0,
-            "val_fraction=1.0: shard.bin must have zero records"
+            stop.load(Ordering::Acquire),
+            "consumer must set `stop` when cap_positions is reached"
         );
-        let (val_blocks, _) = scan_valid_blocks(&td_val.0.join("val.bin")).unwrap();
+        // (b) the lane lands on exactly cap_positions (exact truncation).
+        assert_eq!(
+            stats.positions_committed, 5,
+            "exact-truncation: lane lands on exactly cap_positions=5"
+        );
+        let (blocks, _) = scan_valid_blocks(&td.0.join("lane.bin")).unwrap();
+        let on_disk: u64 = blocks.iter().map(|b| b.records.len() as u64).sum();
+        assert_eq!(on_disk, 5, "exactly 5 usable positions durable on disk");
+        // Game 2 must not have been committed (the cap fired on game 1).
         assert!(
-            val_blocks.iter().flat_map(|b| b.records.iter()).count() > 0,
-            "val_fraction=1.0: val.bin must have records"
+            !blocks.iter().any(|b| b.game_id == 2),
+            "game 2 must not be committed after the cap fired"
         );
     }
 
@@ -726,7 +706,7 @@ mod tests {
     fn consumer_empty_post_dedup_game_advances_cursor() {
         // A game whose every record is a dedup-duplicate must:
         // - Advance next_consume_id.
-        // - NOT write a block to shard.bin.
+        // - NOT write a block to lane.bin.
         // - Increment games_empty_post_dedup.
         // - Unlink the pending file.
         let td = TempDir::new("empty-dedup");
@@ -760,10 +740,10 @@ mod tests {
                 .exists(),
             "pending file for empty-post-dedup game must be unlinked"
         );
-        // Shard should have only game 0's record.
-        let (blocks, _) = scan_valid_blocks(&td.0.join("shard.bin")).unwrap();
+        // Lane should have only game 0's record.
+        let (blocks, _) = scan_valid_blocks(&td.0.join("lane.bin")).unwrap();
         let rec_count: usize = blocks.iter().map(|b| b.records.len()).sum();
-        assert_eq!(rec_count, 1, "only game 0's record in shard");
+        assert_eq!(rec_count, 1, "only game 0's record in lane");
     }
 
     // ── Ghost-pending self-heal ──────────────────────────────────────────

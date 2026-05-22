@@ -3,10 +3,11 @@
 //!
 //! Per-game-file architecture: each worker writes its completed game to
 //! `pending/game-{game_id:020}.bin`; a single consumer thread polls for the
-//! next-expected game_id in strict order, applies dedup → cap → split inline,
-//! and appends to `shard.bin` / `val.bin`. This makes the shard bytes a
-//! deterministic function of `(seed, split_seed, game_id)`, independent of
-//! worker count K (the primary acceptance property).
+//! next-expected game_id in strict order, routes dedup → cap → exact-target
+//! through the shared `LaneCommitter`, and appends to `lane.bin` (M6.H2: a
+//! flat per-lane corpus, no train/val split — that moves to M6.I). This makes
+//! the lane bytes a deterministic function of `(seed, cap_seed, game_id)`,
+//! independent of worker count K (the primary acceptance property).
 //!
 //! Determinism precondition: `SearchLimits{ depth: Some(d), nodes: None,
 //! movetime: None, infinite: false }` with `TimeCaps{soft:MAX,hard:MAX}` ⇒
@@ -80,10 +81,8 @@ pub struct SelfPlayConfig {
     pub opening_random_plies: u32,
     /// Max half-moves before adjudicating an over-long game.
     pub max_plies: u32,
-    /// Output directory (shard log + checkpoint).
+    /// Output directory (`lane.bin` + checkpoint).
     pub out_dir: PathBuf,
-    /// Fraction of games routed to the held-out self-play validation set.
-    pub val_fraction: f64,
     /// Opening regime — every game in the campaign uses this regime, and
     /// every committed record carries `opening_mode.source()`. Replaces
     /// the previous per-game `book_fraction` coin-flip; the book vs off-
@@ -100,17 +99,20 @@ pub struct SelfPlayConfig {
     /// effect on byte-identity — only on commit latency (§2.6 /
     /// Substantive #7).
     pub poll_interval_ms: Option<u64>,
-    /// Seed for the per-game train/val split coin flip and the per-game
-    /// reservoir-cap sampling. Deterministic given `(split_seed, game_id)`;
-    /// K-independent (the split depends only on the seed, not on worker
-    /// scheduling). Pinned in the manifest for reproducibility.
-    pub split_seed: u64,
-    /// Optional cap on TOTAL durable positions (shard.bin + val.bin combined).
-    /// When the consumer's `positions_committed` reaches or exceeds this cap,
-    /// it signals `stop`, the workers drain their last game, and the campaign
-    /// exits gracefully. Counted as the cap is in *positions* (not games),
-    /// because the operator's actual target is corpus size for Texel tuning,
-    /// and games-per-position varies. `None` ⇒ unbounded.
+    /// Seed for the per-game reservoir-cap sampling (Knuth/Vitter Algorithm R,
+    /// per-game sub-stream `substream_seed(cap_seed, game_id)`). Deterministic
+    /// given `(cap_seed, game_id)`; K-independent (the cap depends only on the
+    /// seed, not on worker scheduling). Pinned in the manifest for
+    /// reproducibility. (M6.H2: renamed from `split_seed` — the train/val split
+    /// it also drove moves to M6.I; only the cap role remains.)
+    pub cap_seed: u64,
+    /// Optional cap on TOTAL durable usable positions in `lane.bin`. When the
+    /// committer's cumulative count reaches this cap, the consumer signals
+    /// `stop`, the workers drain their last game, and the campaign exits
+    /// gracefully. The cap is in *positions* (not games) because the operator's
+    /// actual target is corpus size for Texel tuning, and games-per-position
+    /// varies. The committer's exact truncation lands the lane on the cap
+    /// exactly. `None` ⇒ unbounded.
     pub cap_positions: Option<u64>,
 }
 
@@ -129,14 +131,12 @@ pub struct SelfPlayStats {
     /// Worker: games abandoned in-flight (stop-abort) — contributed ZERO records.
     pub games_dropped_inflight: u64,
     /// Consumer: pending files processed (games committed, incl. empty ones).
-    /// In the legacy arch: games written to shard.bin by the writer thread.
     pub games_committed: u64,
     /// Consumer: games that committed zero records (all FENs were
     /// dedup-duplicates or post-dedup-cap count was zero).
     pub games_empty_post_dedup: u64,
-    /// Consumer: records appended to the shards after dedup + cap.
-    /// Renamed from `positions_emitted` (which counted pre-dedup-cap records
-    /// in the legacy architecture; the new name matches the consumer's role).
+    /// Consumer: records appended to `lane.bin` after dedup + cap (cumulative,
+    /// including the resumed-from-disk count).
     pub positions_committed: u64,
 }
 
@@ -145,7 +145,7 @@ pub struct SelfPlayStats {
 /// entirely in RAM; flushed as ONE block only on a natural terminal (R1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GameRecord {
-    /// Unique game id (R7 striping key; store dedup key).
+    /// Unique game id (R7 striping key; per-lane dedup arrival order).
     pub game_id: u64,
     /// Post-opening-skip labeled positions, in game order.
     pub records: Vec<CorpusRecord>,
@@ -333,12 +333,11 @@ fn play_one_game(
             // max_plies adjudication-as-draw.
             break Label::Draw;
         }
-        // Inline per-position filter (replaces the old build-pass loop):
-        // ply ≥ OPENING_SKIP_PLIES ∧ !in_check ∧ |static_eval| ≤ HIGH_SCORE_CP
-        // ∧ quiet predicate ⇒ admitted; strata pre-tagged. Yields a shard
-        // that is already build-ready — every run of the script contributes
-        // to the usable, prepared, labeled corpus. (Cross-game work — dedup,
-        // per-game cap, train/val split — stays in `build` by definition.)
+        // Inline per-position filter: ply ≥ OPENING_SKIP_PLIES ∧ !in_check ∧
+        // |static_eval| ≤ HIGH_SCORE_CP ∧ quiet predicate ⇒ admitted; strata
+        // pre-tagged. Yields build-ready records — the consumer then routes
+        // them through the LaneCommitter for per-lane dedup → per-game cap →
+        // exact target (the cross-game work; M6.H2: no split here).
         if ply >= OPENING_SKIP_PLIES && !in_check(&pos) {
             let se = static_eval_white(&pos);
             if se.abs() <= HIGH_SCORE_CP {
@@ -445,9 +444,10 @@ pub fn calibrate_ladder(buckets_ms: &[u64]) -> Vec<(u8, u32)> {
 // Campaign driver — per-game-file architecture.
 //
 // Workers write completed games to `pending/game-{id:020}.bin`; a single
-// consumer thread commits them in strict game_id order with inline
-// dedup → cap → split. This makes shard bytes a deterministic function of
-// (seed, split_seed, game_id), independent of worker count K.
+// consumer thread commits them in strict game_id order, routing dedup → cap →
+// exact-target through the shared `LaneCommitter` into `lane.bin`. This makes
+// the lane bytes a deterministic function of (seed, cap_seed, game_id),
+// independent of worker count K.
 // ---------------------------------------------------------------------------
 
 /// Per-game depth rung, sampled deterministically from the seeded stream by
@@ -747,17 +747,16 @@ mod tests {
             opening_random_plies: 4,
             max_plies: 40,
             out_dir: out,
-            val_fraction: 0.2,
             opening_mode: OpeningMode::Random,
             book: None,
             poll_interval_ms: None,
-            split_seed: 7,
+            cap_seed: 7,
             cap_positions: None,
         }
     }
 
-    fn shard_multiset(dir: &std::path::Path) -> Vec<(u64, String, u8, u32, u8, u8)> {
-        let (blocks, _) = scan_valid_blocks(&dir.join("shard.bin")).unwrap();
+    fn lane_multiset(dir: &std::path::Path) -> Vec<(u64, String, u8, u32, u8, u8)> {
+        let (blocks, _) = scan_valid_blocks(&dir.join("lane.bin")).unwrap();
         // Include depth_rung + strata in the comparison tuple so a
         // worker-count-dependent bug in rung sampling or stratum
         // computation surfaces as a 1-vs-N divergence (SF4).
@@ -909,8 +908,8 @@ mod tests {
         run(&cfg(td1.0.clone(), 6, 1), &s1).unwrap();
         run(&cfg(td4.0.clone(), 6, 4), &s4).unwrap();
         assert_eq!(
-            shard_multiset(&td1.0),
-            shard_multiset(&td4.0),
+            lane_multiset(&td1.0),
+            lane_multiset(&td4.0),
             "1-worker and 4-worker runs must produce the IDENTICAL record \
              multiset (R7: per-game substream seed ⇒ scheduler-independent)"
         );
@@ -1143,13 +1142,13 @@ mod tests {
     #[test]
     fn interrupted_campaign_writes_only_complete_games() {
         // A campaign stopped immediately: no game can complete (the per-game
-        // loop sees stop=true at its first guard) ⇒ the shard has zero
+        // loop sees stop=true at its first guard) ⇒ the lane has zero
         // partial blocks.
         let td = TempDir::new("interrupt-campaign");
         let stop = AtomicBool::new(true);
         let stats = run(&cfg(td.0.clone(), 8, 2), &stop).unwrap();
         assert_eq!(stats.positions_committed, 0);
-        let (blocks, _) = scan_valid_blocks(&td.0.join("shard.bin")).unwrap();
+        let (blocks, _) = scan_valid_blocks(&td.0.join("lane.bin")).unwrap();
         assert!(
             blocks.is_empty(),
             "an immediately-stopped campaign commits zero (never partial) games"
@@ -1163,10 +1162,10 @@ mod tests {
         let td = TempDir::new("resume-idem");
         let s = AtomicBool::new(false);
         run(&cfg(td.0.clone(), 4, 2), &s).unwrap();
-        let first = shard_multiset(&td.0);
+        let first = lane_multiset(&td.0);
         let s2 = AtomicBool::new(false);
         run(&cfg(td.0.clone(), 4, 2), &s2).unwrap();
-        let second = shard_multiset(&td.0);
+        let second = lane_multiset(&td.0);
         assert_eq!(
             first, second,
             "re-running the same campaign is idempotent (game_id-deduped)"
