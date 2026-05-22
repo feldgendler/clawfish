@@ -28,6 +28,8 @@ fuzz/artifacts/
 /bench/corpus/val.bin
 /bench/corpus/checkpoint.bin
 /bench/corpus/pgn-shard.bin
+# M6.H per-URL fetch bookkeeping (bytes/positions/terminated per source URL).
+/bench/corpus/fetch-state.json
 # Per-game staging files (one per worker-completed game, consumed and
 # unlinked by the dedup thread in strict game_id order). Holds at most
 # ~K files at any time during a running campaign; empty when the

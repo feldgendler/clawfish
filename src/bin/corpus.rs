@@ -46,6 +46,7 @@ fn main() -> ExitCode {
         "calibrate-ladder" => cmd_calibrate_ladder(rest),
         "selfplay" => cmd_selfplay(rest),
         "ingest-pgn" => cmd_ingest_pgn(rest),
+        "fetch" => cmd_fetch(rest),
         "build" => cmd_build(rest),
         "quality-gate" => cmd_quality_gate(rest),
         "export" => cmd_export(rest),
@@ -77,7 +78,9 @@ Subcommands:
                      buckets and write it to filter_spec.txt + manifest.json.
   selfplay           Run a deterministic fixed-depth self-play campaign.
                      Crash-safe (per-game append-block log + checkpoint).
-  ingest-pgn         Stream-parse a CCRL/Lichess PGN into the shard log.
+  ingest-pgn         Stream-parse an on-disk CCRL/Lichess PGN into the shard log.
+  fetch              Stream a CCRL/Lichess dump over HTTPS into the shard log
+                     (M6.H; needs the `corpus-fetch` build feature).
   build              Apply filter → quiet → strata → dedup → cap → split;
                      emit train+val shards, manifest.json, filter_spec.txt.
   quality-gate       Run the six data-quality checks; exit 0 iff the gate passes.
@@ -552,6 +555,103 @@ provenance recorded on every emitted record."
         next_id
     );
     Ok(ExitCode::SUCCESS)
+}
+
+// ─── fetch (M6.H — on-demand network ingestion) ─────────────────────────────
+
+#[cfg(feature = "corpus-fetch")]
+fn cmd_fetch(argv: &[String]) -> Result<ExitCode, String> {
+    use clawfish::corpus::fetch::{FetchConfig, catalog, stream_to_ingest};
+
+    let args = parse_args(argv);
+    if args.has("help") {
+        eprintln!(
+            "corpus fetch --source ccrl|lichess --out <dir> [--target-positions N]
+                   [--url <url>] [--lichess-month YYYY-MM]
+
+Stream a compressed PGN dump over HTTPS, decompress, apply
+`GameFilter::default()`, and append each accepted game as one CRC-framed
+block in <out>/pgn-shard.bin (the same path/discipline as `ingest-pgn`).
+Robust for unattended runs: in-RAM HTTP Range resume, a games-parsed stall
+watchdog, infinite exponential backoff, and content-validity gates.
+
+--target-positions  Stop after this many NEW positions are appended (default:
+                    unbounded — runs to end-of-stream).
+--url               Explicit dump URL. Lichess auto-constructs from
+                    --lichess-month (default a pinned month) when omitted; CCRL
+                    has NO auto-default (official CCRL is .7z, unsupported) and
+                    REQUIRES --url to a .zip/.pgn.zst mirror — see
+                    docs/data-catalog.md."
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let source = match args.require("source")? {
+        "ccrl" => Source::Ccrl,
+        "lichess" => Source::LichessOpen,
+        other => {
+            return Err(format!(
+                "--source must be `ccrl` or `lichess`, got {other:?}"
+            ));
+        }
+    };
+    let out = PathBuf::from(args.require("out")?);
+    let target = args.parse_u64("target-positions", u64::MAX)?;
+
+    let lichess_month = match args.get("lichess-month") {
+        Some(s) => Some(parse_year_month(s)?),
+        None => None,
+    };
+    let url = match args.get("url") {
+        Some(u) => u.to_string(),
+        None => catalog::default_url(source, lichess_month).ok_or_else(|| {
+            "this source has no auto-default URL — pass --url to a .zip/.pgn.zst \
+             mirror (official CCRL is .7z, unsupported). See docs/data-catalog.md"
+                .to_string()
+        })?,
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    install_signal_handler(stop.clone());
+    let filter = GameFilter::default();
+    let cfg = FetchConfig::default();
+
+    eprintln!("corpus: fetch {source:?} target={target} url={url}");
+    let outcome = stream_to_ingest(source, &url, target, &out, &filter, &stop, &cfg)
+        .map_err(|e| format!("fetch: {e}"))?;
+    eprintln!(
+        "corpus: fetch done — positions={} games={} bytes_received={} terminated={:?} next_id={}",
+        outcome.positions_ingested,
+        outcome.games_emitted,
+        outcome.bytes_received,
+        outcome.terminated,
+        outcome.next_game_id,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Parse a `YYYY-MM` token into `(year, month)` with a 1..=12 month guard.
+#[cfg(feature = "corpus-fetch")]
+fn parse_year_month(s: &str) -> Result<(u32, u32), String> {
+    let (y, m) = s
+        .split_once('-')
+        .ok_or_else(|| format!("--lichess-month must be YYYY-MM, got {s:?}"))?;
+    let year: u32 = y.parse().map_err(|_| format!("bad year in {s:?}"))?;
+    let month: u32 = m.parse().map_err(|_| format!("bad month in {s:?}"))?;
+    if !(1..=12).contains(&month) {
+        return Err(format!("month out of range in {s:?}"));
+    }
+    Ok((year, month))
+}
+
+/// `corpus-fetch`-feature-gated: without it, the network stack isn't linked.
+#[cfg(not(feature = "corpus-fetch"))]
+fn cmd_fetch(_argv: &[String]) -> Result<ExitCode, String> {
+    Err(
+        "`corpus fetch` needs the `corpus-fetch` build feature; rebuild with \
+         `cargo build --release --features corpus-fetch`"
+            .to_string(),
+    )
 }
 
 // ─── build ─────────────────────────────────────────────────────────────────

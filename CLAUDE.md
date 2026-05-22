@@ -6,7 +6,7 @@ Variant chess is **explicitly out of scope** for this project — it will be a f
 
 ## Current status
 
-**Production HEAD = `M6.F`** (eval byte-identical to `M6.E`; bench `1213649` / d4 `90591`). **M6.G landed 2026-05-20** (corpus data-infra, no SPRT, no Elo claim; amended 2026-05-21 with the four-source taxonomy — `Source::{SelfPlayOnBook, SelfPlayOffBook, Ccrl, LichessOpen}` + `OpeningMode`-per-campaign, ADR-0035 §10). **Next: M6.H** (robust on-demand Lichess/CCRL ingestion — data-infra extension, no SPRT) **then M6.I** (single joint-Texel pass over the cumulative M6.A–F surface against the `M6.F` SPRT baseline). For details read [`docs/roadmap.md`](docs/roadmap.md) §M6 + the milestone retrospectives in [`docs/milestones/`](docs/milestones/).
+**Production HEAD = `M6.F`** (eval byte-identical to `M6.E`; bench `1213649` / d4 `90591`). **M6.G landed 2026-05-20** (corpus data-infra, no SPRT, no Elo claim; amended 2026-05-21 with the four-source taxonomy — `Source::{SelfPlayOnBook, SelfPlayOffBook, Ccrl, LichessOpen}` + `OpeningMode`-per-campaign, ADR-0035 §10). **M6.H landed 2026-05-22** (robust on-demand Lichess/CCRL ingestion — `corpus fetch` + `corpus::fetch`, behind the non-default `corpus-fetch` Cargo feature; functional gate, no SPRT, no engine touch ⇒ bench unchanged; ADR-0036). **Next: M6.I** (single joint-Texel pass over the cumulative M6.A–F surface against the `M6.F` SPRT baseline). For details read [`docs/roadmap.md`](docs/roadmap.md) §M6 + the milestone retrospectives in [`docs/milestones/`](docs/milestones/).
 
 ## How to pick up a new session
 

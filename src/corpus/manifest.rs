@@ -261,7 +261,7 @@ pub struct Manifest {
 // ── Minimal JSON writer ───────────────────────────────────────────────────────
 
 /// Escape a string for embedding in a JSON string literal.
-fn json_escape(s: &str) -> String {
+pub(crate) fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
         match c {
@@ -403,13 +403,31 @@ fn format_f64(v: f64) -> String {
 
 // ── Minimal JSON parser ───────────────────────────────────────────────────────
 
-/// Lightweight JSON value — only the shapes used by [`Manifest`].
+/// Lightweight JSON value — only the shapes used by [`Manifest`] and (M6.H)
+/// `fetch::catalog`'s `fetch-state.json`. `pub(crate)` so the fetcher reuses
+/// this tested parser instead of duplicating a fragile second one.
 #[derive(Debug)]
-enum JsonVal {
+pub(crate) enum JsonVal {
     Str(String),
     Num(f64),
     Arr(Vec<JsonVal>),
     Obj(Vec<(String, JsonVal)>),
+}
+
+/// Parse a complete JSON document (object/array/scalar) and reject trailing
+/// content. The single `pub(crate)` entry point for the minimal parser.
+/// Only the M6.H `fetch::catalog` consumer uses this, so it is gated behind the
+/// `corpus-fetch` feature (manifest's own parse uses `Parser` directly).
+#[cfg(feature = "corpus-fetch")]
+pub(crate) fn parse_json(src: &str) -> Result<JsonVal, CorpusError> {
+    let mut p = Parser::new(src.as_bytes());
+    p.skip_ws();
+    let v = p.parse_value()?;
+    p.skip_ws();
+    if p.peek().is_some() {
+        return Err(p.err("trailing content after JSON value"));
+    }
+    Ok(v)
 }
 
 struct Parser<'a> {

@@ -15,6 +15,12 @@
 pub mod consumer;
 pub mod dedup;
 pub mod dispatcher;
+/// M6.H on-demand network fetcher (CCRL/Lichess). Gated behind the non-default
+/// `corpus-fetch` Cargo feature so the engine binary never links the HTTP /
+/// decompression stack (`ureq`/`zstd`/`zip`). See `docs/plans/m6.h.md`,
+/// ADR-0036.
+#[cfg(feature = "corpus-fetch")]
+pub mod fetch;
 pub mod filter;
 pub mod manifest;
 pub mod objective;

@@ -56,6 +56,7 @@ Each row points to the dedicated section in this file (and the canonical ADR / p
 | King-safety term (M6.E) | `eval::king_safety::king_safety_term_white(pos) -> (i32, i32)` — king-zone attacker S-curve (`KING_SAFETY_TABLE[units.clamp(0,99)]`, units = Σ per-kind `KING_ATTACK_WEIGHT·popcount(attacks & king_zone)`, gated `<2 attackers ∨ no queen`, MG-only) + castled pawn-shield (SHIELD_1/2, relative-rank mirror) + MG-only open/semi-open-file penalty (both-adjacent amplifier). Zone via the single-source `pub(crate) king_zone(side,ksq)` = `ring \| (fwd & !from_square(ksq))` (king square excluded; 11 central / 8 back-rank / 5 corner). **Computed live in `evaluate_core` — never cached** (not pawn-only — king square + attacker squares; ADR-0033 §6 **supersedes ADR-0032 §3**'s pawn-shield-cache reservation as a correctness hazard). Blend-numerator only, not `static_eval_white`/mop-up (the ADR-0032 §4 boundary class). Pawn-storm omitted (ADR-0033 §3 — documented gap). **Shipped score-neutral: all 13 king-safety weights zeroed in `eval::data` ⇒ term ≡ (0,0) ⇒ `evaluate` byte-identical to `M6.D`**. **No SPRT screen ladder** (the M6.C/M6.D divergence, owned — ADR-0033 §8): research transfer-risk HIGH (PeSTO king-PST double-count) + the three-phase law + SPRT-noisiness + coupled-by-design components ⇒ negative-EV screen; line-296 satisfied vacuously (inert ⇒ no Elo claim). `KING_SAFETY_IN_EVAL=true`, term math live at zero weight, M6.I-ready. ADR-0033 (binds on M6.E per roadmap §M6). | "King-safety term" below; ADR-0033 / m6.e.md |
 | Tier-1 HCE features (M6.F) | `eval::tier1`: (1) **`outpost_term_white`** iterating the `pub(crate) outpost_squares(pos,side) -> Bitboard` seam (`!*_attack_front_spans(enemy_pawns)` ∩ own-pawn-defended), then the `(3..=5)` relative-rank gate + per-kind per-rank `OUTPOST_{KNIGHT,BISHOP}_{MG,EG}` tables — **the gate is correctness-load-bearing** (the span-complement is a valid hole test only in the enemy half); (2) **`rook_file_term_white`** — `file_fill` projection (`(file_fill(own_pawns) & from_square(rook)).any()`), open > semi-open precedence; (3) **`endgame_scale`** — numerator over the **structural** `EG_SCALE_DEN`, applied `blended * scale / EG_SCALE_DEN` **before** `+ mop_up` (`is_ocb_with_pawns` exactly-1-bishop-each opposite complexes + no Q/R + ≥1 pawn; `is_pawnless_drawish` narrow KNNvK/balanced-≤1-minor accept-list, KBNvK/KBBvK excluded as wins; 50-move ramp; `is_kbkb_same_color` already in M6.A — **not** duplicated, disjoint). **Computed live in `evaluate_core` — never cached** (the ADR-0033 §6 live-term class); additive terms blend-numerator only; the scale multiplies the blend numerator only — never `static_eval_white`/mop-up (the ADR-0032 §4 boundary, the **first multiplicative construct** so it gets its own `endgame_scale_excludes_static_accessor_vs_m6e` pin). **Shipped score-neutral inert per the M6.C/M6.D/M6.E precedent: all additive weights zeroed + every scale tunable == `EG_SCALE_DEN` (scale ≡ identity) ⇒ outpost/rook-file ≡ (0,0), `endgame_scale ≡ EG_SCALE_DEN`, `blended·D/D == blended` byte-exact ⇒ `evaluate` byte-identical to `M6.E` ⇒ bench `1213649`/d4 `90591` byte-for-byte (deterministic ×2) ⇒ provably inert ⇒ no confirmation SPRT, no SPRT screen ladder.** `TIER1_IN_EVAL=true`, term math live at the inert config, M6.I-ready. **Endgame-scaling inert-vs-live open ADR question resolved inert-per-precedent** (ADR-0034 §4 — roadmap-stated default; the reinforcing optimizer argument is conditional on the open M6.I optimizer ADR and honorable at M6.I without M6.F landing live; dominated correctness-timing axis costs zero strength — no rated play in the M6.F→M6.G→M6.I gap; owned, not papered). ADR-0034 (binds on M6.F per roadmap §M6). | "Tier-1 HCE features" below; ADR-0034 / m6.f.md |
 | Tuning corpus infra (M6.G) | Reusable game-result-labeled position corpus (data infra, **no `evaluate`/`Position`/search touch — no engine build, no bench**): CCRL + band-filtered Lichess + diversified-opening-book clawfish self-play + label-verified Zurichess quiet set; clock-loss / time-forfeit exclusion + TC-class filter; quiet-position extraction (quiet *definition* pinned by M6.I's tuner qsearch — an M6.G↔M6.I interface contract); opening-ply skip; FEN dedup / per-FEN caps; ADR-0003 label-provenance audit (game-result labels ONLY); held-out deployment-distributed self-play validation set; frozen snapshot + manifest + RNG seeds + re-run script vendored in `bench/`. **Gate: data-quality checks, NOT SPRT** (the M5.E correctness-only-gate precedent applied to data; no Elo claim). Consumers: M6.I, the tuning-backlog "PST co-tuning" Arm B, future SPSA campaigns, M10 NNUE data-prep. | "Tuning corpus infra" below; roadmap §M6 (M6.G scope detail) / ADR (allocated at landing) |
+| On-demand ingestion (M6.H) | `corpus::fetch` (behind the **non-default `corpus-fetch` feature** — engine binary/audit/bench untouched): `stream_to_ingest` streams a compressed PGN dump over HTTPS → decompress (`zstd` `.pgn.zst` / `zip` `.zip`) → the M6.G ingest path, reused verbatim. `ResumableHttpReader<R,F>` (in-attempt HTTP `Range` resume keeps the decoder alive + outer byte-0 restart), games-parsed stall watchdog (`ureq` `timeout_recv_body` heartbeat), decoder-agnostic counter-driven early termination, byte-0-restart idempotence (pinned `base_game_id` + skip-re-seen-ids). 7 robustness gates; TLS via `platform-verifier` (OS trust store). Lichess auto-URL; **CCRL `--url`-required (`.7z`-only upstream)**. The synchronous M6.I primitive. **No `evaluate`/search touch ⇒ bench `1213649` byte-for-byte.** | "Corpus fetch" below; ADR-0036 / m6.h.md |
 | Production search | `AlphaBetaMover`: fail-soft negamax + qsearch (M3.D + M5.E refinements + M5.F TT participation) + ID + caps (M3.E) + TT (M4.A + M5.F qsearch tier) + killers (M4.B) + history (M4.C) + aspiration (M4.D) + NMP (M5.A) + RFP (M5.B) + LMR (M5.C) + FFP (M5.D) + SE (M5.G) + staged movegen (M5.H1 architecture, eager generation; M5.H2 will enable lazy generation); `bench` regression baseline (M3.F) | "Search v1" below; ADR-0016, ADR-0017, ADR-0018, ADR-0019, ADR-0023, ADR-0024, ADR-0025, ADR-0026, ADR-0027, ADR-0028, ADR-0029, ADR-0030 |
 | Transposition table (M4.A + M5.F) | `TranspositionTable` in `src/tt.rs`: `UnsafeCell<Vec<TtEntry>>` + `AtomicUsize` mask + `AtomicU8` generation; depth-preferred + age-bias replacement; full 64-bit Zobrist key; mate-score depth-adjustment; bound-aware probe with cutoffs at non-PV nodes (negamax) and unconditionally (qsearch); `Hash` UCI option (default 16 MiB, range 1–4096). M5.F: qsearch participates with `depth = 0` entries; `is_empty()` discriminator changes to `key == 0`; non-terminal qsearch stores only Lower/Upper (no Exact, per Stockfish 45e5e65). | "Transposition table" below; ADR-0018, ADR-0028 |
 | Game history + draw helpers | `Engine::game_history: Vec<u64>` + `is_repetition` + `is_fifty_move_draw` | "Game history and draw-detection helpers" below |
@@ -411,6 +412,44 @@ internals).
 **Consumers.** M6.I Texel tuning (next phase); the tuning-backlog "PST co-tuning Arm B" entry; future SPSA campaigns; M10 NNUE data-prep.
 
 See ADR-0035, the roadmap M6.G row, `docs/milestones/m6.g.md`, `docs/research/m6-corpus-construction.md`.
+
+## Corpus fetch (M6.H; ADR-0036)
+
+**On-demand network ingestion**, behind the **non-default `corpus-fetch` Cargo
+feature** so the engine binary, its `cargo audit`/`cargo deny`, and its bench
+are unaffected (only the `corpus` CLI's `fetch` subcommand pulls `ureq` 3.3 /
+`zstd` 0.13 / `zip` 8.6). No `evaluate`/search touch ⇒ bench `1213649`/d4
+`90591` byte-for-byte; functional gate, not SPRT.
+
+**Public API.** `corpus::fetch::stream_to_ingest(source, url, target_positions,
+out_dir, filter, stop, cfg) -> Result<FetchOutcome, CorpusError>` — the
+synchronous "give me N more positions from source X" primitive the M6.I
+bi-level driver calls (parallel to `corpus selfplay`). Streams a compressed PGN
+dump over HTTPS → decompress → the **M6.G ingest path reused verbatim**
+(`stream_pgn` → `game_admitted` → `append_block` into `pgn-shard.bin`; R1 atomic
+block log + dedup for free).
+
+**`ResumableHttpReader<R, F>`** is a `Read` adapter below the decompressor,
+generic over the inner reader and a reconnect closure (so the state machine is
+unit-testable with no socket). Two-level resume: in-attempt HTTP `Range` resume
+keeps the same decoder alive (zero re-decompression); the outer infinite-backoff
+loop does byte-0 restarts (idempotent — pinned `base_game_id` + skip-re-seen
+ids). Stall watchdog keys on **games parsed** (`timeout_recv_body =
+stall_timeout` heartbeat), escalating a byte-alive-but-gameless stream.
+Early-termination is **decoder-agnostic** (a shared position counter + a
+disambiguating peek that separates `Eos`-at-target from `EarlyTarget`). TLS via
+`platform-verifier` (OS trust store). 7 robustness gates (connect, stall,
+HTTP-permanence split, redirect cap, PGN magic-byte prefix sniff, parse-sanity
+over a pre-flight prefix, `statvfs` disk pre-check).
+
+**Source resolution.** Lichess auto-constructs its monthly-dump URL; **CCRL
+distributes only as `.7z` (unsupported) ⇒ `--source ccrl` requires an operator
+`--url`** to a `.zip`/`.pgn.zst` mirror (the `.zip` path downloads to a temp
+file then parses the first `.pgn` entry locally). Per-URL contribution tracked
+in `<out>/fetch-state.json` (gitignored). See `docs/data-catalog.md`.
+
+See ADR-0036, the roadmap M6.H row, `docs/milestones/m6.h.md`,
+`docs/research/m6-network-fetch.md`.
 
 ## Search v1 (production: alpha-beta)
 

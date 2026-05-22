@@ -12,6 +12,24 @@ publish = false
 # gated `#[cfg(unix)]`. MIT/Apache-2.0 licensed; covered by `deny.toml`.
 libc = "0.2"
 
+# M6.H corpus-fetch network stack. ALL gated behind the non-default
+# `corpus-fetch` feature (see [features] below) so the engine binary and its
+# `cargo audit`/`cargo deny`/build are unaffected — only the `corpus` CLI's
+# `fetch` subcommand pulls these. See docs/plans/m6.h.md §2, ADR-0036.
+# ureq: sync HTTP client; `platform-verifier` uses the OS trust store (macOS
+# Security framework) — no static webpki-roots, no `gzip` transport feature
+# (we decompress payloads ourselves). zstd: streaming Zstandard decoder for
+# Lichess `.pgn.zst` (vendors libzstd; build-time C compiler only). zip:
+# CCRL `.zip` (deflate-only; download-to-temp + ZipArchive).
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"], optional = true }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"], optional = true }
+zstd = { version = "0.13", optional = true }
+
+[features]
+# Non-default: enables the `corpus fetch` network ingestion path (M6.H).
+# Build/test it with `--features corpus-fetch`; the engine builds without it.
+corpus-fetch = ["dep:ureq", "dep:zip", "dep:zstd"]
+
 [dev-dependencies]
 # Property-based testing. Used in unit tests (modules under `#[cfg(test)]`)
 # and integration tests under `tests/`. Stable-Rust only — no nightly.
