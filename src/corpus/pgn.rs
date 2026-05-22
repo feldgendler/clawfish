@@ -33,6 +33,12 @@ pub struct PgnTags {
     pub black_elo: Option<u32>,
     /// `TimeControl` tag (PGN spec form, e.g. `"600+5"`).
     pub time_control: Option<String>,
+    /// `SetUp` tag (`"1"` ⇒ the game starts from a non-standard `[FEN]`
+    /// position — rejected by `game_admitted`; ADR-0036 amendment).
+    pub setup: Option<String>,
+    /// `FEN` tag (the start position when `SetUp "1"`). Used by the
+    /// non-standard-start gate.
+    pub fen: Option<String>,
 }
 
 /// Counters surfaced into `corpus_stats.txt` + the quality gate.
@@ -411,6 +417,8 @@ fn apply_tag(tags: &mut PgnTags, key: &str, val: String) {
         "WhiteElo" => tags.white_elo = val.trim().parse().ok(),
         "BlackElo" => tags.black_elo = val.trim().parse().ok(),
         "TimeControl" => tags.time_control = Some(val),
+        "SetUp" => tags.setup = Some(val.trim().to_string()),
+        "FEN" => tags.fen = Some(val.trim().to_string()),
         _ => {}
     }
 }
@@ -1132,5 +1140,29 @@ mod tests {
             assert_eq!(mv.from_square(), *from, "SAN {san_str:?} from-square");
             assert_eq!(mv.to_square(), *to, "SAN {san_str:?} to-square");
         }
+    }
+
+    #[test]
+    fn setup_and_fen_tags_parsed() {
+        // The `[SetUp]` + `[FEN]` tags (ADR-0036 non-standard-start gate input)
+        // must be captured into PgnTags by `apply_tag`. The movetext replays
+        // from the standard start (the parser ignores the FEN), so a redundant
+        // startpos FEN keeps the game emitting; the tags carry through.
+        let startpos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        let pgn = format!(
+            "[Event \"x\"]\n[SetUp \"1\"]\n[FEN \"{startpos}\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n"
+        );
+        let mut captured: Option<PgnTags> = None;
+        let mut stats = PgnStats::default();
+        stream_pgn(
+            Cursor::new(pgn),
+            0,
+            &mut |g| captured = Some(g.tags),
+            &mut stats,
+        )
+        .expect("stream");
+        let tags = captured.expect("game emitted");
+        assert_eq!(tags.setup.as_deref(), Some("1"), "SetUp tag parsed");
+        assert_eq!(tags.fen.as_deref(), Some(startpos), "FEN tag parsed");
     }
 }

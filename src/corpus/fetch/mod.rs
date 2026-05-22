@@ -488,7 +488,9 @@ fn ingest_game(
     if call.target_reached() {
         return;
     }
-    if !game_admitted(&gp.tags, filter) {
+    // Game-level admission (Termination / non-standard-start / length / TC /
+    // Elo). `positions.len()` = mainline plies + 1.
+    if !game_admitted(&gp.tags, gp.positions.len(), filter) {
         return;
     }
     let Some(label) = gp.tags.result else {

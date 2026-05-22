@@ -500,7 +500,12 @@ provenance recorded on every emitted record."
             ));
         }
     };
-    let filter = GameFilter::default();
+    // CCRL has no `[TimeControl]` tag (its TC is in `[Event]`), so it needs the
+    // TC-relaxed filter; Lichess uses the default (TC-required) band filter.
+    let filter = match source {
+        Source::Ccrl => clawfish::corpus::filter::ccrl_filter(),
+        _ => GameFilter::default(),
+    };
 
     let f = fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let r = BufReader::new(f);
@@ -515,8 +520,9 @@ provenance recorded on every emitted record."
     let mut stats = PgnStats::default();
     let shard_ref = shard.clone();
     let mut on_game = move |gp: clawfish::corpus::pgn::GamePositions| {
-        // Game-level admission first (Termination/TC/Elo).
-        if !clawfish::corpus::filter::game_admitted(&gp.tags, &filter) {
+        // Game-level admission first (Termination / non-standard-start / length
+        // / TC / Elo). `positions.len()` = mainline plies + 1.
+        if !clawfish::corpus::filter::game_admitted(&gp.tags, gp.positions.len(), &filter) {
             return;
         }
         let label = match gp.tags.result {
@@ -615,7 +621,12 @@ temp file then parsed locally).
 
     let stop = Arc::new(AtomicBool::new(false));
     install_signal_handler(stop.clone());
-    let filter = GameFilter::default();
+    // CCRL needs the TC-relaxed filter (no `[TimeControl]` tag); Lichess uses
+    // the default band filter.
+    let filter = match source {
+        Source::Ccrl => clawfish::corpus::filter::ccrl_filter(),
+        _ => GameFilter::default(),
+    };
     let cfg = FetchConfig::default();
 
     eprintln!("corpus: fetch {source:?} target={target} url={url}");

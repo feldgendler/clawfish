@@ -28,19 +28,17 @@ use clawfish::corpus::store::scan_valid_blocks;
 
 // --- test fixtures ----------------------------------------------------------
 
+/// A fixed 22-ply legal line (symmetric fianchetto) — long enough to pass the
+/// ADR-0036 min-length gate (≥ 20 plies); the movetext is identical across
+/// games (compression resistance comes from the per-game `noise()` Site tag,
+/// not the moves). 22 plies ⇒ 23 positions (startpos + 22).
+const MOVETEXT_22PLY: &str = "1. Nf3 Nf6 2. g3 g6 3. Bg2 Bg7 4. O-O O-O 5. d3 d6 \
+6. c4 c5 7. Nc3 Nc6 8. Rb1 Rb8 9. a3 a6 10. b4 b5 11. cxb5 axb5";
+
 /// One band-filter-passing PGN game (WhiteElo/BlackElo ≥ 2000, Standard TC,
-/// Normal termination). `idx` varies the movetext slightly so the zst payload
-/// is not pathologically compressible (keeps the early-termination byte bound
-/// meaningful). Each game yields 7 positions (startpos + 6 plies).
+/// Normal termination, ≥ 20 plies). Each game yields `POSITIONS_PER_GAME`
+/// positions.
 fn one_game(idx: usize) -> String {
-    let openings = [
-        "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6",
-        "1. d4 d5 2. c4 e6 3. Nc3 Nf6",
-        "1. c4 c5 2. Nf3 Nc6 3. d4 cxd4",
-        "1. e4 c5 2. Nf3 d6 3. d4 cxd4",
-        "1. Nf3 Nf6 2. g3 g6 3. Bg2 Bg7",
-    ];
-    let mv = openings[idx % openings.len()];
     let result = match idx % 3 {
         0 => "1-0",
         1 => "0-1",
@@ -54,7 +52,7 @@ fn one_game(idx: usize) -> String {
     format!(
         "[Event \"Rated game {idx}\"]\n[Site \"{pad}\"]\n[White \"a\"]\n[Black \"b\"]\n\
          [Result \"{result}\"]\n[WhiteElo \"2400\"]\n[BlackElo \"2410\"]\n\
-         [TimeControl \"600+5\"]\n[Termination \"Normal\"]\n\n{mv} {result}\n\n",
+         [TimeControl \"600+5\"]\n[Termination \"Normal\"]\n\n{MOVETEXT_22PLY} {result}\n\n",
         pad = noise(idx),
     )
 }
@@ -79,7 +77,7 @@ fn make_pgn(n_games: usize) -> String {
     (0..n_games).map(one_game).collect()
 }
 
-const POSITIONS_PER_GAME: u64 = 7;
+const POSITIONS_PER_GAME: u64 = 23; // startpos + 22 plies (MOVETEXT_22PLY)
 
 fn zstd_encode(bytes: &[u8]) -> Vec<u8> {
     zstd::stream::encode_all(bytes, 3).expect("zstd encode")
@@ -607,7 +605,11 @@ fn fetch_idempotent_byte0_restart_no_duplicate() {
     );
     let dir = tmp_dir("idem");
     let mut cfg = test_cfg();
-    cfg.preflight_bytes = 4 * 1024; // small pre-flight so real ingest starts early
+    // Small-ish pre-flight so the real ingest starts well before the ~40% drop
+    // point (games append → the byte-0 restart exercises skip-re-seen), but
+    // large enough that the prefix's one truncated last game stays under the
+    // gate-6 10% parse-failure threshold (~30 games at the ~520-byte fixture).
+    cfg.preflight_bytes = 16 * 1024;
     let out = stream_to_ingest(
         Source::LichessOpen,
         &srv.url("/d.pgn.zst"),

@@ -18,15 +18,28 @@ that stops the parse at `target_positions` so a multi-GB full-DB archive is not
 decompressed whole). This makes the CCRL "pipeline" actually work on-demand. The
 rest of this ADR stands; §2's "7z out of scope" is superseded by this amendment.
 
-**Amendment (2026-05-22, game-level + variant filter spec — DECIDED, NOT YET
-IMPLEMENTED).** The ingest path's game-admission filter (`filter::game_admitted`,
+**Amendment (2026-05-22, game-level + variant filter spec — IMPLEMENTED
+2026-05-22).** The ingest path's game-admission filter (`filter::game_admitted`,
 defined in M6.G / ADR-0035 and reused verbatim by §1) is extended with three new
-game-level gates and three explicit *non*-gates. These are requirements recorded
-ahead of implementation: no code lands with this amendment, and the M6.H
-build/bench are unaffected until it does. Whole-game drops are the right
+game-level gates and three explicit *non*-gates. Whole-game drops are the right
 granularity for all three additions because the game's `Result` is the shared
 training label, so a corrupt result poisons every position extracted from that
 game.
+
+**Implementation note + a fourth, discovered gate (CCRL TimeControl).** Shipped:
+`game_admitted` gained a `ply_count` arg + the Rules-infraction / min-length
+(`MIN_GAME_PLIES = 20`) / non-standard-start gates (the last comparing the full
+parsed `Position` to `starting_position()`, so a standard-placement-but-
+black-to-move `[FEN]` without `[SetUp]` is also rejected); `PgnTags` reads
+`SetUp`/`FEN`. **The amendment's non-gate "min_elo is a no-op for CCRL → CCRL
+passes" was incomplete**: empirically CCRL's bare PGN carries `WhiteElo`/
+`BlackElo` (≥ 2000) but **no `[TimeControl]` tag** (its TC is in
+`[Event "CCRL 40/15"]`), so the *TimeControl* gate — not Elo — rejected every
+CCRL game (0 ingested). Fix: `GameFilter.require_tc` + `ccrl_filter()`
+(require_tc=false) skips the TC gate for CCRL; `cmd_fetch`/`cmd_ingest_pgn`
+select the filter per `Source`. Validated end-to-end: the full CCRL 2M ingest
+landed 2,000,175 positions / 14,713 games; Lichess (TC gate retained) landed
+2,000,064 / 26,628.
 
 *Added gates:*
 1. **`Termination "Rules infraction"` → drop**, joining the existing
