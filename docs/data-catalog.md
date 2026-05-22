@@ -3,11 +3,12 @@
 Vetted source URLs + acquisition notes for `corpus fetch` (M6.H on-demand
 ingestion). See `docs/plans/m6.h.md`, ADR-0036, and ADR-0035 (corpus infra).
 
-`corpus fetch` streams a compressed PGN dump over HTTPS, decompresses on the
-fly (`.pgn.zst` via `zstd`, `.zip` via `zip`), filters with
+`corpus fetch` streams a compressed PGN dump over HTTPS, decompresses
+(`.pgn.zst` streamed via `zstd`; `.zip` via `zip` and `.7z` via `sevenz_rust2`,
+both downloaded to a resumable temp file then parsed locally), filters with
 `GameFilter::default()` (WhiteElo/BlackElo ≥ 2000, Standard time-control,
-`Termination != Time forfeit/Abandoned`), and appends to
-`<out>/pgn-shard.bin`. **7z is not supported** (deliberate — see ADR-0036).
+`Termination != Time forfeit/Abandoned`), and appends to `<out>/pgn-shard.bin`.
+The codec is chosen by the URL extension (`.pgn.zst` / `.zip` / `.7z`).
 
 ## Lichess (human games) — `Source::LichessOpen`
 
@@ -30,28 +31,31 @@ https://database.lichess.org/standard/lichess_db_standard_rated_YYYY-MM.pgn.zst
 
 ## CCRL (engine games) — `Source::Ccrl`
 
-**No auto-default — `--url` is REQUIRED.** CCRL (computerchess.org.uk) publishes
-its game databases **only as `.7z`**, which M6.H deliberately does not support,
-and its site is bot-hostile (302/403 to non-browser clients, 2026-05). There is
-no public CCRL `.zip`/`.pgn.zst` mirror to pin here, so the operator must supply
-a `.zip`-of-PGN or `.pgn.zst` URL via `--url`:
+CCRL (computerchess.org.uk) publishes its databases as **`.7z`** (LZMA2), which
+`corpus fetch` supports directly (`sevenz_rust2`). The archive files download
+fine over plain HTTPS (the *index* page is JS-driven, but the archive URLs are
+static). **`--url` is REQUIRED** — CCRL filenames embed a game count
+(`CCRL-4040.[N].pgn.7z`), so there's no stable auto-constructible URL. Vetted
+sources (computerchess.org.uk, browser-UA HEAD-verified 2026-05):
+
+- Full 40/40 database (~2.34 M games):
+  `https://computerchess.org.uk/ccrl/4040/CCRL-4040.[2343842].pgn.7z`
+  (the `[N]` count changes when CCRL re-publishes — get the current filename
+  from `https://computerchess.org.uk/ccrl/4040/games.html`).
+- Per-month slices: `https://computerchess.org.uk/ccrl/4040/games-by-month/YYYY-MM.bare.[N].pgn.7z`.
+- 40/2 archive: `https://computerchess.org.uk/ccrl/402.archive/games-by-engine/<engine>.bare.[N].pgn.7z`.
 
 ```
-corpus fetch --source ccrl --out <dir> --url <https URL to a .zip/.pgn.zst of CCRL PGN>
+corpus fetch --source ccrl --out <dir> --target-positions 2000000 \
+    --url 'https://computerchess.org.uk/ccrl/4040/CCRL-4040.[2343842].pgn.7z'
 ```
 
-To obtain one:
-
-- Download the official `.7z` from CCRL, extract locally, recompress the `.pgn`
-  as `.zip` (or `.pgn.zst`), host it on any HTTPS server that supports byte
-  ranges, and pass that URL; **or**
-- use `corpus ingest-pgn --source ccrl --path <local.pgn>` to ingest an
-  already-extracted PGN on disk (no network — the pre-M6.H path); **or**
-- supply any other engine-vs-engine PGN collection available as `.zip`/`.pgn.zst`
-  and tag it `--source ccrl`.
-
-The `corpus fetch` zip path downloads the (small, tens-of-MB) archive to a temp
-file with Range-resumable progress, then parses the first `*.pgn` entry locally.
+The fetcher downloads the `.7z` to a resumable temp file, opens it with
+`sevenz_rust2`, and streams the first `*.pgn` entry — early-terminating (via the
+target guard) once `--target-positions` is reached, so a multi-GB full-DB
+archive is not decompressed in full for a small slice. (`.zip`/`.pgn.zst` CCRL
+mirrors also work; `corpus ingest-pgn --source ccrl --path <local.pgn>` remains
+the no-network on-disk path.)
 
 ## Provenance discipline (ADR-0035 §1)
 

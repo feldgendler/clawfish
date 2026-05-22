@@ -442,11 +442,15 @@ disambiguating peek that separates `Eos`-at-target from `EarlyTarget`). TLS via
 HTTP-permanence split, redirect cap, PGN magic-byte prefix sniff, parse-sanity
 over a pre-flight prefix, `statvfs` disk pre-check).
 
-**Source resolution.** Lichess auto-constructs its monthly-dump URL; **CCRL
-distributes only as `.7z` (unsupported) ⇒ `--source ccrl` requires an operator
-`--url`** to a `.zip`/`.pgn.zst` mirror (the `.zip` path downloads to a temp
-file then parses the first `.pgn` entry locally). Per-URL contribution tracked
-in `<out>/fetch-state.json` (gitignored). See `docs/data-catalog.md`.
+**Codec by URL extension.** `.pgn.zst` streams (resumable, in-RAM); `.zip`
+(`zip`) and `.7z` (`sevenz_rust2`, pure-Rust LZMA2) download to a resumable temp
+file then parse the first `.pgn` entry locally, with a `TargetGuard` that stops
+the parse at `target_positions` (so a multi-GB CCRL DB isn't decompressed
+whole). **Source resolution.** Lichess auto-constructs its monthly-dump URL;
+**CCRL distributes only as `.7z` (supported) ⇒ `--source ccrl` requires an
+operator `--url`** (the count-bearing filename isn't auto-constructible).
+Per-URL contribution tracked in `<out>/fetch-state.json` (gitignored). See
+`docs/data-catalog.md`.
 
 See ADR-0036, the roadmap M6.H row, `docs/milestones/m6.h.md`,
 `docs/research/m6-network-fetch.md`.

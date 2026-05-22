@@ -220,9 +220,21 @@ struct Attempt<'a> {
     cfg: &'a FetchConfig,
 }
 
+/// Decompression codec, selected by the URL extension (not the provenance
+/// `Source`, which is just the record tag).
+enum Codec {
+    /// `.pgn.zst` — streaming zstd over the resumable reader (Lichess).
+    Zstd,
+    /// `.zip` — download-to-temp + `ZipArchive`.
+    Zip,
+    /// `.7z` — download-to-temp + `sevenz_rust2::ArchiveReader` (CCRL).
+    SevenZ,
+}
+
 /// One fetch attempt: open → decompress → (gates 5+6 pre-flight) → stream_pgn →
-/// ingest. Lichess streams `.pgn.zst`; CCRL downloads the `.zip` to a temp file
-/// then parses it locally (research §4 — small archives, file-offset resume).
+/// ingest. `.pgn.zst` streams (in-RAM resume); `.zip`/`.7z` download to a temp
+/// file then parse the first `.pgn` entry locally (archive metadata needs the
+/// whole file; the temp download is itself resumable, research §4).
 fn run_attempt(source: Source, ctx: &Attempt) -> AttemptResult {
     // Gate 7: a full disk is operator-fixable, not a transient — don't loop.
     if let Some(dir) = ctx.shard.parent()
@@ -230,18 +242,32 @@ fn run_attempt(source: Source, ctx: &Attempt) -> AttemptResult {
     {
         return AttemptResult::Permanent(e.to_string());
     }
-    match source {
-        Source::LichessOpen => run_attempt_lichess(ctx),
-        Source::Ccrl => run_attempt_ccrl(ctx),
-        Source::SelfPlayOnBook | Source::SelfPlayOffBook => {
-            AttemptResult::Permanent("self-play sources are not network-fetched".into())
-        }
+    if matches!(source, Source::SelfPlayOnBook | Source::SelfPlayOffBook) {
+        return AttemptResult::Permanent("self-play sources are not network-fetched".into());
+    }
+    let url = ctx.url.to_ascii_lowercase();
+    let codec = if url.ends_with(".zst") {
+        Codec::Zstd
+    } else if url.ends_with(".zip") {
+        Codec::Zip
+    } else if url.ends_with(".7z") {
+        Codec::SevenZ
+    } else {
+        return AttemptResult::Permanent(format!(
+            "unsupported URL extension (need .pgn.zst / .zip / .7z): {}",
+            ctx.url
+        ));
+    };
+    match codec {
+        Codec::Zstd => run_attempt_zstd_stream(source, ctx),
+        Codec::Zip => run_attempt_archive(source, ctx, Codec::Zip),
+        Codec::SevenZ => run_attempt_archive(source, ctx, Codec::SevenZ),
     }
 }
 
-/// Lichess `.pgn.zst`: streaming zstd over the resumable reader, in-RAM resume,
-/// games-parsed watchdog, counter-driven early termination.
-fn run_attempt_lichess(ctx: &Attempt) -> AttemptResult {
+/// `.pgn.zst`: streaming zstd over the resumable reader (in-RAM resume,
+/// games-parsed watchdog, counter-driven early termination — no temp file).
+fn run_attempt_zstd_stream(source: Source, ctx: &Attempt) -> AttemptResult {
     let mut opener = http_opener(ctx.agent.clone(), ctx.url.to_string());
     let initial = match opener(0) {
         Ok(r) => r,
@@ -261,22 +287,39 @@ fn run_attempt_lichess(ctx: &Attempt) -> AttemptResult {
         Ok(d) => d,
         Err(_) => return AttemptResult::Retry,
     };
-    run_decompressed_pipeline(decoder, Source::LichessOpen, ctx)
+    run_decompressed_pipeline(decoder, source, ctx)
 }
 
-/// CCRL `.zip`: download to a temp file (resumable, bytes-as-progress), then
-/// `ZipArchive` the first `.pgn` entry locally. The temp file is unlinked on
-/// every exit path.
-fn run_attempt_ccrl(ctx: &Attempt) -> AttemptResult {
+/// `.zip`/`.7z`: download the archive to a resumable temp file, then parse its
+/// first `.pgn` entry locally. The temp file is unlinked on every exit path.
+fn run_attempt_archive(source: Source, ctx: &Attempt, codec: Codec) -> AttemptResult {
     let dir = ctx.shard.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!(".fetch-ccrl-{}.zip.part", std::process::id()));
+    let ext = match codec {
+        Codec::Zip => "zip",
+        Codec::SevenZ => "7z",
+        Codec::Zstd => unreachable!("zstd is streamed, not downloaded to temp"),
+    };
+    let tmp = dir.join(format!(".fetch-{}.{ext}.part", std::process::id()));
     let _guard = TmpGuard(&tmp);
 
+    if let Err(r) = download_to_temp(ctx, &tmp) {
+        return r;
+    }
+    match codec {
+        Codec::Zip => parse_zip_pgn(&tmp, source, ctx),
+        Codec::SevenZ => parse_7z_pgn(&tmp, source, ctx),
+        Codec::Zstd => unreachable!(),
+    }
+}
+
+/// Stream the archive body into `tmp` (resumable, bytes-as-progress). On
+/// failure, returns the classified `AttemptResult` to bubble.
+fn download_to_temp(ctx: &Attempt, tmp: &Path) -> Result<(), AttemptResult> {
     let mut opener = http_opener(ctx.agent.clone(), ctx.url.to_string());
     let initial = match opener(0) {
         Ok(r) => r,
-        Err(reader::ReconnectError::Permanent(m)) => return AttemptResult::Permanent(m),
-        Err(_) => return AttemptResult::Retry,
+        Err(reader::ReconnectError::Permanent(m)) => return Err(AttemptResult::Permanent(m)),
+        Err(_) => return Err(AttemptResult::Retry),
     };
     let mut reader = ResumableHttpReader::new(
         initial,
@@ -287,18 +330,25 @@ fn run_attempt_ccrl(ctx: &Attempt) -> AttemptResult {
         ctx.cfg.max_noprogress_resumes,
         /* bytes_are_progress */ true,
     );
-    // Download the whole (small) archive to the temp file.
-    let mut f = match File::create(&tmp) {
+    let mut f = match File::create(tmp) {
         Ok(f) => f,
-        Err(e) => return AttemptResult::Permanent(format!("temp create: {e}")),
+        Err(e) => return Err(AttemptResult::Permanent(format!("temp create: {e}"))),
     };
     if std::io::copy(&mut reader, &mut f).is_err() {
-        return classify_attempt(ctx.call, ctx.att);
+        return Err(classify_attempt(ctx.call, ctx.att));
     }
-    drop(f);
+    // The download's own EOF set `eof_reason = InnerEof`, but that is the END OF
+    // THE ARCHIVE, not the end of the parse. Clear it so the subsequent
+    // local-parse classification (target-reached → EarlyTarget vs drained →
+    // Eos) isn't pre-empted by the InnerEof branch in `classify_attempt`.
+    ctx.att.eof_reason.set(None);
+    Ok(())
+}
 
-    // Parse the first `.pgn` entry locally.
-    let zf = match File::open(&tmp) {
+/// Parse the first `.pgn` entry of a downloaded `.zip` (target-guarded so the
+/// parse stops once `target` is reached, not at the entry's EOF).
+fn parse_zip_pgn(tmp: &Path, source: Source, ctx: &Attempt) -> AttemptResult {
+    let zf = match File::open(tmp) {
         Ok(f) => f,
         Err(_) => return AttemptResult::Retry,
     };
@@ -313,19 +363,62 @@ fn run_attempt_ccrl(ctx: &Attempt) -> AttemptResult {
             .unwrap_or(false)
     });
     let Some(idx) = pgn_idx else {
-        return AttemptResult::Permanent("no .pgn entry in CCRL zip".into());
+        return AttemptResult::Permanent("no .pgn entry in zip archive".into());
     };
     let entry = match archive.by_index(idx) {
         Ok(e) => e,
         Err(_) => return AttemptResult::Retry,
     };
-    // Local parse: no network, so classify by target (early) vs full-file (Eos).
-    match run_decompressed_pipeline(entry, Source::Ccrl, ctx) {
-        AttemptResult::Done(_) if ctx.call.target_reached() => {
-            AttemptResult::Done(Termination::EarlyTarget)
+    run_decompressed_pipeline(TargetGuard::new(entry, ctx.call.clone()), source, ctx)
+}
+
+/// Parse the first `.pgn` entry of a downloaded `.7z` (CCRL). `for_each_entries`
+/// yields the entry as a streaming `Read`; the target-guard returns EOF once
+/// `target` is reached, so iteration stops without decompressing the rest of a
+/// multi-GB archive.
+fn parse_7z_pgn(tmp: &Path, source: Source, ctx: &Attempt) -> AttemptResult {
+    let mut archive = match sevenz_rust2::ArchiveReader::open(tmp, sevenz_rust2::Password::empty())
+    {
+        Ok(a) => a,
+        Err(_) => return AttemptResult::Retry, // corrupt / truncated → re-download
+    };
+    let mut result: Option<AttemptResult> = None;
+    let walk = archive.for_each_entries(|entry, rd| {
+        if entry.name().to_ascii_lowercase().ends_with(".pgn") {
+            let guarded = TargetGuard::new(rd, ctx.call.clone());
+            result = Some(run_decompressed_pipeline(guarded, source, ctx));
+            return Ok(false); // stop after the first .pgn entry
         }
-        AttemptResult::Done(_) => AttemptResult::Done(Termination::Eos),
-        other => other,
+        Ok(true)
+    });
+    match result {
+        Some(r) => r,
+        None if walk.is_err() => AttemptResult::Retry,
+        None => AttemptResult::Permanent("no .pgn entry in 7z archive".into()),
+    }
+}
+
+/// A `Read` adapter that returns EOF (`Ok(0)`) once `target` is reached, so a
+/// local archive parse stops early instead of decompressing the whole entry.
+/// Used only for the `.zip`/`.7z` local-parse paths (the `.zst` streaming path
+/// early-terminates inside `ResumableHttpReader` instead).
+struct TargetGuard<R: Read> {
+    inner: R,
+    call: std::rc::Rc<CallState>,
+}
+
+impl<R: Read> TargetGuard<R> {
+    fn new(inner: R, call: std::rc::Rc<CallState>) -> Self {
+        TargetGuard { inner, call }
+    }
+}
+
+impl<R: Read> Read for TargetGuard<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.call.target_reached() {
+            return Ok(0);
+        }
+        self.inner.read(buf)
     }
 }
 

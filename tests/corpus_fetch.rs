@@ -100,6 +100,20 @@ fn zip_encode_pgn(pgn: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Build a `.7z` (LZMA2) containing a single `games.pgn` entry — the CCRL
+/// archive shape. `sevenz_rust2` compresses from a path, so the PGN is written
+/// to a scratch file first.
+fn sevenz_encode_pgn(pgn: &[u8], tag: &str) -> Vec<u8> {
+    let dir = tmp_dir(&format!("7zsrc-{tag}"));
+    let pgn_path = dir.join("games.pgn");
+    std::fs::write(&pgn_path, pgn).unwrap();
+    let z_path = dir.join("a.7z");
+    sevenz_rust2::compress_to_path(&pgn_path, &z_path).expect("7z compress");
+    let bytes = std::fs::read(&z_path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    bytes
+}
+
 // --- localhost HTTP/1.1 test server -----------------------------------------
 
 #[derive(Clone, Copy)]
@@ -325,7 +339,10 @@ fn shard_game_ids(dir: &Path) -> Vec<u64> {
 fn test_cfg() -> FetchConfig {
     FetchConfig {
         connect_timeout: Duration::from_secs(5),
-        stall_timeout: Duration::from_secs(5),
+        // Generous: the integration tests don't exercise stalling (that's
+        // unit-tested), and a tight window false-positives under the heavy CPU
+        // contention of the parallel test run.
+        stall_timeout: Duration::from_secs(60),
         backoff_initial: Duration::from_millis(10),
         backoff_max: Duration::from_millis(50),
         max_noprogress_resumes: 3,
@@ -664,6 +681,95 @@ fn fetch_ccrl_zip_temp_file_parity() {
         leftovers.is_empty(),
         "temp/extra files not cleaned: {leftovers:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fetch_ccrl_zip_early_termination() {
+    // Directly anchors the .zip early-term classification (the shared
+    // `eof_reason` reset + TargetGuard): a target far below the archive's games
+    // must report EarlyTarget, not Eos, with overshoot ≤ one game.
+    let pgn = make_pgn(500);
+    let payload = zip_encode_pgn(pgn.as_bytes());
+    let srv = TestServer::spawn(payload, Behavior::Serve);
+    let dir = tmp_dir("zipe");
+    let target = 70u64;
+    let out = stream_to_ingest(
+        Source::Ccrl,
+        &srv.url("/snapshot.zip"),
+        target,
+        &dir,
+        &GameFilter::default(),
+        &no_stop(),
+        &test_cfg(),
+    )
+    .expect("zip fetch");
+    assert_eq!(out.terminated, Termination::EarlyTarget);
+    assert!(out.positions_ingested >= target);
+    assert!(out.positions_ingested < target + POSITIONS_PER_GAME);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fetch_ccrl_7z_parity() {
+    // CCRL's real format: a single-entry .7z (LZMA2). The fetcher must download
+    // it, open it with sevenz_rust2, and parse the .pgn entry — parity with the
+    // zip/zst paths.
+    let pgn = make_pgn(100);
+    let payload = sevenz_encode_pgn(pgn.as_bytes(), "parity");
+    let srv = TestServer::spawn(payload, Behavior::Serve);
+    let dir = tmp_dir("7z");
+    let out = stream_to_ingest(
+        Source::Ccrl,
+        &srv.url("/CCRL-4040.[100].pgn.7z"),
+        u64::MAX,
+        &dir,
+        &GameFilter::default(),
+        &no_stop(),
+        &test_cfg(),
+    )
+    .expect("7z fetch");
+    assert_eq!(out.terminated, Termination::Eos);
+    assert_eq!(shard_record_count(&dir), 100 * POSITIONS_PER_GAME);
+    let (blocks, _) = scan_valid_blocks(&dir.join("pgn-shard.bin")).unwrap();
+    assert!(
+        blocks
+            .iter()
+            .all(|b| b.records.iter().all(|r| r.source == Source::Ccrl))
+    );
+    // Temp .7z cleaned up.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "pgn-shard.bin" && n != "fetch-state.json")
+        .collect();
+    assert!(leftovers.is_empty(), "temp .7z not cleaned: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fetch_ccrl_7z_early_termination() {
+    // The TargetGuard must stop the local .7z parse once the target is met
+    // (so a multi-GB CCRL archive isn't fully decompressed for a small slice).
+    let pgn = make_pgn(500);
+    let payload = sevenz_encode_pgn(pgn.as_bytes(), "early");
+    let srv = TestServer::spawn(payload, Behavior::Serve);
+    let dir = tmp_dir("7ze");
+    let target = 70u64; // ~10 games of 3500 positions
+    let out = stream_to_ingest(
+        Source::Ccrl,
+        &srv.url("/CCRL-4040.[500].pgn.7z"),
+        target,
+        &dir,
+        &GameFilter::default(),
+        &no_stop(),
+        &test_cfg(),
+    )
+    .expect("7z fetch");
+    assert_eq!(out.terminated, Termination::EarlyTarget);
+    assert!(out.positions_ingested >= target);
+    assert!(out.positions_ingested < target + POSITIONS_PER_GAME);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

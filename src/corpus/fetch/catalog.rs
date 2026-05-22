@@ -1,11 +1,12 @@
 //! M6.H URL catalog + per-URL fetch-state bookkeeping.
 //!
 //! Lichess monthly dumps follow a predictable URL pattern, so the fetcher can
-//! auto-construct the default Lichess URL. CCRL, by contrast, distributes only
-//! as `.7z` (which M6.H deliberately does not support) and serves no public
-//! `.zip`/`.pgn.zst` mirror, so **CCRL has no auto-default** — the operator
-//! must supply `--url` to a `.zip`/`.pgn.zst` mirror (see `docs/data-catalog.md`
-//! for the rationale + how to obtain one). The per-URL state file
+//! auto-construct the default Lichess URL. CCRL distributes as `.7z` (supported
+//! since the 2026-05-22 amendment — `sevenz_rust2`) but its filenames embed a
+//! game count (`CCRL-4040.[N].pgn.7z`), so there is no stable auto-constructible
+//! URL — **CCRL has no auto-default**; the operator passes `--url` to a current
+//! CCRL archive (`.7z`/`.zip`/`.pgn.zst`; see `docs/data-catalog.md`). The
+//! per-URL state file
 //! (`fetch-state.json`) records how much each URL has contributed so the M6.I
 //! driver can decide whether a URL has more to give. JSON reuses
 //! `corpus::manifest`'s tested parser (no `serde` dep). See
@@ -36,7 +37,8 @@ pub fn lichess_url(year: u32, month: u32) -> String {
 /// Resolve the default URL for `source` when `--url` is omitted.
 ///
 /// - `LichessOpen` → `Some(lichess_url(month | DEFAULT_LICHESS_MONTH))`.
-/// - `Ccrl` → `None` (no public `.zip` default — operator must pass `--url`).
+/// - `Ccrl` → `None` (the count-bearing `.7z` filename isn't auto-constructible;
+///   operator must pass `--url`).
 /// - Self-play sources → `None` (not network-fetched).
 pub fn default_url(source: Source, lichess_month: Option<(u32, u32)>) -> Option<String> {
     match source {

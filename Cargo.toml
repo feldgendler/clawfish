@@ -24,11 +24,14 @@ libc = "0.2"
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"], optional = true }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"], optional = true }
 zstd = { version = "0.13", optional = true }
+# sevenz-rust2: pure-Rust 7z decompressor (LZMA/LZMA2 — what CCRL uses). CCRL
+# distributes ONLY as .7z, so this is the on-demand CCRL path. Apache-2.0.
+sevenz-rust2 = { version = "0.21", optional = true }
 
 [features]
 # Non-default: enables the `corpus fetch` network ingestion path (M6.H).
 # Build/test it with `--features corpus-fetch`; the engine builds without it.
-corpus-fetch = ["dep:ureq", "dep:zip", "dep:zstd"]
+corpus-fetch = ["dep:ureq", "dep:zip", "dep:zstd", "dep:sevenz-rust2"]
 
 [dev-dependencies]
 # Property-based testing. Used in unit tests (modules under `#[cfg(test)]`)

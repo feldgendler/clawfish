@@ -575,13 +575,15 @@ block in <out>/pgn-shard.bin (the same path/discipline as `ingest-pgn`).
 Robust for unattended runs: in-RAM HTTP Range resume, a games-parsed stall
 watchdog, infinite exponential backoff, and content-validity gates.
 
+Supported URL extensions: .pgn.zst (streamed), .zip, .7z (downloaded to a
+temp file then parsed locally).
+
 --target-positions  Stop after this many NEW positions are appended (default:
                     unbounded — runs to end-of-stream).
 --url               Explicit dump URL. Lichess auto-constructs from
                     --lichess-month (default a pinned month) when omitted; CCRL
-                    has NO auto-default (official CCRL is .7z, unsupported) and
-                    REQUIRES --url to a .zip/.pgn.zst mirror — see
-                    docs/data-catalog.md."
+                    REQUIRES --url to an official CCRL .7z (the count-bearing
+                    filename isn't auto-constructible) — see docs/data-catalog.md."
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -605,8 +607,8 @@ watchdog, infinite exponential backoff, and content-validity gates.
     let url = match args.get("url") {
         Some(u) => u.to_string(),
         None => catalog::default_url(source, lichess_month).ok_or_else(|| {
-            "this source has no auto-default URL — pass --url to a .zip/.pgn.zst \
-             mirror (official CCRL is .7z, unsupported). See docs/data-catalog.md"
+            "this source has no auto-default URL — pass --url to a CCRL archive \
+             (.7z/.zip/.pgn.zst). See docs/data-catalog.md"
                 .to_string()
         })?,
     };
@@ -871,8 +873,10 @@ fn write_rerun_script(dir: &Path) -> Result<(), String> {
 # knobs (different seed, games, workers, val_fraction, ...) produces a
 # DIFFERENT corpus, not the frozen one.
 #
-# Tooling: requires `zstd` to decompress Lichess `.pgn.zst` and (optionally)
-# `7z` for CCRL. Both are system tools, NOT Rust deps (R5).
+# Tooling: this re-run script's no-network on-disk staging path (operator
+# extracts archives, then `corpus ingest-pgn`) may use system `zstd`/`7z`.
+# `corpus fetch` itself needs NO system tools — it decompresses .pgn.zst/.zip/.7z
+# in-process via Rust deps (zstd / zip / sevenz-rust2, behind `corpus-fetch`).
 
 set -eu
 
