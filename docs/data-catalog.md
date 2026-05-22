@@ -50,16 +50,18 @@ static). **`--url` is REQUIRED** — CCRL filenames embed a game count
 (`CCRL-4040.[N].pgn.7z`), so there's no stable auto-constructible URL. Vetted
 sources (computerchess.org.uk, browser-UA HEAD-verified 2026-05):
 
-- Full 40/40 database (~2.34 M games):
-  `https://computerchess.org.uk/ccrl/4040/CCRL-4040.[2343842].pgn.7z`
-  (the `[N]` count changes when CCRL re-publishes — get the current filename
-  from `https://computerchess.org.uk/ccrl/4040/games.html`).
+- Full 40/40 database (~2.35 M games):
+  `https://computerchess.org.uk/4040/CCRL-4040.[2349311].pgn.7z`
+  (the `[N]` count changes when CCRL re-publishes — `[2343842]` rolled to
+  `[2349311]` by 2026-05-23. The files live under `/4040/` (the `/ccrl/4040/`
+  path 302-redirects there); get the current filename from the `/4040/`
+  directory listing or `https://computerchess.org.uk/ccrl/4040/games.html`).
 - Per-month slices: `https://computerchess.org.uk/ccrl/4040/games-by-month/YYYY-MM.bare.[N].pgn.7z`.
 - 40/2 archive: `https://computerchess.org.uk/ccrl/402.archive/games-by-engine/<engine>.bare.[N].pgn.7z`.
 
 ```
 corpus fetch --source ccrl --out <dir> --target-positions 2000000 \
-    --url 'https://computerchess.org.uk/ccrl/4040/CCRL-4040.[2343842].pgn.7z'
+    --url 'https://computerchess.org.uk/4040/CCRL-4040.[2349311].pgn.7z'
 ```
 
 The fetcher downloads the `.7z` to a resumable temp file, opens it with
