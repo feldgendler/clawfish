@@ -15,25 +15,18 @@ fuzz/artifacts/
 # outside the repo entirely and don't need a gitignore rule.)
 /config.json
 
-# M6.G/M6.H/M6.H2 corpus-lane bytes: gitignored (operator-materialized via
-# re-run.sh from the manifest's pinned knobs + on-demand `corpus fetch` of
-# CCRL / Lichess sources). The committed manifest + filter_spec + the vendored
-# opening book are sufficient for byte-identical reproduction; the bytes
-# themselves can grow to hundreds of MB (self-play) or low GB once fetch pulls
-# in external PGN sources, all without meaningful git delta, so we don't track
-# them. M6.H2: each lane lives in its own dir under bench/corpus/ and produces
-# one flat `lane.bin` (no train/val split — that moves to M6.I). Future hosting
-# (GitHub release asset / S3 / sister-repo) will let consumers download a
-# frozen canonical artifact instead of re-running re-run.sh. See ADR-0035 §8/§12.
-/bench/corpus/**/lane.bin
-/bench/corpus/**/checkpoint.bin
-# M6.H per-URL fetch bookkeeping (bytes/positions/terminated per source URL).
-/bench/corpus/fetch-state.json
-# Per-game staging files (one per worker-completed game, consumed and
-# unlinked by the dedup thread in strict game_id order). Holds at most
-# ~K files at any time during a running campaign; empty when the
-# consumer has caught up. See ADR-0035 §3.5 (per-game-file reorder).
-/bench/corpus/**/pending/
+# M6.G/M6.H/M6.H2 corpus lanes: the ENTIRE bench/corpus/ tree is gitignored.
+# Each lane (SelfPlayOnBook/OffBook, Ccrl, LichessOpen) lives in its own dir and
+# is regenerable end-to-end — self-play deterministically from its seed/knobs,
+# fetch from the pinned source URL — so neither the bytes (lane.bin can reach
+# hundreds of MB / low GB) NOR the per-lane bookkeeping (manifest.json,
+# re-run.sh, filter_spec.txt, corpus_stats.txt, fetch-state.json, checkpoint.bin,
+# pending/, *.log) are tracked. The reproduction recipe lives in the repo
+# itself: source URLs in docs/data-catalog.md and the campaign commands recorded
+# alongside. Vendored fixtures (bench/data/, bench/*.md) are outside this tree
+# and stay tracked. Future hosting (GitHub release asset / S3 / sister-repo) may
+# publish a frozen canonical artifact for download. See ADR-0035 §8/§12.
+/bench/corpus/
 # Per-spill / per-stage operator artifacts.
 /target/corpus-raw/
 /target/corpus-spill/

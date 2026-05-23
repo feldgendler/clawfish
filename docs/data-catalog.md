@@ -85,3 +85,31 @@ Each fetch merges into `<out>/fetch-state.json` (per-URL `positions_contributed`
 The M6.I bi-level driver consults this to decide whether to revisit a URL or
 move to the next. This file is gitignored (operator-local bookkeeping); the
 lane (`lane.bin`) is the source of truth.
+
+## M6.H2 lane campaigns — reproduction recipe
+
+The four lanes' `bench/corpus/` output (incl. each lane's `manifest.json` /
+`re-run.sh`) is gitignored, so the exact spawn commands are recorded here. Build
+once: `cargo build --release --features corpus-fetch --bin corpus`, then run the
+release binary (each lane → its own gitignored dir; default depth-4 self-play
+ladder). After a lane reaches its target, `corpus finalize --in <dir>` writes the
+manifest/digest and `corpus quality-gate --dir <dir>` validates it.
+
+```
+# Network fetchers (run in parallel; CCRL count [N] rolls over — see above):
+corpus fetch --source ccrl --target-positions 2000000 --out bench/corpus/ccrl \
+    --url 'https://computerchess.org.uk/4040/CCRL-4040.[2349311].pgn.7z'
+corpus fetch --source lichess --lichess-month 2024-12 \
+    --target-positions 2000000 --out bench/corpus/lichess
+
+# Self-play lanes (background QoS; run the second only after the first hits 2M):
+taskpolicy -b corpus selfplay --opening-mode random \
+    --cap-positions 2000000 --seed 1001 --cap-seed 1001 \
+    --out bench/corpus/selfplay-offbook
+taskpolicy -b corpus selfplay --opening-mode book \
+    --cap-positions 2000000 --seed 2002 --cap-seed 2002 \
+    --out bench/corpus/selfplay-onbook
+```
+
+Fetch lanes land on exactly `--target-positions` (exact-truncation); Lichess may
+hit end-of-month first and stop with fewer. Self-play is seed-deterministic.
