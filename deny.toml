@@ -20,6 +20,13 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "CC0-1.0",
+    # Permissive licenses pulled in by the non-default `corpus-fetch` feature's
+    # network/decompression stack (checked here because the `deny` CI job runs
+    # `--all-features`). All four are non-copyleft and OSI/FSF-recognized:
+    "Zlib",                # zlib-rs -> flate2 -> zip (OSI-approved, FSF Free)
+    "Unicode-3.0",         # unicode-ident (Unicode License v3, OSI-approved)
+    "CDLA-Permissive-2.0", # webpki-roots / webpki-root-certs (Mozilla CA bundle data, via ureq/rustls)
+    "bzip2-1.0.6",         # libbz2-rs-sys -> bzip2 -> sevenz-rust2 (BSD-style)
 ]
 confidence-threshold = 0.93
 
