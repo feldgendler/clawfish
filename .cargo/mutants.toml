@@ -717,4 +717,107 @@ exclude_re = [
     # key==0 slot staying the zeroed (0,0,empty) sentinel.** If get ever gains
     # an observable side effect, or key==0 becomes cacheable, re-evaluate.
     "replace == with != in PawnHashTable::get",
+
+    # ---- M6.I: texel loss/params — equivalent mutants -----------------------
+    #
+    # Verified by hand-applying each mutation (Edit + `cargo test --lib texel::`,
+    # then revert) during the M6.I scoped-mutation survivor sweep (2026-05-24).
+
+    # reg_loss_and_grad monotonicity guard `diff < 0.0` → `diff <= 0.0`.
+    # The two differ ONLY at `diff == 0` (an exactly-flat monotone pair). There
+    # the penalty contribution is `mono_lambda · 0² = 0` and the gradient
+    # contribution is `2 · mono_lambda · 0 · inv_n = 0` — both branches add
+    # nothing. So including vs excluding the equality case is observably
+    # identical for every input. EQUIVALENCE DEPENDS ON: the penalty/gradient
+    # being quadratic-in-diff (so the diff==0 contribution is exactly 0).
+    # Function-anchored (one `<` in this helper's monotonicity branch).
+    "replace < with <= in reg_loss_and_grad",
+
+    # fit_k_features golden-section comparison `fc < fd` → `fc <= fd`.
+    # The two differ only when `fc == fd` (an exact tie between the two interior
+    # golden-section probe losses). For the strictly-unimodal sigmoid-MSE-vs-K
+    # objective the interior probes are never exactly equal in f64, and even a
+    # tie resolves the bracket to the same converged K within the returned
+    # midpoint's precision (and far within integer-cp K resolution). No input
+    # distinguishes the returned K. (Anticipated as equivalent in the M6.I plan.)
+    "replace < with <= in fit_k_features",
+
+    # fit_k_features mean `sum / scores.len()` → `sum * scores.len()` /
+    # `sum % scores.len()`: two equivalent `/`-survivors with NO `exclude_re`
+    # rule (the unix_days_to_date_str precedent). The golden-section returns the
+    # K that MINIMIZES the `loss` closure; any strictly-positive monotone
+    # rescaling of `loss` leaves the argmin (hence the returned K) unchanged.
+    #   - `* n`: multiplies the objective by the constant n² > 0 — argmin fixed.
+    #   - `% n`: each record's SSE is `(label − σ)² ∈ [0,1)` and σ never reaches
+    #     0/1 exactly, so the summed SSE is STRICTLY < n for all n ≥ 1 records;
+    #     thus `sum % n == sum` for every reachable input — identity, argmin
+    #     fixed. EQUIVALENCE DEPENDS ON: per-record SSE < 1 (clamped sigmoid
+    #     never saturates) so `sum < scores.len()`.
+    #
+    # NO `exclude_re` rule: `fit_k_features` ALSO has a `/` in the converged-
+    # bracket midpoint return `(a + b) / 2.0`, whose `/`→`*` and `/`→`%`
+    # mutants ARE caught by the fit_k tests (the returned K diverges from the
+    # oracle). A function-anchored `replace / with * in fit_k_features` rule
+    # would suppress those caught mutants; a line-anchored rule violates the
+    # no-fragile-anchors convention. ACCEPTED AS PERMANENT EQUIVALENT MISSES
+    # (M6.I sweep, 2026-05-24).
+
+    # fit_k_features golden-section initial interior points: the `-` INSIDE the
+    # span term `(b - a)` of `c = b - PHI*(b - a)` and `d = a + PHI*(b - a)`
+    # mutated to `(b + a)`: two equivalent `-`-survivors with NO `exclude_re`
+    # rule. The bracket is initialized at `a = LO = 1e-6`, `b = HI = 2.0`, so
+    # `(b + a) − (b − a) = 2a ≈ 2e-6` — a ~1.2e-6 perturbation of ONLY the
+    # INITIAL interior point. Golden-section then re-derives both probes from the
+    # shrinking `[a, b]` bracket over 60 iterations, washing out the initial
+    # perturbation; the returned midpoint K is identical to the original far
+    # within integer-cp K resolution (and within the test's 1e-6 tolerance).
+    # EQUIVALENCE DEPENDS ON: `LO ≈ 0` (so `b ± a` barely differ) and the
+    # iteration count being high enough to converge. NO `exclude_re` rule:
+    # `fit_k_features` ALSO has the load-bearing `-` at `b - PHI*…` (col 19),
+    # whose `-`→`+` IS caught (it inverts the search direction); a function-wide
+    # `replace - with + in fit_k_features` rule would suppress that caught
+    # mutant. ACCEPTED AS PERMANENT EQUIVALENT MISSES (M6.I sweep, 2026-05-24).
+
+    # apply_to_data_rs BEGIN-marker EOL `begin + n + 1`: the `+ 1` mutated to
+    # `- 1` (`begin + n - 1`) or `* 1` (`begin + n`): two equivalent `+`-survivors
+    # with NO `exclude_re` rule. `begin_eol` only sets WHERE the verbatim-copy /
+    # region-body split lands within the BEGIN-marker line. The marker line ends
+    # in a group-name LETTER (e.g. `…BEGIN: iso_dbl_bwd`), so moving the boundary
+    # ±1 byte stays on non-`const`/`;`/bracket bytes: `out` copies the prefix
+    # verbatim and `rewrite_region_body` copies the moved suffix verbatim before
+    # the first `const`, so the two halves RECONSTRUCT the original bytes exactly.
+    # EQUIVALENCE DEPENDS ON: the boundary byte being non-special (true for the
+    # `// TEXEL-TUNABLE-BEGIN: <group>\n` marker format). NO `exclude_re` rule:
+    # `apply_to_data_rs` ALSO has the load-bearing `begin + n` (col 28), whose
+    # `+`→`-`/`*` IS caught (it mis-locates the whole region); a function-wide
+    # rule would suppress that caught mutant. ACCEPTED AS PERMANENT EQUIVALENT
+    # MISSES (M6.I sweep, 2026-05-24).
+
+    # rewrite_region_body RHS-scan start `j = eq + 1` → `eq - 1` / `eq * 1`:
+    # two equivalent `+`-survivors with NO `exclude_re` rule (the
+    # unix_days_to_date_str precedent above). `eq` indexes the `=` of
+    # `const NAME: TYPE = <rhs>;`. The byte before `=` is always the space of
+    # the rustfmt `= ` formatting (never a bracket or `;`), and `=` itself is
+    # non-special to the depth scanner. Starting the scan one byte earlier
+    # (`eq-1`, the space) or at `eq` (`eq*1`) walks the same non-special prefix
+    # and reaches the same depth-0 terminating `;`. No well-formed const RHS
+    # distinguishes the start offsets. EQUIVALENCE DEPENDS ON: the ` = ` spacing
+    # convention in the marked regions.
+    #
+    # NO `exclude_re` rule: `rewrite_region_body` ALSO has non-equivalent `+`
+    # mutations (`after_kw + colon_rel`, `after_kw + eq_rel`, `cursor = semi+1`)
+    # that ARE caught by the apply tests. A function-anchored `replace + with -
+    # in rewrite_region_body` rule would suppress those caught mutants on
+    # re-runs, and a line-anchored rule violates the no-fragile-anchors
+    # convention. ACCEPTED AS PERMANENT EQUIVALENT MISSES (M6.I sweep,
+    # 2026-05-24).
+
+    # table100 deserialize Visitor::expecting → Ok(Default::default()).
+    # `expecting` only formats the human-readable type description used in serde
+    # error messages; it is never called on the success path and does not affect
+    # any deserialized value. Mutating its body changes only an error string.
+    # (Display name: `replace table100::deserialize::<impl Visitor<'de> for
+    # V>::expecting -> fmt::Result with Ok(Default::default())` — match on the
+    # distinctive `::expecting` path fragment.)
+    "replace .*::expecting -> fmt::Result with Ok\\(Default::default\\(\\)\\)",
 ]

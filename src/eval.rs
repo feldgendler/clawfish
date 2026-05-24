@@ -19,7 +19,7 @@ pub(crate) mod mobility;
 pub(crate) mod pawns;
 pub(crate) mod tier1;
 
-mod data;
+pub(crate) mod data;
 use data::{
     EG_BISHOP_PST, EG_KING_PST, EG_KNIGHT_PST, EG_PAWN_PST, EG_QUEEN_PST, EG_ROOK_PST,
     MG_BISHOP_PST, MG_KING_PST, MG_KNIGHT_PST, MG_PAWN_PST, MG_QUEEN_PST, MG_ROOK_PST,
@@ -83,9 +83,12 @@ const fn build_psqt_table(tables: &[[i32; 64]; 6], material: &[i32; 6]) -> [[[i3
     psqt
 }
 
-// Bishop-pair bonus values (MG/EG). Texel pass in M6.F will tune these.
-const BISHOP_PAIR_MG: i32 = 30;
-const BISHOP_PAIR_EG: i32 = 50;
+// Bishop-pair bonus values (MG/EG). FROZEN reference frame (not tuned — the
+// M6.I joint Texel pass holds these fixed; ADR-0037 §3). `pub(crate)` so the
+// `texel::features` reference oracle reads the same frozen values the engine
+// uses — an additive, read-only widening that does not change `evaluate`.
+pub(crate) const BISHOP_PAIR_MG: i32 = 30;
+pub(crate) const BISHOP_PAIR_EG: i32 = 50;
 
 // Mop-up fires when raw_phase < MOP_UP_PHASE_MAX (covers KQK, KRK, etc.).
 const MOP_UP_PHASE_MAX: u8 = 5;
@@ -121,7 +124,11 @@ pub(crate) fn eval_state_from_scratch(pos: &Position) -> (i32, i32, u8) {
 
 /// Returns `true` if the position is an insufficient-material draw.
 /// Covers KvK, KvN, KvB, and KBvKB-same-color.
-fn is_insufficient_material(pos: &Position) -> bool {
+///
+/// `pub(crate)` so the `texel::features` reference oracle can reproduce
+/// `evaluate_core`'s insufficient-material early-return (additive read-only
+/// widening — `evaluate` is unchanged).
+pub(crate) fn is_insufficient_material(pos: &Position) -> bool {
     let total_count = pos.occupied_all().count();
     match total_count {
         2 => true,

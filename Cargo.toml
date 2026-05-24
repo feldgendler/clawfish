@@ -12,6 +12,14 @@ publish = false
 # gated `#[cfg(unix)]`. MIT/Apache-2.0 licensed; covered by `deny.toml`.
 libc = "0.2"
 
+# M6.I Texel tuning harness (`src/texel/`, `texel-tune` bin). General-purpose
+# serialization — used for `bench/m6-params.json` and the optimizer checkpoint
+# (ADR-0037 §9/§10). Engine binary links these too (no feature gate needed),
+# but they are not on the `evaluate`/search hot path. `cargo deny`/`audit`
+# after the dep change.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # M6.H corpus-fetch network stack. ALL gated behind the non-default
 # `corpus-fetch` feature (see [features] below) so the engine binary and its
 # `cargo audit`/`cargo deny`/build are unaffected — only the `corpus` CLI's
@@ -32,6 +40,7 @@ sevenz-rust2 = { version = "0.21", optional = true }
 # Non-default: enables the `corpus fetch` network ingestion path (M6.H).
 # Build/test it with `--features corpus-fetch`; the engine builds without it.
 corpus-fetch = ["dep:ureq", "dep:zip", "dep:zstd", "dep:sevenz-rust2"]
+
 
 [dev-dependencies]
 # Property-based testing. Used in unit tests (modules under `#[cfg(test)]`)
@@ -62,6 +71,13 @@ path = "src/bin/mock_engine.rs"
 [[bin]]
 name = "corpus"
 path = "src/bin/corpus.rs"
+
+# M6.I Texel tuning harness CLI. Consumes the frozen corpus lanes, tunes the
+# deferred eval weights, writes `bench/m6-params.json`. Standalone consumer —
+# does NOT touch `evaluate`/search. See docs/plans/m6.i.md, ADR-0037.
+[[bin]]
+name = "texel-tune"
+path = "src/bin/texel-tune.rs"
 
 [[bench]]
 name = "perft"

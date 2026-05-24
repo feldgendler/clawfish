@@ -301,6 +301,112 @@ pub(crate) fn passed_pawns(own: Bitboard, enemy: Bitboard, side: Color) -> Bitbo
     own & !enemy_front
 }
 
+/// Signed (white − black) isolated / doubled / backward pawn raw counts.
+/// Shares the per-side iso/dbl/bwd detection with [`pawn_eval`].
+#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
+fn iso_dbl_bwd_signed_counts(pos: &Position) -> (i32, i32, i32) {
+    let wp = pos.pieces_colored(Color::White, PieceKind::Pawn);
+    let bp = pos.pieces_colored(Color::Black, PieceKind::Pawn);
+    let (mut iso, mut dbl, mut bwd) = (0i32, 0i32, 0i32);
+    for (side, own, enemy, sign) in [(Color::White, wp, bp, 1i32), (Color::Black, bp, wp, -1i32)] {
+        iso += sign * isolated_pawns(own).count() as i32;
+        dbl += sign * doubled_pawns(own).count() as i32;
+        bwd += sign * backward_pawns(own, enemy, side).count() as i32;
+    }
+    (iso, dbl, bwd)
+}
+
+/// Sparse `(core_index, raw_count)` feature accessor for iso/dbl/bwd — the
+/// Phase-3 Texel seam (ADR-0037 §2). White-POV signed counts (white +, black
+/// −); each term emits BOTH its MG and EG core index (same raw count). Shares
+/// detection with [`pawn_eval`]; `dot(features, shipped core weights)` equals
+/// [`iso_dbl_bwd_term_white`] (pinned by `accessor_dot_weights_equals_term_fn`).
+#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
+pub(crate) fn iso_dbl_bwd_features(pos: &Position) -> Vec<(u16, i32)> {
+    use crate::texel::layout::{Group, group_range};
+    let (iso, dbl, bwd) = iso_dbl_bwd_signed_counts(pos);
+    // IsoDblBwd layout: [ISO_MG, ISO_EG, DBL_MG, DBL_EG, BWD_MG, BWD_EG].
+    let start = group_range(Group::IsoDblBwd).start;
+    let mut out = Vec::new();
+    for (pair, count) in [(0usize, iso), (2, dbl), (4, bwd)] {
+        if count != 0 {
+            out.push(((start + pair) as u16, count)); // MG
+            out.push(((start + pair + 1) as u16, count)); // EG
+        }
+    }
+    out
+}
+
+/// White-perspective `(mg, eg)` iso/dbl/bwd contribution — the linear
+/// isolated/doubled/backward part of [`pawn_eval`]'s pawn-structure score
+/// (excludes the connected-pawn rank bonus). Used by the Phase-3 accessor
+/// cross-check.
+#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
+pub(crate) fn iso_dbl_bwd_term_white(pos: &Position) -> (i32, i32) {
+    let (iso, dbl, bwd) = iso_dbl_bwd_signed_counts(pos);
+    let mg = ISO_MG * iso + DBL_MG * dbl + BWD_MG * bwd;
+    let eg = ISO_EG * iso + DBL_EG * dbl + BWD_EG * bwd;
+    (mg, eg)
+}
+
+/// Signed (white − black) connected-pawn per-relative-rank raw counts (index
+/// 0..8). Shares the per-side connected-pawn detection with [`pawn_eval`].
+#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
+fn conn_signed_rank_counts(pos: &Position) -> [i32; 8] {
+    let wp = pos.pieces_colored(Color::White, PieceKind::Pawn);
+    let bp = pos.pieces_colored(Color::Black, PieceKind::Pawn);
+    let mut counts = [0i32; 8];
+    for (side, own, sign) in [(Color::White, wp, 1i32), (Color::Black, bp, -1i32)] {
+        let mut remaining = connected_pawns(own, side);
+        while let Some(sq) = remaining.pop_lsb() {
+            let rel_rank = match side {
+                Color::White => sq.rank() as usize,
+                Color::Black => 7 - sq.rank() as usize,
+            };
+            counts[rel_rank] += sign;
+        }
+    }
+    counts
+}
+
+/// Sparse `(core_index, raw_count)` feature accessor for connected pawns —
+/// the Phase-3 Texel seam (ADR-0037 §2). White-POV signed per-relative-rank
+/// counts; each rank emits BOTH its MG and EG core index. Shares detection
+/// with [`pawn_eval`]; `dot(features, shipped core weights)` equals
+/// [`conn_term_white`] (pinned by `accessor_dot_weights_equals_term_fn`).
+#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
+pub(crate) fn conn_features(pos: &Position) -> Vec<(u16, i32)> {
+    use crate::texel::layout::{Group, group_range};
+    let counts = conn_signed_rank_counts(pos);
+    // Conn layout: CONN_MG[2..8] (6) then CONN_EG[2..8] (6); rank r → local
+    // (r-2) for MG and 6+(r-2) for EG. Ranks 0,1 are structurally unscored.
+    let start = group_range(Group::Conn).start;
+    let mut out = Vec::new();
+    for (rank, &count) in counts.iter().enumerate().take(8).skip(2) {
+        if count != 0 {
+            let local = rank - 2;
+            out.push(((start + local) as u16, count)); // MG
+            out.push(((start + 6 + local) as u16, count)); // EG
+        }
+    }
+    out
+}
+
+/// White-perspective `(mg, eg)` connected-pawn rank-bonus contribution — the
+/// `connected = phalanx | defended` part of [`pawn_eval`]'s pawn-structure
+/// score. Used by the Phase-3 accessor cross-check.
+#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
+pub(crate) fn conn_term_white(pos: &Position) -> (i32, i32) {
+    let counts = conn_signed_rank_counts(pos);
+    let mut mg = 0i32;
+    let mut eg = 0i32;
+    for (rank, &count) in counts.iter().enumerate() {
+        mg += CONN_MG[rank] * count;
+        eg += CONN_EG[rank] * count;
+    }
+    (mg, eg)
+}
+
 /// White-perspective passed-pawn eval (rank bonus + EG path discriminator +
 /// EG king-tropism). Reads the M6.B-cached `passed[White|Black]`; computed
 /// **live** (king-distance/path are not pawn-only — ADR-0032 §3). Returns

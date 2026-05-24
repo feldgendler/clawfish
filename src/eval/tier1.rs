@@ -51,6 +51,102 @@ pub(crate) fn outpost_squares(pos: &Position, side: Color) -> Bitboard {
     }
 }
 
+/// Sparse `(core_index, raw_count)` feature accessor for outpost — the
+/// Phase-3 Texel seam (ADR-0037 §2). White-POV signed rank-band (3..=5)
+/// indicators; each detected knight/bishop outpost emits BOTH its MG and EG
+/// core index. Shares the `outpost_squares` + relative-rank detection with
+/// [`outpost_term_white`]; `dot(features, shipped core weights)` reproduces it
+/// (pinned by `accessor_dot_weights_equals_term_fn`).
+#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
+pub(crate) fn outpost_features(pos: &Position) -> Vec<(u16, i32)> {
+    use crate::texel::layout::{Group, group_range};
+
+    // Signed per-rel-rank indicators (white +1, black −1) for the 3..=5 band.
+    let mut knight = [0i32; 8];
+    let mut bishop = [0i32; 8];
+    for (side, sign) in [(Color::White, 1i32), (Color::Black, -1i32)] {
+        let outpost_sqs = outpost_squares(pos, side);
+        for sq in (pos.pieces_colored(side, PieceKind::Knight) & outpost_sqs).iter() {
+            let rr = relative_rank(side, sq) as usize;
+            if (3..=5).contains(&rr) {
+                knight[rr] += sign;
+            }
+        }
+        for sq in (pos.pieces_colored(side, PieceKind::Bishop) & outpost_sqs).iter() {
+            let rr = relative_rank(side, sq) as usize;
+            if (3..=5).contains(&rr) {
+                bishop[rr] += sign;
+            }
+        }
+    }
+
+    // Outpost layout: KNIGHT_MG[3..6], KNIGHT_EG[3..6], BISHOP_MG[3..6],
+    // BISHOP_EG[3..6]. rel-rank rr → local (rr-3) within each 3-wide block.
+    let start = group_range(Group::Outpost).start;
+    let mut out = Vec::new();
+    for rr in 3..=5usize {
+        let local = rr - 3;
+        if knight[rr] != 0 {
+            out.push(((start + local) as u16, knight[rr])); // KNIGHT_MG
+            out.push(((start + 3 + local) as u16, knight[rr])); // KNIGHT_EG
+        }
+        if bishop[rr] != 0 {
+            out.push(((start + 6 + local) as u16, bishop[rr])); // BISHOP_MG
+            out.push(((start + 9 + local) as u16, bishop[rr])); // BISHOP_EG
+        }
+    }
+    out
+}
+
+/// Sparse `(core_index, raw_count)` feature accessor for rook-file — the
+/// Phase-3 Texel seam (ADR-0037 §2). White-POV signed open / semi-open file
+/// indicators; each rook emits BOTH the MG and EG core index of its file
+/// state. Shares the `file_fill` open/semi-open detection with
+/// [`rook_file_term_white`]; `dot(features, shipped core weights)` reproduces
+/// it (pinned by `accessor_dot_weights_equals_term_fn`).
+#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
+pub(crate) fn rook_file_features(pos: &Position) -> Vec<(u16, i32)> {
+    use crate::texel::layout::{Group, group_range};
+
+    let wp = pos.pieces_colored(Color::White, PieceKind::Pawn);
+    let bp = pos.pieces_colored(Color::Black, PieceKind::Pawn);
+    let wp_files = bitboard::file_fill(wp);
+    let bp_files = bitboard::file_fill(bp);
+
+    // Signed (white − black) open / semi-open rook counts.
+    let mut open = 0i32;
+    let mut semi = 0i32;
+    for (side, sign) in [(Color::White, 1i32), (Color::Black, -1i32)] {
+        let (own_files, enemy_files) = match side {
+            Color::White => (wp_files, bp_files),
+            Color::Black => (bp_files, wp_files),
+        };
+        for sq in pos.pieces_colored(side, PieceKind::Rook).iter() {
+            let rook_bit = Bitboard::from_square(sq);
+            let on_own = (own_files & rook_bit).any();
+            let on_enemy = (enemy_files & rook_bit).any();
+            if !on_own && !on_enemy {
+                open += sign;
+            } else if !on_own {
+                semi += sign;
+            }
+        }
+    }
+
+    // RookFile layout: [ROOK_OPEN_MG, ROOK_OPEN_EG, ROOK_SEMI_MG, ROOK_SEMI_EG].
+    let start = group_range(Group::RookFile).start;
+    let mut out = Vec::new();
+    if open != 0 {
+        out.push((start as u16, open)); // ROOK_OPEN_MG
+        out.push(((start + 1) as u16, open)); // ROOK_OPEN_EG
+    }
+    if semi != 0 {
+        out.push(((start + 2) as u16, semi)); // ROOK_SEMI_MG
+        out.push(((start + 3) as u16, semi)); // ROOK_SEMI_EG
+    }
+    out
+}
+
 /// White-perspective `(mg, eg)` outpost contribution. Positive when white has
 /// more/better outposts; negative when black does. All weights zeroed at ship.
 pub(crate) fn outpost_term_white(pos: &Position) -> (i32, i32) {

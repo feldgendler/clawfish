@@ -30,6 +30,111 @@ pub(crate) fn king_zone(side: Color, ksq: Square) -> Bitboard {
     ring | (fwd & !Bitboard::from_square(ksq))
 }
 
+/// Signed (white − black) raw counts for the 8 `KsShieldFile` slots, in layout
+/// order: SHIELD_1, SHIELD_1, SHIELD_2, SHIELD_2 (MG/EG pairs), then the 4
+/// MG-only open/semi-open-file penalties. Shares the shield + open-file
+/// detection with [`king_safety_term_white`]; EXCLUDES the frozen attacker
+/// S-curve entirely (ADR-0037 §3, deferred).
+#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
+fn shield_open_file_signed_counts(pos: &Position) -> [i32; 8] {
+    let wp = pos.pieces_colored(Color::White, PieceKind::Pawn);
+    let bp = pos.pieces_colored(Color::Black, PieceKind::Pawn);
+    let all_pawn_files = bitboard::file_fill(wp | bp);
+
+    // Slots: 0=SHIELD_1, 1=SHIELD_1(EG), 2=SHIELD_2, 3=SHIELD_2(EG),
+    // 4=KFILE_SEMI_OPEN, 5=KFILE_OPEN, 6=ADJ_SEMI_OPEN, 7=BOTH_ADJ_SEMI_OPEN.
+    let mut counts = [0i32; 8];
+    for (side, sign) in [(Color::White, 1i32), (Color::Black, -1i32)] {
+        let (own_pawns, own_pawn_files) = match side {
+            Color::White => (wp, bitboard::file_fill(wp)),
+            Color::Black => (bp, bitboard::file_fill(bp)),
+        };
+        let ksq = pos.king_square(side);
+        let kf = ksq.file();
+
+        // (b) pawn shield — only when `side`'s king is on a castled-side file.
+        if kf >= 5 || kf <= 2 {
+            let (r2, r3) = match side {
+                Color::White => (1u8, 2u8),
+                Color::Black => (6u8, 5u8),
+            };
+            let lo = kf.saturating_sub(1);
+            let hi = (kf + 1).min(7);
+            for f in lo..=hi {
+                let on2 = Square::from_file_rank(f, r2).is_some_and(|s| own_pawns.contains(s));
+                let on3 = Square::from_file_rank(f, r3).is_some_and(|s| own_pawns.contains(s));
+                if on2 {
+                    counts[0] += sign; // SHIELD_1 MG
+                    counts[1] += sign; // SHIELD_1 EG
+                } else if on3 {
+                    counts[2] += sign; // SHIELD_2 MG
+                    counts[3] += sign; // SHIELD_2 EG
+                }
+            }
+        }
+
+        // (c) open / semi-open files toward the king — MG-only.
+        let has_own =
+            |f: u8| Square::from_file_rank(f, 0).is_some_and(|s| own_pawn_files.contains(s));
+        let has_any =
+            |f: u8| Square::from_file_rank(f, 0).is_some_and(|s| all_pawn_files.contains(s));
+        if !has_any(kf) {
+            counts[5] += sign; // KS_KFILE_OPEN_MG
+        } else if !has_own(kf) {
+            counts[4] += sign; // KS_KFILE_SEMI_OPEN_MG
+        }
+        let adj: [Option<u8>; 2] = [kf.checked_sub(1), if kf < 7 { Some(kf + 1) } else { None }];
+        let mut semi_adj = 0u32;
+        for f in adj.into_iter().flatten() {
+            if !has_own(f) {
+                counts[6] += sign; // KS_ADJ_SEMI_OPEN_MG (per adjacent file)
+                semi_adj += 1;
+            }
+        }
+        if semi_adj == 2 {
+            counts[7] += sign; // KS_BOTH_ADJ_SEMI_OPEN_MG
+        }
+    }
+    counts
+}
+
+/// Sparse `(core_index, raw_count)` feature accessor for the linear
+/// shield + open/semi-open-file sub-term of king safety — the Phase-3 Texel
+/// seam (ADR-0037 §2). White-POV signed counts (white +, black −) over the 8
+/// `KsShieldFile` slots. EXCLUDES the frozen S-curve attacker contribution.
+/// `dot(features, shipped core weights)` equals [`shield_open_file_term_white`]
+/// (pinned by `accessor_dot_weights_equals_term_fn`).
+#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
+pub(crate) fn shield_open_file_features(pos: &Position) -> Vec<(u16, i32)> {
+    use crate::texel::layout::{Group, group_range};
+    let counts = shield_open_file_signed_counts(pos);
+    let start = group_range(Group::KsShieldFile).start;
+    let mut out = Vec::new();
+    for (local, &count) in counts.iter().enumerate() {
+        if count != 0 {
+            out.push(((start + local) as u16, count));
+        }
+    }
+    out
+}
+
+/// White-perspective `(mg, eg)` of the LINEAR shield + open/semi-open-file
+/// sub-term (no S-curve). The shield+open-file split of
+/// [`king_safety_term_white`]; used by the Phase-3 accessor cross-check.
+#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
+pub(crate) fn shield_open_file_term_white(pos: &Position) -> (i32, i32) {
+    let c = shield_open_file_signed_counts(pos);
+    // SHIELD_1/2 are tapered (MG+EG); the open-file penalties are MG-only.
+    let mg = SHIELD_1_MG * c[0]
+        + SHIELD_2_MG * c[2]
+        + KS_KFILE_SEMI_OPEN_MG * c[4]
+        + KS_KFILE_OPEN_MG * c[5]
+        + KS_ADJ_SEMI_OPEN_MG * c[6]
+        + KS_BOTH_ADJ_SEMI_OPEN_MG * c[7];
+    let eg = SHIELD_1_EG * c[1] + SHIELD_2_EG * c[3];
+    (mg, eg)
+}
+
 /// Returns the white-perspective `(mg, eg)` king-safety contribution (zone
 /// attacker S-curve + castled pawn-shield + open/semi-open-file penalty).
 /// Black's king contributes with −sign. All weights zeroed at ship.

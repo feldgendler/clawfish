@@ -11,6 +11,83 @@ use crate::piece::{Color, PieceKind};
 use crate::position::Position;
 use crate::{magic, movegen};
 
+/// Sparse `(core_index, raw_count)` feature accessor for mobility — the
+/// Phase-3 Texel seam (ADR-0037 §2). Shares the mobility-area + per-kind
+/// attack-bitboard detection with [`mobility_term_white`]; emits a white-POV
+/// signed histogram (white +1, black −1 per detected piece) with BOTH the MG
+/// and EG core index of each occupied bucket, following the layout in
+/// [`crate::texel::layout::Group::MobN`] / `MobB` / `MobR` / `MobQ`.
+/// `dot(mobility_features, shipped core weights)` reproduces
+/// `mobility_term_white` (pinned by `accessor_dot_weights_equals_term_fn`).
+///
+/// `#[allow(dead_code)]`: the seam is consumed by the test cross-check and by
+/// the `texel::features` cache builder (a later slice), not by `evaluate`.
+#[allow(dead_code)]
+pub(crate) fn mobility_features(pos: &Position) -> Vec<(u16, i32)> {
+    use crate::texel::layout::{Group, group_range};
+
+    let occ_all = pos.occupied_all();
+    let wp = pos.pieces_colored(Color::White, PieceKind::Pawn);
+    let bp = pos.pieces_colored(Color::Black, PieceKind::Pawn);
+    let white_pawn_atk = wp.shift_north_east() | wp.shift_north_west();
+    let black_pawn_atk = bp.shift_south_east() | bp.shift_south_west();
+
+    // Per-kind histograms of signed bucket counts (white +1, black −1).
+    let mut knight = [0i32; KNIGHT_MOBILITY_MG.len()];
+    let mut bishop = [0i32; BISHOP_MOBILITY_MG.len()];
+    let mut rook = [0i32; ROOK_MOBILITY_MG.len()];
+    let mut queen = [0i32; QUEEN_MOBILITY_MG.len()];
+
+    for (side, sign) in [(Color::White, 1i32), (Color::Black, -1i32)] {
+        let enemy_pawn_atk = match side {
+            Color::White => black_pawn_atk,
+            Color::Black => white_pawn_atk,
+        };
+        let area = !(pos.occupied(side) | enemy_pawn_atk);
+
+        for sq in pos.pieces_colored(side, PieceKind::Knight).iter() {
+            let c = (movegen::masks::knight_attacks(sq) & area).count() as usize;
+            debug_assert!(c < knight.len(), "knight mob idx {c}");
+            knight[c] += sign;
+        }
+        for sq in pos.pieces_colored(side, PieceKind::Bishop).iter() {
+            let c = (magic::bishop_attacks(sq, occ_all) & area).count() as usize;
+            debug_assert!(c < bishop.len(), "bishop mob idx {c}");
+            bishop[c] += sign;
+        }
+        for sq in pos.pieces_colored(side, PieceKind::Rook).iter() {
+            let c = (magic::rook_attacks(sq, occ_all) & area).count() as usize;
+            debug_assert!(c < rook.len(), "rook mob idx {c}");
+            rook[c] += sign;
+        }
+        for sq in pos.pieces_colored(side, PieceKind::Queen).iter() {
+            let c = (magic::queen_attacks(sq, occ_all) & area).count() as usize;
+            debug_assert!(c < queen.len(), "queen mob idx {c}");
+            queen[c] += sign;
+        }
+    }
+
+    // Each group lays MG[0..N] then EG[0..N]; a bucket emits both indices with
+    // the same signed count.
+    let mut out = Vec::new();
+    for (group, hist) in [
+        (Group::MobN, &knight[..]),
+        (Group::MobB, &bishop[..]),
+        (Group::MobR, &rook[..]),
+        (Group::MobQ, &queen[..]),
+    ] {
+        let start = group_range(group).start;
+        let n = hist.len();
+        for (bucket, &count) in hist.iter().enumerate() {
+            if count != 0 {
+                out.push(((start + bucket) as u16, count));
+                out.push(((start + n + bucket) as u16, count));
+            }
+        }
+    }
+    out
+}
+
 /// Returns the white-perspective `(mg, eg)` mobility contribution for all
 /// N/B/R/Q pieces. Black pieces subtract symmetrically.
 pub(crate) fn mobility_term_white(pos: &Position) -> (i32, i32) {

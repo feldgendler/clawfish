@@ -219,4 +219,34 @@ Run order is forced (not a preference): **A first** — it is M6.I's committed d
 
 ---
 
+### M6.I king-safety attacker S-curve — SPSA-deflate + SPRT (post-M6.I; the one M6 term Texel left off)
+
+**Status.** Deferred at the M6.I harness landing (2026-05-24). M6.I tuned the *linear* king-safety terms (pawn-shield + open/semi-open-file) but **excluded the attacker-count S-curve** (the 100-entry `KING_SAFETY_TABLE` + the 4 per-kind `KING_ATTACK_WEIGHT_*` multipliers) — it ships at zero (off), identical to M6.F. ADR-0037 §3 / `docs/milestones/m6.i.md`. This entry is how the residual gets closed *if* it's worth closing.
+
+**Why Texel-on-quiet-positions can't do it (so a different tool is needed).**
+- **Structural:** the term is non-linear — `score = TABLE[Σ multiplier·attackers]`. M6.I's speed comes from a linear feature-cached model; a non-linear term doesn't fit it, and with the multipliers frozen at their shipped zero the table index freezes to 0 (only `TABLE[0]` reachable). Making the index live needs non-zero multipliers, which either break linearity (tunable) or break the M6.I faithfulness cross-check (frozen-at-literature ≠ the shipped-zero `static_eval`).
+- **Semantic:** the S-curve predicts a *future* tactical collapse; the corpus is deliberately *quiet* (no imminent tactics) and scored by `static_eval`, so the data is selected to exclude exactly this term's signal, and the game-result label is a weak target for a momentary attack count.
+- Conclusion: king danger's value is realized in **games**, so tune it on games (SPSA + SPRT), not on a quiet-position static regression. This is standard engine practice (mACE tuned its king-safety table by GA over play; `docs/research/m6-texel-tuning.md` §4 = freeze the non-linear params and sweep them outside the linear core).
+
+**Tunable space (compact — do NOT tune 100 table entries; no signal, guaranteed overfit).** Keep the literature CPW S-curve *shape*; tune the ~5 knobs that scale it:
+- `KING_ATTACK_WEIGHT_{N,B,R,Q}` (4) — literature 2/2/3/4.
+- A global gain `g ∈ (0,1]` on the table output (the deflation lever for the PeSTO double-count) — or, equivalently, scale the literature `KING_SAFETY_TABLE` by `g` at apply time.
+- Optionally the gate (`<2 attackers ∨ no queen`) thresholds — leave fixed first.
+
+**Approach.**
+1. **Cheap probe (1 SPRT, ~hours):** turn on the literature S-curve at full magnitude (multipliers 2/2/3/4, literature table, `g=1`) and mixed-TC SPRT vs the `M6.I` tag. This directly tests the M6.E HIGH-transfer-risk worry — does the PeSTO MG king PST's already-priced ~30–50 cp of castled-king safety make the literature term a **double-count**?
+   - Gains → ship, done.
+   - Flat / regresses → the double-count is real → step 2.
+2. **SPSA-deflate:** tune `g` (and, if needed, the 4 multipliers) by SPSA against SPRT. The deflation lets the explicit term carry king danger while shrinking enough not to re-count what the PST already encodes. ~5 params → a handful of SPRT-equivalent campaigns. (SPSA harness is a small extension of `elo-iterate`; or a manual coordinate grid over `g ∈ {0.25,0.5,0.75,1.0}` × a coarse multiplier sweep.)
+
+**Validation.** Mixed-TC SPRT vs the `M6.I` tag (post-M6.I, so king safety co-exists with the tuned mobility/pawn weights it interacts with). Apply via a small extension of `texel-tune apply` (or hand-edit the marked `eval::data` king-safety regions — the markers exist).
+
+**Trigger / go-no-go.** Promote after the M6.I SPRT resolves and `M6.I` is tagged. Skip if M10/NNUE is imminent.
+
+**Opportunity-cost caveat (priority decays as M10 approaches).** King safety is exactly the nonlinear pattern NNUE (M10) learns natively and obsoletes — the same decay logic as the "M6.I PST co-tuning" Arm B. Worth the cheap on/off SPRT + a light SPSA deflation *if it pays*; **not** worth heavy hand-tuning of the curve shape. A pre-M10 opportunity only.
+
+**Cross-references.** ADR-0037 §3 (the exclusion + its structural/semantic reasons) / §4 (the non-linear-params-outside-the-linear-core pattern); `docs/milestones/m6.i.md` (king-safety scope + lessons); ADR-0033 / `docs/research/m6-king-safety.md` (M6.E's HIGH transfer-risk verdict — the double-count this campaign measures); `docs/research/m6-texel-tuning.md` §3-§4 (freeze-and-sweep for non-linear terms; quiet-corpus blind spot).
+
+---
+
 *Active queue ends here. New items append above this line.*

@@ -13,9 +13,12 @@ the M6.B measurement point). The engine implements a hand-crafted classical
 evaluation; NNUE is a planned future milestone, not yet present.
 
 **Roadmap: M6 in progress.** Classical-eval infrastructure (M6.A–F) is
-complete and corpus data-infra (M6.G) is landed; next come M6.H (robust
-on-demand Lichess/CCRL ingestion — data infra) and then M6.I, which jointly
-Texel-tunes the cumulative parameter set on the M6.G corpus. Parallel search
+complete; corpus data-infra (M6.G/H/H2) is landed; and the M6.I Texel-tuning
+**harness** has landed (inert — `evaluate` byte-identical to `M6.F`). The harness
+jointly Texel-tunes the cumulative deferred-term parameter set on the corpus; a
+full 8M-position tune has produced a candidate `bench/m6-params.json`. **M6 closes
+when the operator runs the apply → mixed-TC SPRT vs `M6.F` gate** and the verdict
+ladder resolves (ship the tuned weights, or revert to `M6.F`). Parallel search
 (M9) and NNUE evaluation (M10) follow. See [`docs/roadmap.md`](docs/roadmap.md)
 for the full plan.
 

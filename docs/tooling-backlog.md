@@ -48,6 +48,20 @@ Landed as `VirtualClock` UCI option + `--virtual-clock` harness flag on branch `
 
 ---
 
+### M6.I full-suite mutation backstop — deferred texel surfaces (run at M6 close)
+
+**Why active.** M6.I's per-unit `cargo mutants --in-diff` was **scoped to `src/texel/loss.rs` + `src/texel/params.rs`** (the closed-form gradient + the `apply` codegen — the highest-risk, weakest-guarded surfaces: 231 caught / 8 equivalent / ~96%). The full M6.I diff is **1298 mutants** against a subprocess-spawning test suite (`elo_iterate`/`uci_integration`), which at the naive full-suite rate (~minutes/mutant) is ~180 h — squarely the workflow's "don't auto-run hours-long mutation; surface + wait for go-ahead" case (`docs/workflow.md` §"Periodic full-suite backstop"). So mutation of the other texel surfaces was deferred:
+
+- `src/texel/features.rs` (279 mutants — the eval mirror; covered now by the 3-tier cross-check)
+- `src/texel/optimizer.rs` (167 — covered by resume-bit-identical / checkpoint-roundtrip / early-stop / quant-floor)
+- `src/texel/dataset.rs` (89 — cache-roundtrip / split-no-leakage)
+- `src/texel/mixture.rs` (61 — incl. the `reweight_train` mechanism test)
+- the eval-module feature accessors in `eval/{mobility,king_safety,tier1,pawns}.rs` (~309 — `accessor_dot_weights_equals_term_fn` + per-term hardcoded-count pins)
+
+**Trigger.** The M6-close full-suite mutation run (the standing milestone-cadence backstop), after the operator's M6.I SPRT resolves the verdict ladder. The final-review judged the deferred surfaces adequately covered by the existing tests for the *dangerous* mutation classes; this backstop confirms.
+
+**How to run it fast.** The killer optimization (proven on loss+params: ~3 s/mutant vs minutes) is a fast test command that skips the subprocess-spawning integration tests: `cargo mutants -f src/texel/features.rs -f src/texel/optimizer.rs -f src/texel/dataset.rs -f src/texel/mixture.rs -f src/eval/mobility.rs -f src/eval/king_safety.rs -f src/eval/tier1.rs -f src/eval/pawns.rs -- --lib texel::` (the `--lib texel::` confines each mutant's test run to the fast texel unit tests + the accessor pins, which cover these surfaces). At ~3 s/mutant × ~900 mutants ≈ 45 min. Triage survivors per the usual caught/equivalent/real-gap protocol; existing equivalent-mutant `exclude_re` rules in `.cargo/mutants.toml` already cover the loss/params set.
+
 *Active queue ends here. New items append above this line.* Parameter-tuning items (SPRT/SPSA campaigns) live in [`docs/tuning-backlog.md`](tuning-backlog.md), not here.
 
 ---

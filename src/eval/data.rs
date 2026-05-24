@@ -33,6 +33,7 @@
 // per `.cargo/mutants.toml` alongside the PST arrays.
 // ---------------------------------------------------------------------------
 
+// TEXEL-TUNABLE-BEGIN: iso_dbl_bwd
 /// Isolated pawn penalty, middlegame (per pawn). Negative = penalty.
 /// Zeroed in the shipped CONN-only config (M6.F re-tunes); see block comment.
 pub(crate) const ISO_MG: i32 = 0;
@@ -50,7 +51,9 @@ pub(crate) const DBL_EG: i32 = 0;
 pub(crate) const BWD_MG: i32 = 0;
 /// Backward pawn penalty, endgame. Zeroed — see `BWD_MG`.
 pub(crate) const BWD_EG: i32 = 0;
+// TEXEL-TUNABLE-END: iso_dbl_bwd
 
+// TEXEL-TUNABLE-BEGIN: conn
 /// Connected pawn bonus table, middlegame. Indexed by relative rank (0..7).
 /// Relative rank = `sq.rank()` for white; `7 - sq.rank()` for black.
 /// Indices 0 and 1 are 0: rank-0 is the back rank (unreachable for a pawn),
@@ -64,6 +67,7 @@ pub(crate) const CONN_MG: [i32; 8] = [0, 0, 3, 7, 13, 22, 40, 70];
 /// Connected pawn bonus table, endgame. Same indexing as `CONN_MG`.
 #[rustfmt::skip]
 pub(crate) const CONN_EG: [i32; 8] = [0, 0, 5, 10, 18, 30, 55, 95];
+// TEXEL-TUNABLE-END: conn
 
 // ---------------------------------------------------------------------------
 // M6.C passed-pawn weight constants. Source: docs/research/m6-passed-pawns.md
@@ -114,6 +118,7 @@ pub(crate) const CONN_EG: [i32; 8] = [0, 0, 5, 10, 18, 30, 55, 95];
 // `.cargo/mutants.toml` alongside the PST/CONN arrays.
 // ---------------------------------------------------------------------------
 
+// TEXEL-TUNABLE-BEGIN: passed
 /// Passed pawn rank bonus, middlegame. Indexed by relative rank (0..7).
 /// Zeroed in the shipped score-neutral config (M6.F re-tunes); see block
 /// comment.
@@ -141,6 +146,7 @@ pub(crate) const PASSED_KDIST_OWN_PER_STEP: i32 = 0;
 /// to the promotion square (rank-scaled; a near enemy king is a penalty).
 /// Zeroed — see `PASSED_KDIST_OWN_PER_STEP`.
 pub(crate) const PASSED_KDIST_ENEMY_PER_STEP: i32 = 0;
+// TEXEL-TUNABLE-END: passed
 
 /// Chebyshev-distance clamp for the king-tropism term: beyond 5 steps king
 /// intervention is too slow to matter at shallow depth (research §2.2). A
@@ -194,6 +200,7 @@ pub(crate) const PASSED_KDIST_CAP: i32 = 5;
 //                128,130,133,136,140,157,158,161,174,177,191,199]
 //
 // Data, not logic — excluded from cargo mutants per .cargo/mutants.toml.
+// TEXEL-TUNABLE-BEGIN: mobility
 #[rustfmt::skip]
 pub(crate) const KNIGHT_MOBILITY_MG: [i32; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 0];
 #[rustfmt::skip]
@@ -214,6 +221,7 @@ pub(crate) const QUEEN_MOBILITY_MG: [i32; 28] = [
 pub(crate) const QUEEN_MOBILITY_EG: [i32; 28] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+// TEXEL-TUNABLE-END: mobility
 
 // ---------------------------------------------------------------------------
 // M6.E king-safety weight constants. Source: CPW-Engine/Fruit/Glaurung
@@ -308,6 +316,7 @@ pub(crate) const KING_ATTACK_WEIGHT_Q: i32 = 0; // lit 4
 #[rustfmt::skip]
 pub(crate) const KING_SAFETY_TABLE: [i32; 100] = [0; 100];
 
+// TEXEL-TUNABLE-BEGIN: king_safety_shield_file
 /// Pawn-shield bonus: friendly pawn on king's 2nd rank, middlegame. Zeroed.
 pub(crate) const SHIELD_1_MG: i32 = 0; // lit  10
 /// Pawn-shield bonus: friendly pawn on king's 2nd rank, endgame. Zeroed.
@@ -325,6 +334,7 @@ pub(crate) const KS_KFILE_OPEN_MG: i32 = 0; // lit -20
 pub(crate) const KS_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
 /// MG amplification: both adjacent files semi-open (no-cover threshold). Zeroed.
 pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
+// TEXEL-TUNABLE-END: king_safety_shield_file
 
 // ---------------------------------------------------------------------------
 // M6.F Tier-1 HCE feature constants. Sources: CPW Outposts, CPW Rook on Open
@@ -377,6 +387,7 @@ pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
 
 // Outpost — per-kind, per-relative-rank MG/EG (rel-rank 0..7; predicate gates
 // rel-rank ∈ 3..=5 i.e. chess ranks 4–6 so out-of-band entries never index).
+// TEXEL-TUNABLE-BEGIN: outpost
 /// Knight outpost bonus, middlegame, indexed by relative rank (0..7). Zeroed
 /// (M6.I re-derives); literature defaults ~[0,0,0,18,28,16,0,0].
 // Used from tier1.rs; #[allow] covers the stub-slice gap until impl is wired.
@@ -391,7 +402,9 @@ pub(crate) const OUTPOST_BISHOP_MG: [i32; 8] = [0; 8]; // lit ~[0,0,0,12,18,10,0
 /// Bishop outpost bonus, endgame. Zeroed — see `OUTPOST_KNIGHT_MG`.
 #[allow(dead_code)]
 pub(crate) const OUTPOST_BISHOP_EG: [i32; 8] = [0; 8]; // lit ~[0,0,0, 8,12, 6,0,0]
+// TEXEL-TUNABLE-END: outpost
 
+// TEXEL-TUNABLE-BEGIN: rook_file
 /// Rook on fully open file (no pawn either color) bonus, middlegame. Zeroed.
 #[allow(dead_code)]
 pub(crate) const ROOK_OPEN_FILE_MG: i32 = 0; // lit  20
@@ -404,12 +417,14 @@ pub(crate) const ROOK_SEMI_OPEN_FILE_MG: i32 = 0; // lit  10
 /// Rook on semi-open file bonus, endgame. Zeroed — see `ROOK_SEMI_OPEN_FILE_MG`.
 #[allow(dead_code)]
 pub(crate) const ROOK_SEMI_OPEN_FILE_EG: i32 = 0; // lit   5
+// TEXEL-TUNABLE-END: rook_file
 
 /// Endgame draw-scale fixed-point denominator. STRUCTURAL — not a tunable;
 /// the per-position scale = numerator / EG_SCALE_DEN ∈ [0, 1].
 /// Every scale tunable at ship = EG_SCALE_DEN ⇒ scale ≡ identity.
 #[allow(dead_code)]
 pub(crate) const EG_SCALE_DEN: i32 = 64; // structural (not tuned)
+// TEXEL-TUNABLE-BEGIN: scale
 /// OCB-with-pawns draw-scale numerator. M6.I tunable; identity value =
 /// EG_SCALE_DEN. Shipped = EG_SCALE_DEN (identity); literature ~32 (0.5×DEN).
 #[allow(dead_code)]
@@ -418,14 +433,17 @@ pub(crate) const OCB_WITH_PAWNS_SCALE: i32 = 64; // = DEN ⇒ identity; lit ~32 
 /// EG_SCALE_DEN. Shipped = EG_SCALE_DEN (identity); literature ~8 (0.125×DEN).
 #[allow(dead_code)]
 pub(crate) const PAWNLESS_DRAW_SCALE: i32 = 64; // = DEN ⇒ identity; lit ~8
+// TEXEL-TUNABLE-END: scale
 /// 50-move proximity taper onset in halfmoves. STRUCTURAL — not a tunable
 /// (semantically correct onset; tuning changes meaning, not magnitude).
 #[allow(dead_code)]
 pub(crate) const FIFTY_MOVE_TAPER_FROM: i32 = 80; // structural onset (halfmoves)
+// TEXEL-TUNABLE-BEGIN: scale
 /// 50-move taper floor: scale value at halfmove 100. M6.I tunable; identity =
 /// EG_SCALE_DEN. Shipped = EG_SCALE_DEN (identity, ramp flat); lit ~16 (0.25).
 #[allow(dead_code)]
 pub(crate) const FIFTY_MOVE_FLOOR: i32 = 64; // = DEN ⇒ identity; lit ~16
+// TEXEL-TUNABLE-END: scale
 
 /// Centipawn material values indexed by `PieceKind::index()` (P=0 … K=5).
 /// King material is 0 — kings are never captured; the king PST term is

@@ -226,6 +226,8 @@ dependencies = [
  "criterion",
  "libc",
  "proptest",
+ "serde",
+ "serde_json",
  "sevenz-rust2",
  "ureq",
  "zip",

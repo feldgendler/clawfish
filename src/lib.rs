@@ -25,6 +25,9 @@ pub mod position;
 pub mod search;
 pub mod slow_attacks;
 pub mod square;
+/// M6.I — Texel tuning harness (deferred eval-weight calibration). See
+/// `docs/decisions/0037-texel-tuning-harness.md`.
+pub mod texel;
 pub mod tt;
 pub mod uci;
 pub mod zobrist;
