@@ -3284,7 +3284,7 @@ pub fn is_fifty_move_draw(halfmove_clock: u8) -> bool {
 // `qsearch` returns a side-to-move-relative score, negated for Black here.
 //
 // Consumed by `corpus::quiet` (M6.G) and downstream by M6.I, the
-// tuning-backlog "PST co-tuning" Arm B, future SPSA campaigns, and M10
+// tuning-backlog "PST co-tuning" Arm B, future SPSA campaigns, and M11
 // NNUE data-prep — a deliberately public data-infra seam.
 // ---------------------------------------------------------------------------
 

@@ -35,7 +35,7 @@ The modest tactical lean (WAC +7, STS +50) is consistent with the SPRT's +1.74 E
 
 **Revisit conditions** (analogous to M5.H2's deferral):
 - Clawfish reaches **depth ≥ 14 at typical TCs** (currently ~depth 8-12 at mixed-TC). At deeper search, score-continuity improves and the intermediate-tier mechanism's literature payoff (Crafty / Meesha / RobboLito reports of +10-20 Elo) is more plausibly realizable.
-- OR: the engine's ordering quality improves substantially (e.g., post-M10 NNUE) so that tier-1 failure rates drop and tier-2 firings become rarer-but-more-targeted.
+- OR: the engine's ordering quality improves substantially (e.g., post-M11 NNUE) so that tier-1 failure rates drop and tier-2 firings become rarer-but-more-targeted.
 
 **Tunables preserved for future revisit** (in case a future iteration reaches the revisit conditions):
 - `ASPIRATION_INTERMEDIATE_HALF_WIDTH` (v1 was 150 — Crafty-proportional): try `100`, `200`, `250` if revisiting.
@@ -163,14 +163,14 @@ Three SPSA-tunable params. Empirically this baseline captures 60-80% of the ML m
 - M4.D's gate is the fixed schedule passing mixed-TC SPRT; building ML training infra is a multi-week scope expansion to a phase that should land in days.
 - Prerequisites missing: tapered eval for proper phase signal (M6), SPSA / CLOP harness for the cheap baseline, position corpus, offline label-generation pipeline.
 - Elo headroom small at this layer: ~+3-5 Elo realistic ceiling for ML over hand-tuned, vs +50-80 Elo for NMP, +80-100 Elo for LMR, +400+ Elo for NNUE. Opportunity cost is poor.
-- NNUE (M10) re-trains the eval from scratch; an ML aspiration model trained on PeSTO eval would need re-training post-NNUE.
+- NNUE (M11) re-trains the eval from scratch; an ML aspiration model trained on PeSTO eval would need re-training post-NNUE.
 
 **When to land.** Four-tier escalation, each tier proceeding only if the previous shows ≥ +5 Elo of remaining headroom worth chasing:
 
 1. **Fixed schedule (M4.D)** — ±50 default, width-tuned via mixed-TC SPRT. Ships at M4.D close.
-2. **TC- or depth-adaptive parametric (post-M5, pre-M10)** — `base · max(min_factor, 1 - α·(depth - threshold))`. SPSA-tuned. Cheapest validation of the depth/TC interaction motif.
-3. **Cheap delta-baseline (post-M10 or earlier if (2) saturates)** — `window = clamp(k · |score(d-1) − score(d-2)|, MIN, MAX)`. Three SPSA-tunable params.
-4. **MLP (post-M10, only if (2)+(3) saturate)** — full feature set + hidden layer.
+2. **TC- or depth-adaptive parametric (post-M5, pre-M11)** — `base · max(min_factor, 1 - α·(depth - threshold))`. SPSA-tuned. Cheapest validation of the depth/TC interaction motif.
+3. **Cheap delta-baseline (post-M11 or earlier if (2) saturates)** — `window = clamp(k · |score(d-1) − score(d-2)|, MIN, MAX)`. Three SPSA-tunable params.
+4. **MLP (post-M11, only if (2)+(3) saturate)** — full feature set + hidden layer.
 
 **Estimated size.** Adaptive parametric: ~30-50 LOC + SPSA harness reuse. Cheap delta-baseline: ~50 LOC + SPSA harness reuse. ML model: ~500-800 LOC (feature extraction + inference + offline-training pipeline as a separate Python or Rust binary), plus the corpus + label-generation infrastructure (potentially shared with Texel tuning or NNUE data prep).
 
@@ -180,7 +180,7 @@ Three SPSA-tunable params. Empirically this baseline captures 60-80% of the ML m
 
 **Pulled from M5.H1 plan §1 / ADR-0030 §8.** Split the captures stage into "good captures" (SEE ≥ 0) yielded immediately after TT and "bad captures" (SEE < 0) yielded last, after quiets. Per CPW Static Exchange Evaluation + Move Ordering pages.
 
-**Prerequisites.** SEE infrastructure (no current ETA in roadmap; M10+ candidate alongside NNUE training). Without SEE, the MVV-LVA-only capture sort is the recommended starting point per research §6.2.
+**Prerequisites.** SEE infrastructure (no current ETA in roadmap; M11+ candidate alongside NNUE training). Without SEE, the MVV-LVA-only capture sort is the recommended starting point per research §6.2.
 
 **Estimated Elo gain.** Hard to disentangle from SEE itself; captures-split is one of several SEE consumers. Tuning-backlog entry rather than roadmap-promised.
 
@@ -199,7 +199,7 @@ These survive because the M6.I tune used only ridge-toward-shipped + light monot
 
 **Why deferred, not done now.** Re-tuning under sign/monotonicity constraints needs its own SPRT (any weight change vs the shipped `M6.I` is a strength claim). It is not free, and the expected delta is small (these are minor terms). Worth doing only when a tuning slot opens and ideally folded into the larger Arm-B PST co-tune below (which already re-opens the whole eval-weight surface).
 
-**Recommended approach at promotion.** Warm-start from the shipped `M6.I` vector. Add per-term sign constraints (penalty terms ≤ 0; passed/connected bonuses ≥ 0 and rank-monotone) as projected-gradient clamps or strong one-sided ridge. Pick the constraint strength by held-out validation loss; SPRT the winner vs `M6.I`. **Baseline = the `M6.I` tag.** Abandon if (a) constrained validation loss is materially worse (the corpus genuinely wants the unconstrained shapes), or (b) M10/NNUE lands first (obsoletes classical weights).
+**Recommended approach at promotion.** Warm-start from the shipped `M6.I` vector. Add per-term sign constraints (penalty terms ≤ 0; passed/connected bonuses ≥ 0 and rank-monotone) as projected-gradient clamps or strong one-sided ridge. Pick the constraint strength by held-out validation loss; SPRT the winner vs `M6.I`. **Baseline = the `M6.I` tag.** Abandon if (a) constrained validation loss is materially worse (the corpus genuinely wants the unconstrained shapes), or (b) M11/NNUE lands first (obsoletes classical weights).
 
 **Cross-references.** `docs/milestones/m6.i.md` ("Counterintuitive term shapes"); ADR-0037 §5 (ridge-toward-shipped + monotonicity, the regularization that was *not* hard-constraining); the Arm-B item below (natural merge target — both re-open the eval-weight surface against the corpus).
 
@@ -228,7 +228,7 @@ Run order is forced (not a preference): **A first** — it is M6.I's committed d
 
 **Expected impact.** Recovery of the under-weighting bias the frozen-PST screens left on the table across M6.B–F. Magnitude unknown until A's sensitivity table quantifies the pinned-near-zero residual; plausibly modest (the per-phase screens suggest the dominant double-counts are a handful of axes: pawn-shield × PeSTO king MG PST, slider mobility EG × PeSTO slider PST, CONN × ISO, and the M6.F outpost/rook-file × PeSTO N/B/R centralization overlap). Bounded upside, real provenance/variance cost — hence gated, not queued.
 
-**Hard rejection criteria.** Abandon permanently if: (a) the λ-sweep's held-out-validation-optimal λ is ≈ ∞ (data does not want the PSTs to move — frozen was right); or (b) the best λ beats A on validation loss but SPRT-regresses or is flat vs `M6.I` (proxy-overfit confirmed, the regime warning realized); or (c) M10/NNUE has landed first — NNUE re-trains the eval from scratch and obsoletes all classical PSTs, zeroing this campaign's value. Priority therefore decays as M10 approaches; this is a *pre-M10* opportunity only.
+**Hard rejection criteria.** Abandon permanently if: (a) the λ-sweep's held-out-validation-optimal λ is ≈ ∞ (data does not want the PSTs to move — frozen was right); or (b) the best λ beats A on validation loss but SPRT-regresses or is flat vs `M6.I` (proxy-overfit confirmed, the regime warning realized); or (c) M11/NNUE has landed first — NNUE re-trains the eval from scratch and obsoletes all classical PSTs, zeroing this campaign's value. Priority therefore decays as M11 approaches; this is a *pre-M11* opportunity only.
 
 **Cross-references.** Roadmap §M6 (M6.I scope detail, frozen-PST commitment; M6.G corpus scope detail; M6.F Tier-1-feature scope detail); ADR-0032 §8 / ADR-0033 §7-8 ("re-derive … against our PeSTO PSTs" — the freeze, whose rationale this entry records explicitly); `src/eval/data.rs` (`MATERIAL`/PST arrays — the frozen reference frame); the M6.D/M6.E per-phase screens (empirical double-count evidence). Conceptual lineage: the gauge-freedom / K-anchoring discussion (centipawn scale is set by the vendored PeSTO magnitude, pinned by freezing K against the M6.F baseline; co-tuning would re-gauge — out of scope for A, in scope for B under the ridge-toward-PeSTO prior).
 
@@ -258,9 +258,9 @@ Run order is forced (not a preference): **A first** — it is M6.I's committed d
 
 **Validation.** Mixed-TC SPRT vs the `M6.I` tag (post-M6.I, so king safety co-exists with the tuned mobility/pawn weights it interacts with). Apply via a small extension of `texel-tune apply` (or hand-edit the marked `eval::data` king-safety regions — the markers exist).
 
-**Trigger / go-no-go.** Promote after the M6.I SPRT resolves and `M6.I` is tagged. Skip if M10/NNUE is imminent.
+**Trigger / go-no-go.** Promote after the M6.I SPRT resolves and `M6.I` is tagged. Skip if M11/NNUE is imminent.
 
-**Opportunity-cost caveat (priority decays as M10 approaches).** King safety is exactly the nonlinear pattern NNUE (M10) learns natively and obsoletes — the same decay logic as the "M6.I PST co-tuning" Arm B. Worth the cheap on/off SPRT + a light SPSA deflation *if it pays*; **not** worth heavy hand-tuning of the curve shape. A pre-M10 opportunity only.
+**Opportunity-cost caveat (priority decays as M11 approaches).** King safety is exactly the nonlinear pattern NNUE (M11) learns natively and obsoletes — the same decay logic as the "M6.I PST co-tuning" Arm B. Worth the cheap on/off SPRT + a light SPSA deflation *if it pays*; **not** worth heavy hand-tuning of the curve shape. A pre-M11 opportunity only.
 
 **Cross-references.** ADR-0037 §3 (the exclusion + its structural/semantic reasons) / §4 (the non-linear-params-outside-the-linear-core pattern); `docs/milestones/m6.i.md` (king-safety scope + lessons); ADR-0033 / `docs/research/m6-king-safety.md` (M6.E's HIGH transfer-risk verdict — the double-count this campaign measures); `docs/research/m6-texel-tuning.md` §3-§4 (freeze-and-sweep for non-linear terms; quiet-corpus blind spot).
 

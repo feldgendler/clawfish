@@ -104,7 +104,7 @@ Path F (completed move loop) stores `best_move = cutoff_move` when bound is Lowe
 - **Qsearch repetition / 50-move detection**: ADR-0027 §7 preserved skip; preserved here.
 - **Per-entry static-eval cache**: separate engine subsystem; out of scope.
 - **Bucketed TT**: direct-mapped depth-preferred unchanged.
-- **Lockless XOR trick (M9)**: deferred.
+- **Lockless XOR trick (M10)**: deferred.
 
 ## Consequences
 

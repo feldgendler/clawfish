@@ -17,7 +17,7 @@
 //!
 //! Consumed by M6.I (Texel tuning — reads four flat lane dirs and owns the
 //! inter-lane mix AND the train/val split), the tuning-backlog "PST co-tuning"
-//! Arm B, future SPSA campaigns, and M10 NNUE data-prep. See
+//! Arm B, future SPSA campaigns, and M11 NNUE data-prep. See
 //! `docs/plans/m6.h2-corpus-lanes.md`, `docs/plans/m6.g.md`,
 //! `docs/research/m6-corpus-construction.md`, and ADR-0035.
 

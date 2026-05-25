@@ -16,7 +16,7 @@ Returns the best score actually found, not clamped to `[alpha, beta]`. Per CPW "
 
 `MATE = 30000`, `INF = 30001`, `MATE_IN_MAX_PLY = MATE - MAX_PLY = 29936`. Eval saturation comfortably below `MATE_IN_MAX_PLY`.
 
-Why `i32`: matches `eval::evaluate(&Position) -> i32` and existing `SearchResult::score_cp: Option<i32>`. No casts at module boundaries. The Opus research §1.4 case for `i16` (SIMD-friendly NNUE inference) is real but pays off at M10, not M3 — converting later is one type alias.
+Why `i32`: matches `eval::evaluate(&Position) -> i32` and existing `SearchResult::score_cp: Option<i32>`. No casts at module boundaries. The Opus research §1.4 case for `i16` (SIMD-friendly NNUE inference) is real but pays off at M11, not M3 — converting later is one type alias.
 
 ### 3. Mate scoring: ply-adjusted
 
@@ -154,7 +154,7 @@ All deferred to M4 per the research consensus. M3.C is plain alpha-beta + MVV-LV
 | Alternative | Why rejected |
 |---|---|
 | Fail-hard | Worse node counts (Fishburn 1983); masks score-out-of-range bugs that fail-soft surfaces; no TT-interaction concern at M3 since no TT exists. |
-| `i16` scores | SIMD payoff is M10 (NNUE inference); cost of casting at the `eval` boundary is non-zero today for zero benefit today. |
+| `i16` scores | SIMD payoff is M11 (NNUE inference); cost of casting at the `eval` boundary is non-zero today for zero benefit today. |
 | `MATE = 32000` | `MATE = 30000` is enough headroom (eval saturates at ~3000 cp; MATE_IN_MAX_PLY at 29936 is well clear). 32000 vs 30000 is wash; pick the smaller for slightly more eval headroom. |
 | Defer mate-distance pruning to M4 | Roadmap commits to M3.C; cost is 5 lines; safe pruning. Opus research-suggested deferral noted but overridden by roadmap. |
 | `Search::go(&mut SearchContext)` | Trait change cascades through every Search impl; the search-owns-its-history alternative keeps the trait stable and the SearchContext immutable. Two-clone cost (~200 bytes per `go`) is negligible. |

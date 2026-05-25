@@ -19,7 +19,7 @@ cumulative deferred-term weights on the 8M-position corpus, and the tuned eval
 **H1-accept, Δ Elo +93.86 [+68.97, +119.72]** (618 games). The gain is
 depth-amplifying — it regresses at ultra-fast TC but dominates at slow TC, which
 is why the SPRT is run over a mix of time controls. Production HEAD = `M6.I`
-(bench `1411314`). Parallel search (M9) and NNUE evaluation (M10) follow. See
+(bench `1411314`). Parallel search (M10) and NNUE evaluation (M11) follow. See
 [`docs/roadmap.md`](docs/roadmap.md) for the full plan.
 
 ### Tier goals
@@ -31,7 +31,7 @@ Informal markers for "done enough for now" at each stage:
 | 1 | Play correct chess at all (legal moves, no protocol bugs) | n/a | **achieved at M2** |
 | 2 | Beat the project's owner reliably | ~2000–2400 | **achieved at M3** (~2114 at the M3 anchor) |
 | 3 | Beat grandmasters reliably | ~2600–2900 | targeting end-M5 / mid-M6 |
-| 4 | Grow out of reach for the best humans | ~3200–3500 | targeting M10 (NNUE) |
+| 4 | Grow out of reach for the best humans | ~3200–3500 | targeting M11 (NNUE) |
 | 5 | Compete with the strongest engines | 3600+ | aspirational; requires parallel search + NNUE + a strong training pipeline |
 
 Goals 3–5 use approximate Elo proxies since real GMs and elite engines aren't

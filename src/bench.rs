@@ -50,7 +50,7 @@ pub(crate) const BENCH_POSITIONS: [&str; 16] = [
 /// Default depth for `bench` when no argument given. Empirically calibrated
 /// to ~9 s wall on Apple M4 (M3.E binary, 2026-04-29) at the engine's
 /// ~7–11 Mnps; sub-30 s on 3× slower CI runners. Raise as TT (M4) and
-/// parallelism (M9) cut per-depth wallclock; revisit at each milestone where
+/// parallelism (M10) cut per-depth wallclock; revisit at each milestone where
 /// nps changes materially.
 pub(crate) const BENCH_DEFAULT_DEPTH: u32 = 7;
 
