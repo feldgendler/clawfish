@@ -29,7 +29,7 @@ use clawfish::corpus::quiet::{is_quiet, static_eval_white};
 use clawfish::corpus::selfplay::{
     OpeningMode, SelfPlayConfig, calibrate_ladder, run as selfplay_run,
 };
-use clawfish::corpus::store::{GameBlock, atomic_write, scan_valid_blocks};
+use clawfish::corpus::store::{GameBlock, atomic_write, scan_valid_blocks, truncate_to_valid};
 use clawfish::corpus::{
     CorpusRecord, DEPTH_RUNG_EXTERNAL, HIGH_SCORE_CP, Label, OPENING_SKIP_PLIES, QUIET_MARGIN_CP,
     Source,
@@ -259,6 +259,7 @@ Flags:
         opening_book_sha256: None,
         opening_mode: None,
         corpus_sha256: String::new(),
+        truncated_boundary_offset: None,
     };
     write_manifest(&out, &manifest).map_err(|e| format!("write_manifest: {e}"))?;
     eprintln!(
@@ -406,6 +407,118 @@ running one campaign per mode."
     let stop = Arc::new(AtomicBool::new(false));
     install_signal_handler(Arc::clone(&stop));
 
+    // Extend detection: if there is a finalized lane with a smaller target,
+    // this is an extend call. Validate the determinism guards and drop the
+    // partial boundary block before re-running selfplay.
+    if let Some(new_target) = cap_positions
+        && let Ok(existing_m) = read_manifest(&out)
+        && existing_m.target_usable.is_some()
+    {
+        let existing_target = existing_m.target_usable.unwrap();
+        // SHRINK is an error — extending to a smaller target is undefined.
+        if new_target < existing_target {
+            return Err(format!(
+                "extend refused: new target {new_target} < existing committed target \
+                 {existing_target} — shrink is not supported (use `corpus truncate`)"
+            ));
+        }
+        if new_target > existing_target {
+            // Determinism guards: refuse if any knob that affects byte output differs.
+            let cur_commit = engine_commit();
+            if existing_m.engine_commit != cur_commit {
+                return Err(format!(
+                    "extend refused: engine_commit mismatch (manifest={:?}, current={:?}); \
+                     bit-identical extend requires the same eval build",
+                    existing_m.engine_commit, cur_commit
+                ));
+            }
+            if existing_m.cap_seed != cap_seed {
+                return Err(format!(
+                    "extend refused: cap_seed mismatch (manifest={}, requested={}); \
+                     bit-identical extend requires the same cap_seed",
+                    existing_m.cap_seed, cap_seed
+                ));
+            }
+            if existing_m.self_play_seed != seed {
+                return Err(format!(
+                    "extend refused: self_play_seed mismatch (manifest={}, requested={})",
+                    existing_m.self_play_seed, seed
+                ));
+            }
+            if existing_m.workers != workers as u32 {
+                return Err(format!(
+                    "extend refused: workers mismatch (manifest={}, requested={})",
+                    existing_m.workers, workers
+                ));
+            }
+            if existing_m.depth_ladder != depth_ladder {
+                return Err(format!(
+                    "extend refused: depth_ladder mismatch (manifest={:?}, requested={:?})",
+                    existing_m.depth_ladder, depth_ladder
+                ));
+            }
+            if existing_m.opening_random_plies != opening_random_plies {
+                return Err(format!(
+                    "extend refused: opening_random_plies mismatch (manifest={}, requested={})",
+                    existing_m.opening_random_plies, opening_random_plies
+                ));
+            }
+            if existing_m.max_plies != max_plies {
+                return Err(format!(
+                    "extend refused: max_plies mismatch (manifest={}, requested={})",
+                    existing_m.max_plies, max_plies
+                ));
+            }
+            let existing_mode = existing_m.opening_mode.as_deref().unwrap_or("random");
+            let requested_mode = match opening_mode {
+                OpeningMode::Book => "book",
+                OpeningMode::Random => "random",
+            };
+            if existing_mode != requested_mode {
+                return Err(format!(
+                    "extend refused: opening_mode mismatch (manifest={existing_mode:?}, \
+                     requested={requested_mode:?})"
+                ));
+            }
+            if existing_m.opening_book_sha256 != book.as_ref().map(|b| b.sha256().to_owned()) {
+                return Err(
+                    "extend refused: opening_book_sha256 mismatch — the opening book has \
+                     changed; bit-identical extend requires the same book"
+                        .to_string(),
+                );
+            }
+            // Truncate the partial boundary block before re-running, so extend is
+            // idempotent (crash-safe: the manifest still names the OLD offset).
+            // ONLY when a partial boundary exists (Some); a whole-on-boundary or
+            // drained base lane has nothing to drop.
+            if let Some(boundary_off) = existing_m.truncated_boundary_offset {
+                let lane = out.join("lane.bin");
+                if lane.exists() {
+                    eprintln!(
+                        "corpus: extend — dropping partial boundary block at offset {boundary_off}"
+                    );
+                    truncate_to_valid(&lane, boundary_off)
+                        .map_err(|e| format!("truncate boundary block: {e}"))?;
+                }
+            }
+            // ALWAYS delete the checkpoint on extend, so the consumer re-derives
+            // next_consume_id / next_dispatch_id from the (possibly-truncated)
+            // lane scan. This is load-invariant; the base build's FINALIZED
+            // checkpoint can record a contention-dependent advanced
+            // next_dispatch_id (the worker reads ahead and claims games before
+            // the cap stops it). Resuming off that checkpoint would SKIP games
+            // and diverge from a fresh build — the exact bit-identity flake seen
+            // under heavy load on the whole-on-boundary (None) path. Re-deriving
+            // from the lane is deterministic regardless of load.
+            let ckpt = out.join("checkpoint.bin");
+            if ckpt.exists() {
+                fs::remove_file(&ckpt).map_err(|e| format!("remove checkpoint.bin: {e}"))?;
+                eprintln!("corpus: extend — checkpoint.bin removed (re-derive from lane)");
+            }
+            eprintln!("corpus: extend {existing_target} → {new_target} (selfplay seed={seed})");
+        }
+    }
+
     let games_display = if games == u64::MAX {
         "unbounded".to_string()
     } else {
@@ -467,6 +580,11 @@ running one campaign per mode."
         OpeningMode::Book => "selfplay-on-book".into(),
         OpeningMode::Random => "selfplay-off-book".into(),
     });
+    // Persist the truncated_boundary_offset AFTER the build completes (crash-
+    // safety invariant M3: the manifest still names the OLD offset during the
+    // extend run, so a crash mid-extend causes the next run to re-truncate to
+    // the old offset and re-derive the boundary game deterministically).
+    m.truncated_boundary_offset = stats.truncated_boundary_offset;
     write_manifest(&out, &m).map_err(|e| format!("update selfplay knobs: {e}"))?;
     Ok(ExitCode::SUCCESS)
 }
@@ -495,6 +613,7 @@ fn stub_manifest(depth_ladder: Vec<(u8, u32)>) -> Manifest {
         opening_book_sha256: None,
         opening_mode: None,
         corpus_sha256: clawfish::corpus::quality_gate::CORPUS_SHA256_PENDING_SENTINEL.to_string(),
+        truncated_boundary_offset: None,
     }
 }
 
@@ -545,6 +664,30 @@ emitted record.
     let path = PathBuf::from(args.require("path")?);
     let out = PathBuf::from(args.require("out")?);
     fs::create_dir_all(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
+
+    // Refuse to ingest-pgn into a lane that was built by fetch or self-play:
+    // those lanes use stable game ids (base_game_id=1 for fetch, dispatcher-
+    // assigned for self-play) that ingest-pgn's `max_existing + 1` base would
+    // silently collide with, breaking the id-base invariant that bit-identical
+    // extend relies on.
+    if let Ok(existing_m) = read_manifest(&out) {
+        let existing_source = existing_m.source.as_deref().unwrap_or("");
+        let is_fetch_or_selfplay = matches!(
+            existing_source,
+            "ccrl" | "lichess" | "selfplay-on-book" | "selfplay-off-book"
+        );
+        if is_fetch_or_selfplay {
+            return Err(format!(
+                "ingest-pgn refused: the lane at {} was built by {:?}; ingest-pgn \
+                 cannot extend a fetch or self-play lane (it would break the stable \
+                 game-id invariant that bit-identical extend requires). Use `corpus \
+                 fetch` or `corpus selfplay` to extend this lane.",
+                out.display(),
+                existing_source
+            ));
+        }
+    }
+
     let source_tag = args.get("source").unwrap_or("ccrl").to_string();
     let source = match source_tag.as_str() {
         "ccrl" => Source::Ccrl,
@@ -742,6 +885,66 @@ temp file then parsed locally).
         ..FetchConfig::default()
     };
 
+    // Extend detection: if there is a finalized lane with a smaller target,
+    // this is an extend call. Validate the determinism guards and drop the
+    // partial boundary block before re-fetching.
+    let new_target_opt = (target != u64::MAX).then_some(target);
+    if let Some(new_target) = new_target_opt
+        && let Ok(existing_m) = read_manifest(&out)
+        && existing_m.target_usable.is_some()
+    {
+        let existing_target = existing_m.target_usable.unwrap();
+        if new_target < existing_target {
+            return Err(format!(
+                "extend refused: new target {new_target} < existing committed target \
+                 {existing_target} — shrink is not supported (use `corpus truncate`)"
+            ));
+        }
+        if new_target > existing_target {
+            let cur_commit = engine_commit();
+            if existing_m.engine_commit != cur_commit {
+                return Err(format!(
+                    "extend refused: engine_commit mismatch (manifest={:?}, current={:?}); \
+                     bit-identical extend requires the same eval build",
+                    existing_m.engine_commit, cur_commit
+                ));
+            }
+            if existing_m.cap_seed != cap_seed {
+                return Err(format!(
+                    "extend refused: cap_seed mismatch (manifest={}, requested={})",
+                    existing_m.cap_seed, cap_seed
+                ));
+            }
+            if existing_m.source.as_deref() != Some(source_tag.as_str()) {
+                return Err(format!(
+                    "extend refused: source mismatch (manifest={:?}, requested={source_tag:?}); \
+                     bit-identical extend requires the same source filter/provenance",
+                    existing_m.source
+                ));
+            }
+            if let Some(existing_url) = &existing_m.source_url
+                && existing_url != &url
+            {
+                return Err(format!(
+                    "extend refused: source_url mismatch (manifest={existing_url:?}, \
+                     requested={url:?}); bit-identical extend requires the same source"
+                ));
+            }
+            // Drop the partial boundary block before re-fetching (idempotent).
+            if let Some(boundary_off) = existing_m.truncated_boundary_offset {
+                let lane = out.join("lane.bin");
+                if lane.exists() {
+                    eprintln!(
+                        "corpus: extend — dropping partial boundary block at offset {boundary_off}"
+                    );
+                    truncate_to_valid(&lane, boundary_off)
+                        .map_err(|e| format!("truncate boundary block: {e}"))?;
+                }
+            }
+            eprintln!("corpus: extend {existing_target} → {new_target} (fetch {url})");
+        }
+    }
+
     eprintln!("corpus: fetch {source:?} target={target} url={url}");
     let outcome = stream_to_ingest(source, &url, target, &out, &filter, &stop, &cfg)
         .map_err(|e| format!("fetch: {e}"))?;
@@ -760,8 +963,12 @@ temp file then parsed locally).
     let mut m = read_manifest(&out).unwrap_or_else(|_| stub_manifest(vec![(4, 1)]));
     m.source_url = Some(url);
     m.cap_seed = cap_seed;
-    m.target_usable = (target != u64::MAX).then_some(target);
+    m.target_usable = new_target_opt;
     m.source = Some(source_tag);
+    // Persist the truncated_boundary_offset AFTER the build completes (crash-
+    // safety invariant M3: the manifest still names the OLD offset during the
+    // extend run).
+    m.truncated_boundary_offset = outcome.truncated_boundary_offset;
     write_manifest(&out, &m).map_err(|e| format!("update fetch knobs: {e}"))?;
     Ok(ExitCode::SUCCESS)
 }
@@ -1412,6 +1619,7 @@ mod tests {
             opening_book_sha256: None,
             opening_mode: None,
             corpus_sha256: "deadbeef".into(),
+            truncated_boundary_offset: None,
         }
     }
 

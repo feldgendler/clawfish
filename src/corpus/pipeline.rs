@@ -46,6 +46,14 @@ pub struct LaneCommitter {
     target: Option<u64>,
     /// Usable positions committed so far (cumulative, incl. resume).
     committed: u64,
+    /// The lane byte-offset BEFORE the boundary game's block was appended.
+    /// Set iff the exact-target truncation fired for this game (`Some`), so
+    /// `truncate_to_valid(lane, off)` drops the partial boundary block and
+    /// extend is idempotent. `None` when the build drained to EOF before
+    /// reaching the target, or the boundary game committed whole (no
+    /// truncation). Initialized to `None`; set at most once (boundary fires
+    /// exactly once per build).
+    truncated_boundary_offset: Option<u64>,
 }
 
 /// Outcome of one [`LaneCommitter::commit_game`] call.
@@ -89,6 +97,7 @@ impl LaneCommitter {
                 cap_seed,
                 target,
                 committed,
+                truncated_boundary_offset: None,
             },
             committed_ids,
         ))
@@ -108,6 +117,7 @@ impl LaneCommitter {
             cap_seed,
             target,
             committed,
+            truncated_boundary_offset: None,
         }
     }
 
@@ -125,32 +135,56 @@ impl LaneCommitter {
         game_id: u64,
         records: Vec<CorpusRecord>,
     ) -> Result<CommitOutcome, CorpusError> {
-        // 1. Per-lane FEN dedup (first-seen-wins). `HashSet::insert` returns
-        //    `true` only for the first occurrence, so a FEN already in the set
-        //    (from an earlier game in this lane or from the resume scan) is
-        //    dropped.
+        // 1. Per-lane FEN dedup against the COMMITTED set (first-seen-wins),
+        //    plus within-this-game dedup. We do NOT insert into `fen_set` here —
+        //    only positions actually committed enter it (step 4). So a position
+        //    discarded by this game's reservoir cap or exact-target truncation
+        //    gets a fair chance in a LATER game (richer corpus, still no
+        //    duplicates), and crucially `fen_set` mirrors the on-disk lane
+        //    exactly — which is what makes a resume scan reconstruct it byte-
+        //    for-byte, the foundation of bit-identical extend (ADR-0035 v2).
+        let mut seen_this_game: HashSet<String> = HashSet::new();
         let deduped: Vec<CorpusRecord> = records
             .into_iter()
-            .filter(|r| self.fen_set.insert(r.fen.clone()))
+            .filter(|r| !self.fen_set.contains(&r.fen) && seen_this_game.insert(r.fen.clone()))
             .collect();
 
-        // 2. Per-game reservoir cap among dedup-survivors.
+        // 2. Per-game reservoir cap among dedup-survivors (samples among
+        //    not-yet-committed uniques — the "don't waste cap slots" property
+        //    is preserved).
         let mut capped = cap_dedup_survivors(deduped, self.cap_seed, game_id, PER_GAME_CAP);
 
         // 3. Exact target truncation: never overshoot. The boundary game keeps
         //    only `target - committed` records.
-        if let Some(target) = self.target {
+        let truncation_fired = if let Some(target) = self.target {
             let room = target.saturating_sub(self.committed);
             if (capped.len() as u64) > room {
                 capped.truncate(room as usize);
+                true
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
 
         let usable = capped.len() as u64;
         let empty_post_dedup = capped.is_empty();
         if !empty_post_dedup {
-            append_block(lane_path, game_id, &capped)?;
+            // 4. ONLY the committed (post-cap, post-truncate) FENs enter the
+            //    dedup set, so it stays identical to what is on disk.
+            for r in &capped {
+                self.fen_set.insert(r.fen.clone());
+            }
+            let pre_offset = append_block(lane_path, game_id, &capped)?;
             self.committed += usable;
+            // Record the pre-append offset iff exact-target truncation fired for
+            // this game. This is the idempotent truncation point for extend:
+            // `truncate_to_valid(lane, off)` drops the partial boundary block.
+            // Set only once: once target_reached, no further commits happen.
+            if truncation_fired && self.truncated_boundary_offset.is_none() {
+                self.truncated_boundary_offset = Some(pre_offset);
+            }
         }
 
         Ok(CommitOutcome {
@@ -168,6 +202,19 @@ impl LaneCommitter {
     /// `true` iff a target is set and the committed count has reached it.
     pub fn target_reached(&self) -> bool {
         self.target.is_some_and(|t| self.committed >= t)
+    }
+
+    /// The lane byte-offset before the boundary game's block was appended, if
+    /// the exact-target truncation fired. `Some` only when the build landed
+    /// mid-game (partial boundary); `None` when the stream drained before the
+    /// target or the boundary game committed whole.
+    ///
+    /// On extend, the driver calls `truncate_to_valid(lane, off)` to drop the
+    /// partial boundary block, making the truncation idempotent. The committer
+    /// is then rebuilt from the truncated lane and the boundary game is
+    /// re-derived from scratch (whole this time, room ample at the new target).
+    pub fn truncated_boundary_offset(&self) -> Option<u64> {
+        self.truncated_boundary_offset
     }
 }
 
@@ -507,5 +554,83 @@ mod tests {
         assert!(o1.target_reached);
         assert_eq!(c.committed(), target);
         assert_eq!(total_records(&td.lane()), target);
+    }
+
+    #[test]
+    fn committer_ii_cap_discarded_position_committed_by_later_game() {
+        // (II) dedup-against-committed: a position discarded by one game's
+        // reservoir cap is NOT remembered, so a later game reaching the same
+        // position commits it. (Under the old dedup-against-all-seen it was
+        // lost forever.)
+        let td = TempDir::new("ii-cap-discard");
+        let mut c = fresh(0xABCD, None);
+
+        // Game 0: 15 unique FENs → cap keeps 10, discards 5.
+        let all: Vec<String> = (0..15u32)
+            .map(|p| format!("ii-fen-{p} w - - 0 1"))
+            .collect();
+        let recs0: Vec<CorpusRecord> = all
+            .iter()
+            .enumerate()
+            .map(|(p, f)| rec(0, p as u32, f))
+            .collect();
+        c.commit_game(&td.lane(), 0, recs0).unwrap();
+
+        let (blocks, _) = scan_valid_blocks(&td.lane()).unwrap();
+        let committed: HashSet<&str> = blocks[0].records.iter().map(|r| r.fen.as_str()).collect();
+        assert_eq!(committed.len(), PER_GAME_CAP, "game 0 committed exactly 10");
+        let discarded: &str = all
+            .iter()
+            .map(|s| s.as_str())
+            .find(|f| !committed.contains(f))
+            .expect("5 FENs were discarded by the cap");
+
+        let o1 = c
+            .commit_game(&td.lane(), 1, vec![rec(1, 0, discarded)])
+            .unwrap();
+        assert_eq!(
+            o1.usable_committed, 1,
+            "a cap-discarded position is committable by a later game under (II)"
+        );
+        assert_eq!(c.committed(), PER_GAME_CAP as u64 + 1);
+    }
+
+    #[test]
+    fn committer_ii_resume_fen_set_is_committed_only() {
+        // (II) makes the resumed dedup set == the on-disk set EXACTLY: a
+        // cap-discarded FEN re-emitted after a resume is committed (it was never
+        // stored, so it is not in the rebuilt fen_set). This exact
+        // reconstruction is the foundation of bit-identical extend.
+        let td = TempDir::new("ii-resume-committed-only");
+        let all: Vec<String> = (0..15u32)
+            .map(|p| format!("ii-r-fen-{p} w - - 0 1"))
+            .collect();
+        {
+            let mut c = fresh(0xBEEF, None);
+            let recs0: Vec<CorpusRecord> = all
+                .iter()
+                .enumerate()
+                .map(|(p, f)| rec(0, p as u32, f))
+                .collect();
+            c.commit_game(&td.lane(), 0, recs0).unwrap();
+        }
+
+        let (blocks, _) = scan_valid_blocks(&td.lane()).unwrap();
+        let committed: HashSet<&str> = blocks[0].records.iter().map(|r| r.fen.as_str()).collect();
+        let discarded: &str = all
+            .iter()
+            .map(|s| s.as_str())
+            .find(|f| !committed.contains(f))
+            .expect("cap discarded 5");
+
+        let (mut c, _) = LaneCommitter::resume(&td.lane(), 0xBEEF, None).unwrap();
+        assert_eq!(c.committed(), PER_GAME_CAP as u64);
+        let o = c
+            .commit_game(&td.lane(), 1, vec![rec(1, 0, discarded)])
+            .unwrap();
+        assert_eq!(
+            o.usable_committed, 1,
+            "resume fen_set is committed-only ⇒ a discarded FEN is committable"
+        );
     }
 }

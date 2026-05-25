@@ -467,3 +467,31 @@ M6.H2 unifies the four `Source` lanes (`SelfPlayOnBook`, `SelfPlayOffBook`, `Ccr
   reproducibility).
 - `docs/roadmap.md` §M6 — "M6.G scope detail" + R1–R7 + R-TC +
   Verification.
+
+## Addendum (post-M6.I, 2026-05-25) — dedup-against-committed (v2)
+
+The per-lane FEN dedup originally inserted EVERY dedup-survivor into the dedup
+set *before* the per-game reservoir cap. Side effects: (a) a position discarded
+by the cap was still "seen", so no later game could contribute it (the corpus
+under-counts recurring positions); (b) the dedup set could not be reconstructed
+from `lane.bin` (which holds only committed records) — it contained discarded
+"ghosts".
+
+**Change (v2):** `LaneCommitter::commit_game` dedups against the COMMITTED set
+only — a FEN enters the dedup set iff the position is actually committed (post
+cap + post exact-target truncation), plus a within-game first-seen guard. Still
+no duplicate positions in the corpus; the cap still samples among
+not-yet-committed uniques; a cap-discarded position gets a fair chance in a
+later game (a RICHER corpus); and crucially **the dedup set == the on-disk set**,
+so a resume scan reconstructs it byte-for-byte.
+
+**Consequence:** a fresh build under v2 is a DIFFERENT draw from the M6.G/H/H2
+(v1) corpus — different position IDENTITY (which positions appear), not merely a
+different size. v1 lanes are not content-comparable to v2; a re-tune on v2 uses
+a fresh corpus. Bench-neutral (corpus tooling only; no eval/search change).
+
+**Enables bit-identical, non-wasting lane EXTEND** (ADR-0036 addendum): because
+the resume scan reconstructs the exact dedup set, extending a lane built to N up
+to T yields a `lane.bin` byte-identical to a fresh build to T, re-processing
+only the boundary game. Validated by SHA-equality tests on both self-play and
+fetch lanes. Plan: `docs/plans/corpus-fetch-extend.md`.

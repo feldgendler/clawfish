@@ -1775,3 +1775,99 @@ fn fetch_stop_flag_clean_exit() {
     assert_eq!(out.terminated, Termination::Stopped);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Bit-identical fetch EXTEND — the fetch half of the "test extend in BOTH
+/// fetching and self-play lanes" gate. Build fresh to 2X; separately build to X
+/// (made to land mid-game → a partial boundary block), drop that block, and
+/// re-stream to 2X (= extend); assert `lane.bin` is BYTE-IDENTICAL to the fresh
+/// build. Exercises the fetch-specific extend logic: C1 stable base id, C3
+/// target-as-total resume, C2 prefix skip-by-id, and the boundary
+/// drop-and-re-derive (the (cmd_fetch) driver wiring is symmetric to the
+/// already-proven cmd_selfplay subprocess path).
+#[test]
+fn fetch_extend_lane_is_bit_identical_to_fresh_build() {
+    let n_games = 120;
+    let total = expected_usable_total(n_games);
+    assert!(
+        total >= 24,
+        "fixture must yield enough usable positions; got {total}"
+    );
+    let target_2x = total / 2; // comfortably below `total` so the stream never drains
+
+    let pgn = make_pgn(n_games);
+    let payload = zstd_encode(pgn.as_bytes());
+
+    // FRESH → 2X.
+    let srv = TestServer::spawn(payload.clone(), Behavior::Serve);
+    let fresh = tmp_dir("fext-fresh");
+    let o_fresh = stream_to_ingest(
+        Source::LichessOpen,
+        &srv.url("/x.pgn.zst"),
+        target_2x,
+        &fresh,
+        &GameFilter::default(),
+        &no_stop(),
+        &test_cfg(),
+    )
+    .expect("fresh-to-2X");
+    assert_eq!(o_fresh.positions_ingested, target_2x, "fresh build hit 2X");
+    let fresh_bytes = std::fs::read(fresh.join("lane.bin")).unwrap();
+
+    // Find an X in (0, 2X) that lands MID-game (records a partial boundary), so
+    // the truncate-and-re-derive path is exercised. delta=0 (X = total/4) almost
+    // always lands mid-game; the rest are a safety net.
+    let mut built: Option<(PathBuf, u64)> = None;
+    for delta in [0u64, 1, 2, 3, 5, 7] {
+        let target_x = target_2x / 2 + delta;
+        if target_x == 0 || target_x >= target_2x {
+            continue;
+        }
+        let srv_x = TestServer::spawn(payload.clone(), Behavior::Serve);
+        let ext = tmp_dir("fext-ext");
+        let o_x = stream_to_ingest(
+            Source::LichessOpen,
+            &srv_x.url("/x.pgn.zst"),
+            target_x,
+            &ext,
+            &GameFilter::default(),
+            &no_stop(),
+            &test_cfg(),
+        )
+        .expect("build-to-X");
+        assert_eq!(o_x.positions_ingested, target_x);
+        if let Some(off) = o_x.truncated_boundary_offset {
+            built = Some((ext, off));
+            break;
+        }
+        let _ = std::fs::remove_dir_all(&ext);
+    }
+    let (ext, off) = built.expect("some probed X lands mid-game (partial boundary)");
+
+    // Drop the partial boundary block, then extend to 2X (what cmd_fetch does).
+    clawfish::corpus::store::truncate_to_valid(&ext.join("lane.bin"), off)
+        .expect("truncate partial boundary");
+    let srv_e = TestServer::spawn(payload, Behavior::Serve);
+    stream_to_ingest(
+        Source::LichessOpen,
+        &srv_e.url("/x.pgn.zst"),
+        target_2x,
+        &ext,
+        &GameFilter::default(),
+        &no_stop(),
+        &test_cfg(),
+    )
+    .expect("extend-to-2X");
+    let ext_bytes = std::fs::read(ext.join("lane.bin")).unwrap();
+
+    assert_eq!(
+        fresh_bytes.len(),
+        ext_bytes.len(),
+        "fetch extend lane.bin size differs from fresh-to-2X"
+    );
+    assert_eq!(
+        fresh_bytes, ext_bytes,
+        "fetch extend is NOT byte-identical to a fresh build to 2X"
+    );
+    let _ = std::fs::remove_dir_all(&fresh);
+    let _ = std::fs::remove_dir_all(&ext);
+}

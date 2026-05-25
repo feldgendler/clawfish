@@ -275,18 +275,26 @@ pub fn truncate_to_valid(path: &Path, valid_len: u64) -> Result<(), CorpusError>
 }
 
 /// Append one game block to the shard and `fsync`. The atomic unit (R1/R2).
+///
+/// Returns the byte offset of the file BEFORE the write (the length before
+/// appending). This pre-append offset is the exact truncation point needed by
+/// the boundary-game extend logic: `truncate_to_valid(lane, pre_offset)` drops
+/// the partial boundary block, making extend idempotent.
 pub fn append_block(
     path: &Path,
     game_id: u64,
     records: &[CorpusRecord],
-) -> Result<(), CorpusError> {
+) -> Result<u64, CorpusError> {
     let block = encode_block(game_id, records);
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    // Read the pre-append length via the file handle (the file is already open
+    // in append mode, so metadata().len() is the current size before write_all).
+    let pre_offset = f.metadata()?.len();
     // One `write_all` of the whole block — a short write here leaves a torn
     // frame the CRC scan rejects WHOLESALE, never a partial record.
     f.write_all(&block)?;
     f.sync_all()?;
-    Ok(())
+    Ok(pre_offset)
 }
 
 /// Append pre-encoded bytes (the output of `encode_block`) to the shard and

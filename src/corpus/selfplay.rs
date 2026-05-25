@@ -138,6 +138,10 @@ pub struct SelfPlayStats {
     /// Consumer: records appended to `lane.bin` after dedup + cap (cumulative,
     /// including the resumed-from-disk count).
     pub positions_committed: u64,
+    /// The lane byte-offset before the boundary game's block was appended, if
+    /// the exact-target truncation fired this run. Forwarded from the consumer's
+    /// `ConsumerStats`. Used by the extend driver to persist the offset.
+    pub truncated_boundary_offset: Option<u64>,
 }
 
 /// One completed game's transactional payload: the game id + every
@@ -705,6 +709,7 @@ pub fn run(cfg: &SelfPlayConfig, stop: &AtomicBool) -> Result<SelfPlayStats, Cor
         games_committed: consumer_stats.games_committed,
         games_empty_post_dedup: consumer_stats.games_empty_post_dedup,
         positions_committed: consumer_stats.positions_committed,
+        truncated_boundary_offset: consumer_stats.truncated_boundary_offset,
     })
 }
 

@@ -317,6 +317,7 @@ pub fn consumer_loop(
         }
     }
 
+    stats.truncated_boundary_offset = committer.truncated_boundary_offset();
     Ok(stats)
 }
 
@@ -374,6 +375,10 @@ pub struct ConsumerStats {
     /// Total records appended to `lane.bin` after dedup + cap (cumulative,
     /// including the resumed-from-disk count — mirrors `LaneCommitter::committed`).
     pub positions_committed: u64,
+    /// The lane byte-offset before the boundary game's block was appended, if
+    /// the exact-target truncation fired this run. Forwarded from the committer.
+    /// Used by the extend driver to persist the offset in the manifest.
+    pub truncated_boundary_offset: Option<u64>,
 }
 
 #[cfg(test)]

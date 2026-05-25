@@ -234,3 +234,37 @@ The M6.H2 lane refactor (ADR-0035 §12) changes the fetch / `ingest-pgn` contrac
   M6.H forward-pointer).
 - `docs/plans/m6.h.md`, `docs/research/m6-network-fetch.md`,
   `docs/data-catalog.md`, `docs/roadmap.md` §M6 (M6.H scope detail + gates 1–7).
+
+## Addendum (post-M6.I, 2026-05-25) — bit-identical, non-wasting lane extension
+
+`corpus fetch` and `corpus selfplay` now EXTEND a finalized lane to a higher
+position target, yielding a `lane.bin` byte-identical to a fresh build to that
+target while re-processing only the single boundary game. Mechanism:
+
+- **Stable, run-independent game ids** — fetch pins `base_game_id = 1`;
+  self-play's dispatcher/consumer is deterministic given its knobs.
+- **Dedup-against-committed (ADR-0035 v2)** ⇒ the resume scan reconstructs the
+  exact dedup set, so re-derivation matches a fresh build bit-for-bit.
+- **`truncated_boundary_offset`** — the exact-target truncation records the byte
+  offset before the partial boundary block; surfaced from `commit_game`, written
+  to the manifest by the driver AFTER the build, PRESERVED (never derived) by
+  `finalize`. (A partial 3-record block is byte-indistinguishable from a genuine
+  3-record game on a scan, so the offset cannot be reconstructed — it must be
+  threaded from the commit that produced it.)
+- **Extend** = truncate `lane.bin` to that offset (drop the partial boundary;
+  idempotent set-length ⇒ crash-safe re-runs), skip already-committed games by
+  id (non-wasting — no prefix quiet-search), re-derive the boundary game WHOLE,
+  append new games to the target. The manifest offset is updated only AFTER the
+  extend completes, so a crash mid-extend re-truncates idempotently to the old
+  offset and re-derives (bounded re-work, no data loss).
+- **Guards** (refuse on mismatch so a divergent extend cannot silently corrupt a
+  lane): `engine_commit`, `cap_seed`, `source`/`source_url` (fetch), and the
+  self-play knobs (`self_play_seed`/`workers`/`depth_ladder`/
+  `opening_random_plies`/`max_plies`/`opening_mode`/`opening_book_sha256`); a
+  shrink request is a hard error; `ingest-pgn` is refused on a fetch/self-play
+  lane (id-base regime). Bench-neutral.
+
+Tests: `tests/corpus_extend.rs` (bit-identity, crash-mid-append, idempotent,
+exact-on-boundary, drained, shrink-rejected + 6 unit) and
+`tests/corpus_fetch.rs::fetch_extend_lane_is_bit_identical_to_fresh_build`.
+Plan + review history: `docs/plans/corpus-fetch-extend.md`.

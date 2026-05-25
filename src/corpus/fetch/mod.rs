@@ -31,7 +31,6 @@ use crate::corpus::objective::strata_for;
 use crate::corpus::pgn::{GamePositions, PgnStats, stream_pgn};
 use crate::corpus::pipeline::LaneCommitter;
 use crate::corpus::quiet::{is_quiet, static_eval_white};
-use crate::corpus::store::scan_valid_blocks;
 use crate::corpus::{
     CorpusError, CorpusRecord, DEPTH_RUNG_EXTERNAL, HIGH_SCORE_CP, OPENING_SKIP_PLIES, Source,
 };
@@ -122,28 +121,46 @@ pub struct FetchOutcome {
     /// ingest uses) — accounts for filter gaps; equals `base_game_id` if nothing
     /// was appended.
     pub next_game_id: u64,
+    /// The lane byte-offset before the boundary game's block was appended, if
+    /// the exact-target truncation fired this call (`Some`). Used by the extend
+    /// driver to drop the partial boundary block before re-deriving it whole.
+    /// `None` when the stream drained before the target or the boundary game
+    /// committed whole.
+    pub truncated_boundary_offset: Option<u64>,
 }
 
-/// Stream `target_positions` NEW usable positions from `url` (a `source`-typed
-/// CCRL/Lichess dump) into `<out_dir>/lane.bin`, applying `filter` (game-level
-/// admission) AND the full per-position inline pipeline (skip8 ∧ `!in_check` ∧
-/// `|static_eval| ≤ HIGH_SCORE_CP` ∧ `is_quiet`) before routing the surviving
-/// quiet-certified records through the shared [`LaneCommitter`] (per-lane FEN
-/// dedup → per-game cap → exact target truncation). `target_positions` counts
-/// **usable** (post-pipeline) positions; the committer's exact truncation lands
-/// the lane on the target exactly. Blocks under infinite outer backoff (unless
-/// `cfg.max_attempts` caps it) until the target is reached / the stream drains
-/// / `stop` is set; returns `Err` only on a permanent failure (4xx, disk).
-/// `target_positions == 0` means **unbounded** (no early-stop — drain the whole
-/// stream), matching the CLI's `u64::MAX` default.
+/// Stream usable positions from `url` (a `source`-typed CCRL/Lichess dump) into
+/// `<out_dir>/lane.bin`, applying `filter` (game-level admission) AND the full
+/// per-position inline pipeline (skip8 ∧ `!in_check` ∧ `|static_eval| ≤
+/// HIGH_SCORE_CP` ∧ `is_quiet`) before routing the surviving quiet-certified
+/// records through the shared [`LaneCommitter`] (per-lane FEN dedup → per-game
+/// cap → exact target truncation).
+///
+/// `target_positions` is the TOTAL desired lane size (including any positions
+/// already on disk from a prior run). The committer's resume counts existing
+/// positions and derives `new_to_append = target - existing`; a call on a lane
+/// that already has `≥ target_positions` usable positions returns immediately
+/// with `EarlyTarget`. `target_positions == 0` is **unbounded** (no early-stop).
+///
+/// The committer's exact truncation lands the lane on the target exactly.
+/// Blocks under infinite outer backoff (unless `cfg.max_attempts` caps it) until
+/// the target is reached / the stream drains / `stop` is set; returns `Err` only
+/// on a permanent failure (4xx, disk).
+///
+/// **C1 — stable game ids:** `base_game_id` is pinned to 1 (constant). A game's
+/// id = `base + parse_index` where `parse_index` is its index among successfully
+/// emitted games (parse + SAN-replay + result-present). This makes ids a
+/// run-independent function of the source bytes, which is required for
+/// bit-identical extend (the skip-prefix-by-id invariant).
+///
+/// **C2 — non-wasting extend:** games with `id ≤ resume_skip_through` are
+/// skipped BEFORE the per-position pipeline so the quiet-search prefix is never
+/// re-run. `resume_skip_through = max(committed_ids)` from the resume scan; 0
+/// (skip nothing) on a fresh lane.
 ///
 /// Idempotence (plan §1.4): the `LaneCommitter` is created ONCE per call (via
-/// `resume`, which gives the committed-game-id set + the dedup `fen_set`), and
-/// `base_game_id = max_existing_game_id + 1` is pinned once. In-process byte-0
-/// restarts skip already-appended game_ids via `is_already_appended` BEFORE the
-/// committer (no double-insert into `fen_set`, no double-count); a cross-process
-/// resume rebuilds `fen_set` from `lane.bin` so a re-ingested early game's FENs
-/// are dropped as dups. See `docs/plans/m6.h2-corpus-lanes.md` §1.4.
+/// `resume`), persists across byte-0 restarts, and skips already-appended game
+/// ids via `is_already_appended` so restarts are true no-ops.
 pub fn stream_to_ingest(
     source: Source,
     url: &str,
@@ -155,21 +172,60 @@ pub fn stream_to_ingest(
 ) -> Result<FetchOutcome, CorpusError> {
     std::fs::create_dir_all(out_dir)?;
     let lane = out_dir.join("lane.bin");
-    // Pinned ONCE for the whole call (across all byte-0 restarts): a re-parse
-    // re-derives the same id per physical game, so the skip-re-seen logic makes
-    // an in-process restart a true no-op (§5A).
-    let base_game_id = max_existing_game_id(out_dir) + 1;
-    let call = CallState::new(target_positions, stop.clone());
+
+    // C1: pin base_game_id = 1 (run-independent, stable across extends).
+    // Previously this was `max_existing_game_id + 1`; for fetch lanes the base
+    // is always 1 so a game's id is purely its parse-index, reproducible from
+    // the same source bytes on any run.
+    const BASE_GAME_ID: u64 = 1;
+    let base_game_id = BASE_GAME_ID;
+
     let agent = build_agent(cfg.connect_timeout, cfg.stall_timeout, cfg.max_redirects);
 
-    // The LaneCommitter is created ONCE per call (NOT per attempt), so it
-    // persists across byte-0 restarts: its `fen_set` + `committed` count
-    // survive a RangeIgnored-forced restart so the re-parsed prefix dedups
-    // against what is already on disk + in-memory. `resume` does the single
-    // scan of lane.bin (rebuilding fen_set + the committed count). `target=0`
-    // (unbounded) maps to `None`.
+    // C3: target is TOTAL. Resume first, read existing, then pass
+    // `new_to_append` (= target - existing) to CallState so the early-stop
+    // trigger agrees with the committer's cumulative total. `target=0` (unbounded)
+    // ⇒ no early-stop.
     let target = (target_positions != 0).then_some(target_positions);
-    let (mut committer, _committed_ids) = LaneCommitter::resume(&lane, cfg.cap_seed, target)?;
+    // The LaneCommitter is created ONCE per call (NOT per attempt) so its
+    // `fen_set` + `committed` count survive byte-0 restarts. `resume` does the
+    // single scan of lane.bin (rebuilding fen_set + the committed count).
+    let (mut committer, committed_ids) = LaneCommitter::resume(&lane, cfg.cap_seed, target)?;
+    let existing = committer.committed();
+    // C2: max committed id → skip everything below it on the next stream pass.
+    let resume_skip_through: u64 = committed_ids.iter().copied().max().unwrap_or(0);
+
+    // Early-out: nothing to do if already at or past the target.
+    if target_positions != 0 && existing >= target_positions {
+        update_fetch_state(
+            out_dir,
+            url,
+            &FetchOutcome {
+                positions_ingested: 0,
+                games_emitted: 0,
+                bytes_received: 0,
+                terminated: Termination::EarlyTarget,
+                next_game_id: base_game_id,
+                truncated_boundary_offset: None,
+            },
+        );
+        return Ok(FetchOutcome {
+            positions_ingested: 0,
+            games_emitted: 0,
+            bytes_received: 0,
+            terminated: Termination::EarlyTarget,
+            next_game_id: base_game_id,
+            truncated_boundary_offset: None,
+        });
+    }
+
+    // The per-call target for CallState is NEW positions to append = total_target - existing.
+    let new_to_append = if target_positions != 0 {
+        target_positions.saturating_sub(existing)
+    } else {
+        0 // unbounded
+    };
+    let call = CallState::new(new_to_append, stop.clone());
     // One QSearcher per call (fetch is single-threaded; reused across games —
     // lives in the Attempt bundle as &mut, NOT in the Rc-shared CallState).
     let mut qsearcher = QSearcher::new();
@@ -190,6 +246,7 @@ pub fn stream_to_ingest(
             lane: &lane,
             source,
             base_game_id,
+            resume_skip_through,
             filter,
             call: &call,
             att: &att,
@@ -225,15 +282,14 @@ pub fn stream_to_ingest(
         games_emitted: call.games_emitted.get(),
         bytes_received: last_bytes,
         terminated,
-        // The next free id is one past the HIGHEST appended id, NOT
-        // `base + games_emitted` — `stream_pgn` assigns ids to every emitted
-        // game (pre-filter), so the appended block ids have gaps wherever a
-        // game was filtered out. A follow-on ingest recomputes the same value
-        // from `max_existing_game_id`.
+        // The next free id is informational: one past the HIGHEST appended id
+        // (accounts for filter gaps). A follow-on ingest can use it as a hint,
+        // though extend re-derives from the stable base_game_id=1 + parse_index.
         next_game_id: call
             .max_appended_game_id
             .get()
             .map_or(base_game_id, |m| m + 1),
+        truncated_boundary_offset: committer.truncated_boundary_offset(),
     };
     update_fetch_state(out_dir, url, &outcome);
     Ok(outcome)
@@ -261,6 +317,10 @@ struct Attempt<'a> {
     lane: &'a Path,
     source: Source,
     base_game_id: u64,
+    /// C2: the highest game_id already committed on disk. Games with
+    /// `id ≤ resume_skip_through` are skipped before the per-position pipeline
+    /// (before the quiet-search) so the prefix is never re-processed.
+    resume_skip_through: u64,
     filter: &'a GameFilter,
     call: &'a std::rc::Rc<CallState>,
     att: &'a std::rc::Rc<AttemptState>,
@@ -520,8 +580,19 @@ fn run_decompressed_pipeline<R: Read>(mut decompressed: R, ctx: &mut Attempt) ->
         let committer = &mut *ctx.committer;
         let qsearcher = &mut *ctx.qsearcher;
         let base_game_id = ctx.base_game_id;
+        let resume_skip_through = ctx.resume_skip_through;
         let mut on_game = |gp: GamePositions| {
-            ingest_game(gp, source, lane, filter, call, att, committer, qsearcher);
+            ingest_game(
+                gp,
+                source,
+                lane,
+                filter,
+                call,
+                att,
+                committer,
+                qsearcher,
+                resume_skip_through,
+            );
         };
         let _ = stream_pgn(
             BufReader::new(chained),
@@ -540,6 +611,12 @@ fn run_decompressed_pipeline<R: Read>(mut decompressed: R, ctx: &mut Attempt) ->
 /// `positions_ingested` is bumped by the committer's `usable_committed`, NOT
 /// the raw quiet-certified `recs.len()` — the lane lands on `target` exactly
 /// (plan §1.4).
+///
+/// `resume_skip_through`: C2 non-wasting extend — games with `id ≤` this value
+/// were already committed in a prior run. Skip them before the per-position
+/// pipeline (before the quiet-search) so the prefix is never re-processed.
+/// Pass 0 for a fresh lane (skips nothing: every `id ≥ 1` is NOT skipped by
+/// the `id <= 0` predicate).
 #[allow(clippy::too_many_arguments)] // per-call refs reborrowed out of Attempt
 fn ingest_game(
     gp: GamePositions,
@@ -550,10 +627,19 @@ fn ingest_game(
     att: &std::rc::Rc<AttemptState>,
     committer: &mut LaneCommitter,
     qsearcher: &mut QSearcher,
+    resume_skip_through: u64,
 ) {
     // Liveness: EVERY yielded game (even re-seen / filtered) proves the stream
     // is healthy and refreshes the watchdog clock.
     att.note_progress();
+    // C2: skip committed prefix — games with id ≤ resume_skip_through are
+    // already on disk (from a prior run's full blocks). Their FENs are already
+    // in the committer's fen_set; re-running the pipeline is wasteful and would
+    // produce the same output anyway (dedup drops them). Skip BEFORE the
+    // per-position pipeline (before the quiet-search) for zero prefix overhead.
+    if resume_skip_through != 0 && gp.game_id <= resume_skip_through {
+        return;
+    }
     // Skip games already appended this call (byte-0-restart idempotence). This
     // MUST run before the committer so a re-parsed early game never re-enters
     // the dedup set or the committed count (§1.4).
@@ -669,22 +755,6 @@ fn read_up_to<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
         }
     }
     Ok(filled)
-}
-
-/// Highest existing `game_id` in this lane's `lane.bin`; 0 if none (M6.H2: each
-/// lane lives in its own dir, so its `game_id` space is private — only `lane.bin`
-/// is scanned). The fetch reserves ids strictly above this.
-fn max_existing_game_id(dir: &Path) -> u64 {
-    let mut max = 0u64;
-    let p = dir.join("lane.bin");
-    if p.exists()
-        && let Ok((blocks, _)) = scan_valid_blocks(&p)
-    {
-        for b in &blocks {
-            max = max.max(b.game_id);
-        }
-    }
-    max
 }
 
 /// Merge this call's result into `<dir>/fetch-state.json` (best-effort).

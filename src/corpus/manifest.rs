@@ -274,6 +274,14 @@ pub struct Manifest {
     /// reproducibility check (quality gate) re-derives this from disk and
     /// fails if the digest drifts.
     pub corpus_sha256: String,
+    /// The lane byte-offset before the boundary game's block was appended, if
+    /// the exact-target truncation fired (`Some`). Written by the driver after
+    /// a build completes; used by the extend driver to drop the partial
+    /// boundary block before re-deriving it whole (making extend idempotent).
+    /// `None` when the build drained before the target or the boundary game
+    /// committed whole. `#[serde(default)]`-equivalent: absent on old manifests
+    /// → `None` (backward-compatible).
+    pub truncated_boundary_offset: Option<u64>,
 }
 
 // ── Minimal JSON writer ───────────────────────────────────────────────────────
@@ -393,6 +401,9 @@ fn write_manifest_json(m: &Manifest) -> String {
         out.push_str("  \"source\": ");
         write_json_string(&mut out, s);
         out.push_str(",\n");
+    }
+    if let Some(off) = m.truncated_boundary_offset {
+        out.push_str(&format!("  \"truncated_boundary_offset\": {off},\n"));
     }
     out.push_str("  \"corpus_sha256\": ");
     write_json_string(&mut out, &m.corpus_sha256);
@@ -753,6 +764,8 @@ fn parse_manifest_json(src: &str) -> Result<Manifest, CorpusError> {
     let source_url = optional_str(&top, "source_url").map(str::to_owned);
     let target_usable = optional_u64(&top, "target_usable");
     let source = optional_str(&top, "source").map(str::to_owned);
+    // Extend field — absent on all pre-extend manifests → None (backward-compatible).
+    let truncated_boundary_offset = optional_u64(&top, "truncated_boundary_offset");
 
     Ok(Manifest {
         schema_version,
@@ -774,6 +787,7 @@ fn parse_manifest_json(src: &str) -> Result<Manifest, CorpusError> {
         opening_book_sha256,
         opening_mode,
         corpus_sha256,
+        truncated_boundary_offset,
     })
 }
 
@@ -932,6 +946,7 @@ mod tests {
             opening_mode: Some("book".to_owned()),
             corpus_sha256: "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
                 .to_owned(),
+            truncated_boundary_offset: Some(98765),
         };
 
         let dir = tempdir();
@@ -967,6 +982,7 @@ mod tests {
         assert_eq!(m.source_url, None);
         assert_eq!(m.target_usable, None);
         assert_eq!(m.source, None);
+        assert_eq!(m.truncated_boundary_offset, None);
     }
 
     // ── filter_spec echoes pinned constants ───────────────────────────────────

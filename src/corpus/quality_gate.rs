@@ -501,6 +501,7 @@ mod tests {
             opening_book_sha256: None,
             opening_mode: None,
             corpus_sha256,
+            truncated_boundary_offset: None,
         };
         write_manifest(dir, &m).unwrap();
     }
