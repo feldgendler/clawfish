@@ -1,6 +1,6 @@
 # ADR-0037 — Texel tuning harness (M6.I): feature-extraction linear model, Adam, frozen-PST reference frame
 
-**Status:** Accepted (M6.I lands the Texel-tuning *harness* — `src/texel/` + `src/bin/texel-tune.rs` — as a standalone consumer that does NOT touch `evaluate`; `evaluate` byte-identical to `M6.F`, bench `1213649` / d4 `90591`. The *tuned weights* ship as a separate diff gated by a mixed-TC SPRT vs `M6.F` per the §9 verdict ladder — the operator-run landing step, the M6.G corpus-materialization precedent.)
+**Status:** Accepted + **REALIZED (tuned weights shipped 2026-05-25).** The harness (`src/texel/` + `src/bin/texel-tune.rs`) landed 2026-05-24 inert (`evaluate` byte-identical to `M6.F`, bench `1213649` / d4 `90591`). The tuned weights then shipped as a separate diff via `texel-tune apply`, gated by a mixed-TC + virtual-clock SPRT vs `M6.F`: **verdict=H1 at 618 games, Δ Elo +93.86 [+68.97, +119.72]** — **§9 verdict-ladder rung 1**, so the tuned vector is now the production eval (bench `1411314` / d4 `111498`). M6 closes here. The gain is depth-amplifying (per-TC: 10+0.1 W31/L64, 60+0.6 W99/L10), vindicating the mixed-TC mandate. Some terms have counterintuitive SPRT-validated shapes (`ISO_MG=+5`, negative early-rank `PASSED_MG`) — a sign/monotonicity-constrained retune is backlogged (`docs/tuning-backlog.md`).
 
 ## Context
 

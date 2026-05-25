@@ -12,15 +12,15 @@ at mixed time control, single-threaded on Apple Silicon (200-game estimate at
 the M6.B measurement point). The engine implements a hand-crafted classical
 evaluation; NNUE is a planned future milestone, not yet present.
 
-**Roadmap: M6 in progress.** Classical-eval infrastructure (M6.A–F) is
-complete; corpus data-infra (M6.G/H/H2) is landed; and the M6.I Texel-tuning
-**harness** has landed (inert — `evaluate` byte-identical to `M6.F`). The harness
-jointly Texel-tunes the cumulative deferred-term parameter set on the corpus; a
-full 8M-position tune has produced a candidate `bench/m6-params.json`. **M6 closes
-when the operator runs the apply → mixed-TC SPRT vs `M6.F` gate** and the verdict
-ladder resolves (ship the tuned weights, or revert to `M6.F`). Parallel search
-(M9) and NNUE evaluation (M10) follow. See [`docs/roadmap.md`](docs/roadmap.md)
-for the full plan.
+**Roadmap: M6 complete.** Classical-eval infrastructure (M6.A–F) and corpus
+data-infra (M6.G/H/H2) landed; the M6.I Texel tune jointly re-derived the
+cumulative deferred-term weights on the 8M-position corpus, and the tuned eval
+**shipped 2026-05-25** after a mixed-TC + virtual-clock SPRT vs `M6.F` returned
+**H1-accept, Δ Elo +93.86 [+68.97, +119.72]** (618 games). The gain is
+depth-amplifying — it regresses at ultra-fast TC but dominates at slow TC, which
+is why the SPRT is run over a mix of time controls. Production HEAD = `M6.I`
+(bench `1411314`). Parallel search (M9) and NNUE evaluation (M10) follow. See
+[`docs/roadmap.md`](docs/roadmap.md) for the full plan.
 
 ### Tier goals
 

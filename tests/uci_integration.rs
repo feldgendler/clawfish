@@ -244,13 +244,12 @@ fn integration_eof_terminates_engine_cleanly() {
 // `bestmove` line, and asserts the move is a legal move from startpos.
 // ---------------------------------------------------------------------------
 
-// Pinned at M4.A Slice C: depth-3 bestmove from startpos shifted back to g1f3
-// once the engine-owned TT is wired into SearchContext. With TT-move-first
-// ordering, iteration-2's root entry (depth-2 bestmove) guides iteration-3's
-// root move order, and the TT-aided search selects g1f3 as the depth-3 choice.
-// Previously d2d4 (Slice B, no TT in SearchContext) and g1f3 before that (M3.E,
-// prior_root_move hint active).
-const EXPECTED_BESTMOVE_DEPTH_3: &str = "g1f3";
+// Depth-3 bestmove from startpos. History: g1f3 (M4.A Slice C, once the
+// engine-owned TT was wired into SearchContext); before that d2d4 (Slice B,
+// no TT) and g1f3 (M3.E). At the M6.I tuned ship the activated positional
+// terms (mobility/etc.) again tip the depth-3 choice to d2d4. This is a
+// deterministic regression anchor, not a correctness claim about d4 vs Nf3.
+const EXPECTED_BESTMOVE_DEPTH_3: &str = "d2d4";
 
 #[test]
 fn integration_alphabeta_depth3_returns_legal_bestmove_from_startpos() {
@@ -1116,22 +1115,18 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
         "E51: bench node counts must match across two runs in the same session \
          with qsearch-in-TT active; got {nodes1} vs {nodes2}"
     );
-    // M6.C depth-4 bench-signature pin. M6.C ships **score-neutral**: the
-    // passed-pawn term is wired into `evaluate_core` but every `PASSED_*`
-    // weight is zeroed in `eval::data` (the §11-step-3 / ADR-0032 §7 outcome
-    // — a three-screen SPRT proved the literature-default weights have a
-    // scale-invariant structural mismatch; M6.F joint Texel re-introduces and
-    // reshapes the whole set). With all passed weights zeroed the term is
-    // behaviorally inert and `evaluate` is byte-identical to `M6.B` (the
-    // CONN-only build), so the depth-4 bench reverts to M6.B's `90_591`.
-    // Per the roadmap bench-node-count policy this number is a determinism
-    // anchor, not a no-regression signal. M6.F re-tunes the passed-pawn
-    // weights jointly; the bench will move again then.
-    // Score-neutral M6.B / M6.A pin was 94_501; M5.F pin was 89_080.
-    const M6B_DEPTH4_BENCH_NODES: u64 = 90_591;
+    // Depth-4 bench-signature pin. The deferred eval terms (mobility, passed
+    // pawns, outposts, rook-file, king shield, ISO/DBL/BWD, CONN rescale) were
+    // zeroed inert through M6.B–M6.F, so the anchor sat at `90_591` (byte-equal
+    // to the M6.B CONN-only build). The M6.I Texel tune (SPRT-validated +93.9
+    // Elo vs M6.F) activates them, so the depth-4 bench moved to `111_498`.
+    // Per the roadmap bench-node-count policy this is a determinism anchor, not
+    // a no-regression signal.
+    // History: M6.B–F `90_591`; score-neutral M6.B/M6.A `94_501`; M5.F `89_080`.
+    const M6I_DEPTH4_BENCH_NODES: u64 = 111_498;
     assert_eq!(
-        nodes1, M6B_DEPTH4_BENCH_NODES,
-        "E51: bench node count changed from M6.B pin ({M6B_DEPTH4_BENCH_NODES} at depth=4); \
+        nodes1, M6I_DEPTH4_BENCH_NODES,
+        "E51: bench node count changed from the M6.I pin ({M6I_DEPTH4_BENCH_NODES} at depth=4); \
          re-pin if intentional; got {nodes1}"
     );
 }

@@ -188,6 +188,23 @@ Three SPSA-tunable params. Empirically this baseline captures 60-80% of the ML m
 
 ---
 
+### M6.I sign/monotonicity-constrained deferred-term retune — DEFERRED 2026-05-25 (post-ship; low priority)
+
+**Status.** M6.I shipped (SPRT H1, +93.86 Elo vs `M6.F`) with the deferred-term vector that the unconstrained Texel pass produced. Several individual terms settled at counterintuitive, prior-violating values that the joint game-result fit nonetheless validated in aggregate:
+
+- `ISO_MG = +5` — isolated-pawn MG is a small *bonus*, not the expected penalty (`ISO_EG = -1`, correct sign).
+- `PASSED_MG = [0,0,-30,-17,25,36,40,0]` — **negative MG for early-rank passers** (ranks 2–3), and the passed bonus is not EG-dominant at rank 6 (eg 37 < mg 40).
+
+These survive because the M6.I tune used only ridge-toward-shipped + light monotonicity smoothing, not hard sign/shape constraints, and the corpus is self-play-heavy (correlated-feature imprinting is plausible). They are minor, weakly-identified terms; the ship is sound. The eval-term test suite dropped the now-violated positional-prior assertions (ISO ≤ 0; passed EG-dominance/monotonicity) — see `docs/milestones/m6.i.md` "Test updates".
+
+**Why deferred, not done now.** Re-tuning under sign/monotonicity constraints needs its own SPRT (any weight change vs the shipped `M6.I` is a strength claim). It is not free, and the expected delta is small (these are minor terms). Worth doing only when a tuning slot opens and ideally folded into the larger Arm-B PST co-tune below (which already re-opens the whole eval-weight surface).
+
+**Recommended approach at promotion.** Warm-start from the shipped `M6.I` vector. Add per-term sign constraints (penalty terms ≤ 0; passed/connected bonuses ≥ 0 and rank-monotone) as projected-gradient clamps or strong one-sided ridge. Pick the constraint strength by held-out validation loss; SPRT the winner vs `M6.I`. **Baseline = the `M6.I` tag.** Abandon if (a) constrained validation loss is materially worse (the corpus genuinely wants the unconstrained shapes), or (b) M10/NNUE lands first (obsoletes classical weights).
+
+**Cross-references.** `docs/milestones/m6.i.md` ("Counterintuitive term shapes"); ADR-0037 §5 (ridge-toward-shipped + monotonicity, the regularization that was *not* hard-constraining); the Arm-B item below (natural merge target — both re-open the eval-weight surface against the corpus).
+
+---
+
 ### M6.I PST co-tuning (joint full-eval retune) — DEFERRED until M6.I lands; gated on M6.I sensitivity diagnostics
 
 **Status.** Not yet attemptable. M6.I as scoped (roadmap §M6, ADR-0032 §8 / ADR-0033 §7-8) is a Texel pass over the **deferred-term surface only** (~180 weights: M6.B ISO/DBL/BWD + CONN, M6.C passed-pawn, M6.D mobility, M6.E king-safety, **plus the small M6.F Tier-1 feature-weight additions** — outpost rank-table + rook open/semi-open-file + endgame-scaling coefficients, on the order of ~15–25 more weights) with the vendored PeSTO material + 12 PSTs (768 entries) **held frozen as the reference frame**. This entry captures the *next* campaign: relaxing that freeze and co-tuning the PSTs jointly with the deferred terms.

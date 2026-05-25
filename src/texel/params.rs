@@ -894,9 +894,13 @@ mod tests {
     }
 
     #[test]
-    fn conn_is_live_other_core_groups_zero_at_shipped() {
+    fn tuned_core_groups_live_at_shipped() {
+        // M6.I SHIP state (post-`texel-tune apply`): the deferred eval terms that
+        // were zeroed inert across M6.B–F are now activated with their tuned
+        // values. This is the inverse of the pre-ship guard — it confirms the
+        // tuned vector is actually compiled into the shipped constants, not that
+        // they remain dormant.
         let s = EvalParams::shipped();
-        // CONN is the one live group (M6.F production state).
         assert!(
             s.conn_mg[2..8].iter().any(|&x| x != 0.0),
             "CONN_MG should be live"
@@ -905,13 +909,22 @@ mod tests {
             s.conn_eg[2..8].iter().any(|&x| x != 0.0),
             "CONN_EG should be live"
         );
-        // Everything else in the core is zero.
-        assert_eq!(s.iso_mg, 0.0);
-        assert!(s.passed_mg.iter().all(|&x| x == 0.0));
-        assert!(s.knight_mobility_mg.iter().all(|&x| x == 0.0));
-        assert_eq!(s.shield_1_mg, 0.0);
-        assert!(s.outpost_knight_mg.iter().all(|&x| x == 0.0));
-        assert_eq!(s.rook_open_file_mg, 0.0);
+        // The five recovered groups (M6.I retrospective): mobility, passed pawns,
+        // king shield, knight outposts, rook-on-(semi)open-file.
+        assert!(
+            s.knight_mobility_mg.iter().any(|&x| x != 0.0),
+            "knight mobility should be live"
+        );
+        assert!(
+            s.passed_mg.iter().any(|&x| x != 0.0),
+            "passed-pawn bonus should be live"
+        );
+        assert_ne!(s.shield_1_mg, 0.0, "king shield should be live");
+        assert!(
+            s.outpost_knight_mg.iter().any(|&x| x != 0.0),
+            "knight outpost should be live"
+        );
+        assert_ne!(s.rook_open_file_mg, 0.0, "rook open-file should be live");
     }
 
     #[test]

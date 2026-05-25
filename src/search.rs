@@ -9723,9 +9723,21 @@ mod tests {
     /// AS17. A stop flipped between try 1 and try 2 of iter-N propagates: the
     /// re-search aborts cleanly; the outer ID loop breaks at iter-N; the
     /// prior iteration's snapshot is the reported result.
+    ///
+    /// Fixture: Kiwipete, not the KPK `fail_high_fixture`. The abort must land
+    /// *during* the re-search, which requires the re-search to span ≥ the
+    /// 4096-node stop-poll cadence; KPK's iterations are far too small (a
+    /// re-search there completes as a cheap fail-low before the cadence fires,
+    /// so the iteration finishes with an empty PV and `last_complete` advances
+    /// past the prior move — the M6.I tuned-eval regression that exposed this).
+    /// Kiwipete's iter-6 spans ~10^5 nodes, so the re-search reliably crosses
+    /// the cadence and aborts mid-try, preserving iter-5's snapshot.
     #[test]
     fn id_loop_aborts_during_second_aspiration_try_breaks_outer_iter_cleanly() {
-        let pos = fail_high_fixture();
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete fixture FEN must parse");
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = SearchContext {
             stop: Arc::clone(&stop),

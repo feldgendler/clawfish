@@ -36,21 +36,21 @@
 // TEXEL-TUNABLE-BEGIN: iso_dbl_bwd
 /// Isolated pawn penalty, middlegame (per pawn). Negative = penalty.
 /// Zeroed in the shipped CONN-only config (M6.F re-tunes); see block comment.
-pub(crate) const ISO_MG: i32 = 0;
+pub(crate) const ISO_MG: i32 = 5;
 /// Isolated pawn penalty, endgame (per pawn). Zeroed — see `ISO_MG`.
-pub(crate) const ISO_EG: i32 = 0;
+pub(crate) const ISO_EG: i32 = -1;
 
 /// Doubled pawn penalty, middlegame (per *extra* pawn on a file).
 /// Zeroed in the shipped CONN-only config (M6.F re-tunes); see block comment.
-pub(crate) const DBL_MG: i32 = 0;
+pub(crate) const DBL_MG: i32 = -21;
 /// Doubled pawn penalty, endgame. Zeroed — see `DBL_MG`.
-pub(crate) const DBL_EG: i32 = 0;
+pub(crate) const DBL_EG: i32 = -12;
 
 /// Backward pawn penalty, middlegame (CPW-simple predicate).
 /// Zeroed in the shipped CONN-only config (M6.F re-tunes); see block comment.
-pub(crate) const BWD_MG: i32 = 0;
+pub(crate) const BWD_MG: i32 = -7;
 /// Backward pawn penalty, endgame. Zeroed — see `BWD_MG`.
-pub(crate) const BWD_EG: i32 = 0;
+pub(crate) const BWD_EG: i32 = -7;
 // TEXEL-TUNABLE-END: iso_dbl_bwd
 
 // TEXEL-TUNABLE-BEGIN: conn
@@ -62,11 +62,11 @@ pub(crate) const BWD_EG: i32 = 0;
 /// / relative ranks 2–7). Index 7 = promotion rank, kept in the table for
 /// completeness but never hit mid-search.
 #[rustfmt::skip]
-pub(crate) const CONN_MG: [i32; 8] = [0, 0, 3, 7, 13, 22, 40, 70];
+pub(crate) const CONN_MG: [i32; 8] = [0, 0, 3, 7, 7, 47, 72, 70];
 
 /// Connected pawn bonus table, endgame. Same indexing as `CONN_MG`.
 #[rustfmt::skip]
-pub(crate) const CONN_EG: [i32; 8] = [0, 0, 5, 10, 18, 30, 55, 95];
+pub(crate) const CONN_EG: [i32; 8] = [0, 0, 11, 9, 15, 26, 37, 95];
 // TEXEL-TUNABLE-END: conn
 
 // ---------------------------------------------------------------------------
@@ -123,29 +123,29 @@ pub(crate) const CONN_EG: [i32; 8] = [0, 0, 5, 10, 18, 30, 55, 95];
 /// Zeroed in the shipped score-neutral config (M6.F re-tunes); see block
 /// comment.
 #[rustfmt::skip]
-pub(crate) const PASSED_MG: [i32; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+pub(crate) const PASSED_MG: [i32; 8] = [0, 0, -30, -17, 25, 36, 40, 0];
 
 /// Passed pawn rank bonus, endgame. Same indexing as `PASSED_MG`.
 /// Zeroed — see `PASSED_MG`.
 #[rustfmt::skip]
-pub(crate) const PASSED_EG: [i32; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+pub(crate) const PASSED_EG: [i32; 8] = [0, 0, 15, 38, 39, 35, 3, 0];
 
 /// EG-only path-clear delta (MadChess free-path minus base EG). `+` when the
 /// front-span is empty of all pieces, `−` when an enemy piece is on it, `0`
 /// when only a friendly piece is on it (three-state — research §3 / ADR-0032
 /// §6). Same indexing as `PASSED_MG`. Zeroed — see block comment.
 #[rustfmt::skip]
-pub(crate) const PASSED_FREE_EG_DELTA: [i32; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+pub(crate) const PASSED_FREE_EG_DELTA: [i32; 8] = [0, 0, -1, 11, 21, 26, 34, 0];
 
 /// EG-only king-tropism: cp per Chebyshev step the **own** king is closer to
 /// the passer's promotion square (rank-scaled by relative rank). Zeroed in the
 /// shipped score-neutral config (M6.F re-tunes); see block comment.
-pub(crate) const PASSED_KDIST_OWN_PER_STEP: i32 = 0;
+pub(crate) const PASSED_KDIST_OWN_PER_STEP: i32 = 6;
 
 /// EG-only king-tropism: cp per Chebyshev step the **enemy** king is closer
 /// to the promotion square (rank-scaled; a near enemy king is a penalty).
 /// Zeroed — see `PASSED_KDIST_OWN_PER_STEP`.
-pub(crate) const PASSED_KDIST_ENEMY_PER_STEP: i32 = 0;
+pub(crate) const PASSED_KDIST_ENEMY_PER_STEP: i32 = 3;
 // TEXEL-TUNABLE-END: passed
 
 /// Chebyshev-distance clamp for the king-tropism term: beyond 5 steps king
@@ -202,25 +202,21 @@ pub(crate) const PASSED_KDIST_CAP: i32 = 5;
 // Data, not logic — excluded from cargo mutants per .cargo/mutants.toml.
 // TEXEL-TUNABLE-BEGIN: mobility
 #[rustfmt::skip]
-pub(crate) const KNIGHT_MOBILITY_MG: [i32; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub(crate) const KNIGHT_MOBILITY_MG: [i32; 9] = [-29, -10, 0, 6, 11, 14, 19, 25, 31];
 #[rustfmt::skip]
-pub(crate) const KNIGHT_MOBILITY_EG: [i32; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub(crate) const KNIGHT_MOBILITY_EG: [i32; 9] = [-36, -29, -12, 4, 14, 24, 21, 10, -12];
 #[rustfmt::skip]
-pub(crate) const BISHOP_MOBILITY_MG: [i32; 14] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub(crate) const BISHOP_MOBILITY_MG: [i32; 14] = [-31, -20, -10, -3, 3, 6, 9, 10, 16, 21, 22, 25, 25, 12];
 #[rustfmt::skip]
-pub(crate) const BISHOP_MOBILITY_EG: [i32; 14] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub(crate) const BISHOP_MOBILITY_EG: [i32; 14] = [-38, -31, -25, -14, 2, 15, 23, 24, 24, 24, 24, 21, 23, 22];
 #[rustfmt::skip]
-pub(crate) const ROOK_MOBILITY_MG: [i32; 15] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub(crate) const ROOK_MOBILITY_MG: [i32; 15] = [-34, -20, -15, -6, -6, 3, 9, 15, 22, 24, 26, 28, 29, 29, 47];
 #[rustfmt::skip]
-pub(crate) const ROOK_MOBILITY_EG: [i32; 15] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub(crate) const ROOK_MOBILITY_EG: [i32; 15] = [-37, -30, -25, -20, -5, 2, 5, 11, 16, 23, 25, 25, 26, 21, -15];
 #[rustfmt::skip]
-pub(crate) const QUEEN_MOBILITY_MG: [i32; 28] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub(crate) const QUEEN_MOBILITY_MG: [i32; 28] = [-9, -11, -14, -12, -13, -12, -10, -6, -3, 4, 5, 11, 17, 20, 21, 27, 29, 32, 34, 38, 39, 39, 34, 31, 22, 10, 1, -3];
 #[rustfmt::skip]
-pub(crate) const QUEEN_MOBILITY_EG: [i32; 28] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub(crate) const QUEEN_MOBILITY_EG: [i32; 28] = [-25, -33, -34, -33, -29, -25, -13, -3, 9, 17, 27, 26, 32, 34, 36, 37, 39, 41, 40, 41, 40, 37, 31, 14, 19, -4, -4, -11];
 // TEXEL-TUNABLE-END: mobility
 
 // ---------------------------------------------------------------------------
@@ -318,22 +314,22 @@ pub(crate) const KING_SAFETY_TABLE: [i32; 100] = [0; 100];
 
 // TEXEL-TUNABLE-BEGIN: king_safety_shield_file
 /// Pawn-shield bonus: friendly pawn on king's 2nd rank, middlegame. Zeroed.
-pub(crate) const SHIELD_1_MG: i32 = 0; // lit  10
+pub(crate) const SHIELD_1_MG: i32 = 9; // lit  10
 /// Pawn-shield bonus: friendly pawn on king's 2nd rank, endgame. Zeroed.
-pub(crate) const SHIELD_1_EG: i32 = 0; // lit   5
+pub(crate) const SHIELD_1_EG: i32 = -1; // lit   5
 /// Pawn-shield bonus: friendly pawn on king's 3rd rank, middlegame. Zeroed.
-pub(crate) const SHIELD_2_MG: i32 = 0; // lit   5
+pub(crate) const SHIELD_2_MG: i32 = 6; // lit   5
 /// Pawn-shield bonus: friendly pawn on king's 3rd rank, endgame. Zeroed.
-pub(crate) const SHIELD_2_EG: i32 = 0; // lit   3
+pub(crate) const SHIELD_2_EG: i32 = -8; // lit   3
 
 /// MG penalty: king file is semi-open (no own pawn, enemy pawn present). Zeroed.
-pub(crate) const KS_KFILE_SEMI_OPEN_MG: i32 = 0; // lit -15
+pub(crate) const KS_KFILE_SEMI_OPEN_MG: i32 = -19; // lit -15
 /// MG penalty: king file is fully open (no pawn of either color). Zeroed.
-pub(crate) const KS_KFILE_OPEN_MG: i32 = 0; // lit -20
+pub(crate) const KS_KFILE_OPEN_MG: i32 = -42; // lit -20
 /// MG penalty per adjacent file that is semi-open (no own pawn). Zeroed.
-pub(crate) const KS_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
+pub(crate) const KS_ADJ_SEMI_OPEN_MG: i32 = -16; // lit -10
 /// MG amplification: both adjacent files semi-open (no-cover threshold). Zeroed.
-pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
+pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = -23; // lit -10
 // TEXEL-TUNABLE-END: king_safety_shield_file
 
 // ---------------------------------------------------------------------------
@@ -392,31 +388,31 @@ pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = 0; // lit -10
 /// (M6.I re-derives); literature defaults ~[0,0,0,18,28,16,0,0].
 // Used from tier1.rs; #[allow] covers the stub-slice gap until impl is wired.
 #[allow(dead_code)]
-pub(crate) const OUTPOST_KNIGHT_MG: [i32; 8] = [0; 8]; // lit ~[0,0,0,18,28,16,0,0]
+pub(crate) const OUTPOST_KNIGHT_MG: [i32; 8] = [0, 0, 0, 7, 17, 20, 0, 0]; // lit ~[0,0,0,18,28,16,0,0]
 /// Knight outpost bonus, endgame. Zeroed — see `OUTPOST_KNIGHT_MG`.
 #[allow(dead_code)]
-pub(crate) const OUTPOST_KNIGHT_EG: [i32; 8] = [0; 8]; // lit ~[0,0,0,12,18,10,0,0]
+pub(crate) const OUTPOST_KNIGHT_EG: [i32; 8] = [0, 0, 0, 18, 18, 22, 0, 0]; // lit ~[0,0,0,12,18,10,0,0]
 /// Bishop outpost bonus, middlegame. Zeroed — see `OUTPOST_KNIGHT_MG`.
 #[allow(dead_code)]
-pub(crate) const OUTPOST_BISHOP_MG: [i32; 8] = [0; 8]; // lit ~[0,0,0,12,18,10,0,0]
+pub(crate) const OUTPOST_BISHOP_MG: [i32; 8] = [0, 0, 0, 19, 22, 10, 0, 0]; // lit ~[0,0,0,12,18,10,0,0]
 /// Bishop outpost bonus, endgame. Zeroed — see `OUTPOST_KNIGHT_MG`.
 #[allow(dead_code)]
-pub(crate) const OUTPOST_BISHOP_EG: [i32; 8] = [0; 8]; // lit ~[0,0,0, 8,12, 6,0,0]
+pub(crate) const OUTPOST_BISHOP_EG: [i32; 8] = [0, 0, 0, 10, -1, -6, 0, 0]; // lit ~[0,0,0, 8,12, 6,0,0]
 // TEXEL-TUNABLE-END: outpost
 
 // TEXEL-TUNABLE-BEGIN: rook_file
 /// Rook on fully open file (no pawn either color) bonus, middlegame. Zeroed.
 #[allow(dead_code)]
-pub(crate) const ROOK_OPEN_FILE_MG: i32 = 0; // lit  20
+pub(crate) const ROOK_OPEN_FILE_MG: i32 = 29; // lit  20
 /// Rook on fully open file bonus, endgame. Zeroed — see `ROOK_OPEN_FILE_MG`.
 #[allow(dead_code)]
-pub(crate) const ROOK_OPEN_FILE_EG: i32 = 0; // lit  10
+pub(crate) const ROOK_OPEN_FILE_EG: i32 = 16; // lit  10
 /// Rook on semi-open file (own pawn absent, enemy present) bonus, middlegame. Zeroed.
 #[allow(dead_code)]
-pub(crate) const ROOK_SEMI_OPEN_FILE_MG: i32 = 0; // lit  10
+pub(crate) const ROOK_SEMI_OPEN_FILE_MG: i32 = 18; // lit  10
 /// Rook on semi-open file bonus, endgame. Zeroed — see `ROOK_SEMI_OPEN_FILE_MG`.
 #[allow(dead_code)]
-pub(crate) const ROOK_SEMI_OPEN_FILE_EG: i32 = 0; // lit   5
+pub(crate) const ROOK_SEMI_OPEN_FILE_EG: i32 = 5; // lit   5
 // TEXEL-TUNABLE-END: rook_file
 
 /// Endgame draw-scale fixed-point denominator. STRUCTURAL — not a tunable;

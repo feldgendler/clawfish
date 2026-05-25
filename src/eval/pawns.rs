@@ -1088,15 +1088,14 @@ mod tests {
         let pe_a = pawn_eval(&a);
         let pe_b = pawn_eval(&b);
         // Composition pinned symbolically against `eval::data` (lone white
-        // isolani ⇒ white net = ISO term only). Holds at the M6.B shipped
-        // CONN-only config (ISO_MG = ISO_EG = 0) and at any M6.F re-tune.
+        // isolani ⇒ white net = ISO term only). Tracks the shipped consts, so it
+        // holds at the M6.B inert CONN-only config (ISO = 0) and at the M6.I tuned
+        // ship. NOTE: the M6.I Texel retune set ISO_MG slightly POSITIVE (+5;
+        // ISO_EG = -1), overriding the "isolated pawn is always a penalty" prior —
+        // a weakly-identified minor term the joint, SPRT-validated vector is free
+        // to set. No sign assertion is made here (see docs/milestones/m6.i.md).
         assert_eq!(pe_a.mg, ISO_MG, "lone white isolani → mg = ISO_MG");
         assert_eq!(pe_a.eg, ISO_EG, "lone white isolani → eg = ISO_EG");
-        assert!(
-            pe_a.mg <= 0,
-            "ISO is a penalty term (≤0 at any weight; 0 in M6.B CONN-only ship)"
-        );
-        assert!(pe_a.eg <= 0, "ISO eg is a penalty term (≤0 at any weight)");
         assert_eq!(
             pe_b.mg, -pe_a.mg,
             "mirrored black-only isolani mg must be the negation of white's"
@@ -1296,8 +1295,18 @@ mod tests {
         let b = Position::from_fen("4k3/8/8/3pp3/8/8/8/4K3 w - - 0 1").expect("conn mirror B");
         let pe_a = pawn_eval(&a);
         let pe_b = pawn_eval(&b);
-        assert_eq!(pe_a.mg, 14, "rank-4 phalanx d4/e4 → mg = 2*CONN_MG[3] = 14");
-        assert_eq!(pe_a.eg, 20, "rank-4 phalanx d4/e4 → eg = 2*CONN_EG[3] = 20");
+        // Symbolic against the shipped consts (robust to the M6.I re-tune:
+        // CONN_MG[3] = 7 unchanged, CONN_EG[3] = 10 → 9).
+        assert_eq!(
+            pe_a.mg,
+            2 * CONN_MG[3],
+            "rank-4 phalanx d4/e4 → mg = 2*CONN_MG[3]"
+        );
+        assert_eq!(
+            pe_a.eg,
+            2 * CONN_EG[3],
+            "rank-4 phalanx d4/e4 → eg = 2*CONN_EG[3]"
+        );
         assert!(pe_a.mg > 0, "white phalanx d4/e4 → positive mg (bonus)");
         assert!(
             pe_a.eg > 0,
@@ -1696,25 +1705,16 @@ mod tests {
             PASSED_EG[6] + PASSED_FREE_EG_DELTA[6],
             "rel-rank-6 eg = PASSED_EG[6] + path-clear Δ[6]"
         );
-        // EG-dominant / monotone-in-advancement is a magnitude property zeroed
-        // by the shipped config; asserted symbolically so it holds at 0 and
-        // M6.F-revalidates (M6.B's relational→symbolic re-expression move).
-        assert!(
-            PASSED_EG[2] + PASSED_FREE_EG_DELTA[2] >= PASSED_MG[2],
-            "passed bonus is EG-dominant at rel-rank 2 (M6.F-revalidated)"
-        );
-        assert!(
-            PASSED_EG[6] + PASSED_FREE_EG_DELTA[6] >= PASSED_MG[6],
-            "passed bonus is EG-dominant at rel-rank 6 (M6.F-revalidated)"
-        );
-        assert!(
-            PASSED_MG[6] >= PASSED_MG[2],
-            "rank-6 mg ≥ rank-2 mg (monotone rank table; M6.F-revalidated)"
-        );
-        assert!(
-            PASSED_EG[6] + PASSED_FREE_EG_DELTA[6] >= PASSED_EG[2] + PASSED_FREE_EG_DELTA[2],
-            "rank-6 eg ≥ rank-2 eg (monotone rank table; M6.F-revalidated)"
-        );
+        // The EG-dominance / rank-monotonicity priors that held for the inert
+        // (all-zero) and literature configs were DROPPED at the M6.I tuned ship:
+        // the Texel-recovered passed table is deliberately non-intuitive —
+        // PASSED_MG = [..,-30,-17,25,36,40,0] (negative MG for early passers) and
+        // EG = [..,15,38,39,35,3,0], so e.g. rel-rank-6 is not EG-dominant
+        // (eg 3+34=37 < mg 40). The joint vector was SPRT-validated (+93.9 Elo
+        // [+69.0,+119.7] vs M6.F); per-term shape priors are not invariants of
+        // the shipped weights. The symbolic index-tracking assertions above (the
+        // term reads PASSED_*[rel_rank]) remain the structural invariant.
+        // See docs/milestones/m6.i.md "counterintuitive term shapes".
     }
 
     /// D6 / research §7 "rank-7 MG non-zero" pitfall. A real pawn cannot stand

@@ -465,10 +465,12 @@ mod tests {
         );
         assert_eq!(
             evaluate(&pos_white_pawn_missing),
-            -67,
-            "white missing e2 pawn: evaluate must be -67 cp \
-            (MG material 82 + PST[e2^56=52]=-15 → net 67, pawn down; \
-            at raw_phase=24 blend equals MG (eg term × 0); bishop pair symmetric → 0)"
+            -50,
+            "white missing e2 pawn: evaluate must be -50 cp. \
+            Through M6.F this was -67 (material+PST only: MG material 82 + \
+            PST[e2^56=52]=-15 → net 67, pawn down). At the M6.I tuned ship the \
+            now-live positional terms (mobility, etc.) net the missing-e2 \
+            asymmetry to -50; sign still correct (white down a pawn)."
         );
     }
 
@@ -1315,31 +1317,28 @@ mod tests {
     }
 
     /// `evaluate` is unchanged on a pawn-free position (regression guard
-    /// against accidental non-pawn-core drift in the Slice-D refactor). A
-    /// pawn-free position has no pawn-structure contribution by definition,
-    /// so the M6.B `evaluate` value must equal what the non-pawn core
-    /// alone produces. KRvK with white winning has a known non-zero value
-    /// driven by material/PST/mop-up; we pin it to the value `evaluate`
-    /// returns *today* (pre-M6.B) — recorded here as the M6.A baseline.
+    /// against accidental non-pawn-core drift). Through M6.F this pinned the
+    /// value to the M6.A baseline (525), on the premise that the only post-M6.A
+    /// eval terms (pawn structure) cannot contribute on a pawn-free board, so
+    /// `evaluate` must equal the M6.A non-pawn core exactly.
     ///
-    /// Hand-derivation of the invariant (not the literal): pawn-free →
-    /// pawn_eval == (0,0,empty) → evaluate_core(pos, (0,0,empty)) must
-    /// equal the M6.A `evaluate(pos)` exactly. The literal value below is
-    /// captured from the M6.A HEAD `evaluate` and is the regression anchor.
+    /// That premise ENDED at the M6.I tuned ship: mobility and
+    /// rook-(semi)open-file are non-pawn terms that DO fire on a pawn-free
+    /// board, so the anchor moved 525 → 567. It remains a deterministic
+    /// regression anchor for the shipped `evaluate` on this exact KRvK fixture.
     #[test]
-    fn eval_pawn_free_position_unchanged_vs_m6a() {
+    fn eval_pawn_free_krk_eval_anchor() {
         // White Ke1 + Ra1, Black Ke8 — KRK, white winning. Pawn-free.
         let pos =
             Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").expect("KRK white winning FEN");
-        // M6.A baseline value of evaluate() on this exact fixture. If the
-        // Slice-D non-pawn core refactor drifts, this fails. (The number is
-        // the regression anchor; recomputed from M6.A HEAD.)
-        const M6A_BASELINE: i32 = 525;
+        // Deterministic value of evaluate() on this exact fixture at the M6.I
+        // tuned ship (was 525 at M6.A–M6.F; mobility + rook-open-file now add on
+        // the pawn-free board). A change here flags non-pawn-core eval drift.
+        const KRK_EVAL_ANCHOR: i32 = 567;
         assert_eq!(
             evaluate(&pos),
-            M6A_BASELINE,
-            "pawn-free evaluate() must be unchanged from the M6.A baseline \
-             (pawn structure cannot contribute on a pawn-free board)"
+            KRK_EVAL_ANCHOR,
+            "pawn-free KRvK evaluate() regression anchor (M6.I tuned ship)"
         );
     }
 

@@ -179,13 +179,34 @@ else
     SEED_HARNESS_ARGS=()
 fi
 
+# Per-engine launch QoS prefix. Defaults to `taskpolicy -c utility` (background
+# QoS — keeps the machine responsive for interactive use, all engines homogeneous
+# on E-cores). Override via SPRT_LAUNCH_PREFIX; set it empty ('') to run at the
+# default user QoS (full priority — appropriate when the machine is idle/unattended
+# and throughput matters). `-` (not `:-`) so an explicitly-empty value is honored.
+LAUNCH_PREFIX="${SPRT_LAUNCH_PREFIX-taskpolicy -c utility}"
+if [[ -n "$LAUNCH_PREFIX" ]]; then
+    LAUNCH_PREFIX_ARGS=(--engine-launch-prefix "$LAUNCH_PREFIX" --opponent-launch-prefix "$LAUNCH_PREFIX")
+else
+    LAUNCH_PREFIX_ARGS=()
+fi
+
+# Optional CPU-time-based clock (`--virtual-clock`): the engine clock only ticks
+# on actual CPU time, so scheduling contention / core-type heterogeneity does not
+# bias HEAD-vs-baseline. ADR-0037 R-TC mandates it for the M6.I eval-gate SPRT.
+if [[ "${SPRT_VIRTUAL_CLOCK:-0}" == "1" ]]; then
+    VC_ARGS=(--virtual-clock)
+else
+    VC_ARGS=()
+fi
+
 # Common harness invocation. Adjudication thresholds match the historical
 # fastchess settings the SPRT runs were calibrated against.
 COMMON_HARNESS_ARGS=(
     --engine "$CURRENT_BINARY"
     --opponent "$BASELINE_BINARY"
-    --engine-launch-prefix "taskpolicy -c utility"
-    --opponent-launch-prefix "taskpolicy -c utility"
+    "${LAUNCH_PREFIX_ARGS[@]}"
+    "${VC_ARGS[@]}"
     "${TC_HARNESS_ARGS[@]}"
     "${SEED_HARNESS_ARGS[@]}"
     --concurrency "$CONCURRENCY"

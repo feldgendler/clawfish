@@ -839,7 +839,15 @@ mod tests {
         let dir = unique_temp_dir("resume-eq");
         let (cache, meta) = build_tiny_cache(&dir);
         let split = dataset::split_by_game(&meta, 0.25, 21);
-        let init = EvalParams::shipped();
+        // Start from an off-optimum init (all-deferred-terms-zero — the cold-start
+        // shape the real M6.I tune used), NOT `EvalParams::shipped()`: post-M6.I
+        // SHIP, shipped() sits at the integer-stable tuned optimum, which trips the
+        // (intentionally conservative, non-checkpointed — see the loop comment) integer
+        // quantization floor and stops the uninterrupted run early, defeating this
+        // test's max-iter-path bit-identity check. With weights that genuinely move
+        // each epoch, only `max_iter` governs, so resume is bit-identical.
+        let zero_core = vec![0.0; EvalParams::shipped().core_to_vec().len()];
+        let init = EvalParams::shipped().with_core(&zero_core);
         let ckpt_path = dir.join("tune.ckpt");
 
         // Uninterrupted: 2N iterations (no checkpoint needed; compare against resumed).
