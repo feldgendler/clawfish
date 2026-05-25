@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::corpus::prng::Prng;
 use crate::texel::TexelError;
-use crate::texel::dataset::{CacheMeta, Split, effective_source_counts, split_by_game};
+use crate::texel::dataset::{CacheMeta, Split, split_by_game};
 use crate::texel::optimizer::{TuneConfig, TuneResult, tune};
 use crate::texel::params::EvalParams;
 
@@ -18,11 +18,12 @@ use crate::texel::params::EvalParams;
 /// that minimizes the aggregate held-out objective. Returns the chosen mix and
 /// its inner tune result.
 ///
-/// Per candidate vertex `m`: the train split is reweighted by sampling
-/// `effective_source_counts(&m, ...)` records from each source's train pool
-/// (seeded `Prng`, deterministic), then `tune` is called on that reweighted
-/// split — so K is refit once per candidate on that candidate's corpus. The
-/// objective is `TuneResult.val_loss` on the FIXED val split (unweighted),
+/// Per candidate vertex `m`: the train split is reweighted by `reweight_train`,
+/// which realizes the mix VOLUME-BASED — the largest real-data total needing no
+/// duplication (`T = min_s(pool_s / p_s)`), sampled without replacement (seeded
+/// `Prng`, deterministic) — then `tune` is called on that reweighted split, so K
+/// is refit once per candidate on that candidate's corpus. The objective is
+/// `TuneResult.val_loss` on the FIXED val split (unweighted),
 /// ensuring comparable selection signal across candidates. The simplex is
 /// initialized at the uniform mix plus four corner-leaning vertices so the
 /// uniform mix is always a candidate — the returned minimum is therefore never
@@ -113,9 +114,6 @@ pub fn simplex_search(
 /// < available; sample-with-replacement if target > available). The val split
 /// is the fixed base val — identical across all candidates.
 fn reweight_train(base_split: &Split, meta: &CacheMeta, mix: &[f64; 4], seed: u64) -> Split {
-    let total = base_split.train.len() as u64;
-    let target = effective_source_counts(mix, &meta.per_source, total);
-
     // Partition the train pool by source.
     let mut pools: [Vec<u32>; 4] = Default::default();
     for &idx in &base_split.train {
@@ -125,31 +123,51 @@ fn reweight_train(base_split: &Split, meta: &CacheMeta, mix: &[f64; 4], seed: u6
         }
     }
 
-    // Sample target[s] indices from each source's pool (seeded, deterministic).
-    let mut train = Vec::with_capacity(total as usize);
+    // VOLUME-BASED realization (no oversampling). For normalized proportions
+    // p_s, the largest total T with `p_s·T ≤ pool_s` for every populated source
+    // is `T = min_s(pool_s / p_s)`; then `target_s = round(p_s·T) ≤ pool_s`, so
+    // every draw is a subsample WITHOUT replacement (zero duplication). This is
+    // the fix that makes "the meta-search asks for more of source X" pull *real*
+    // positions: conjuring more data raises pool_s and therefore the honest T,
+    // whereas the old `round(mix·Σpools)` budget duplicated any source upweighted
+    // beyond its share (the 0.55 simplex vertices oversampled ~2.2× on a uniform
+    // corpus). The held-out val set is unchanged across candidates, so val_loss
+    // stays comparable even though T differs by mix.
+    let sum: f64 = mix.iter().sum();
+    let mut t = f64::INFINITY;
+    if sum > 0.0 {
+        for s in 0..4 {
+            let p = mix[s] / sum;
+            if p > 0.0 && !pools[s].is_empty() {
+                t = t.min(pools[s].len() as f64 / p);
+            }
+        }
+    }
+    let t = if t.is_finite() { t } else { 0.0 };
+    let target: [usize; 4] = std::array::from_fn(|s| {
+        if sum <= 0.0 {
+            return 0;
+        }
+        (((mix[s] / sum) * t).round() as usize).min(pools[s].len())
+    });
+
+    // Subsample target[s] indices from each pool without replacement (seeded,
+    // deterministic; target_s ≤ pool_s by construction).
+    let mut train = Vec::with_capacity(target.iter().sum());
     for s in 0..4 {
-        let n = target[s] as usize;
+        let n = target[s];
         let pool = &pools[s];
         if pool.is_empty() || n == 0 {
             continue;
         }
         let mut rng = Prng::new(seed ^ (s as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        if n <= pool.len() {
-            // Subsample without replacement: Fisher-Yates partial shuffle.
-            let mut indices: Vec<usize> = (0..pool.len()).collect();
-            for i in 0..n {
-                let j = i + (rng.below((pool.len() - i) as u64)) as usize;
-                indices.swap(i, j);
-            }
-            for i in 0..n {
-                train.push(pool[indices[i]]);
-            }
-        } else {
-            // Oversample with replacement.
-            for _ in 0..n {
-                let j = (rng.below(pool.len() as u64)) as usize;
-                train.push(pool[j]);
-            }
+        let mut indices: Vec<usize> = (0..pool.len()).collect();
+        for i in 0..n {
+            let j = i + (rng.below((pool.len() - i) as u64)) as usize;
+            indices.swap(i, j);
+        }
+        for &i in indices.iter().take(n) {
+            train.push(pool[i]);
         }
     }
 
@@ -275,13 +293,14 @@ mod tests {
         }
     }
 
-    /// `reweight_train` produces a train multiset whose per-source counts match
-    /// `effective_source_counts` for both the subsample (target ≤ pool) and
-    /// oversample-with-replacement (target > pool) branches, and is deterministic
-    /// under a fixed seed. Pins the mechanism the end-to-end tests cannot observe.
+    /// `reweight_train` is VOLUME-BASED: it realizes the mix with the largest
+    /// real-data total that needs no duplication (`T = min_s(pool_s / p_s)`), so
+    /// every per-source count is ≤ its pool (subsample without replacement, never
+    /// oversampled), the proportions match the mix, the favored source consumes
+    /// its full pool, and it is deterministic under a fixed seed.
     #[test]
-    fn reweight_train_counts_match_effective_source_counts() {
-        use crate::texel::dataset::{CacheMeta, Split, effective_source_counts};
+    fn reweight_train_is_volume_based_no_oversampling() {
+        use crate::texel::dataset::{CacheMeta, Split};
 
         // Build a synthetic CacheMeta whose game_keys give a known per-source
         // distribution: 40 records each for sources 0-3 (160 total), all assigned
@@ -307,24 +326,23 @@ mod tests {
             train,
             val: Vec::new(),
         };
-        let train_total = n_total as u64;
-
-        // Skewed mix chosen to exercise BOTH sampling branches (pool = 40/source):
-        //   target[0] = round(0.20 * 160) = 32  (≤ 40 → subsample, no replacement)
-        //   target[1] = round(0.50 * 160) = 80  (>  40 → oversample with replacement)
-        //   target[2] = round(0.15 * 160) = 24  (≤ 40 → subsample)
-        //   target[3] = round(0.15 * 160) = 24  (≤ 40 → subsample)
+        // Pools = 40 each. With p = [0.2, 0.5, 0.15, 0.15] (already normalized),
+        // T = min_s(pool_s / p_s) = min(200, 80, 266.7, 266.7) = 80, bound by the
+        // favored source 1 (0.5). target = round(p·T) = [16, 40, 12, 12]: source 1
+        // uses its FULL pool (max real data), the rest subsample — no oversampling.
         let mix = [0.2f64, 0.5, 0.15, 0.15];
-        let target = effective_source_counts(&mix, &per_source, train_total);
-        // Verify our setup: source 0 subsamples, source 1 oversamples.
-        assert!(
-            target[0] <= n_per_src as u64,
-            "source 0 must be in subsample branch for this test; target={target:?}"
+        let target: [u64; 4] = [16, 40, 12, 12];
+        assert_eq!(
+            target[1], n_per_src as u64,
+            "favored source must use its full pool (the volume cap binds here)"
         );
-        assert!(
-            target[1] > n_per_src as u64,
-            "source 1 must be in oversample branch for this test; target={target:?}"
-        );
+        for (s, &t) in target.iter().enumerate() {
+            assert!(
+                t <= n_per_src as u64,
+                "volume-based reweight must never exceed a pool (no oversampling); \
+                 source {s} target {t} vs pool {n_per_src}"
+            );
+        }
 
         let seed = 0xABCD_1234_u64;
         let result = reweight_train(&base_split, &meta, &mix, seed);
@@ -358,13 +376,25 @@ mod tests {
             );
         }
 
-        // Oversample branch: total count exceeds pool size (repeats are expected).
-        let src1_count = got_counts[1];
-        assert!(
-            src1_count > n_per_src as u64,
-            "oversample branch must produce more records than the pool size; \
-             pool={n_per_src}, got={src1_count}"
+        // No oversampling: the favored source 1 consumed its ENTIRE pool with
+        // DISTINCT indices (it oversampled with repeats under the old budget).
+        assert_eq!(
+            got_counts[1], n_per_src as u64,
+            "favored source 1 must use its full pool, not oversample; got={got_counts:?}"
         );
+        let src1_indices: Vec<u32> = result
+            .train
+            .iter()
+            .copied()
+            .filter(|&i| meta.game_keys[i as usize].0 == 1)
+            .collect();
+        let mut seen1 = std::collections::HashSet::new();
+        for idx in &src1_indices {
+            assert!(
+                seen1.insert(idx),
+                "volume-based reweight must not repeat index {idx} for source 1"
+            );
+        }
 
         // Determinism: the same seed yields the identical train index multiset.
         let result2 = reweight_train(&base_split, &meta, &mix, seed);
