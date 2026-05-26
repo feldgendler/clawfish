@@ -194,6 +194,7 @@ fn tmp_path(path: &Path) -> std::path::PathBuf {
 }
 
 /// Tune-run configuration (the inner Adam solve).
+#[derive(Clone)]
 pub struct TuneConfig {
     /// Adam learning rate.
     pub lr: f64,
@@ -214,6 +215,10 @@ pub struct TuneConfig {
     /// Write a checkpoint every this many iterations (ignored when
     /// `checkpoint_path` is `None`).
     pub checkpoint_every: u64,
+    /// If `Some(label)`, emit a one-line progress report to stderr on every
+    /// held-out evaluation. `None` is silent (default; existing callers and
+    /// tests stay quiet).
+    pub progress_label: Option<String>,
 }
 
 /// The tune result: tuned params + the fitted K + the final held-out objective.
@@ -316,6 +321,17 @@ pub fn tune(
                 state.patience = 0;
             } else {
                 state.patience += 1;
+            }
+
+            if let Some(label) = &cfg.progress_label {
+                eprintln!(
+                    "[{label}] epoch {iter}/{max_iter}  val_loss {val:.6}  \
+                     best {best_val:.6}  patience {patience}/{cfg_patience}",
+                    iter = state.iter,
+                    max_iter = cfg.max_iter,
+                    patience = state.patience,
+                    cfg_patience = cfg.patience,
+                );
             }
 
             // Integer-quantization floor: stop once the int-rounded weights are
@@ -617,6 +633,7 @@ mod tests {
             val_fraction: 0.25,
             checkpoint_path: None,
             checkpoint_every: 10,
+            progress_label: None,
         }
     }
 

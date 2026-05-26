@@ -16,6 +16,7 @@ use crate::texel::layout::{self, Group};
 
 /// Regularization config (ADR-0037 §5). `init` is the shipped core vec — the
 /// L2 ridge pulls toward production, never toward literature values.
+#[derive(Clone)]
 pub struct Reg {
     /// L2 ridge strength (pull toward [`Reg::init`]).
     pub l2_lambda: f64,

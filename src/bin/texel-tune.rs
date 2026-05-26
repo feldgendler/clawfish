@@ -208,6 +208,7 @@ fn cmd_tune(args: &Args) -> Result<(), String> {
         val_fraction,
         checkpoint_path: checkpoint.clone(),
         checkpoint_every: eval_every,
+        progress_label: None,
     };
 
     // Resume from a valid checkpoint if one exists (a torn `.tmp` is ignored by
@@ -271,9 +272,12 @@ fn cmd_mixture(args: &Args) -> Result<(), String> {
         val_fraction,
         checkpoint_path: None,
         checkpoint_every: eval_every,
+        progress_label: None,
     };
 
-    let (mix, result) = mixture::simplex_search(&cache, &meta, &cfg).map_err(|e| e.to_string())?;
+    let progress_path = out_params.with_extension("progress");
+    let (mix, result) = mixture::simplex_search(&cache, &meta, &cfg, Some(&progress_path))
+        .map_err(|e| e.to_string())?;
     write_params(
         &out_params,
         &result.params,

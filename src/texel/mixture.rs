@@ -6,6 +6,7 @@
 //! path runs a fixed mix; the simplex is a secondary `texel-tune mixture`
 //! subcommand the operator escalates to only if the first SPRT is marginal.
 
+use std::io::Write;
 use std::path::Path;
 
 use crate::corpus::prng::Prng;
@@ -36,6 +37,7 @@ pub fn simplex_search(
     cache: &Path,
     meta: &CacheMeta,
     cfg: &TuneConfig,
+    progress_path: Option<&Path>,
 ) -> Result<([f64; 4], TuneResult), TexelError> {
     // Initial simplex: uniform + four vertices leaning toward each lane.
     let uniform = [0.25, 0.25, 0.25, 0.25];
@@ -49,19 +51,38 @@ pub fn simplex_search(
     // Fixed val split (common across all candidates for comparable objectives).
     let base_split = split_by_game(meta, cfg.val_fraction, cfg.seed);
 
+    // Running best so the status file is always up to date.
+    let mut best_so_far: Option<(f64, [f64; 4], f64)> = None; // (val_loss, mix, k)
+    let mut tunes_done: usize = 0;
+
     // Evaluate every vertex once.
     let mut objs: Vec<(f64, [f64; 4], TuneResult)> = Vec::with_capacity(verts.len());
-    for &v in &verts {
+    for (k, &v) in verts.iter().enumerate() {
+        let label = format!("meta seed {}/{} mix={v:.3?}", k + 1, verts.len());
+        let mut inner_cfg = cfg.clone();
+        inner_cfg.progress_label = Some(label.clone());
         let reweighted = reweight_train(&base_split, meta, &v, cfg.seed);
-        let res = tune(cache, &reweighted, &EvalParams::shipped(), cfg, None)?;
+        let res = tune(cache, &reweighted, &EvalParams::shipped(), &inner_cfg, None)?;
         let obj = res.val_loss;
+        tunes_done += 1;
+        // Update best.
+        if best_so_far.is_none_or(|(best, _, _)| obj < best) {
+            best_so_far = Some((obj, v, res.k));
+        }
+        let (best_val, best_mix, best_k) = best_so_far.expect("just set");
+        eprintln!(
+            "[meta] seed tune {tunes_done} mix={v:.3?}  K={k_val:.6}  val_loss={obj:.6}  \
+             best_mix={best_mix:.3?}  best_val={best_val:.6}",
+            k_val = res.k,
+        );
+        write_progress_file(progress_path, tunes_done, 0, best_mix, best_k, best_val);
         objs.push((obj, v, res));
     }
 
     // Coarse Nelder–Mead: reflect the worst vertex through the centroid of the
     // rest for a bounded number of iterations.
     const ITERS: usize = 12;
-    for _ in 0..ITERS {
+    for i in 0..ITERS {
         // Index of the current worst (highest-objective) vertex.
         let worst = objs
             .iter()
@@ -71,8 +92,8 @@ pub fn simplex_search(
             .expect("non-empty simplex");
         // Centroid of all but the worst.
         let mut centroid = [0.0; 4];
-        for (i, (_, v, _)) in objs.iter().enumerate() {
-            if i == worst {
+        for (j, (_, v, _)) in objs.iter().enumerate() {
+            if j == worst {
                 continue;
             }
             for k in 0..4 {
@@ -90,13 +111,31 @@ pub fn simplex_search(
             reflected[k] = centroid[k] + (centroid[k] - wv[k]);
         }
         let reflected = normalize(reflected);
+        let label = format!("meta iter {}/{ITERS} reflect mix={reflected:.3?}", i + 1);
+        let mut inner_cfg = cfg.clone();
+        inner_cfg.progress_label = Some(label.clone());
         let reweighted = reweight_train(&base_split, meta, &reflected, cfg.seed);
-        let res = tune(cache, &reweighted, &EvalParams::shipped(), cfg, None)?;
+        let res = tune(cache, &reweighted, &EvalParams::shipped(), &inner_cfg, None)?;
         let obj = res.val_loss;
+        let res_k = res.k;
+        tunes_done += 1;
         // Accept the reflection only if it beats the worst.
-        if obj < objs[worst].0 {
+        let accepted = obj < objs[worst].0;
+        if accepted {
             objs[worst] = (obj, reflected, res);
         }
+        // Update best.
+        if best_so_far.is_none_or(|(best, _, _)| obj < best) {
+            best_so_far = Some((obj, reflected, res_k));
+        }
+        let (best_val, best_mix, best_k) = best_so_far.expect("non-empty after seeds");
+        eprintln!(
+            "[meta] iter {}/{ITERS} reflect mix={reflected:.3?}  K={res_k:.6}  \
+             val_loss={obj:.6}  accepted={accepted}  \
+             best_mix={best_mix:.3?}  best_val={best_val:.6}",
+            i + 1,
+        );
+        write_progress_file(progress_path, tunes_done, i + 1, best_mix, best_k, best_val);
     }
 
     // Return the best-objective vertex.
@@ -105,6 +144,53 @@ pub fn simplex_search(
         .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
         .expect("non-empty simplex");
     Ok((best.1, best.2))
+}
+
+/// Format the meta-tuning status for the progress file.
+///
+/// Produces a human-readable, grep-friendly plain-text summary so the operator
+/// can `tail -f` it or `cat` it mid-run without any tooling.
+pub fn format_meta_progress(
+    tunes_done: usize,
+    simplex_iter: usize,
+    best_mix: [f64; 4],
+    best_k: f64,
+    best_val: f64,
+) -> String {
+    format!(
+        "tunes_done={tunes_done}\n\
+         simplex_iter={simplex_iter}\n\
+         best_mix=[{:.4},{:.4},{:.4},{:.4}]\n\
+         best_k={best_k:.6}\n\
+         best_val_loss={best_val:.6}\n",
+        best_mix[0], best_mix[1], best_mix[2], best_mix[3],
+    )
+}
+
+/// Atomically overwrite the progress file at `path` (temp → rename).
+/// Silently ignores errors — this is observability, not correctness.
+fn write_progress_file(
+    path: Option<&Path>,
+    tunes_done: usize,
+    simplex_iter: usize,
+    best_mix: [f64; 4],
+    best_k: f64,
+    best_val: f64,
+) {
+    let Some(path) = path else { return };
+    let content = format_meta_progress(tunes_done, simplex_iter, best_mix, best_k, best_val);
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp_path = std::path::Path::new(&tmp);
+    let write_ok = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(tmp_path)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if write_ok.is_ok() {
+        let _ = std::fs::rename(tmp_path, path);
+    }
 }
 
 /// Build a reweighted train split for candidate mix `m`.
@@ -290,6 +376,7 @@ mod tests {
             val_fraction: 0.25,
             checkpoint_path: None,
             checkpoint_every: 10,
+            progress_label: None,
         }
     }
 
@@ -419,7 +506,7 @@ mod tests {
     fn simplex_selects_on_held_out_objective() {
         let dir = unique_temp_dir("simplex-select");
         let (cache, meta) = build(&dir);
-        let (mix, result) = simplex_search(&cache, &meta, &cfg(7)).expect("simplex");
+        let (mix, result) = simplex_search(&cache, &meta, &cfg(7), None).expect("simplex");
         let s: f64 = mix.iter().sum();
         assert!(
             (s - 1.0).abs() < 1e-6,
@@ -454,7 +541,7 @@ mod tests {
         let (cache, meta) = build(&dir);
 
         // The held-out objective at the simplex-chosen mix.
-        let (chosen_mix, chosen) = simplex_search(&cache, &meta, &cfg(13)).expect("simplex");
+        let (chosen_mix, chosen) = simplex_search(&cache, &meta, &cfg(13), None).expect("simplex");
 
         assert!(
             chosen.val_loss.is_finite(),
@@ -490,5 +577,20 @@ mod tests {
             uniform_vertex_result.val_loss
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `format_meta_progress` produces a stable, human-readable plain-text block
+    /// suitable for writing to a status file and tailing mid-run.
+    #[test]
+    fn format_meta_progress_canonical_string() {
+        let s = super::format_meta_progress(7, 3, [0.4, 0.3, 0.2, 0.1], 0.005700, 0.234567);
+        assert_eq!(
+            s,
+            "tunes_done=7\n\
+             simplex_iter=3\n\
+             best_mix=[0.4000,0.3000,0.2000,0.1000]\n\
+             best_k=0.005700\n\
+             best_val_loss=0.234567\n"
+        );
     }
 }
