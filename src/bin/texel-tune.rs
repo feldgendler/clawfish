@@ -276,8 +276,13 @@ fn cmd_mixture(args: &Args) -> Result<(), String> {
     };
 
     let progress_path = out_params.with_extension("progress");
-    let (mix, result) = mixture::simplex_search(&cache, &meta, &cfg, Some(&progress_path))
-        .map_err(|e| e.to_string())?;
+    // Resume checkpoint: written after every inner tune, so an interrupted
+    // (killed / suspended-then-OOM'd) meta-tune resumes at the next inner tune
+    // instead of restarting from zero. Removed on successful completion.
+    let ckpt_path = out_params.with_extension("mixckpt");
+    let (mix, result) =
+        mixture::simplex_search(&cache, &meta, &cfg, Some(&progress_path), Some(&ckpt_path))
+            .map_err(|e| e.to_string())?;
     write_params(
         &out_params,
         &result.params,
@@ -289,6 +294,7 @@ fn cmd_mixture(args: &Args) -> Result<(), String> {
         seed,
     )?;
     let _ = std::fs::remove_file(&cache);
+    let _ = std::fs::remove_file(&ckpt_path);
     eprintln!(
         "texel-tune mixture: chosen mix {mix:?}, K={}, val_loss={}",
         result.k, result.val_loss

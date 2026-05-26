@@ -32,3 +32,10 @@ fuzz/artifacts/
 /target/corpus-spill/
 /target/corpus-work/
 /target/corpus-campaign.log
+
+# texel-tune scratch outputs: the transient feature cache (can reach GBs), the
+# meta-tune resume checkpoint, and the human-readable progress file. All
+# regenerable from the lanes + the recorded campaign command; never tracked.
+/bench/*.mixcache
+/bench/*.mixckpt
+/bench/*.progress

@@ -46,6 +46,7 @@ Each retrospective captures what landed, verification numbers, the SPRT outcome,
 | ELOH.D | ✓ | Per-pair TC sampling (`--tc-sample <SPEC>` + `--seed N`) for mixed-TC SPRT and Δ(TC) regression. SplitMix64 master stream pre-materialises all per-pair TCs at run start. PGN `TimeControl` tag + per-game `tc=` summary field + `summary-by-tc:` aggregate. Mutually exclusive with `--tc` at parse time. |
 | ELOH.E | ✓ | In-process pentanomial-GSPRT + fixed-games match + smoke flows. New `mod sprt` (LLR + Wald bounds + pentanomial CI); `--sprt-elo0/elo1/alpha/beta` CLI flags; per-worker `pair_score_buffers` keyed by `worker_id` (load-bearing under concurrency >1); `match.pgn` concatenation step. ADR-0022. ADR-0012 amended. **Closes ELOH milestone.** |
 | [Tooling/fuzzing](tooling-fuzzing.md) | ✓ | `cargo-fuzz` harnesses for FEN + UCI (ADR-0013); 3.17B execs aggregate across saturation + smoke campaigns, one real parser bug found and fixed. |
+| [meta-tune post-mortem](meta-tune-postmortem.md) | ABORTED (no ship, no Elo claim) | Post-M6.I corpus-mixture meta-tune; aborted after ~9 h without completing. Infra kept + CI-green (corpus (II)+extend, suspend-tolerant watchdog, mixture observability). Root causes: inner optimizer re-streamed the cache every epoch (fixed: `load_split_records`); full-batch loss too smooth for early-stop → ran to `max_iter` (open: cap `--max-iter`); launched blind; no mixture checkpointing (fixed: `MixCheckpoint` resume). Re-run preconditions in [`../tuning-backlog.md`](../tuning-backlog.md). |
 
 ## Baseline tag convention
 

@@ -6,8 +6,8 @@
 //! path runs a fixed mix; the simplex is a secondary `texel-tune mixture`
 //! subcommand the operator escalates to only if the first SPRT is marginal.
 
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use crate::corpus::prng::Prng;
 use crate::texel::TexelError;
@@ -38,8 +38,92 @@ pub fn simplex_search(
     meta: &CacheMeta,
     cfg: &TuneConfig,
     progress_path: Option<&Path>,
+    checkpoint_path: Option<&Path>,
 ) -> Result<([f64; 4], TuneResult), TexelError> {
-    // Initial simplex: uniform + four vertices leaning toward each lane.
+    Ok(
+        simplex_search_impl(cache, meta, cfg, progress_path, checkpoint_path, None)?
+            .expect("simplex_search without a stop bound always runs to completion"),
+    )
+}
+
+/// Seed vertices in the initial simplex (uniform + one corner-leaning vertex
+/// per lane).
+const SEED_COUNT: usize = 5;
+/// Coarse Nelder–Mead reflection iterations after the seed vertices.
+const REFLECT_ITERS: usize = 12;
+
+/// Global-best vertex found so far, with the full inner-tune result needed both
+/// to return it and to persist/restore it across a checkpoint.
+struct BestVertex {
+    val: f64,
+    mix: [f64; 4],
+    result: TuneResult,
+}
+
+/// Persisted meta-search state — enough to resume the simplex at an inner-tune
+/// boundary without redoing any completed inner tune (the meta-tune post-mortem,
+/// `docs/milestones/meta-tune-postmortem.md`). Written atomically after every
+/// inner tune. Encoded as a length-framed BINARY layout with each `f64` written
+/// by its IEEE-754 bit pattern (`to_bits`) — NOT JSON: serde_json's shortest-
+/// decimal float serialization is not bit-exact for every `f64` (it can differ
+/// by ≤1 ULP), which would let a resumed search select a different worst/best
+/// vertex. The bit-pattern layout (mirroring `optimizer::save_checkpoint`)
+/// round-trips every bit exactly and ends with a CRC so a torn write is
+/// rejected. Inner-tune granularity is sufficient now that `optimizer::tune` no
+/// longer re-streams the cache per epoch (a kill loses at most the one in-flight
+/// inner tune, which restarts from scratch).
+#[derive(Clone, PartialEq, Debug)]
+struct MixCheckpoint {
+    /// Fingerprint of the `(cfg, corpus)` the persisted objectives were computed
+    /// under (see [`mix_config_fingerprint`]). A resume whose current fingerprint
+    /// differs is treated as a cold start — the restored `objs`/`best` were
+    /// computed under a different split/corpus and would make the simplex compare
+    /// incomparable objectives. Mirrors the `layout_hash`/`lane_sha256` staleness
+    /// guard the feature cache uses.
+    config_hash: u64,
+    /// Current simplex: `(held-out objective, mix)` per vertex.
+    objs: Vec<(f64, [f64; 4])>,
+    /// Global-best vertex mix.
+    best_mix: [f64; 4],
+    /// Global-best vertex tuned core weight vector (rebuilds the `TuneResult`).
+    best_core: Vec<f64>,
+    /// Global-best frozen K.
+    best_k: f64,
+    /// Global-best held-out objective.
+    best_val: f64,
+    /// Global-best inner-tune iteration count.
+    best_iters: u64,
+    /// Seed vertices evaluated (`0..=SEED_COUNT`).
+    seeds_done: usize,
+    /// Reflection iterations completed (`0..=REFLECT_ITERS`).
+    reflections_done: usize,
+    /// Total inner tunes completed (`= seeds_done + reflections_done`).
+    tunes_done: usize,
+}
+
+/// Inner implementation of [`simplex_search`]. `stop_after` is a test hook:
+/// when `Some(n)`, the search returns `Ok(None)` (after writing the checkpoint)
+/// as soon as `n` inner tunes have completed, simulating an interruption at an
+/// inner-tune boundary. Production passes `None` and always gets `Ok(Some(_))`.
+///
+/// The returned vertex is the global best, tracked in `best` *independently* of
+/// the simplex `objs` (so it survives even though `objs` drops the per-vertex
+/// `TuneResult`). Its objective equals the old `min_by(objs)` objective: the
+/// best vertex is never the Nelder–Mead *worst*, so it is never the one a
+/// reflection replaces, hence it stays in the simplex throughout. The *mix* it
+/// returns can differ from the old `min_by` only under tied objectives (the old
+/// `min_by` kept the first equal-minimum vertex; `best` keeps the first to
+/// *reach* the minimum) — an immaterial tiebreak, the held-out objective is
+/// identical and any min-objective mix is an equally valid SPRT candidate.
+fn simplex_search_impl(
+    cache: &Path,
+    meta: &CacheMeta,
+    cfg: &TuneConfig,
+    progress_path: Option<&Path>,
+    checkpoint_path: Option<&Path>,
+    stop_after: Option<usize>,
+) -> Result<Option<([f64; 4], TuneResult)>, TexelError> {
+    // Initial simplex: uniform + one vertex leaning toward each lane.
     let uniform = [0.25, 0.25, 0.25, 0.25];
     let mut verts: Vec<[f64; 4]> = vec![uniform];
     for lane in 0..4 {
@@ -47,42 +131,86 @@ pub fn simplex_search(
         v[lane] = 0.55;
         verts.push(normalize(v));
     }
+    debug_assert_eq!(verts.len(), SEED_COUNT);
 
     // Fixed val split (common across all candidates for comparable objectives).
     let base_split = split_by_game(meta, cfg.val_fraction, cfg.seed);
 
-    // Running best so the status file is always up to date.
-    let mut best_so_far: Option<(f64, [f64; 4], f64)> = None; // (val_loss, mix, k)
-    let mut tunes_done: usize = 0;
-
-    // Evaluate every vertex once.
-    let mut objs: Vec<(f64, [f64; 4], TuneResult)> = Vec::with_capacity(verts.len());
-    for (k, &v) in verts.iter().enumerate() {
-        let label = format!("meta seed {}/{} mix={v:.3?}", k + 1, verts.len());
+    // One inner Adam solve at lane-mix `mix`, labelled for the progress log.
+    let run_inner = |mix: &[f64; 4], label: String| -> Result<TuneResult, TexelError> {
         let mut inner_cfg = cfg.clone();
-        inner_cfg.progress_label = Some(label.clone());
-        let reweighted = reweight_train(&base_split, meta, &v, cfg.seed);
-        let res = tune(cache, &reweighted, &EvalParams::shipped(), &inner_cfg, None)?;
-        let obj = res.val_loss;
-        tunes_done += 1;
-        // Update best.
-        if best_so_far.is_none_or(|(best, _, _)| obj < best) {
-            best_so_far = Some((obj, v, res.k));
+        inner_cfg.progress_label = Some(label);
+        let reweighted = reweight_train(&base_split, meta, mix, cfg.seed);
+        tune(cache, &reweighted, &EvalParams::shipped(), &inner_cfg, None)
+    };
+
+    // Restore prior state (resume) or cold-start. A checkpoint whose config
+    // fingerprint does not match this run's (different seed / val-fraction /
+    // iteration knobs / corpus) is discarded — its objectives are incomparable
+    // to what this run will compute.
+    let config_hash = mix_config_fingerprint(cfg, meta);
+    let restored = checkpoint_path
+        .and_then(load_mix_checkpoint)
+        .filter(|c| c.config_hash == config_hash);
+    let (mut objs, mut best, seeds_done, reflections_done, mut tunes_done) = match restored {
+        Some(c) => {
+            let result = TuneResult {
+                params: EvalParams::shipped().with_core(&c.best_core),
+                k: c.best_k,
+                val_loss: c.best_val,
+                iters: c.best_iters,
+            };
+            let best = Some(BestVertex {
+                val: c.best_val,
+                mix: c.best_mix,
+                result,
+            });
+            (c.objs, best, c.seeds_done, c.reflections_done, c.tunes_done)
         }
-        let (best_val, best_mix, best_k) = best_so_far.expect("just set");
+        None => (Vec::<(f64, [f64; 4])>::new(), None, 0usize, 0usize, 0usize),
+    };
+
+    // Evaluate the remaining seed vertices.
+    for k in seeds_done..verts.len() {
+        let v = verts[k];
+        let label = format!("meta seed {}/{} mix={v:.3?}", k + 1, verts.len());
+        let res = run_inner(&v, label)?;
+        let obj = res.val_loss;
+        objs.push((obj, v));
+        tunes_done += 1;
+        if best.as_ref().is_none_or(|b| obj < b.val) {
+            best = Some(BestVertex {
+                val: obj,
+                mix: v,
+                result: res,
+            });
+        }
+        let b = best.as_ref().expect("best set after first seed");
         eprintln!(
-            "[meta] seed tune {tunes_done} mix={v:.3?}  K={k_val:.6}  val_loss={obj:.6}  \
-             best_mix={best_mix:.3?}  best_val={best_val:.6}",
-            k_val = res.k,
+            "[meta] seed tune {tunes_done}/{} mix={v:.3?}  val_loss={obj:.6}  \
+             best_mix={:.3?}  best_val={:.6}",
+            SEED_COUNT + REFLECT_ITERS,
+            b.mix,
+            b.val,
         );
-        write_progress_file(progress_path, tunes_done, 0, best_mix, best_k, best_val);
-        objs.push((obj, v, res));
+        record_progress(
+            progress_path,
+            checkpoint_path,
+            config_hash,
+            &objs,
+            b,
+            k + 1,
+            reflections_done,
+            tunes_done,
+        )?;
+        if stop_after == Some(tunes_done) {
+            return Ok(None);
+        }
     }
 
     // Coarse Nelder–Mead: reflect the worst vertex through the centroid of the
     // rest for a bounded number of iterations.
-    const ITERS: usize = 12;
-    for i in 0..ITERS {
+    for i in reflections_done..REFLECT_ITERS {
         // Index of the current worst (highest-objective) vertex.
         let worst = objs
             .iter()
@@ -92,7 +220,7 @@ pub fn simplex_search(
             .expect("non-empty simplex");
         // Centroid of all but the worst.
         let mut centroid = [0.0; 4];
-        for (j, (_, v, _)) in objs.iter().enumerate() {
+        for (j, (_, v)) in objs.iter().enumerate() {
             if j == worst {
                 continue;
             }
@@ -111,39 +239,258 @@ pub fn simplex_search(
             reflected[k] = centroid[k] + (centroid[k] - wv[k]);
         }
         let reflected = normalize(reflected);
-        let label = format!("meta iter {}/{ITERS} reflect mix={reflected:.3?}", i + 1);
-        let mut inner_cfg = cfg.clone();
-        inner_cfg.progress_label = Some(label.clone());
-        let reweighted = reweight_train(&base_split, meta, &reflected, cfg.seed);
-        let res = tune(cache, &reweighted, &EvalParams::shipped(), &inner_cfg, None)?;
-        let obj = res.val_loss;
-        let res_k = res.k;
-        tunes_done += 1;
-        // Accept the reflection only if it beats the worst.
-        let accepted = obj < objs[worst].0;
-        if accepted {
-            objs[worst] = (obj, reflected, res);
-        }
-        // Update best.
-        if best_so_far.is_none_or(|(best, _, _)| obj < best) {
-            best_so_far = Some((obj, reflected, res_k));
-        }
-        let (best_val, best_mix, best_k) = best_so_far.expect("non-empty after seeds");
-        eprintln!(
-            "[meta] iter {}/{ITERS} reflect mix={reflected:.3?}  K={res_k:.6}  \
-             val_loss={obj:.6}  accepted={accepted}  \
-             best_mix={best_mix:.3?}  best_val={best_val:.6}",
-            i + 1,
+        let label = format!(
+            "meta iter {}/{REFLECT_ITERS} reflect mix={reflected:.3?}",
+            i + 1
         );
-        write_progress_file(progress_path, tunes_done, i + 1, best_mix, best_k, best_val);
+        let res = run_inner(&reflected, label)?;
+        let obj = res.val_loss;
+        // Accept the reflection into the simplex only if it beats the worst.
+        let accepted = accept_reflection(&mut objs, worst, obj, reflected);
+        tunes_done += 1;
+        if best.as_ref().is_none_or(|b| obj < b.val) {
+            best = Some(BestVertex {
+                val: obj,
+                mix: reflected,
+                result: res,
+            });
+        }
+        let b = best.as_ref().expect("best set after seeds");
+        eprintln!(
+            "[meta] iter {}/{REFLECT_ITERS} reflect mix={reflected:.3?}  val_loss={obj:.6}  \
+             accepted={accepted}  best_mix={:.3?}  best_val={:.6}",
+            i + 1,
+            b.mix,
+            b.val,
+        );
+        record_progress(
+            progress_path,
+            checkpoint_path,
+            config_hash,
+            &objs,
+            b,
+            verts.len(),
+            i + 1,
+            tunes_done,
+        )?;
+        if stop_after == Some(tunes_done) {
+            return Ok(None);
+        }
     }
 
-    // Return the best-objective vertex.
-    let best = objs
-        .into_iter()
-        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
-        .expect("non-empty simplex");
-    Ok((best.1, best.2))
+    let best = best.expect("at least one inner tune ran");
+    Ok(Some((best.mix, best.result)))
+}
+
+/// Accept a reflected vertex into the simplex iff its objective beats the
+/// current worst vertex's; returns whether it was accepted. Extracted as a pure
+/// helper so the accept/replace rule (the core Nelder–Mead trajectory driver)
+/// is unit-testable in isolation.
+fn accept_reflection(objs: &mut [(f64, [f64; 4])], worst: usize, obj: f64, mix: [f64; 4]) -> bool {
+    let accepted = obj < objs[worst].0;
+    if accepted {
+        objs[worst] = (obj, mix);
+    }
+    accepted
+}
+
+/// Fingerprint of the configuration + corpus an inner-tune objective depends on,
+/// so a resume can reject a checkpoint written under a different `(cfg, corpus)`
+/// (see [`MixCheckpoint::config_hash`]). Folds the meta-search-affecting knobs
+/// (`seed`, `val_fraction`, `max_iter`, `patience`, `eval_every`) and the corpus
+/// identity (`layout_hash` + the per-lane sha256s) into a 64-bit CRC pair.
+///
+/// `lr`/`reg` are deliberately omitted because `cmd_mixture` hardcodes them; if
+/// the `mixture` subcommand ever exposes an `--lr`/regularization flag, add it
+/// here too, or a stale checkpoint under a different value would wrongly match.
+fn mix_config_fingerprint(cfg: &TuneConfig, meta: &CacheMeta) -> u64 {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&cfg.seed.to_le_bytes());
+    buf.extend_from_slice(&cfg.val_fraction.to_bits().to_le_bytes());
+    buf.extend_from_slice(&cfg.max_iter.to_le_bytes());
+    buf.extend_from_slice(&(cfg.patience as u64).to_le_bytes());
+    buf.extend_from_slice(&cfg.eval_every.to_le_bytes());
+    buf.extend_from_slice(&meta.layout_hash.to_le_bytes());
+    for sha in &meta.lane_sha256 {
+        buf.extend_from_slice(&(sha.len() as u64).to_le_bytes());
+        buf.extend_from_slice(sha.as_bytes());
+    }
+    let lo = crate::corpus::store::crc32(&buf) as u64;
+    buf.push(0xA5);
+    let hi = crate::corpus::store::crc32(&buf) as u64;
+    (hi << 32) | lo
+}
+
+/// Write the progress file and (if enabled) the resume checkpoint after an
+/// inner tune. The progress file is best-effort observability; the checkpoint
+/// write is correctness-critical for resume, so its errors propagate.
+#[allow(clippy::too_many_arguments)]
+fn record_progress(
+    progress_path: Option<&Path>,
+    checkpoint_path: Option<&Path>,
+    config_hash: u64,
+    objs: &[(f64, [f64; 4])],
+    best: &BestVertex,
+    seeds_done: usize,
+    reflections_done: usize,
+    tunes_done: usize,
+) -> Result<(), TexelError> {
+    write_progress_file(
+        progress_path,
+        tunes_done,
+        reflections_done,
+        best.mix,
+        best.result.k,
+        best.val,
+    );
+    if let Some(path) = checkpoint_path {
+        let c = MixCheckpoint {
+            config_hash,
+            objs: objs.to_vec(),
+            best_mix: best.mix,
+            best_core: best.result.params.core_to_vec(),
+            best_k: best.result.k,
+            best_val: best.val,
+            best_iters: best.result.iters,
+            seeds_done,
+            reflections_done,
+            tunes_done,
+        };
+        save_mix_checkpoint(path, &c)?;
+    }
+    Ok(())
+}
+
+/// Meta-search checkpoint binary-format magic (`"MIX1"`); rejects foreign bytes.
+const MIX_CKPT_MAGIC: u32 = 0x4D49_5831;
+
+/// Atomically write the meta-search checkpoint (temp → fsync → rename). A torn
+/// `.tmp` is never renamed into place, so `load_mix_checkpoint` only ever sees
+/// a complete file.
+fn save_mix_checkpoint(path: &Path, c: &MixCheckpoint) -> Result<(), TexelError> {
+    let bytes = encode_mix_checkpoint(c);
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp_path = PathBuf::from(&tmp);
+    {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Load a meta-search checkpoint, treating a missing or malformed file (bad
+/// magic, short read, CRC mismatch) as "no checkpoint" (cold start) — resume is
+/// an optimization, never a hard dependency.
+fn load_mix_checkpoint(path: &Path) -> Option<MixCheckpoint> {
+    let bytes = std::fs::read(path).ok()?;
+    decode_mix_checkpoint(&bytes)
+}
+
+/// Length-framed binary encoding with every `f64` written by `to_bits`, ending
+/// in a CRC (mirrors `optimizer::encode_checkpoint`'s bit-exact discipline).
+fn encode_mix_checkpoint(c: &MixCheckpoint) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&MIX_CKPT_MAGIC.to_le_bytes());
+    body.extend_from_slice(&c.config_hash.to_le_bytes());
+    body.extend_from_slice(&(c.objs.len() as u32).to_le_bytes());
+    for (obj, mix) in &c.objs {
+        body.extend_from_slice(&obj.to_bits().to_le_bytes());
+        for x in mix {
+            body.extend_from_slice(&x.to_bits().to_le_bytes());
+        }
+    }
+    for x in &c.best_mix {
+        body.extend_from_slice(&x.to_bits().to_le_bytes());
+    }
+    body.extend_from_slice(&(c.best_core.len() as u32).to_le_bytes());
+    for x in &c.best_core {
+        body.extend_from_slice(&x.to_bits().to_le_bytes());
+    }
+    body.extend_from_slice(&c.best_k.to_bits().to_le_bytes());
+    body.extend_from_slice(&c.best_val.to_bits().to_le_bytes());
+    body.extend_from_slice(&c.best_iters.to_le_bytes());
+    body.extend_from_slice(&(c.seeds_done as u64).to_le_bytes());
+    body.extend_from_slice(&(c.reflections_done as u64).to_le_bytes());
+    body.extend_from_slice(&(c.tunes_done as u64).to_le_bytes());
+    let crc = crate::corpus::store::crc32(&body);
+    body.extend_from_slice(&crc.to_le_bytes());
+    body
+}
+
+/// Decode + validate (magic + CRC) — the inverse of [`encode_mix_checkpoint`].
+/// Any inconsistency yields `None` (treated as no checkpoint).
+fn decode_mix_checkpoint(bytes: &[u8]) -> Option<MixCheckpoint> {
+    // magic(4) + config_hash(8) + n_objs(4) + crc(4)
+    if bytes.len() < 4 + 8 + 4 + 4 {
+        return None;
+    }
+    let crc_at = bytes.len() - 4;
+    let crc_stored = u32::from_le_bytes(bytes[crc_at..].try_into().ok()?);
+    if crate::corpus::store::crc32(&bytes[..crc_at]) != crc_stored {
+        return None;
+    }
+    let mut r = &bytes[..crc_at];
+    if read_u32(&mut r)? != MIX_CKPT_MAGIC {
+        return None;
+    }
+    let config_hash = read_u64(&mut r)?;
+    let n_objs = read_u32(&mut r)? as usize;
+    let mut objs = Vec::with_capacity(n_objs);
+    for _ in 0..n_objs {
+        let obj = read_f64(&mut r)?;
+        let mix = read_mix(&mut r)?;
+        objs.push((obj, mix));
+    }
+    let best_mix = read_mix(&mut r)?;
+    let n_core = read_u32(&mut r)? as usize;
+    let mut best_core = Vec::with_capacity(n_core);
+    for _ in 0..n_core {
+        best_core.push(read_f64(&mut r)?);
+    }
+    let best_k = read_f64(&mut r)?;
+    let best_val = read_f64(&mut r)?;
+    let best_iters = read_u64(&mut r)?;
+    let seeds_done = read_u64(&mut r)? as usize;
+    let reflections_done = read_u64(&mut r)? as usize;
+    let tunes_done = read_u64(&mut r)? as usize;
+    if !r.is_empty() {
+        return None;
+    }
+    Some(MixCheckpoint {
+        config_hash,
+        objs,
+        best_mix,
+        best_core,
+        best_k,
+        best_val,
+        best_iters,
+        seeds_done,
+        reflections_done,
+        tunes_done,
+    })
+}
+
+fn read_u32(r: &mut &[u8]) -> Option<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b).ok()?;
+    Some(u32::from_le_bytes(b))
+}
+
+fn read_u64(r: &mut &[u8]) -> Option<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b).ok()?;
+    Some(u64::from_le_bytes(b))
+}
+
+fn read_f64(r: &mut &[u8]) -> Option<f64> {
+    Some(f64::from_bits(read_u64(r)?))
+}
+
+fn read_mix(r: &mut &[u8]) -> Option<[f64; 4]> {
+    Some([read_f64(r)?, read_f64(r)?, read_f64(r)?, read_f64(r)?])
 }
 
 /// Format the meta-tuning status for the progress file.
@@ -506,7 +853,7 @@ mod tests {
     fn simplex_selects_on_held_out_objective() {
         let dir = unique_temp_dir("simplex-select");
         let (cache, meta) = build(&dir);
-        let (mix, result) = simplex_search(&cache, &meta, &cfg(7), None).expect("simplex");
+        let (mix, result) = simplex_search(&cache, &meta, &cfg(7), None, None).expect("simplex");
         let s: f64 = mix.iter().sum();
         assert!(
             (s - 1.0).abs() < 1e-6,
@@ -541,7 +888,8 @@ mod tests {
         let (cache, meta) = build(&dir);
 
         // The held-out objective at the simplex-chosen mix.
-        let (chosen_mix, chosen) = simplex_search(&cache, &meta, &cfg(13), None).expect("simplex");
+        let (chosen_mix, chosen) =
+            simplex_search(&cache, &meta, &cfg(13), None, None).expect("simplex");
 
         assert!(
             chosen.val_loss.is_finite(),
@@ -591,6 +939,215 @@ mod tests {
              best_mix=[0.4000,0.3000,0.2000,0.1000]\n\
              best_k=0.005700\n\
              best_val_loss=0.234567\n"
+        );
+    }
+
+    /// The meta-search checkpoint round-trips through the on-disk binary codec
+    /// bit-exactly — every `f64` (the simplex objectives, the best vertex's
+    /// objective/K, and its tuned core weights) survives `save → load` with an
+    /// identical bit pattern, which is what makes a resumed search select the
+    /// identical worst/best vertex as an uninterrupted one.
+    #[test]
+    fn mix_checkpoint_roundtrips_bit_exact() {
+        let dir = unique_temp_dir("mixckpt-roundtrip");
+        let c = MixCheckpoint {
+            config_hash: 0xDEAD_BEEF_1234_5678,
+            objs: vec![
+                (0.234_567_891_234, [0.25, 0.25, 0.25, 0.25]),
+                (0.198_765_432_109, [0.55, 0.15, 0.15, 0.15]),
+                (0.301_111_222_333, [0.15, 0.55, 0.15, 0.15]),
+            ],
+            best_mix: [0.55, 0.15, 0.15, 0.15],
+            best_core: vec![-50.25, 0.0, 7.0 / 3.0, 1e-9, -3.14159265358979],
+            best_k: 0.005_712_345_6,
+            best_val: 0.198_765_432_109,
+            best_iters: 4321,
+            seeds_done: 5,
+            reflections_done: 2,
+            tunes_done: 7,
+        };
+        let path = dir.join("search.mixckpt");
+        super::save_mix_checkpoint(&path, &c).expect("save");
+        let back = super::load_mix_checkpoint(&path).expect("load");
+        assert_eq!(back, c, "checkpoint must round-trip structurally");
+        // f64 fields must be bit-identical (not merely ≈) — pin via bits.
+        for (a, b) in back.objs.iter().zip(c.objs.iter()) {
+            assert_eq!(
+                a.0.to_bits(),
+                b.0.to_bits(),
+                "objective must be bit-identical"
+            );
+            for (x, y) in a.1.iter().zip(b.1.iter()) {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "mix proportion must be bit-identical"
+                );
+            }
+        }
+        assert_eq!(back.best_k.to_bits(), c.best_k.to_bits(), "K bit-identical");
+        assert_eq!(
+            back.best_val.to_bits(),
+            c.best_val.to_bits(),
+            "best_val bit-identical"
+        );
+        for (a, b) in back.best_core.iter().zip(c.best_core.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "core weight bit-identical");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A simplex search interrupted at an inner-tune boundary and then resumed
+    /// from its checkpoint produces a **bit-identical** final result to an
+    /// uninterrupted run: same chosen mix, same tuned weights, same K, same
+    /// held-out objective, same inner-tune iteration count. This is the
+    /// resume-equals-uninterrupted contract for the meta-search (the inner Adam
+    /// solve's own resume contract is covered by
+    /// `optimizer::resume_equals_uninterrupted`).
+    #[test]
+    fn simplex_resume_equals_uninterrupted() {
+        let dir = unique_temp_dir("simplex-resume");
+        let (cache, meta) = build(&dir);
+        let cfg = cfg(31);
+
+        // Uninterrupted full run (no checkpoint).
+        let (mix_full, res_full) =
+            super::simplex_search_impl(&cache, &meta, &cfg, None, None, None)
+                .expect("full run")
+                .expect("full run completes");
+
+        // Interrupted run: stop after 7 inner tunes (5 seeds + 2 reflections),
+        // writing the checkpoint.
+        let ckpt = dir.join("search.mixckpt");
+        let stopped = super::simplex_search_impl(&cache, &meta, &cfg, None, Some(&ckpt), Some(7))
+            .expect("stopped run");
+        assert!(
+            stopped.is_none(),
+            "stop_after must return None (interrupted)"
+        );
+        assert!(ckpt.exists(), "interrupted run must leave a checkpoint");
+
+        // Resume from the checkpoint and complete.
+        let (mix_resume, res_resume) =
+            super::simplex_search_impl(&cache, &meta, &cfg, None, Some(&ckpt), None)
+                .expect("resume run")
+                .expect("resume run completes");
+
+        // Identical chosen mix (bit-exact), tuned weights, K, objective, iters.
+        for (a, b) in mix_resume.iter().zip(mix_full.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "resumed mix must match uninterrupted"
+            );
+        }
+        assert_eq!(
+            res_resume.val_loss.to_bits(),
+            res_full.val_loss.to_bits(),
+            "resumed val_loss must match uninterrupted"
+        );
+        assert_eq!(
+            res_resume.k.to_bits(),
+            res_full.k.to_bits(),
+            "resumed K must match uninterrupted"
+        );
+        assert_eq!(
+            res_resume.iters, res_full.iters,
+            "resumed inner-tune iters must match uninterrupted"
+        );
+        let rc = res_resume.params.core_to_vec();
+        let fc = res_full.params.core_to_vec();
+        for (i, (a, b)) in rc.iter().zip(fc.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "resumed core weight[{i}] must match uninterrupted"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A checkpoint written under one config must NOT be resumed under a
+    /// different config (different seed here): its objectives were computed on a
+    /// different split and are incomparable. The mismatch is treated as a cold
+    /// start, so the resumed run equals a *fresh* full run under the new config —
+    /// not a corrupted blend of the two. Guards the unattended-re-run footgun of
+    /// reusing `--out-params` across configs.
+    #[test]
+    fn simplex_rejects_checkpoint_from_different_config() {
+        let dir = unique_temp_dir("simplex-cfg-mismatch");
+        let (cache, meta) = build(&dir);
+
+        // Write a checkpoint under seed 31 (stop partway so it persists).
+        let ckpt = dir.join("search.mixckpt");
+        let _ = super::simplex_search_impl(&cache, &meta, &cfg(31), None, Some(&ckpt), Some(7))
+            .expect("seed-31 partial run");
+        assert!(ckpt.exists(), "partial run must leave a checkpoint");
+
+        // "Resume" under a DIFFERENT seed (99): the stale checkpoint must be
+        // discarded, so the result equals a fresh seed-99 run from scratch.
+        let (mix_resume, res_resume) =
+            super::simplex_search_impl(&cache, &meta, &cfg(99), None, Some(&ckpt), None)
+                .expect("seed-99 resume")
+                .expect("completes");
+        let (mix_fresh, res_fresh) =
+            super::simplex_search_impl(&cache, &meta, &cfg(99), None, None, None)
+                .expect("seed-99 fresh")
+                .expect("completes");
+        for (a, b) in mix_resume.iter().zip(mix_fresh.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "stale-config checkpoint must be ignored (cold start under new config)"
+            );
+        }
+        assert_eq!(
+            res_resume.val_loss.to_bits(),
+            res_fresh.val_loss.to_bits(),
+            "stale-config checkpoint must not influence the new-config result"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `accept_reflection` is the Nelder–Mead trajectory driver: it replaces the
+    /// worst vertex iff the reflection strictly beats it, and reports acceptance.
+    /// A vertex that does not beat the worst is rejected and leaves the simplex
+    /// untouched.
+    #[test]
+    fn accept_reflection_replaces_only_on_strict_improvement() {
+        let mut objs = vec![
+            (0.30, [0.25, 0.25, 0.25, 0.25]),
+            (0.50, [0.55, 0.15, 0.15, 0.15]), // worst (index 1)
+            (0.40, [0.15, 0.55, 0.15, 0.15]),
+        ];
+
+        // Worse than the worst (0.60 > 0.50): rejected, simplex unchanged.
+        let before = objs.clone();
+        let accepted = super::accept_reflection(&mut objs, 1, 0.60, [0.1, 0.2, 0.3, 0.4]);
+        assert!(
+            !accepted,
+            "a reflection worse than the worst must be rejected"
+        );
+        assert_eq!(
+            objs, before,
+            "a rejected reflection must not mutate the simplex"
+        );
+
+        // Tie (0.50 == 0.50): NOT a strict improvement → rejected.
+        let accepted = super::accept_reflection(&mut objs, 1, 0.50, [0.1, 0.2, 0.3, 0.4]);
+        assert!(
+            !accepted,
+            "a reflection tying the worst must be rejected (strict <)"
+        );
+        assert_eq!(objs, before, "a tie must not mutate the simplex");
+
+        // Better than the worst (0.45 < 0.50): accepted, replaces index 1.
+        let accepted = super::accept_reflection(&mut objs, 1, 0.45, [0.7, 0.1, 0.1, 0.1]);
+        assert!(accepted, "a reflection beating the worst must be accepted");
+        assert_eq!(
+            objs[1],
+            (0.45, [0.7, 0.1, 0.1, 0.1]),
+            "an accepted reflection must replace the worst slot"
         );
     }
 }

@@ -1,10 +1,12 @@
 //! Adam + early-stop + checkpoint/resume + coordinate-descent cross-check
 //! (ADR-0037 §5/§10 R1/R3).
 //!
-//! The Adam solve runs on the cached sparse features at frozen K. Each
-//! iteration is one full-batch epoch over `split.train` (the gradient is summed
-//! across the streamed chunks, then one Adam update is applied), so the run is
-//! deterministic and resumable without any per-step RNG. Stopping = held-out
+//! The Adam solve runs on the cached sparse features at frozen K. The train and
+//! held-out records are deserialized into memory ONCE (a single streaming pass,
+//! [`load_split_records`]) and reused across every epoch; each iteration is one
+//! full-batch epoch over those in-memory train records (the gradient is summed
+//! over them, then one Adam update is applied), so the run is deterministic and
+//! resumable without any per-step RNG. Stopping = held-out
 //! plateau (patience, restore-best) ∧ integer-quantization floor ∧ max-iter
 //! backstop. Checkpoints are atomic (temp → fsync → rename) so a SIGKILL costs
 //! at most one optimizer step and resume is bit-identical.
@@ -250,6 +252,16 @@ pub fn tune(
     let train_set: HashSet<u32> = split.train.iter().copied().collect();
     let val_set: HashSet<u32> = split.val.iter().copied().collect();
 
+    // Load the train + held-out records into memory ONCE (single streaming pass)
+    // and reuse them across every epoch. The previous design re-streamed and
+    // re-deserialized the entire on-disk cache on every epoch — both for the
+    // gradient and each held-out eval — which on a multi-million-position cache
+    // dominated runtime (×max_iter epochs ×inner tunes; the meta-tune
+    // post-mortem, docs/milestones/meta-tune-postmortem.md). Iterating the
+    // records in memory is bit-identical: the gradient/loss see the same records
+    // in the same cache order.
+    let (train_recs, val_recs) = load_split_records(cache, &train_set, &val_set)?;
+
     // Restore-or-cold-start the full state.
     let mut state = match resume {
         Some(c) => c,
@@ -276,7 +288,7 @@ pub fn tune(
     // checkpoint's `val_hist` (which already carries that iter-0 entry), so the
     // resumed best selection is bit-identical to an uninterrupted run.
     if state.val_hist.is_empty() {
-        let init_val = held_out_loss(cache, &val_set, &state.w, state.k)?;
+        let init_val = held_out_loss(&val_recs, &state.w, state.k);
         state.val_hist.push(init_val);
     }
     let mut best_val = state.val_hist.iter().copied().fold(f64::INFINITY, f64::min);
@@ -292,9 +304,10 @@ pub fn tune(
     let mut plateau_fired = false;
 
     while state.iter < cfg.max_iter {
-        // One full-batch epoch: sum the gradient over every train record.
+        // One full-batch epoch: sum the gradient over every (in-memory) train
+        // record at the current weights / frozen K.
         let mut grad = vec![0.0f64; n_core];
-        accumulate_train_gradient(cache, &train_set, &state.w, state.k, &cfg.reg, &mut grad)?;
+        let _ = loss_and_grad(&train_recs, &state.w, state.k, &cfg.reg, &mut grad);
 
         // Adam update.
         state.iter += 1;
@@ -312,7 +325,7 @@ pub fn tune(
         // Periodic held-out eval + stopping checks.
         let do_eval = state.iter % cfg.eval_every == 0 || state.iter == cfg.max_iter;
         if do_eval {
-            let val = held_out_loss(cache, &val_set, &state.w, state.k)?;
+            let val = held_out_loss(&val_recs, &state.w, state.k);
             state.val_hist.push(val);
 
             if val + 1e-12 < best_val {
@@ -369,7 +382,7 @@ pub fn tune(
     } else {
         &state.w
     };
-    let final_loss = held_out_loss(cache, &val_set, final_w, state.k)?;
+    let final_loss = held_out_loss(&val_recs, final_w, state.k);
 
     Ok(TuneResult {
         params: init.with_core(final_w),
@@ -390,31 +403,39 @@ fn maybe_checkpoint(cfg: &TuneConfig, state: &Checkpoint) -> Result<(), TexelErr
     Ok(())
 }
 
-/// Sum the full-batch gradient over the train records at weights `w` / scaling
-/// `k`, including the regularization grad (added once, by the loss module).
-fn accumulate_train_gradient(
+/// Stream the on-disk cache ONCE and partition its records into the train and
+/// held-out subsets, each preserving cache order. Called a single time per
+/// [`tune`] so the epoch loop iterates the records in memory instead of
+/// re-streaming + re-deserializing the whole cache every epoch (the meta-tune
+/// perf bug — see the module header / post-mortem). `split.train` / `split.val`
+/// are disjoint by construction (group-by-game split, or the mixture reweight's
+/// per-source subsample of the train pool), so a record falls into at most one
+/// set; a record in neither (a reweight-subsampled-out train-pool position) is
+/// skipped. Iterating these vectors yields a bit-identical gradient/loss to the
+/// previous per-epoch streaming because the record sequence is identical.
+fn load_split_records(
     cache: &Path,
     train_set: &HashSet<u32>,
-    w: &[f64],
-    k: f64,
-    reg: &Reg,
-    grad: &mut [f64],
-) -> Result<(), TexelError> {
+    val_set: &HashSet<u32>,
+) -> Result<(Vec<CachedRec>, Vec<CachedRec>), TexelError> {
+    let mut train: Vec<CachedRec> = Vec::with_capacity(train_set.len());
+    let mut val: Vec<CachedRec> = Vec::with_capacity(val_set.len());
     let mut idx: u32 = 0;
-    let mut train: Vec<CachedRec> = Vec::new();
     for chunk in stream_chunks(cache, 65_536) {
         for rec in chunk {
             if train_set.contains(&idx) {
                 train.push(rec);
+            } else if val_set.contains(&idx) {
+                val.push(rec);
             }
             idx += 1;
         }
     }
-    let _ = loss_and_grad(&train, w, k, reg, grad);
-    Ok(())
+    Ok((train, val))
 }
 
-/// Mean held-out MSE at weights `w` / scaling `k`.
+/// Mean held-out MSE at weights `w` / scaling `k` over the in-memory held-out
+/// records.
 ///
 /// Scores on the continuous (un-rounded) cached score, so the held-out
 /// objective tracks the smooth surface the Adam gradient minimizes: a float
@@ -422,34 +443,29 @@ fn accumulate_train_gradient(
 /// plateau / restore-best logic sees the true convergence trajectory rather
 /// than integer-quantization noise. The separate integer-quantization-floor
 /// stop (`round(w)` stable) is what enforces deployment-faithful rounding.
-fn held_out_loss(
-    cache: &Path,
-    val_set: &HashSet<u32>,
-    w: &[f64],
-    k: f64,
-) -> Result<f64, TexelError> {
-    let mut idx: u32 = 0;
-    let mut sum = 0.0f64;
-    let mut n = 0usize;
-    for chunk in stream_chunks(cache, 65_536) {
-        for rec in &chunk {
-            if val_set.contains(&idx) {
-                let mut s = rec.base as f64;
-                for &(j, c) in rec.coeffs.iter() {
-                    s += c as f64 * w[j as usize];
-                }
-                let pred = sigmoid(k * s);
-                let label = Label::from_u8(rec.label)
-                    .expect("valid label byte")
-                    .as_f64();
-                let d = label - pred;
-                sum += d * d;
-                n += 1;
-            }
-            idx += 1;
-        }
+fn held_out_loss(val_recs: &[CachedRec], w: &[f64], k: f64) -> f64 {
+    if val_recs.is_empty() {
+        // Sentinel for a degenerate (empty) held-out set — same as the old
+        // streaming form's `n == 0` guard. Callers feed a non-empty val split
+        // (`split_by_game` with a non-zero `val_fraction`); an all-empty val
+        // would make a tune a silent no-op, which `adam_recovers_known_optimum`
+        // catches (its `val_loss < initial` assertion fails when both are 0.0).
+        return 0.0;
     }
-    Ok(if n == 0 { 0.0 } else { sum / n as f64 })
+    let mut sum = 0.0f64;
+    for rec in val_recs {
+        let mut s = rec.base as f64;
+        for &(j, c) in rec.coeffs.iter() {
+            s += c as f64 * w[j as usize];
+        }
+        let pred = sigmoid(k * s);
+        let label = Label::from_u8(rec.label)
+            .expect("valid label byte")
+            .as_f64();
+        let d = label - pred;
+        sum += d * d;
+    }
+    sum / val_recs.len() as f64
 }
 
 /// Logistic sigmoid, clamped (mirrors `objective`'s clamp).

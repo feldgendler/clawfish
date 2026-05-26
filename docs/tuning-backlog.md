@@ -266,4 +266,55 @@ Run order is forced (not a preference): **A first** — it is M6.I's committed d
 
 ---
 
+### Corpus-mixture meta-tune (post-M6.I) — RE-RUN PRECONDITIONS (campaign aborted 2026-05-26)
+
+**Status.** A first attempt to beat `M6.I` via a corpus-mixture meta-tune
+(`texel-tune mixture`: bi-level Nelder–Mead over the four lane proportions, inner
+Adam Texel solve per candidate, warm-started from `M6.I`) was launched on a 16M
+corpus rebuilt under dedup-against-committed (II) and **aborted after ~9 h
+without completing**. Full post-mortem: [`../milestones/meta-tune-postmortem.md`](../milestones/meta-tune-postmortem.md).
+The infra it spun off shipped CI-green (corpus (II)+extend `25b943e`,
+suspend-tolerant watchdog `c8f2cb7`, meta-tune observability `5caf723`).
+
+**Two of the four root causes are now fixed in-tree** (so this is a *re-run*, not
+a from-scratch campaign):
+
+- Inner optimizer no longer re-streams the on-disk cache every epoch
+  (`optimizer::load_split_records` — records loaded once, iterated in memory).
+  Order-of-magnitude inner-tune speedup; behaviour-preserving (bit-identical).
+- `mixture::simplex_search` now checkpoints after every inner tune
+  (`<out-params>.mixckpt`, bit-exact binary codec) and resumes — a kill/suspend
+  no longer forfeits the run.
+- Observability already shipped (`5caf723`): per-epoch log + `<out-params>.progress`.
+
+**Still open before re-running (do these first):**
+
+1. **Cap the inner-tune `--max-iter` low** (e.g. 100–200). The headline reason
+   the run ballooned: full-batch held-out loss is too smooth for `patience=5`
+   (absolute `1e-12` improvement test) or the integer-quantization floor to fire,
+   so each inner tune ran toward `max-iter=1000`. The warm start from `M6.I` is
+   near-optimal ⇒ inner tunes need few epochs. **Cheapest, highest-leverage
+   lever.** Optionally also a *relative*-improvement patience threshold and/or
+   minibatch/subsample for honest early-stop. Validate the chosen mix is stable
+   vs a longer run on a small corpus before trusting the cap.
+2. **(Optional) parallelize the five seed-vertex inner tunes** — they are
+   independent (reflections are sequential). A deterministic parallel seed phase
+   would cut wall-clock further.
+
+**Re-run recipe.** Build a release binary that includes the above (and the
+already-landed perf/checkpoint/observability code); launch `texel-tune mixture`
+at background QoS + `nice` with the low `--max-iter`; watch
+`<out-params>.progress` and the `.mixckpt`. Confirm the winning mix by mixed-TC
++ virtual-clock SPRT vs the `M6.I` tag; ship only if it beats `M6.I` (+93.86).
+
+**Hard rejection / decay.** Same opportunity-cost decay as the other pre-M11
+eval items: NNUE (M11) re-trains the eval from scratch and obsoletes the
+classical-weight mixture. A pre-M11 opportunity only; deprioritize as M11
+approaches.
+
+**Cross-references.** [`../milestones/meta-tune-postmortem.md`](../milestones/meta-tune-postmortem.md);
+ADR-0037 §8 (bi-level mixture); `src/texel/mixture.rs` / `src/texel/optimizer.rs`.
+
+---
+
 *Active queue ends here. New items append above this line.*
