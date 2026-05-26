@@ -293,6 +293,34 @@ pub(crate) fn send_line(h: &mut EngineHandle, line: &str) -> Result<(), HarnessE
         .map_err(HarnessError::Io)
 }
 
+/// Slack below which a short `recv_timeout` is treated as a genuine watchdog
+/// expiry rather than a suspend. The watchdog measures elapsed time with the
+/// monotonic, **suspend-excluding** `Instant` clock (macOS `mach_absolute_time`,
+/// Linux `CLOCK_MONOTONIC`). If `recv_timeout` returns `Timeout` but the
+/// monotonic clock shows it consumed materially LESS than the wait we asked for,
+/// the timeout fired early because the process was SUSPENDED (machine sleep /
+/// lid close) — the channel timeout counted frozen wall-time the monotonic clock
+/// did not. That gap must exceed this slack (above scheduler jitter / spurious
+/// wakeups) to count as a suspend.
+///
+/// Why monotonic time and not the engine's CPU "virtual clock": the only
+/// realistic engine hang here is a runaway/infinite search loop, which accrues
+/// active time; clawfish's search is single-threaded (no lock deadlock), the
+/// harness drains stdout (no full-pipe block), and the SPRT is local (no I/O
+/// stall) — so there is no no-CPU hang to miss. Monotonic time also still
+/// advances while the system is awake, so it would even catch a hypothetical
+/// stall that a pure CPU-time clock would sleep through. (Revisit once parallel
+/// search — M10 — introduces real threads/locks.)
+const SUSPEND_SLACK: Duration = Duration::from_secs(2);
+
+/// `true` iff a `recv_timeout(requested)` that returned `Timeout` did so because
+/// the process was suspended rather than because the watchdog genuinely expired:
+/// the monotonic time actually elapsed (`monotonic_elapsed`) fell short of
+/// `requested` by more than [`SUSPEND_SLACK`]. Pure, for testability.
+fn timeout_was_suspend(requested: Duration, monotonic_elapsed: Duration) -> bool {
+    matches!(requested.checked_sub(monotonic_elapsed), Some(gap) if gap > SUSPEND_SLACK)
+}
+
 /// Drain the engine's output channel until `bestmove` arrives or an error
 /// condition fires. Updates `h.last_info` as `Info` lines flow through.
 pub(crate) fn recv_until_bestmove(
@@ -322,7 +350,9 @@ pub(super) fn recv_until_bestmove_inner(
         if remaining.is_zero() {
             return Err(HarnessError::Watchdog);
         }
-        match rx.recv_timeout(remaining) {
+        let waited = Instant::now();
+        let recv = rx.recv_timeout(remaining);
+        match recv {
             Ok(EngineLine::Bestmove { uci, ponder }) => {
                 return Ok(BestMoveOutcome { uci, ponder });
             }
@@ -342,7 +372,17 @@ pub(super) fn recv_until_bestmove_inner(
             }
             Ok(EngineLine::Eof) => return Err(HarnessError::EngineExit),
             Ok(EngineLine::Other(_)) => {} // pass-through; ignore
-            Err(mpsc::RecvTimeoutError::Timeout) => return Err(HarnessError::Watchdog),
+            // A timeout is a genuine watchdog expiry UNLESS the process was
+            // suspended (lid close): `recv_timeout` then fired early on frozen
+            // wall-time that the suspend-excluding `Instant` clock did not
+            // count. Re-loop in that case — the unchanged `Instant` deadline
+            // still grants the engine its full remaining (active) budget.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if timeout_was_suspend(remaining, waited.elapsed()) {
+                    continue;
+                }
+                return Err(HarnessError::Watchdog);
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err(HarnessError::EngineExit),
         }
     }
@@ -373,7 +413,9 @@ pub(super) fn wait_for_uciok_inner(
         if remaining.is_zero() {
             return Err(HarnessError::Watchdog);
         }
-        match rx.recv_timeout(remaining) {
+        let waited = std::time::Instant::now();
+        let recv = rx.recv_timeout(remaining);
+        match recv {
             Ok(EngineLine::Other(s)) if s.trim() == "uciok" => return Ok(caps),
             Ok(EngineLine::Other(s)) => {
                 // Inspect each non-uciok line for option advertisements.
@@ -384,7 +426,14 @@ pub(super) fn wait_for_uciok_inner(
                 }
             }
             Ok(EngineLine::Eof) => return Err(HarnessError::EngineExit),
-            Err(mpsc::RecvTimeoutError::Timeout) => return Err(HarnessError::Watchdog),
+            // Suspend (lid close) ⇒ re-loop; genuine expiry ⇒ Watchdog. See the
+            // `recv_until_bestmove_inner` timeout arm + `timeout_was_suspend`.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if timeout_was_suspend(remaining, waited.elapsed()) {
+                    continue;
+                }
+                return Err(HarnessError::Watchdog);
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err(HarnessError::EngineExit),
             _ => {} // discard info lines, etc.
         }
@@ -529,6 +578,31 @@ mod tests {
         let err =
             recv_until_bestmove_inner(&rx, &mut last_info, Duration::from_millis(100)).unwrap_err();
         assert!(matches!(err, HarnessError::Watchdog), "got {err:?}");
+    }
+
+    #[test]
+    fn timeout_was_suspend_distinguishes_sleep_from_expiry() {
+        // Genuine expiry: monotonic clock shows ~the full requested wait → fire.
+        assert!(!timeout_was_suspend(
+            Duration::from_secs(60),
+            Duration::from_secs(60)
+        ));
+        // Scheduler jitter / spurious wakeup within SUSPEND_SLACK (1.5s < 2s).
+        assert!(!timeout_was_suspend(
+            Duration::from_secs(60),
+            Duration::from_millis(58_500)
+        ));
+        // recv_timeout fired but the monotonic (suspend-excluding) clock barely
+        // advanced → the process was suspended (lid close) → re-loop, not expiry.
+        assert!(timeout_was_suspend(
+            Duration::from_secs(60),
+            Duration::from_secs(3)
+        ));
+        // Monotonic elapsed >= requested (clock skew / overshoot) → not a suspend.
+        assert!(!timeout_was_suspend(
+            Duration::from_secs(60),
+            Duration::from_secs(61)
+        ));
     }
 
     #[test]
