@@ -34,8 +34,12 @@ fuzz/artifacts/
 /target/corpus-campaign.log
 
 # texel-tune scratch outputs: the transient feature cache (can reach GBs), the
-# meta-tune resume checkpoint, and the human-readable progress file. All
-# regenerable from the lanes + the recorded campaign command; never tracked.
+# meta-tune resume checkpoint, the human-readable progress file, and the
+# `texel-tune apply`-input params JSON. All regenerable from the lanes + the
+# recorded campaign command; the source of truth post-apply is `src/eval/data.rs`
+# (the rewritten `TEXEL-TUNABLE` regions), so the JSON is intermediate scratch
+# and never tracked.
 /bench/*.mixcache
 /bench/*.mixckpt
 /bench/*.progress
+/bench/*.json

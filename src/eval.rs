@@ -465,12 +465,13 @@ mod tests {
         );
         assert_eq!(
             evaluate(&pos_white_pawn_missing),
-            -50,
-            "white missing e2 pawn: evaluate must be -50 cp. \
-            Through M6.F this was -67 (material+PST only: MG material 82 + \
-            PST[e2^56=52]=-15 → net 67, pawn down). At the M6.I tuned ship the \
-            now-live positional terms (mobility, etc.) net the missing-e2 \
-            asymmetry to -50; sign still correct (white down a pawn)."
+            -54,
+            "white missing e2 pawn: evaluate must be -54 cp. \
+            Through M6.F this was -67 (material+PST only); at M6.I the now-live \
+            positional terms (mobility, etc.) net the missing-e2 asymmetry to \
+            -50. At M6.J the cold-start retune on the new non-uniform corpus \
+            mix shifted the positional weights, landing the same asymmetry at \
+            -54 — sign still correct (white down a pawn)."
         );
     }
 

@@ -282,6 +282,19 @@ fn play_one_game(
     rng: &mut Prng,
     stop: &Arc<AtomicBool>,
 ) -> Option<GameRecord> {
+    // R3 hardening: enforce the "this game starts with cold searcher state"
+    // contract by construction, so the output depends ONLY on (game_id, depth,
+    // opening_mode, seed) and not on whatever TT / history / killers /
+    // pawn-hash entries linger from a prior `play_one_game` on the same
+    // `&mut` searchers. `selfplay::run` already constructs fresh searchers per
+    // game; this reset makes the *inner* function honour the same invariant
+    // unconditionally, so `fresh_vs_warm_searcher_same_seed_same_game_identical`
+    // is true by construction rather than by lucky search-state alignment at a
+    // particular eval landscape (which is how it passed at M6.I and broke at
+    // M6.J once the weights shifted the search trajectory).
+    *searcher = AlphaBetaMover::new();
+    *qsearcher = QSearcher::new();
+
     // Opening seed: `Book` mode samples from the vendored book (which
     // MUST be loaded — the CLI rejects `Book + book = None` before we
     // reach here); `Random` mode starts from the startpos. Every record
