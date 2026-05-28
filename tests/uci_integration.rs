@@ -1119,14 +1119,19 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
     // pawns, outposts, rook-file, king shield, ISO/DBL/BWD, CONN rescale) were
     // zeroed inert through M6.B–M6.F, so the anchor sat at `90_591` (byte-equal
     // to the M6.B CONN-only build). The M6.I Texel tune (SPRT-validated +93.9
-    // Elo vs M6.F) activates them, so the depth-4 bench moved to `111_498`.
-    // Per the roadmap bench-node-count policy this is a determinism anchor, not
-    // a no-regression signal.
-    // History: M6.B–F `90_591`; score-neutral M6.B/M6.A `94_501`; M5.F `89_080`.
-    const M6I_DEPTH4_BENCH_NODES: u64 = 111_498;
+    // Elo vs M6.F) activates them, so the depth-4 bench moved to `111_498`. The
+    // M6.J candidate cold-start retune (full Nelder–Mead meta-tuner over the
+    // M6.H2 16M-position corpus, mix `[0.32, 0.15, 0.23, 0.31]`) shifts the
+    // tuned weights and moves the anchor to `112_497`, pending the operator's
+    // SPRT vs M6.I (ADR-0037 §9; if H1-reject the apply reverts and the pin
+    // goes back to `111_498`). Per the roadmap bench-node-count policy this is
+    // a determinism anchor, not a no-regression signal.
+    // History: M6.I `111_498`; M6.B–F `90_591`; score-neutral M6.B/M6.A
+    // `94_501`; M5.F `89_080`.
+    const M6J_DEPTH4_BENCH_NODES: u64 = 112_497;
     assert_eq!(
-        nodes1, M6I_DEPTH4_BENCH_NODES,
-        "E51: bench node count changed from the M6.I pin ({M6I_DEPTH4_BENCH_NODES} at depth=4); \
+        nodes1, M6J_DEPTH4_BENCH_NODES,
+        "E51: bench node count changed from the M6.J pin ({M6J_DEPTH4_BENCH_NODES} at depth=4); \
          re-pin if intentional; got {nodes1}"
     );
 }
