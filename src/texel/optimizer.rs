@@ -224,6 +224,7 @@ pub struct TuneConfig {
 }
 
 /// The tune result: tuned params + the fitted K + the final held-out objective.
+#[derive(Clone)]
 pub struct TuneResult {
     /// Best (restore-best) tuned parameters.
     pub params: EvalParams,
