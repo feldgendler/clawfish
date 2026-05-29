@@ -538,6 +538,14 @@ Elo calibration vs Stockfish           →  step 12, at milestone close, after S
 
 Total wallclock for the step-12 block at a milestone close is several hours; the gates do not parallelize. Running them in parallel saves no clock time once the contaminated runs are re-done.
 
+### Chaining unattended step-12 gates — process-exit, not log-content
+
+When the user kicks off a step-12 sequence and walks away (overnight, "do all three"), the **chain must auto-advance on process exit, not on the orchestrator polling log content**. M6.J close hit this footgun: the agent armed a Monitor on the SPRT log filtered for `sprt: verdict=H[01]`, the SPRT exhausted `SPRT_GAMES` and emitted `sprt: verdict=continue` instead, the filter did not match, and Tasks #35 (Elo) and #36 (WAC+STS) stayed unstarted for ~7 h until the operator woke up and asked.
+
+**Rule:** for any unattended chain of step-12 gates, encode the sequence in a single nohup'd bash script — `sprt.sh && elo-iterate.sh && epd-suite.sh wac && epd-suite.sh sts` — so each successor fires on `$?==0` of its predecessor. The chain script logs to one file the agent can tail; the agent's job is to react when the chain script itself exits, not to dispatch each gate manually.
+
+If a log-content Monitor must be used at all, its filter has to cover **every terminal state**, not just the happy path. For SPRT specifically the terminal verdicts are `H1`, `H0`, **and `continue` on the final games-cap line** (the cap-hit-with-no-decision case is a real outcome — verdict ladder ADR-0037 §9 applies CI-based rungs to it). Pair the Monitor with either (a) a `wait $!` on the script PID or (b) a ScheduleWakeup heartbeat that verifies the process is still alive — a silent Monitor is not evidence of running work.
+
 ## Resource contention discipline
 
 **Background-load-sensitive workloads run strictly sequentially on this machine, never in parallel — with each other or with any other CPU-heavy job.** The rule is load-bearing for both **measurement validity** (CPU contention depresses fixed-`movetime` metrics in ways that mimic real regressions) and **OOM safety** (running SPRT alongside `cargo mutants` has hit memory pressure on the dev machine in the past — `cargo mutants` spawns N parallel test workers, each of which builds and links the crate, and stacks badly with `elo-iterate`'s N concurrent engine subprocesses).

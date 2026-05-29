@@ -62,6 +62,43 @@ Per roadmap §"Same-campaign re-baseline required" (RUN ALONE, sandbox-disabled,
 
 Live-term vs `M6.B` (same campaign): WAC **−2** (flat, ±2 band). STS **+151 credit** (≫ ±68 — real). Per-theme (claimed pawn-advancement group): #9 "Advancement of a/b/c pawns" 542→600 = **+58**; #13 "Pawn Play in the Center" 639→645 +6; #8 "AKPC" 536→525 −11 (within per-theme noise); #11 "King Activity" 526→601 = **+75** (the king-tropism sub-term's direct target). Only notable negative #10 "Simplification" 710→648 −62 (not a claimed theme; within per-theme noise; aggregate +151 dwarfs it). **Diagnostic conclusion: the literature passed-pawn term is directionally correct — it lifts exactly the themes it claims — but mis-*scaled* not mis-*designed* (it SPRT-regressed via TC-localized over-magnitude; ADR-0032 §8). This is the M6.I "reshape, don't delete" corroboration.** Discharges the M6.B watch-item (2): M6.B's same-campaign 271 WAC / 9640 STS is now on record.
 
+### M6.J same-campaign re-baseline — 2026-05-29
+
+Per roadmap §"Same-campaign re-baseline required" (RUN ALONE, sandbox-disabled, `--movetime 1000 --concurrency 4`, Apple M4). M6.I row produced by `scripts/epd-suite.sh backfill M6.I` on the same machine state immediately after the M6.J HEAD run. M6.J is the production-HEAD measurement (post-`f390b46` cold-start apply). This is the first M6-era same-campaign re-baseline since M6.E's rejected-config diagnostic (M6.F–H carried score-neutral or no-engine-touch landings ⇒ same-campaign EPD was moot until eval shifted again at M6.J).
+
+| Milestone | Baseline tag | WAC (solved/300) | WAC % | STS (credit/15000) | STS % | STS-Elo |
+|---|---|---:|---:|---:|---:|---:|
+| M6.I (re-baseline, same campaign) | `M6.I` | 271 | 90.3% | 10260 | 68.4% | 2803 |
+| **M6.J (HEAD)** | HEAD | **270** | **90.0%** | **10362** | **69.1%** | **2833** |
+
+M6.J vs `M6.I` (same campaign): WAC **−1** (flat, ±2 band). STS **+102 credit / +30 STS-Elo** (≫ ±68 noise — **decisive aggregate positive**). Corroborates the SPRT pentanomial CI **+41.01 Elo [+18.26, +64.12]** (rung-1 ship per ADR-0037 §9). Per-theme:
+
+| # | Theme | M6.I | M6.J | Δ |
+|---|---|---:|---:|---:|
+| 1 | Undermine | 800 | 762 | **−38** |
+| 2 | Open Files and Diagonals | 683 | 693 | +10 |
+| 3 | Knight Outposts | 701 | 709 | +8 |
+| 4 | Square Vacancy | 729 | 690 | **−39** |
+| 5 | Bishop vs Knight | 713 | 734 | +21 |
+| 6 | Recapturing | 772 | 779 | +7 |
+| 7 | Offer of Simplification | 620 | 685 | **+65** |
+| 8 | AKPC | 590 | 628 | **+38** |
+| 9 | Advancement of a/b/c pawns | 625 | 583 | **−42** |
+| 10 | Simplification | 666 | 706 | **+40** |
+| 11 | King Activity | 517 | 555 | **+38** |
+| 12 | Center Control | 732 | 742 | +10 |
+| 13 | Pawn Play in the Center | 771 | 762 | −9 |
+| 14 | 7th Rank | 758 | 753 | −5 |
+| 15 | AT | 583 | 581 | −2 |
+
+Strong movers up (≥+38): **Offer of Simplification +65, Simplification +40, AKPC +38, King Activity +38**, Bishop vs Knight +21. Strong movers down (≤−38): **a/b/c Advancement −42, Square Vacancy −39, Undermine −38**.
+
+The **King Activity +38 and AKPC +38** results are notable because King Activity remains the lowest-absolute theme (555/1000) but moved the correct direction despite M6.J inheriting M6.I's structural exclusion of the king-safety attacker-count S-curve (units ≡ 0 ⇒ `KING_SAFETY_TABLE[0]` is the only reachable cell ⇒ table dead by construction; `tuning-backlog.md`). The cold-start retune found a different local optimum on the *linear* king terms (shield + open/semi-files + king-PST blend in the M6 PST) that lifted the king-related themes via second-order effects.
+
+The **a/b/c Advancement −42** loss is the largest negative — aligned with the M6.I-flagged counterintuitive passed-pawn term shapes (`ISO_MG=+5`, negative early-rank `PASSED_MG`) that the cold-start retune likely reproduced. A **sign/monotonicity-constrained Texel retune** (`tuning-backlog.md`) is the principled fix.
+
+Absolute STS totals vary ±4% across campaigns per the documented variance — the *same-campaign* delta computed here is the valid measure; M6.I's 10260 here is this campaign's re-baseline, not comparable to other-campaign figures.
+
 ### M6.E same-campaign re-baseline — 2026-05-19 (rejected-config diagnostic)
 
 Per roadmap §"Same-campaign re-baseline required" (RUN ALONE, sandbox-disabled, `--movetime 1000 --concurrency 4`, Apple M4; the M6.C-precedent params). **Caveat:** this campaign measured the **live literature-default (rejected) king-safety config**, not the shipped artifact — M6.E ships **score-neutral** (all 13 king-safety weights zeroed; `evaluate` byte-identical to `M6.D`), so the shipped build's WAC/STS == `M6.D`'s by construction and there is no per-theme delta to gate (the M6.B/C/D "rejected-config EPD no longer applies to the shipped build" precedent — the secondary gate is moot). M6.E ran **no SPRT screen ladder** (ADR-0033 §8); this is the one cheap M6.I directional-brief substitute the plan committed to. Patch-faithfulness confirmed: live-default `bench 1102432` ≠ M6.D shipped `1213649` ⇒ the literature term is genuinely active.
