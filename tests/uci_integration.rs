@@ -1122,18 +1122,17 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
     // Elo vs M6.F) activates them, so the depth-4 bench moved to `111_498`. The
     // M6.J candidate cold-start retune (full Nelder–Mead meta-tuner over the
     // M6.H2 16M-position corpus, mix `[0.32, 0.15, 0.23, 0.31]`) shifted the
-    // anchor to `112_497`. M6.K activates the king-safety attacker S-curve to
-    // the literature CPW values (ADR-0038), changing eval scores ⇒ search
-    // cutoffs ⇒ the depth-4 bench moves to `117_941`, pending the operator's
-    // stage-1 SPRT vs M6.J (if rung-4 revert, the activation reverts and the
-    // pin goes back to `112_497`). Per the roadmap bench-node-count policy this
-    // is a determinism anchor, not a no-regression signal.
-    // History: M6.J `112_497`; M6.I `111_498`; M6.B–F `90_591`; score-neutral
-    // M6.B/M6.A `94_501`; M5.F `89_080`.
-    const M6K_DEPTH4_BENCH_NODES: u64 = 117_941;
+    // anchor to `112_497`. M6.K activated the king-safety attacker S-curve at
+    // g=1 (→ `117_941`) and g=0.5 (→ `113_158`); both SPRT probes regressed vs
+    // M6.J, so the S-curve was removed entirely and the eval returns to M6.J's
+    // `112_497`. Per the roadmap bench-node-count policy this is a determinism
+    // anchor, not a no-regression signal.
+    // History: M6.K-g0.5 `113_158`; M6.K-g1 `117_941`; M6.J `112_497`;
+    // M6.I `111_498`; M6.B–F `90_591`; M5.F `89_080`.
+    const M6J_DEPTH4_BENCH_NODES: u64 = 112_497;
     assert_eq!(
-        nodes1, M6K_DEPTH4_BENCH_NODES,
-        "E51: bench node count changed from the M6.K pin ({M6K_DEPTH4_BENCH_NODES} at depth=4); \
+        nodes1, M6J_DEPTH4_BENCH_NODES,
+        "E51: bench node count changed from the M6.J pin ({M6J_DEPTH4_BENCH_NODES} at depth=4); \
          re-pin if intentional; got {nodes1}"
     );
 }

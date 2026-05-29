@@ -4,14 +4,12 @@
 //! [`EvalParams`] carries the FULL tunable eval surface as runtime fields,
 //! mirroring `eval::data` array-for-array. The [`layout`](crate::texel::layout)
 //! linear-core groups live here as the live values to be tuned; the
-//! excluded/outer fields (the 4 king-attack multipliers, the 100-entry S-curve
-//! table, the 3 scale numerators) are carried so a round-trip is total, but
-//! they are NOT part of the core vector — they are held at `shipped()` (the
-//! S-curve + multipliers are frozen, the scale numerators are outer-swept).
+//! outer-swept fields (the 3 scale numerators) are carried for total round-trips
+//! but are NOT part of the core vector. The attacker S-curve was removed after
+//! both M6.K SPRT probes regressed (ADR-0038).
 //!
 //! [`shipped`] reads the current `eval::data` const values so this struct is
-//! the single source of truth (CONN is live / non-zero; every other deferred
-//! term is zero — the M6.F production state).
+//! the single source of truth (M6.J production weights).
 
 use std::path::Path;
 
@@ -120,18 +118,6 @@ pub struct EvalParams {
     /// Rook-on-semi-open-file EG bonus.
     pub rook_semi_open_file_eg: f64,
 
-    // ----- Excluded: king-safety S-curve + attacker multipliers (frozen) -----
-    /// King-zone attacker-unit multiplier, knight (frozen at shipped).
-    pub king_attack_weight_n: f64,
-    /// King-zone attacker-unit multiplier, bishop (frozen at shipped).
-    pub king_attack_weight_b: f64,
-    /// King-zone attacker-unit multiplier, rook (frozen at shipped).
-    pub king_attack_weight_r: f64,
-    /// King-zone attacker-unit multiplier, queen (frozen at shipped).
-    pub king_attack_weight_q: f64,
-    /// 100-entry king-safety S-curve table (frozen at shipped).
-    pub king_safety_table: [f64; 100],
-
     // ----- Outer-swept: endgame-scale numerators (not in core vec) -----
     /// OCB-with-pawns draw-scale numerator (outer-swept).
     pub ocb_with_pawns_scale: f64,
@@ -190,12 +176,6 @@ impl EvalParams {
             rook_open_file_eg: data::ROOK_OPEN_FILE_EG as f64,
             rook_semi_open_file_mg: data::ROOK_SEMI_OPEN_FILE_MG as f64,
             rook_semi_open_file_eg: data::ROOK_SEMI_OPEN_FILE_EG as f64,
-
-            king_attack_weight_n: data::KING_ATTACK_WEIGHT_N as f64,
-            king_attack_weight_b: data::KING_ATTACK_WEIGHT_B as f64,
-            king_attack_weight_r: data::KING_ATTACK_WEIGHT_R as f64,
-            king_attack_weight_q: data::KING_ATTACK_WEIGHT_Q as f64,
-            king_safety_table: arr(&data::KING_SAFETY_TABLE),
 
             ocb_with_pawns_scale: data::OCB_WITH_PAWNS_SCALE as f64,
             pawnless_draw_scale: data::PAWNLESS_DRAW_SCALE as f64,
@@ -416,12 +396,6 @@ impl EvalParams {
             rook_semi_open_file_mg: r(self.rook_semi_open_file_mg),
             rook_semi_open_file_eg: r(self.rook_semi_open_file_eg),
 
-            king_attack_weight_n: r(self.king_attack_weight_n),
-            king_attack_weight_b: r(self.king_attack_weight_b),
-            king_attack_weight_r: r(self.king_attack_weight_r),
-            king_attack_weight_q: r(self.king_attack_weight_q),
-            king_safety_table: ri100(&self.king_safety_table),
-
             ocb_with_pawns_scale: r(self.ocb_with_pawns_scale),
             pawnless_draw_scale: r(self.pawnless_draw_scale),
             fifty_move_floor: r(self.fifty_move_floor),
@@ -513,19 +487,6 @@ pub struct EvalParamsI32 {
     pub rook_semi_open_file_mg: i32,
     /// See [`EvalParams::rook_semi_open_file_eg`].
     pub rook_semi_open_file_eg: i32,
-
-    /// See [`EvalParams::king_attack_weight_n`].
-    pub king_attack_weight_n: i32,
-    /// See [`EvalParams::king_attack_weight_b`].
-    pub king_attack_weight_b: i32,
-    /// See [`EvalParams::king_attack_weight_r`].
-    pub king_attack_weight_r: i32,
-    /// See [`EvalParams::king_attack_weight_q`].
-    pub king_attack_weight_q: i32,
-    /// See [`EvalParams::king_safety_table`]. Serialized as a length-100
-    /// sequence (serde's array `impl` stops at 32; ADR-0037 §9 schema).
-    #[serde(with = "table100")]
-    pub king_safety_table: [i32; 100],
 
     /// See [`EvalParams::ocb_with_pawns_scale`].
     pub ocb_with_pawns_scale: i32,
@@ -791,47 +752,6 @@ fn const_value_map(p: &EvalParamsI32) -> std::collections::HashMap<&'static str,
     m
 }
 
-/// Serde adapter for `[i32; 100]` (the S-curve table): serde's built-in array
-/// impls stop at length 32, so it (de)serializes as a length-100 sequence and
-/// rejects any other length.
-mod table100 {
-    use serde::de::{Error, SeqAccess, Visitor};
-    use serde::ser::SerializeTuple;
-    use serde::{Deserializer, Serializer};
-    use std::fmt;
-
-    pub fn serialize<S: Serializer>(t: &[i32; 100], s: S) -> Result<S::Ok, S::Error> {
-        let mut seq = s.serialize_tuple(100)?;
-        for v in t {
-            seq.serialize_element(v)?;
-        }
-        seq.end()
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[i32; 100], D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = [i32; 100];
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a sequence of 100 i32 values")
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut out = [0i32; 100];
-                for (i, slot) in out.iter_mut().enumerate() {
-                    *slot = seq
-                        .next_element()?
-                        .ok_or_else(|| A::Error::invalid_length(i, &self))?;
-                }
-                if seq.next_element::<i32>()?.is_some() {
-                    return Err(A::Error::invalid_length(101, &self));
-                }
-                Ok(out)
-            }
-        }
-        d.deserialize_tuple(100, V)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Small array-conversion helpers (kept local; no abstraction surface).
 // ---------------------------------------------------------------------------
@@ -865,10 +785,6 @@ fn ri15(src: &[f64; 15]) -> [i32; 15] {
 }
 
 fn ri28(src: &[f64; 28]) -> [i32; 28] {
-    ri(src)
-}
-
-fn ri100(src: &[f64; 100]) -> [i32; 100] {
     ri(src)
 }
 
@@ -934,10 +850,8 @@ mod tests {
         // Perturb a core entry.
         v[0] = 42.0;
         let p = s.with_core(&v);
-        // Non-core (scale numerators, S-curve, multipliers) unchanged.
+        // Non-core (scale numerators) unchanged.
         assert_eq!(p.ocb_with_pawns_scale, s.ocb_with_pawns_scale);
-        assert_eq!(p.king_safety_table, s.king_safety_table);
-        assert_eq!(p.king_attack_weight_q, s.king_attack_weight_q);
         // Core entry applied.
         assert_eq!(p.iso_mg, 42.0);
     }
@@ -1003,9 +917,7 @@ mod tests {
                 "queen_mobility_eg[{k}]"
             );
         }
-        // Non-core (excluded / outer) fields.
-        assert_eq!(s.king_attack_weight_q, data::KING_ATTACK_WEIGHT_Q as f64);
-        assert_eq!(s.king_safety_table[0], data::KING_SAFETY_TABLE[0] as f64);
+        // Outer-swept fields.
         assert_eq!(s.ocb_with_pawns_scale, data::OCB_WITH_PAWNS_SCALE as f64);
         assert_eq!(s.fifty_move_floor, data::FIFTY_MOVE_FLOOR as f64);
     }
@@ -1049,10 +961,8 @@ mod tests {
     #[test]
     fn params_json_roundtrip() {
         let mut ints = EvalParams::shipped().to_ints();
-        // Perturb a few fields (incl. a high S-curve index past serde's 32 cap).
         ints.iso_mg = -7;
         ints.knight_mobility_mg[4] = 13;
-        ints.king_safety_table[99] = 42;
         let pf = ParamsFile {
             schema_version: SCHEMA_VERSION,
             params: ints,
@@ -1083,10 +993,6 @@ mod tests {
             back, pf,
             "ParamsFile must round-trip through JSON losslessly"
         );
-        assert_eq!(
-            back.params.king_safety_table[99], 42,
-            "len-100 table slot 99"
-        );
     }
 
     /// JSON round-trips an `EvalParamsI32` whose array fields carry DISTINCT,
@@ -1095,10 +1001,10 @@ mod tests {
     ///
     /// This is the value-discriminating complement to `params_json_roundtrip`
     /// (which round-trips the mostly-zero shipped defaults): a constant-array
-    /// mutation of the `riN`/`ri8`/`ri100` conversion helpers (`replace … with
+    /// mutation of the `riN`/`ri8` conversion helpers (`replace … with
     /// [0; N]` / `[1; N]` / `[-1; N]`) cannot reproduce these index-dependent
     /// values, and the serde array (de)ser of the populated fields is exercised
-    /// across both the ≤32 derive arrays and the length-100 `table100` adapter.
+    /// across all the ≤32 derive arrays.
     #[test]
     fn params_json_roundtrip_nonzero_arrays() {
         // Populate the float params with distinct, index-dependent values so the
@@ -1126,8 +1032,6 @@ mod tests {
         fill(&mut p.outpost_knight_eg, 2);
         fill(&mut p.outpost_bishop_mg, -3);
         fill(&mut p.outpost_bishop_eg, 4);
-        // The length-100 king-safety table (past serde's 32-array derive cap).
-        fill(&mut p.king_safety_table, -50);
 
         let ints = p.to_ints();
 
@@ -1136,7 +1040,7 @@ mod tests {
         // so the integer mirror MUST be exactly `[base, base+1, …]`. Comparing
         // against these hand-derived arrays — NOT against a `to_ints()`
         // re-derivation — breaks the self-consistency tautology: a constant-array
-        // mutant of the `riN`/`ri8`/`ri100` helper (`[0;N]`/`[1;N]`/`[-1;N]`)
+        // mutant of the `riN`/`ri8` helper (`[0;N]`/`[1;N]`/`[-1;N]`)
         // changes `to_ints()` AND would still "round-trip", but it cannot match
         // these independent index-dependent expectations.
         let expect =
@@ -1210,11 +1114,6 @@ mod tests {
             expect(4, 8),
             "ri8 outpost_b_eg"
         );
-        assert_eq!(
-            ints.king_safety_table.to_vec(),
-            expect(-50, 100),
-            "ri100 king_safety"
-        );
 
         let pf = ParamsFile {
             schema_version: SCHEMA_VERSION,
@@ -1260,17 +1159,6 @@ mod tests {
         assert_eq!(back.params.outpost_knight_eg, ints.outpost_knight_eg);
         assert_eq!(back.params.outpost_bishop_mg, ints.outpost_bishop_mg);
         assert_eq!(back.params.outpost_bishop_eg, ints.outpost_bishop_eg);
-        // The full length-100 table deserializes element-for-element to the
-        // independent index-dependent expectation (kills a constant-array
-        // `table100` deser mutant directly, not via a self-consistent compare).
-        assert_eq!(back.params.king_safety_table.to_vec(), expect(-50, 100));
-        for (i, &v) in back.params.king_safety_table.iter().enumerate() {
-            assert_eq!(
-                v,
-                -50 + i as i32,
-                "king_safety_table[{i}] index-dependent value"
-            );
-        }
     }
 
     /// `write_params_file` (pretty JSON) + `read_params_file` round-trips a
@@ -1284,7 +1172,6 @@ mod tests {
         let mut ints = EvalParams::shipped().to_ints();
         ints.iso_mg = -7;
         ints.knight_mobility_mg[4] = 13;
-        ints.king_safety_table[99] = 42;
         let pf = ParamsFile {
             schema_version: SCHEMA_VERSION,
             params: ints,

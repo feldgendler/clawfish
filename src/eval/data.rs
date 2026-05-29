@@ -222,66 +222,11 @@ pub(crate) const QUEEN_MOBILITY_EG: [i32; 28] = [-28, -34, -34, -33, -31, -24, -
 // ---------------------------------------------------------------------------
 // M6.E king-safety weight constants. Source: CPW-Engine/Fruit/Glaurung
 // lineage (docs/research/m6-king-safety.md §2/§6; ADR-0003-clean — not
-// engine source). Per-kind attacker-unit multipliers; 100-entry S-curve
-// SafetyTable; castled-king pawn-shield bonuses (two rank tiers, three
-// files); open/semi-open file MG-only penalties.
-//
-// **Shipped config: ALL king-safety weights zeroed (score-neutral landing).**
-// Research §8 verdict: HIGH transfer risk — the single highest-risk M6 term:
-//   - PeSTO's MG king PST already prices ~30–50 cp of castled-king safety
-//     (the dominant double-count axis, stronger than M6.D's PST double-count).
-//   - The SafetyTable S-curve saturates at 500 cp (calibrated against engines
-//     with jointly-tuned PSTs; our zeroed mobility/pawn-structure baseline is
-//     not that baseline).
-//   - King safety is the noisiest term to SPRT (TC-dependent, opening-pool-
-//     dominated variance; mixed-TC screens ~5× M6.B cost).
-//   - Components are coupled by design (shield weakness feeds S-curve;
-//     open-file and S-curve price the same king-danger state): no
-//     interaction-immune subset (contrast M6.B's clean CONN-only +103).
-// The M6.C/M6.D three-phase "co-calibrated-elsewhere ≠ transfers here" law
-// (M6.B −197.94 / M6.C −21.74 / M6.D −131.62 / co-scale *worsened* −220.18)
-// applies with strongest force here. **M6.E skips the diagnostic screen ladder
-// entirely** (ADR-0033 §8 / plan §10) on the justified prediction that the
-// screen's only outcome is "defer" at the highest screen cost of any M6 term.
-// Inert landing: zeroed weights ⇒ term ≡ (0,0) ⇒ evaluate byte-identical to
-// M6.D ⇒ bench 1213649 / depth-4 90591 byte-for-byte ⇒ no SPRT needed.
-//
-// **M6.F joint Texel obligation (extended).** Re-derives the entire king-safety
-// weight set (S-curve table shape + per-kind attacker multipliers + shield +
-// open-file + MG/EG split) *jointly* with M6.B ISO/DBL/BWD + CONN rescale,
-// M6.C passed-pawn reshape, and M6.D mobility reshape — one joint pass. The
-// §7 double-count axes (pawn-shield × PeSTO king MG PST — dominant; attack
-// S-curve × king PST — low-moderate; CONN × shield — low) are the load-
-// bearing inputs to that pass. ADR-0033 §7/§8.
-//
-// **Literature defaults (the M6.F starting point, recorded verbatim):**
-//
-// Per-kind attacker multipliers (CPW-Engine form: units = weight × attacked
-// king-zone squares, summed to SAFETY_TABLE index). Source: CPW-Engine eval
-// (Glaurung/Fruit lineage, the one complete citable set outside engine source
-// repos — ADR-0003-clean):
-//   KING_ATTACK_WEIGHT_N = 2   KING_ATTACK_WEIGHT_B = 2
-//   KING_ATTACK_WEIGHT_R = 3   KING_ATTACK_WEIGHT_Q = 4
-//
-// SAFETY_TABLE (100-entry CPW-Engine S-curve, Glaurung 1.2 lineage verbatim;
-// same values reproduced on CPW King Safety page and CPW-Engine eval page;
-// S-curve: slow rise 0–10, steeper 10–60, flat 500 from index 61+):
-//   [  0,  0,  1,  2,  3,  5,  7,  9, 12, 15,
-//     18, 22, 26, 30, 35, 39, 44, 50, 56, 62,
-//     68, 75, 82, 85, 89, 97,105,113,122,131,
-//    140,150,169,180,191,202,213,225,237,248,
-//    260,272,283,295,307,319,330,342,354,366,
-//    377,389,401,412,424,436,448,459,471,483,
-//    494,500,500,500,500,500,500,500,500,500,
-//    500,500,500,500,500,500,500,500,500,500,
-//    500,500,500,500,500,500,500,500,500,500,
-//    500,500,500,500,500,500,500,500,500,500]
-//
-// Gating (CPW-Engine): attack_units = 0 if < 2 distinct attackers OR enemy
-// has no queen (conservative at M6.E; M6.F may relax). Index clamped to
-// min(units, 99) — the saturating tail is by design (S-curve flat at 500).
-// Attack penalty MG-only (EG = 0; king walks in EG, fights PeSTO EG king PST
-// centralization incentive — ADR-0033 §2/§5; research §5).
+// engine source). Castled-king pawn-shield bonuses (two rank tiers, three
+// files); open/semi-open file MG-only penalties. The attacker S-curve was
+// removed after both the g=1 and g=0.5 SPRT probes regressed vs `M6.J`
+// (M6.K; ADR-0038). Shield + open-file terms were Texel-tuned at M6.I
+// (ADR-0037).
 //
 // Pawn-shield defaults (center of literature range; two-tier: SHIELD_1 >
 // SHIELD_2, unmoved rank-2 pawn strictly better than rank-3):
@@ -296,35 +241,6 @@ pub(crate) const QUEEN_MOBILITY_EG: [i32; 28] = [-28, -34, -34, -33, -31, -24, -
 // These are data constants, not logic — excluded from `cargo mutants` per
 // `.cargo/mutants.toml` alongside the PST/mobility arrays.
 // ---------------------------------------------------------------------------
-
-/// King-zone attacker-unit multiplier, knight. Literature CPW value (M6.K
-/// activation — stage 1, SPRT-pending vs `M6.J`; see ADR-0038).
-pub(crate) const KING_ATTACK_WEIGHT_N: i32 = 2;
-/// King-zone attacker-unit multiplier, bishop. Literature CPW value — see `KING_ATTACK_WEIGHT_N`.
-pub(crate) const KING_ATTACK_WEIGHT_B: i32 = 2;
-/// King-zone attacker-unit multiplier, rook. Literature CPW value — see `KING_ATTACK_WEIGHT_N`.
-pub(crate) const KING_ATTACK_WEIGHT_R: i32 = 3;
-/// King-zone attacker-unit multiplier, queen. Literature CPW value — see `KING_ATTACK_WEIGHT_N`.
-pub(crate) const KING_ATTACK_WEIGHT_Q: i32 = 4;
-
-/// CPW-Engine 100-entry S-curve SafetyTable. Indexed by accumulated attack
-/// units; clamped to [0, 99]. Activated to the literature Glaurung-1.2-lineage
-/// curve at M6.K (stage 1, SPRT-pending vs `M6.J`; ADR-0038). Slow rise 0–10,
-/// steeper 10–60, flat 500 from index 61. Frozen (excluded from the Texel core
-/// vector — ADR-0037 §3); a future SPSA-deflate (stage 2) re-scales it as data.
-#[rustfmt::skip]
-pub(crate) const KING_SAFETY_TABLE: [i32; 100] = [
-      0,   0,   1,   2,   3,   5,   7,   9,  12,  15,
-     18,  22,  26,  30,  35,  39,  44,  50,  56,  62,
-     68,  75,  82,  85,  89,  97, 105, 113, 122, 131,
-    140, 150, 169, 180, 191, 202, 213, 225, 237, 248,
-    260, 272, 283, 295, 307, 319, 330, 342, 354, 366,
-    377, 389, 401, 412, 424, 436, 448, 459, 471, 483,
-    494, 500, 500, 500, 500, 500, 500, 500, 500, 500,
-    500, 500, 500, 500, 500, 500, 500, 500, 500, 500,
-    500, 500, 500, 500, 500, 500, 500, 500, 500, 500,
-    500, 500, 500, 500, 500, 500, 500, 500, 500, 500,
-];
 
 // TEXEL-TUNABLE-BEGIN: king_safety_shield_file
 /// Pawn-shield bonus: friendly pawn on king's 2nd rank, middlegame. Zeroed.

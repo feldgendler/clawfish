@@ -1,27 +1,27 @@
 //! King-safety eval term (M6.E). White-perspective (mg, eg); the side under
 //! attack contributes ±sign symmetrically. Computed live in `evaluate_core`
 //! (not pawn-only ⇒ never cached — ADR-0033 §6, supersedes ADR-0032 §3).
-//! Zone = 3×3 ring + forward wedge; per-kind attacker units → SAFETY_TABLE;
-//! castled-king pawn-shield; MG-only open/semi-open-file penalty. The attacker
-//! S-curve is activated to the literature CPW values at M6.K (ADR-0038); the
-//! shield + open-file linear terms were Texel-tuned at M6.I (ADR-0037).
+//! Zone = 3×3 ring + forward wedge; castled-king pawn-shield;
+//! MG-only open/semi-open-file penalty. The attacker S-curve was removed after
+//! both the g=1 and g=0.5 SPRT probes regressed (M6.K; ADR-0038). Shield +
+//! open-file linear terms were Texel-tuned at M6.I (ADR-0037).
 
 use crate::bitboard::{self, Bitboard};
 use crate::eval::data::{
-    KING_ATTACK_WEIGHT_B, KING_ATTACK_WEIGHT_N, KING_ATTACK_WEIGHT_Q, KING_ATTACK_WEIGHT_R,
-    KING_SAFETY_TABLE, KS_ADJ_SEMI_OPEN_MG, KS_BOTH_ADJ_SEMI_OPEN_MG, KS_KFILE_OPEN_MG,
-    KS_KFILE_SEMI_OPEN_MG, SHIELD_1_EG, SHIELD_1_MG, SHIELD_2_EG, SHIELD_2_MG,
+    KS_ADJ_SEMI_OPEN_MG, KS_BOTH_ADJ_SEMI_OPEN_MG, KS_KFILE_OPEN_MG, KS_KFILE_SEMI_OPEN_MG,
+    SHIELD_1_EG, SHIELD_1_MG, SHIELD_2_EG, SHIELD_2_MG,
 };
+use crate::movegen;
 use crate::piece::{Color, PieceKind};
 use crate::position::Position;
 use crate::square::Square;
-use crate::{magic, movegen};
 
 /// King-safety zone for `side`: the 3×3 ring around `ksq` plus the three
 /// squares one rank toward the enemy beyond the ring's forward edge (ADR-0033
 /// §1). The king's own square is excluded (`& !from_square(ksq)` is
-/// load-bearing — see plan §3 comment). Single source of truth called by both
-/// `king_safety_term_white` and the zone tests.
+/// load-bearing — see plan §3 comment). Called by the zone tests; kept for
+/// future use (e.g., if a non-S-curve attacker term is ever re-introduced).
+#[allow(dead_code)]
 pub(crate) fn king_zone(side: Color, ksq: Square) -> Bitboard {
     let ring = movegen::masks::king_attacks(ksq);
     let fwd = match side {
@@ -136,67 +136,27 @@ pub(crate) fn shield_open_file_term_white(pos: &Position) -> (i32, i32) {
     (mg, eg)
 }
 
-/// Returns the white-perspective `(mg, eg)` king-safety contribution (zone
-/// attacker S-curve + castled pawn-shield + open/semi-open-file penalty).
-/// Black's king contributes with −sign. S-curve at literature CPW values
-/// (M6.K); shield + open-file Texel-tuned (M6.I).
+/// Returns the white-perspective `(mg, eg)` king-safety contribution
+/// (zone-based castled pawn-shield + open/semi-open-file penalty).
+/// Black's king contributes with −sign. Texel-tuned at M6.I (ADR-0037).
+/// The attacker S-curve was removed after both SPRT probes regressed (M6.K).
 pub(crate) fn king_safety_term_white(pos: &Position) -> (i32, i32) {
-    let occ_all = pos.occupied_all();
     let wp = pos.pieces_colored(Color::White, PieceKind::Pawn);
     let bp = pos.pieces_colored(Color::Black, PieceKind::Pawn);
     let all_pawn_files = bitboard::file_fill(wp | bp);
     let (mut mg, mut eg) = (0i32, 0i32);
 
     for (side, sign) in [(Color::White, 1i32), (Color::Black, -1i32)] {
-        let (enemy, own_pawns, own_pawn_files) = match side {
-            Color::White => (Color::Black, wp, bitboard::file_fill(wp)),
-            Color::Black => (Color::White, bp, bitboard::file_fill(bp)),
+        let (own_pawns, own_pawn_files) = match side {
+            Color::White => (wp, bitboard::file_fill(wp)),
+            Color::Black => (bp, bitboard::file_fill(bp)),
         };
         let ksq = pos.king_square(side);
-        let zone = king_zone(side, ksq);
 
         // King-safety from `side`'s OWN perspective (penalty = negative,
         // shield = positive); white-perspective contribution = sign * ks_*.
         let mut ks_mg = 0i32;
         let mut ks_eg = 0i32;
-
-        // (a) attacker S-curve — enemy N/B/R/Q attacking `side`'s zone.
-        let mut units = 0i32;
-        let mut attackers = 0u32;
-        for psq in pos.pieces_colored(enemy, PieceKind::Knight).iter() {
-            let h = (movegen::masks::knight_attacks(psq) & zone).count() as i32;
-            if h > 0 {
-                attackers += 1;
-                units += KING_ATTACK_WEIGHT_N * h;
-            }
-        }
-        for psq in pos.pieces_colored(enemy, PieceKind::Bishop).iter() {
-            let h = (magic::bishop_attacks(psq, occ_all) & zone).count() as i32;
-            if h > 0 {
-                attackers += 1;
-                units += KING_ATTACK_WEIGHT_B * h;
-            }
-        }
-        for psq in pos.pieces_colored(enemy, PieceKind::Rook).iter() {
-            let h = (magic::rook_attacks(psq, occ_all) & zone).count() as i32;
-            if h > 0 {
-                attackers += 1;
-                units += KING_ATTACK_WEIGHT_R * h;
-            }
-        }
-        for psq in pos.pieces_colored(enemy, PieceKind::Queen).iter() {
-            let h = (magic::queen_attacks(psq, occ_all) & zone).count() as i32;
-            if h > 0 {
-                attackers += 1;
-                units += KING_ATTACK_WEIGHT_Q * h;
-            }
-        }
-        let enemy_has_queen = pos.pieces_colored(enemy, PieceKind::Queen).any();
-        if attackers < 2 || !enemy_has_queen {
-            units = 0;
-        }
-        let idx = units.clamp(0, (KING_SAFETY_TABLE.len() - 1) as i32) as usize;
-        ks_mg -= KING_SAFETY_TABLE[idx]; // MG-only (EG king-safety = 0, ADR-0033 §2/§5)
 
         // (b) pawn shield — only when `side`'s king is on a castled-side file.
         let kf = ksq.file();
@@ -258,29 +218,28 @@ mod tests {
     use super::{king_safety_term_white, king_zone};
     use crate::bitboard;
     use crate::eval::data::{
-        KING_ATTACK_WEIGHT_B, KING_ATTACK_WEIGHT_N, KING_ATTACK_WEIGHT_Q, KING_ATTACK_WEIGHT_R,
-        KING_SAFETY_TABLE, KS_ADJ_SEMI_OPEN_MG, KS_BOTH_ADJ_SEMI_OPEN_MG, KS_KFILE_OPEN_MG,
-        KS_KFILE_SEMI_OPEN_MG, SHIELD_1_EG, SHIELD_1_MG, SHIELD_2_EG, SHIELD_2_MG,
+        KS_ADJ_SEMI_OPEN_MG, KS_BOTH_ADJ_SEMI_OPEN_MG, KS_KFILE_OPEN_MG, KS_KFILE_SEMI_OPEN_MG,
+        SHIELD_1_EG, SHIELD_1_MG, SHIELD_2_EG, SHIELD_2_MG,
     };
     use crate::piece::{Color, PieceKind};
     use crate::position::Position;
     use crate::square::Square;
-    use crate::{magic, movegen};
 
     fn pos_of(fen: &str) -> Position {
         Position::from_fen(fen).expect("fixture FEN must parse")
     }
 
     // -----------------------------------------------------------------------
-    // Structural / table-integrity tests (GREEN against stub).
+    // Structural tests.
     // -----------------------------------------------------------------------
 
     /// Start position is perfectly symmetric (White and Black king-safety
     /// contributions cancel). Returns `(0, 0)`.
     ///
-    /// Returns `(0, 0)` by gate + symmetry: the start position has no king-zone
-    /// attacker (the `< 2 attackers` gate fires) and is color-symmetric, so the
-    /// result is `(0, 0)` independent of the (now-activated) S-curve weights.
+    /// Returns `(0, 0)` by symmetry + geometry: the e-file king is not on a
+    /// castled-side file so no shield is evaluated, the e-file has pawns so no
+    /// open-file penalty, and the position is color-symmetric so white and black
+    /// contributions cancel.
     #[test]
     fn king_safety_startpos_is_zero() {
         let pos = Position::starting_position();
@@ -288,173 +247,6 @@ mod tests {
             king_safety_term_white(&pos),
             (0, 0),
             "start position is symmetric → white and black cancel → (0,0)"
-        );
-    }
-
-    /// `KING_SAFETY_TABLE.len() == 100` (vendoring-typo guard).
-    ///
-    /// TDD state: GREEN against stub (pure data assertion, does not call the
-    /// function).
-    #[test]
-    fn king_safety_tables_have_expected_lengths() {
-        assert_eq!(
-            KING_SAFETY_TABLE.len(),
-            100,
-            "KING_SAFETY_TABLE must have exactly 100 entries (CPW S-curve)"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // M6.K activation pins: the literature CPW S-curve is now LIVE (multipliers
-    // 2/2/3/4, the 100-entry Glaurung-1.2-lineage table). These tests fail
-    // against the pre-M6.K zeroed data and guard the activation + transcription.
-    // -----------------------------------------------------------------------
-
-    /// Representative `KING_SAFETY_TABLE` entries pinned against transcription
-    /// typos (the table is vendored verbatim from the `data.rs` block comment).
-    /// `[14]` is load-bearing for `king_safety_activated_penalty_is_negative`.
-    #[test]
-    fn king_safety_literature_table_values_pinned() {
-        let expected: &[(usize, i32)] = &[
-            (0, 0),
-            (1, 0),
-            (2, 1),
-            (5, 5),
-            (10, 18),
-            (14, 35),
-            (31, 150),
-            (32, 169),
-            (60, 494),
-            (61, 500),
-            (99, 500),
-        ];
-        for &(i, v) in expected {
-            assert_eq!(
-                KING_SAFETY_TABLE[i], v,
-                "KING_SAFETY_TABLE[{i}] must be {v} (CPW literature S-curve); got {}",
-                KING_SAFETY_TABLE[i]
-            );
-        }
-    }
-
-    /// The S-curve is non-decreasing and saturates at 500 (its defining shape).
-    /// A property more compact than enumerating all 100 entries; kills a
-    /// reordered / dipped transcription a point-pin set could miss. (Pre-M6.K,
-    /// against the all-zero table the monotonicity loop is vacuously true — it
-    /// is the `TABLE[99] == 500` saturation pin below that makes this test fail
-    /// red until activation.)
-    #[test]
-    fn king_safety_table_monotonic_nondecreasing() {
-        for i in 0..KING_SAFETY_TABLE.len() - 1 {
-            assert!(
-                KING_SAFETY_TABLE[i] <= KING_SAFETY_TABLE[i + 1],
-                "S-curve must be non-decreasing: TABLE[{i}]={} > TABLE[{}]={}",
-                KING_SAFETY_TABLE[i],
-                i + 1,
-                KING_SAFETY_TABLE[i + 1]
-            );
-        }
-        assert_eq!(
-            KING_SAFETY_TABLE[99], 500,
-            "S-curve saturates at 500 in the flat tail"
-        );
-    }
-
-    /// The 4 per-kind attacker multipliers are at their literature CPW values.
-    /// Anchors the activation itself — an accidental re-zero fails here.
-    #[test]
-    fn king_safety_multipliers_literature_pinned() {
-        assert_eq!(
-            (
-                KING_ATTACK_WEIGHT_N,
-                KING_ATTACK_WEIGHT_B,
-                KING_ATTACK_WEIGHT_R,
-                KING_ATTACK_WEIGHT_Q
-            ),
-            (2, 2, 3, 4),
-            "literature CPW attacker multipliers N/B/R/Q = 2/2/3/4"
-        );
-    }
-
-    /// Activation anchor (bare literal, NOT recomputed from `eval::data`).
-    ///
-    /// Fixture: White Kg1 under attack by Black Nd3 + Qe4 (Ka8 elsewhere). The
-    /// gate passes (2 attackers + queen); Nd3 hits 1 zone square, Qe4 hits 3, so
-    /// `units = KING_ATTACK_WEIGHT_N·1 + KING_ATTACK_WEIGHT_Q·3 = 2 + 12 = 14`
-    /// and `KING_SAFETY_TABLE[14] = 35` ⇒ a white-POV S-curve penalty of −35,
-    /// layered on the M6.I open-file delta (white −95 vs black −57 = −38). Total
-    /// white-POV `(mg, eg) = (−73, 0)`.
-    ///
-    /// The expected value is a **hardcoded literal**: against the pre-M6.K
-    /// zeroed table the S-curve contributes 0 and the term would be `(−38, 0)`
-    /// (open-file only), so this assertion fails unless the S-curve is genuinely
-    /// active. (The sibling `king_safety_attack_units_symbolic_from_data` covers
-    /// the auto-tracking exact-arithmetic angle; this is its literal complement.)
-    #[test]
-    fn king_safety_activated_penalty_is_negative() {
-        let pos = pos_of("k7/8/8/8/4q3/3n4/8/6K1 w - - 0 1");
-        assert_eq!(
-            king_safety_term_white(&pos),
-            (-73, 0),
-            "activated literature S-curve: TABLE[14] = −35 on top of the −38 \
-             open-file delta ⇒ (−73, 0); the non-activated table gives (−38, 0)"
-        );
-    }
-
-    /// The S-curve is MG-only (ADR-0033 §2/§5): firing it must not touch EG.
-    /// Differential test — remove the queen so the gate fires (S-curve → 0)
-    /// while the pawnless open-file / shield geometry is unchanged; the only
-    /// difference is then the S-curve MG term, of exactly −KING_SAFETY_TABLE[14].
-    #[test]
-    fn king_safety_scurve_is_mg_only() {
-        // `firing`: 2 attackers (Nd3 + Qe4) + queen ⇒ gate passes, units = 14.
-        // `gated`: drop the queen ⇒ BOTH gate conditions fire (1 attacker AND no
-        // queen) ⇒ units = 0. Pawnless and same king squares in both, so the
-        // open-file and shield contributions are identical and cancel in the
-        // difference, leaving only the S-curve MG term.
-        let firing = pos_of("k7/8/8/8/4q3/3n4/8/6K1 w - - 0 1");
-        let gated = pos_of("k7/8/8/8/8/3n4/8/6K1 w - - 0 1");
-        let (mg_f, eg_f) = king_safety_term_white(&firing);
-        let (mg_g, eg_g) = king_safety_term_white(&gated);
-        assert_eq!(
-            eg_f, 0,
-            "S-curve must not contribute to EG (firing position)"
-        );
-        assert_eq!(eg_g, 0, "gated position EG also 0");
-        assert_eq!(
-            mg_f - mg_g,
-            -35,
-            "firing the S-curve adds exactly −KING_SAFETY_TABLE[14] = −35 to MG \
-             only (open-file/shield identical between the two positions)"
-        );
-    }
-
-    /// Saturation-clamp behavioral pin at a SECOND operating point (the flat
-    /// tail), via the live `king_safety_term_white` path — complements the
-    /// index-14 `king_safety_activated_penalty_is_negative` anchor.
-    ///
-    /// `saturated`: White Ke1 swamped by three black queens (d3/e3/f3) AND three
-    /// rooks (d4/e4/f4). The exact unit count is irrelevant — three adjacent
-    /// queens alone clear ~60 units and the rooks push far past the index-61
-    /// saturation knee, so the S-curve pegs at `KING_SAFETY_TABLE[99] = 500`
-    /// regardless of the precise sum (deliberately avoids fragile hand-counting
-    /// of a dense position). `gated`: queens replaced by knights ⇒ no enemy
-    /// queen ⇒ gate fires ⇒ S-curve = 0, with identical (pawnless) open-file /
-    /// shield geometry. The difference isolates the saturated S-curve as a bare
-    /// literal `−500` — fails against any non-saturating or zeroed table.
-    #[test]
-    fn king_safety_scurve_saturates_at_table_tail() {
-        let saturated = pos_of("k7/8/8/8/3rrr2/3qqq2/8/4K3 w - - 0 1");
-        let gated = pos_of("k7/8/8/8/3rrr2/3nnn2/8/4K3 w - - 0 1");
-        let (mg_s, eg_s) = king_safety_term_white(&saturated);
-        let (mg_g, eg_g) = king_safety_term_white(&gated);
-        assert_eq!(eg_s, 0, "S-curve is MG-only (saturated position EG = 0)");
-        assert_eq!(eg_g, 0, "gated position EG = 0");
-        assert_eq!(
-            mg_s - mg_g,
-            -500,
-            "a saturating attacker pile pegs the S-curve at KING_SAFETY_TABLE[99] \
-             = 500 (white-POV −500); open-file/shield identical between the two"
         );
     }
 
@@ -740,375 +532,6 @@ mod tests {
         assert!(
             !zone.contains(Square::C3),
             "c3 must NOT be in Ka1 zone (no wrap)"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Gate / S-curve tests.
-    // -----------------------------------------------------------------------
-
-    /// Gate: < 2 distinct attackers ⇒ S-curve contribution = 0 (units zeroed).
-    ///
-    /// Fixture: White Kg1, Black Ka8 + Qe5 (enemy queen present, 1 attacker).
-    ///
-    /// Weight-free precondition (calls `king_zone` + magic attacks — exercises
-    /// real zone code, fails NOW if zone is wrong): Qe5 must hit ≥1 zone square
-    /// of White's Kg1 zone. This verifies the attacker_count = 1 claim.
-    ///
-    /// Two-sided derivation from eval::data:
-    ///   White Kg1 S-curve: attackers=1 < 2 ⇒ units=0 ⇒ KING_SAFETY_TABLE[0]=0 ⇒ 0.
-    ///   White Kg1 shield: kf=6(g)≥5, no white pawns ⇒ 0.
-    ///   White Kg1 open-file: no pawns on g/f/h:
-    ///     g open ⇒ KS_KFILE_OPEN_MG. f,h adj no own ⇒ 2×KS_ADJ_SEMI_OPEN_MG + KS_BOTH.
-    ///     ks_mg_white = KS_KFILE_OPEN_MG + 2×KS_ADJ_SEMI_OPEN_MG + KS_BOTH_ADJ_SEMI_OPEN_MG.
-    ///   Black Ka8 S-curve: enemy=White, no white N/B/R/Q ⇒ units=0 ⇒ 0.
-    ///   Black Ka8 shield: kf=0(a)≤2, files {a,b}, no black pawns ⇒ 0.
-    ///   Black Ka8 open-file: no pawns on a or b:
-    ///     a open ⇒ KS_KFILE_OPEN_MG. b adj, 1 adj total ⇒ KS_ADJ_SEMI_OPEN_MG.
-    ///     ks_mg_black = KS_KFILE_OPEN_MG + KS_ADJ_SEMI_OPEN_MG.
-    ///   White-perspective total:
-    ///     mg = ks_mg_white − ks_mg_black
-    ///        = (KS_KFILE_OPEN_MG + 2×KS_ADJ_SEMI_OPEN_MG + KS_BOTH)
-    ///          − (KS_KFILE_OPEN_MG + KS_ADJ_SEMI_OPEN_MG)
-    ///        = KS_ADJ_SEMI_OPEN_MG + KS_BOTH_ADJ_SEMI_OPEN_MG.
-    ///     eg = 0.
-    ///   At zeroed weights: mg = 0, eg = 0.
-    ///
-    /// TDD state: GREEN against stub (expected = (0,0) at zeroed weights).
-    /// Load-bearing at M6.F (gate < 2 → units=0 is structurally tested by the
-    /// precondition asserting exactly 1 zone-hitting piece).
-    #[test]
-    fn king_safety_attacker_gate_below_two() {
-        // White Kg1, Black Ka8 + Qe5. Lone enemy queen = 1 attacker < 2.
-        let pos = pos_of("k7/8/8/4q3/8/8/8/6K1 w - - 0 1");
-
-        // Weight-free precondition: verify exactly 1 enemy piece hits the zone.
-        let white_ksq = pos.king_square(Color::White);
-        let zone_w = king_zone(Color::White, white_ksq);
-        let occ = pos.occupied_all();
-        let q_hits = magic::queen_attacks(Square::E5, occ) & zone_w;
-        assert!(
-            q_hits.any(),
-            "fixture invariant: Qe5 must attack ≥1 square in White Kg1 zone \
-             (attacker_count = 1, gate < 2 fires)"
-        );
-        // No other black N/B/R attacks the zone (only the queen).
-        let no_other = pos
-            .pieces_colored(Color::Black, PieceKind::Knight)
-            .iter()
-            .all(|sq| (movegen::masks::knight_attacks(sq) & zone_w).is_empty())
-            && pos
-                .pieces_colored(Color::Black, PieceKind::Bishop)
-                .iter()
-                .all(|sq| (magic::bishop_attacks(sq, occ) & zone_w).is_empty())
-            && pos
-                .pieces_colored(Color::Black, PieceKind::Rook)
-                .iter()
-                .all(|sq| (magic::rook_attacks(sq, occ) & zone_w).is_empty());
-        assert!(
-            no_other,
-            "fixture invariant: only the queen attacks the zone (attacker_count = 1)"
-        );
-
-        // Two-sided symbolic derivation from eval::data (all constants = 0):
-        let ks_mg_white = KS_KFILE_OPEN_MG + 2 * KS_ADJ_SEMI_OPEN_MG + KS_BOTH_ADJ_SEMI_OPEN_MG;
-        let ks_mg_black = KS_KFILE_OPEN_MG + KS_ADJ_SEMI_OPEN_MG;
-        let expected = (ks_mg_white - ks_mg_black, 0i32);
-        assert_eq!(
-            king_safety_term_white(&pos),
-            expected,
-            "1 attacker (gate < 2 fires) ⇒ S-curve = 0; \
-             two-sided open-file expected ({},{}) from data",
-            expected.0,
-            expected.1
-        );
-    }
-
-    /// Gate: ≥2 attackers but NO enemy queen ⇒ S-curve contribution = 0.
-    ///
-    /// Fixture: White Kg1, Black Ka8 + Nf4 + Rg5 (2 zone-attacking pieces,
-    /// no queen). The "no queen" clause of the gate fires.
-    ///   Nf4 attacks g2,h3 ∈ zone. Rg5 slides south: g4,g3,g2 ∈ zone (blocked
-    ///   by Kg1 before leaving). Two distinct pieces → attacker_count = 2.
-    ///
-    /// Weight-free precondition (calls `king_zone` + attack fns): verify ≥2
-    /// distinct black pieces each hit ≥1 square in the white king zone.
-    ///
-    /// Two-sided derivation from eval::data:
-    ///   White Kg1 S-curve: enemy_has_queen=false ⇒ units=0 ⇒ 0.
-    ///   White Kg1 shield: no white pawns ⇒ 0.
-    ///   White Kg1 open-file: same as gate_below_two fixture:
-    ///     ks_mg_white = KS_KFILE_OPEN_MG + 2×KS_ADJ_SEMI_OPEN_MG + KS_BOTH.
-    ///   Black Ka8 S-curve: no white N/B/R/Q ⇒ 0.
-    ///   Black Ka8 open-file: ks_mg_black = KS_KFILE_OPEN_MG + KS_ADJ_SEMI_OPEN_MG.
-    ///   Total: mg = (KS_KFILE_OPEN_MG + 2×KS_ADJ + KS_BOTH) − (KS_KFILE_OPEN_MG + KS_ADJ)
-    ///             = KS_ADJ_SEMI_OPEN_MG + KS_BOTH_ADJ_SEMI_OPEN_MG. eg = 0.
-    ///   At zeroed weights: (0, 0).
-    ///
-    /// TDD state: GREEN against stub. Load-bearing at M6.F (no-queen clause).
-    #[test]
-    fn king_safety_attacker_gate_no_queen() {
-        // White Kg1, Black Ka8 + Nf4 + Rg5. No black queen.
-        let pos = pos_of("k7/8/8/6r1/5n2/8/8/6K1 w - - 0 1");
-
-        // Weight-free precondition: ≥2 enemy pieces hit the zone.
-        let white_ksq = pos.king_square(Color::White);
-        let zone_w = king_zone(Color::White, white_ksq);
-        let occ = pos.occupied_all();
-        let n_hits = movegen::masks::knight_attacks(Square::F4) & zone_w;
-        let r_hits = magic::rook_attacks(Square::G5, occ) & zone_w;
-        assert!(
-            n_hits.any(),
-            "fixture invariant: Nf4 must attack ≥1 square in White Kg1 zone"
-        );
-        assert!(
-            r_hits.any(),
-            "fixture invariant: Rg5 must attack ≥1 square in White Kg1 zone"
-        );
-        assert!(
-            !pos.pieces_colored(Color::Black, PieceKind::Queen).any(),
-            "fixture invariant: no black queen (no-queen gate must fire)"
-        );
-
-        // Two-sided symbolic derivation from eval::data (constants = 0):
-        let ks_mg_white = KS_KFILE_OPEN_MG + 2 * KS_ADJ_SEMI_OPEN_MG + KS_BOTH_ADJ_SEMI_OPEN_MG;
-        let ks_mg_black = KS_KFILE_OPEN_MG + KS_ADJ_SEMI_OPEN_MG;
-        let expected = (ks_mg_white - ks_mg_black, 0i32);
-        assert_eq!(
-            king_safety_term_white(&pos),
-            expected,
-            "2 attackers but no queen ⇒ S-curve = 0 (no-queen gate fires); \
-             two-sided open-file expected ({},{}) from data",
-            expected.0,
-            expected.1
-        );
-    }
-
-    /// Gate-PASSING S-curve test: ≥2 distinct attackers AND enemy queen present.
-    ///
-    /// This is the key gate-PASSING fixture: attacker_count ≥ 2 AND queen
-    /// present ⇒ gate does NOT fire ⇒ units flow into SAFETY_TABLE lookup.
-    /// Targets the plan §7 mutation `attackers < 2` → `<= 2`: with exactly 2
-    /// zone-attacking pieces, a `<= 2` mutation would wrongly fire the gate
-    /// and zero out units — distinguishable at M6.F when weights are non-zero.
-    ///
-    /// Fixture: White Kg1, Black Ka8 + Nd3 + Qe4.
-    ///   White king zone (Kg1): {f1,h1,f2,g2,h2,f3,g3,h3} (8 squares, from
-    ///   king_zone_white_g1_exact_squares). occ = {g1,a8,d3,e4}.
-    ///
-    ///   Nd3 knight attacks (from d3=(3,2)):
-    ///     (+1,+2)=e5, (+1,-2)=e1, (-1,+2)=c5, (-1,-2)=c1,
-    ///     (+2,+1)=f4, (+2,-1)=f2, (-2,+1)=b4, (-2,-1)=b2.
-    ///     ∩ zone {f1,h1,f2,g2,h2,f3,g3,h3}: f2 ✓. Count = 1.
-    ///     KING_ATTACK_WEIGHT_N × 1 = 0 (zeroed, lit 2×1=2).
-    ///
-    ///   Qe4 queen attacks (magic, occ={g1,a8,d3,e4}):
-    ///     Rook-N: e5,e6,e7,e8. Rook-S: e3,e2,e1. Rook-E: f4,g4,h4. Rook-W: d4,c4,b4,a4.
-    ///     Bishop-NE: f5,g6,h7. Bishop-NW: d5,c6,b7,a8(blocked). Bishop-SE: f3,g2,h1.
-    ///     Bishop-SW: d3(blocked by Nd3).
-    ///     ∩ zone: f3 ✓, g2 ✓, h1 ✓. Count = 3.
-    ///     KING_ATTACK_WEIGHT_Q × 3 = 0 (zeroed, lit 4×3=12).
-    ///
-    ///   Gate: attackers_with_zone_hits = {Nd3(1 hit), Qe4(3 hits)} = 2 pieces.
-    ///   enemy_has_queen = true. 2 ≥ 2 AND queen present ⇒ gate does NOT fire.
-    ///   units = KING_ATTACK_WEIGHT_N×1 + KING_ATTACK_WEIGHT_Q×3 = 0+0 = 0
-    ///           (lit: 2+12=14).
-    ///   idx = units.clamp(0,99) = 0 (lit: 14). KING_SAFETY_TABLE[0] = 0 (lit: 2).
-    ///   ks_mg_white_scurve = −KING_SAFETY_TABLE[0] = 0 (lit: −2).
-    ///
-    ///   White Kg1 shield: no white pawns ⇒ 0.
-    ///   White Kg1 open-file: no own/any pawns on g/f/h:
-    ///     ks_mg_white_openfile = KS_KFILE_OPEN_MG + 2×KS_ADJ_SEMI_OPEN_MG + KS_BOTH.
-    ///   ks_mg_white = ks_mg_white_scurve + ks_mg_white_openfile.
-    ///
-    ///   Black Ka8 S-curve: enemy=White, no white N/B/R/Q ⇒ units=0 ⇒ 0.
-    ///   Black Ka8 open-file: kf=0, no pawns:
-    ///     ks_mg_black = KS_KFILE_OPEN_MG + KS_ADJ_SEMI_OPEN_MG.
-    ///
-    ///   Total: mg = ks_mg_white − ks_mg_black
-    ///             = (−KING_SAFETY_TABLE[units.clamp(0,99) as usize]
-    ///                + KS_KFILE_OPEN_MG + 2×KS_ADJ + KS_BOTH)
-    ///               − (KS_KFILE_OPEN_MG + KS_ADJ)
-    ///             = −KING_SAFETY_TABLE[0] + KS_ADJ + KS_BOTH.
-    ///          eg = 0.
-    ///   At zeroed weights: mg = 0, eg = 0.
-    ///
-    /// TDD state: GREEN against stub (expected = (0,0) at zeroed weights).
-    /// Load-bearing post-M6.F: gate-passing path + exact per-kind unit sum.
-    #[test]
-    fn king_safety_attack_units_symbolic_from_data() {
-        // White Kg1, Black Ka8 + Nd3 + Qe4. Exactly 2 zone-attackers + queen.
-        let pos = pos_of("k7/8/8/8/4q3/3n4/8/6K1 w - - 0 1");
-
-        // Weight-free preconditions using king_zone + attack fns.
-        let white_ksq = pos.king_square(Color::White);
-        let zone_w = king_zone(Color::White, white_ksq);
-        let occ = pos.occupied_all();
-
-        // Nd3 hits f2 in zone.
-        let nd3_zone_hits = movegen::masks::knight_attacks(Square::D3) & zone_w;
-        assert!(
-            nd3_zone_hits.any(),
-            "fixture invariant: Nd3 must attack ≥1 square in White Kg1 zone \
-             (zone-attacker count towards the gate threshold)"
-        );
-        assert_eq!(
-            nd3_zone_hits.count(),
-            1,
-            "Nd3 should hit exactly 1 zone square (f2); got {}",
-            nd3_zone_hits.count()
-        );
-
-        // Qe4 hits f3,g2,h1 in zone.
-        let qe4_zone_hits = magic::queen_attacks(Square::E4, occ) & zone_w;
-        assert!(
-            qe4_zone_hits.any(),
-            "fixture invariant: Qe4 must attack ≥1 square in White Kg1 zone"
-        );
-        assert_eq!(
-            qe4_zone_hits.count(),
-            3,
-            "Qe4 should hit exactly 3 zone squares (f3,g2,h1); got {}",
-            qe4_zone_hits.count()
-        );
-
-        // Exactly 2 distinct zone-attacking pieces; enemy queen present.
-        assert!(
-            pos.pieces_colored(Color::Black, PieceKind::Queen).any(),
-            "fixture invariant: enemy queen must be present (gate condition requires it)"
-        );
-        // Gate does NOT fire: attackers = 2 ≥ 2 AND queen present.
-        // (If `attackers < 2` were mutated to `<= 2`, the gate would wrongly fire
-        // at M6.F with non-zero weights — this is the plan §7 mutation it targets.)
-
-        // Two-sided symbolic derivation from eval::data (constants = 0):
-        let nd3_hits = nd3_zone_hits.count() as i32; // 1
-        let qe4_hits = qe4_zone_hits.count() as i32; // 3
-        let units = KING_ATTACK_WEIGHT_N * nd3_hits + KING_ATTACK_WEIGHT_Q * qe4_hits; // 0
-        let idx = units.clamp(0, (KING_SAFETY_TABLE.len() - 1) as i32) as usize;
-        let ks_mg_white_scurve = -KING_SAFETY_TABLE[idx];
-        let ks_mg_white_openfile =
-            KS_KFILE_OPEN_MG + 2 * KS_ADJ_SEMI_OPEN_MG + KS_BOTH_ADJ_SEMI_OPEN_MG;
-        let ks_mg_white = ks_mg_white_scurve + ks_mg_white_openfile;
-        let ks_mg_black = KS_KFILE_OPEN_MG + KS_ADJ_SEMI_OPEN_MG; // Ka8: open a, 1 adj
-        let expected = (ks_mg_white - ks_mg_black, 0i32);
-
-        assert_eq!(
-            king_safety_term_white(&pos),
-            expected,
-            "gate-passing: 2 attackers + queen ⇒ units flow to SAFETY_TABLE; \
-             expected ({},{}) from data (lit units={})",
-            expected.0,
-            expected.1,
-            KING_ATTACK_WEIGHT_N * nd3_hits + KING_ATTACK_WEIGHT_Q * qe4_hits,
-        );
-    }
-
-    /// Gate-PASSING S-curve: bishop + rook zone-attackers (covers B and R per-kind weights).
-    ///
-    /// Targets the B↔R swap and wrong-per-kind-constant mutations that the N/Q
-    /// fixture cannot kill (plan §7: per-kind weight pairing is a mutation surface).
-    ///
-    /// Fixture: White Kg1, Black Ka8 + Be4 + Rg5 + Qd8.
-    ///   White king zone (Kg1): {f1,h1,f2,g2,h2,f3,g3,h3} (8 squares).
-    ///   occ = {g1, a8, e4, g5, d8}.
-    ///
-    ///   Be4 bishop attacks (magic, occ):
-    ///     SE diagonal (toward zone): f3 ✓, g2 ✓, h1 ✓ (3 zone hits).
-    ///     KING_ATTACK_WEIGHT_B × 3 = 0 (zeroed, lit 2×3=6).
-    ///
-    ///   Rg5 rook attacks south (occ): g4, g3 ✓, g2 ✓, g1 (blocked). 2 zone hits.
-    ///     KING_ATTACK_WEIGHT_R × 2 = 0 (zeroed, lit 3×2=6).
-    ///
-    ///   Qd8: south d7..d1, east e8..h8, diagonal SE blocked at g5. 0 zone hits.
-    ///     Attackers = 2 (Be4 + Rg5, each h>0); enemy_has_queen = true.
-    ///     Gate: 2 ≥ 2 AND queen ⇒ gate does NOT fire.
-    ///     units = KING_ATTACK_WEIGHT_B×3 + KING_ATTACK_WEIGHT_R×2.
-    ///
-    ///   White Kg1 open-file (no pawns): KS_KFILE_OPEN_MG + 2×KS_ADJ + KS_BOTH.
-    ///   Black Ka8 open-file: KS_KFILE_OPEN_MG + KS_ADJ_SEMI_OPEN_MG.
-    ///
-    ///   Total: mg = (−KING_SAFETY_TABLE[units.clamp(0,99)] + KS_KFILE_OPEN_MG + 2×KS_ADJ + KS_BOTH)
-    ///               − (KS_KFILE_OPEN_MG + KS_ADJ)
-    ///            = −KING_SAFETY_TABLE[0] + KS_ADJ + KS_BOTH.
-    ///          eg = 0.
-    ///   At zeroed weights: (0, 0).
-    ///
-    /// TDD state: GREEN against the real impl at zeroed weights. Load-bearing at
-    /// M6.F: a B↔R swap (KING_ATTACK_WEIGHT_B↔R) or wrong-per-kind-constant
-    /// mutation is distinguishable when weights are non-zero (lit: B=6, R=6, but
-    /// swapping changes individual-kind multipliers differently for mixed hit-counts).
-    #[test]
-    fn king_safety_attack_units_all_kinds_symbolic() {
-        // White Kg1, Black Ka8 + Be4 + Rg5 + Qd8.
-        let pos = pos_of("k2q4/8/8/6r1/4b3/8/8/6K1 w - - 0 1");
-
-        // Weight-free preconditions using king_zone + attack fns.
-        let white_ksq = pos.king_square(Color::White);
-        let zone_w = king_zone(Color::White, white_ksq);
-        let occ = pos.occupied_all();
-
-        // Be4 hits f3, g2, h1 in zone (SE diagonal, no blockers on that ray).
-        let be4_zone_hits = magic::bishop_attacks(Square::E4, occ) & zone_w;
-        assert!(
-            be4_zone_hits.any(),
-            "fixture invariant: Be4 must attack ≥1 square in White Kg1 zone"
-        );
-        assert_eq!(
-            be4_zone_hits.count(),
-            3,
-            "Be4 should hit exactly 3 zone squares (f3,g2,h1); got {}",
-            be4_zone_hits.count()
-        );
-
-        // Rg5 hits g3, g2 in zone (south slide blocked by Kg1).
-        let rg5_zone_hits = magic::rook_attacks(Square::G5, occ) & zone_w;
-        assert!(
-            rg5_zone_hits.any(),
-            "fixture invariant: Rg5 must attack ≥1 square in White Kg1 zone"
-        );
-        assert_eq!(
-            rg5_zone_hits.count(),
-            2,
-            "Rg5 should hit exactly 2 zone squares (g3,g2); got {}",
-            rg5_zone_hits.count()
-        );
-
-        // Qd8 hits 0 zone squares (south ray d-file, east e8..h8, SE blocked by Rg5).
-        let qd8_zone_hits = magic::queen_attacks(Square::D8, occ) & zone_w;
-        assert_eq!(
-            qd8_zone_hits.count(),
-            0,
-            "Qd8 should hit 0 zone squares (blocked / wrong file); got {}",
-            qd8_zone_hits.count()
-        );
-
-        // Gate: attackers = 2 (Be4, Rg5 each h>0); enemy_has_queen = true.
-        assert!(
-            pos.pieces_colored(Color::Black, PieceKind::Queen).any(),
-            "fixture invariant: enemy queen must be present"
-        );
-
-        // Two-sided symbolic derivation from eval::data.
-        let be4_hits = be4_zone_hits.count() as i32; // 3
-        let rg5_hits = rg5_zone_hits.count() as i32; // 2
-        let units = KING_ATTACK_WEIGHT_B * be4_hits + KING_ATTACK_WEIGHT_R * rg5_hits; // 0
-        let idx = units.clamp(0, (KING_SAFETY_TABLE.len() - 1) as i32) as usize;
-        let ks_mg_white_scurve = -KING_SAFETY_TABLE[idx];
-        let ks_mg_white_openfile =
-            KS_KFILE_OPEN_MG + 2 * KS_ADJ_SEMI_OPEN_MG + KS_BOTH_ADJ_SEMI_OPEN_MG;
-        let ks_mg_white = ks_mg_white_scurve + ks_mg_white_openfile;
-        let ks_mg_black = KS_KFILE_OPEN_MG + KS_ADJ_SEMI_OPEN_MG; // Ka8: open a, 1 adj
-        let expected = (ks_mg_white - ks_mg_black, 0i32);
-
-        assert_eq!(
-            king_safety_term_white(&pos),
-            expected,
-            "B+R attackers + queen: units flow to SAFETY_TABLE; \
-             expected ({},{}) from data (lit units={})",
-            expected.0,
-            expected.1,
-            KING_ATTACK_WEIGHT_B * be4_hits + KING_ATTACK_WEIGHT_R * rg5_hits,
         );
     }
 
@@ -1438,52 +861,6 @@ mod tests {
             adj_count, 1,
             "a-file king has only 1 adjacent file (b); \
              KS_BOTH_ADJ_SEMI_OPEN_MG can never be triggered (semi_adj ≤ 1)"
-        );
-    }
-
-    /// Index-clamp arithmetic and no-panic check.
-    ///
-    /// (1) `i32::MAX.clamp(0, 99) == 99` (saturating high end).
-    /// (2) `(-1i32).clamp(0, 99) == 0` (saturating low end / negative-units floor).
-    /// (3) `KING_SAFETY_TABLE.len() == 100` (bounds match the clamp).
-    /// (4) A contrived high-attacker FEN does not panic and returns a finite score.
-    ///
-    /// The clamp `units.clamp(0, 99)` is a real bounds-correct clamp: with live
-    /// M6.F weights, units can exceed 99 (Q×4 × ≤11 zone squares + others).
-    /// The saturating S-curve tail is correct behavior, not defensive masking.
-    ///
-    /// TDD state: GREEN (weight-free arithmetic + no-panic).
-    #[test]
-    fn king_safety_index_clamp_saturates_no_panic() {
-        // (3) KING_SAFETY_TABLE.len() == 100: bounds match the clamp.
-        assert_eq!(
-            KING_SAFETY_TABLE.len(),
-            100,
-            "KING_SAFETY_TABLE must be 100 entries for the clamp to be correct"
-        );
-        // (1) High-end clamp.
-        assert_eq!(
-            i32::MAX.clamp(0, (KING_SAFETY_TABLE.len() - 1) as i32) as usize,
-            99,
-            "i32::MAX must clamp to 99 (table upper bound)"
-        );
-        // (2) Negative-input clamp to 0 (units are always ≥0 by construction,
-        //     but the clamp lower bound is still correct to assert).
-        assert_eq!(
-            (-1i32).clamp(0, (KING_SAFETY_TABLE.len() - 1) as i32) as usize,
-            0,
-            "-1 must clamp to 0 (units never negative; lower-bound check)"
-        );
-        // (4) No-panic with many attackers near the king.
-        let pos = pos_of("k7/8/8/8/1nnqqrr1/8/8/4K3 w - - 0 1");
-        let (mg, eg) = king_safety_term_white(&pos);
-        assert!(
-            mg.abs() < 100_000,
-            "king_safety_term_white must return a finite mg score; got {mg}"
-        );
-        assert!(
-            eg.abs() < 100_000,
-            "king_safety_term_white must return a finite eg score; got {eg}"
         );
     }
 }

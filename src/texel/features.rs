@@ -15,7 +15,7 @@ use crate::Position;
 use crate::bitboard::{self, Bitboard};
 use crate::eval::data::PASSED_KDIST_CAP;
 use crate::eval::{self, chebyshev_distance};
-use crate::piece::{Color, PieceKind};
+use crate::piece::Color;
 use crate::square::Square;
 use crate::texel::layout::{self, Group, group_range};
 use crate::texel::params::EvalParams;
@@ -59,20 +59,8 @@ pub fn reference_score_white(pos: &Position, p: &EvalParams) -> i32 {
     let (op_mg, op_eg) = dot_features(&eval::tier1::outpost_features(pos), &core);
     let (rf_mg, rf_eg) = dot_features(&eval::tier1::rook_file_features(pos), &core);
 
-    // King-safety S-curve: frozen at `p`'s shipped values (excluded from the
-    // core). At shipped these are all zero ⇒ the term contributes exactly 0;
-    // we keep it explicit (and exact) so the oracle == engine at shipped.
-    let kss_mg = king_safety_scurve_mg(pos, p);
-
-    let mg_sum = (mg_pst + bp_mg) as f64
-        + iso_mg
-        + conn_mg
-        + pp_mg
-        + mob_mg
-        + ks_mg
-        + kss_mg
-        + op_mg
-        + rf_mg;
+    let mg_sum =
+        (mg_pst + bp_mg) as f64 + iso_mg + conn_mg + pp_mg + mob_mg + ks_mg + op_mg + rf_mg;
     let eg_sum =
         (eg_pst + bp_eg) as f64 + iso_eg + conn_eg + pp_eg + mob_eg + ks_eg + op_eg + rf_eg;
 
@@ -237,60 +225,6 @@ fn passed_term(pos: &Position, p: &EvalParams) -> (f64, f64) {
         }
     }
     (mg, eg)
-}
-
-/// King-safety S-curve MG contribution that the LINEAR shield seam excludes,
-/// recomputed from `p`'s frozen (integer-valued) S-curve fields. At shipped
-/// weights every entry is zero ⇒ contributes exactly 0; kept exact so the
-/// oracle matches the engine. EG is always 0 (king-safety is MG-only).
-fn king_safety_scurve_mg(pos: &Position, p: &EvalParams) -> f64 {
-    let occ_all = pos.occupied_all();
-    let mut mg = 0i32;
-    let table_len = p.king_safety_table.len() as i32;
-
-    for (side, sign) in [(Color::White, 1i32), (Color::Black, -1i32)] {
-        let enemy = side.flip();
-        let ksq = pos.king_square(side);
-        let zone = eval::king_safety::king_zone(side, ksq);
-
-        let mut units = 0i32;
-        let mut attackers = 0u32;
-        for psq in pos.pieces_colored(enemy, PieceKind::Knight).iter() {
-            let h = (crate::movegen::masks::knight_attacks(psq) & zone).count() as i32;
-            if h > 0 {
-                attackers += 1;
-                units += p.king_attack_weight_n.round() as i32 * h;
-            }
-        }
-        for psq in pos.pieces_colored(enemy, PieceKind::Bishop).iter() {
-            let h = (crate::magic::bishop_attacks(psq, occ_all) & zone).count() as i32;
-            if h > 0 {
-                attackers += 1;
-                units += p.king_attack_weight_b.round() as i32 * h;
-            }
-        }
-        for psq in pos.pieces_colored(enemy, PieceKind::Rook).iter() {
-            let h = (crate::magic::rook_attacks(psq, occ_all) & zone).count() as i32;
-            if h > 0 {
-                attackers += 1;
-                units += p.king_attack_weight_r.round() as i32 * h;
-            }
-        }
-        for psq in pos.pieces_colored(enemy, PieceKind::Queen).iter() {
-            let h = (crate::magic::queen_attacks(psq, occ_all) & zone).count() as i32;
-            if h > 0 {
-                attackers += 1;
-                units += p.king_attack_weight_q.round() as i32 * h;
-            }
-        }
-        let enemy_has_queen = pos.pieces_colored(enemy, PieceKind::Queen).any();
-        if attackers < 2 || !enemy_has_queen {
-            units = 0;
-        }
-        let idx = units.clamp(0, table_len - 1) as usize;
-        mg -= sign * p.king_safety_table[idx].round() as i32;
-    }
-    mg as f64
 }
 
 /// Endgame draw-scale numerator from `p`'s scale fields. Mirrors
@@ -551,15 +485,10 @@ mod tests {
     /// the shipped core vec, over the battery. THE test that validates the tuned
     /// regime (ADR-0037 §7 Tier 2).
     ///
-    /// The fast linear model (`extract` / `model_score_white`) deliberately
-    /// EXCLUDES the king-safety attacker S-curve (ADR-0037 §3 — the excluded
-    /// nonlinear term that keeps the gradient solve linear). Since M6.K
-    /// activated that S-curve to non-zero literature values, the reference
-    /// scorer now carries a non-zero `king_safety_scurve_mg` addend the linear
-    /// model cannot represent. This Tier-2 test validates the LINEAR core
-    /// fidelity, so the S-curve is zeroed in the comparison params here; the
-    /// S-curve term itself is validated against `evaluate` by
-    /// `reference_matches_static_eval_at_shipped` (Tier 1).
+    /// The attacker S-curve was removed (M6.K, both SPRT probes regressed), so
+    /// the reference scorer and the linear model are now fully symmetric: both
+    /// cover shield + open-file via the linear core, and neither carries a
+    /// nonlinear term. No S-curve exclusion is required.
     #[test]
     fn model_matches_reference_at_random_and_literature_weights() {
         const TOL_CP: f64 = 2.0;
@@ -574,14 +503,7 @@ mod tests {
             // Identity scale: with_core leaves the (shipped-identity) scale
             // numerators untouched, so the reference scorer runs at identity
             // scale and matches the linear fast model.
-            let mut params = shipped.with_core(w);
-            // Isolate the linear core: zero the frozen, non-linear S-curve that
-            // the fast model excludes by construction (see the doc comment).
-            params.king_attack_weight_n = 0.0;
-            params.king_attack_weight_b = 0.0;
-            params.king_attack_weight_r = 0.0;
-            params.king_attack_weight_q = 0.0;
-            params.king_safety_table = [0.0; 100];
+            let params = shipped.with_core(w);
             for pos in &positions {
                 let model = model_score_white(&extract(pos), w);
                 let reference = reference_score_white(pos, &params) as f64;
