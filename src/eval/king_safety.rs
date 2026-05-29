@@ -2,8 +2,9 @@
 //! attack contributes ±sign symmetrically. Computed live in `evaluate_core`
 //! (not pawn-only ⇒ never cached — ADR-0033 §6, supersedes ADR-0032 §3).
 //! Zone = 3×3 ring + forward wedge; per-kind attacker units → SAFETY_TABLE;
-//! castled-king pawn-shield; MG-only open/semi-open-file penalty. All weights
-//! zeroed at ship (score-neutral, ADR-0033 §8) — term math live, M6.F-ready.
+//! castled-king pawn-shield; MG-only open/semi-open-file penalty. The attacker
+//! S-curve is activated to the literature CPW values at M6.K (ADR-0038); the
+//! shield + open-file linear terms were Texel-tuned at M6.I (ADR-0037).
 
 use crate::bitboard::{self, Bitboard};
 use crate::eval::data::{
@@ -137,7 +138,8 @@ pub(crate) fn shield_open_file_term_white(pos: &Position) -> (i32, i32) {
 
 /// Returns the white-perspective `(mg, eg)` king-safety contribution (zone
 /// attacker S-curve + castled pawn-shield + open/semi-open-file penalty).
-/// Black's king contributes with −sign. All weights zeroed at ship.
+/// Black's king contributes with −sign. S-curve at literature CPW values
+/// (M6.K); shield + open-file Texel-tuned (M6.I).
 pub(crate) fn king_safety_term_white(pos: &Position) -> (i32, i32) {
     let occ_all = pos.occupied_all();
     let wp = pos.pieces_colored(Color::White, PieceKind::Pawn);
@@ -276,8 +278,9 @@ mod tests {
     /// Start position is perfectly symmetric (White and Black king-safety
     /// contributions cancel). Returns `(0, 0)`.
     ///
-    /// TDD state: GREEN against stub (stub returns (0,0); real impl also
-    /// returns (0,0) by symmetry at zeroed weights). No weights involved.
+    /// Returns `(0, 0)` by gate + symmetry: the start position has no king-zone
+    /// attacker (the `< 2 attackers` gate fires) and is color-symmetric, so the
+    /// result is `(0, 0)` independent of the (now-activated) S-curve weights.
     #[test]
     fn king_safety_startpos_is_zero() {
         let pos = Position::starting_position();
@@ -298,6 +301,160 @@ mod tests {
             KING_SAFETY_TABLE.len(),
             100,
             "KING_SAFETY_TABLE must have exactly 100 entries (CPW S-curve)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M6.K activation pins: the literature CPW S-curve is now LIVE (multipliers
+    // 2/2/3/4, the 100-entry Glaurung-1.2-lineage table). These tests fail
+    // against the pre-M6.K zeroed data and guard the activation + transcription.
+    // -----------------------------------------------------------------------
+
+    /// Representative `KING_SAFETY_TABLE` entries pinned against transcription
+    /// typos (the table is vendored verbatim from the `data.rs` block comment).
+    /// `[14]` is load-bearing for `king_safety_activated_penalty_is_negative`.
+    #[test]
+    fn king_safety_literature_table_values_pinned() {
+        let expected: &[(usize, i32)] = &[
+            (0, 0),
+            (1, 0),
+            (2, 1),
+            (5, 5),
+            (10, 18),
+            (14, 35),
+            (31, 150),
+            (32, 169),
+            (60, 494),
+            (61, 500),
+            (99, 500),
+        ];
+        for &(i, v) in expected {
+            assert_eq!(
+                KING_SAFETY_TABLE[i], v,
+                "KING_SAFETY_TABLE[{i}] must be {v} (CPW literature S-curve); got {}",
+                KING_SAFETY_TABLE[i]
+            );
+        }
+    }
+
+    /// The S-curve is non-decreasing and saturates at 500 (its defining shape).
+    /// A property more compact than enumerating all 100 entries; kills a
+    /// reordered / dipped transcription a point-pin set could miss. (Pre-M6.K,
+    /// against the all-zero table the monotonicity loop is vacuously true — it
+    /// is the `TABLE[99] == 500` saturation pin below that makes this test fail
+    /// red until activation.)
+    #[test]
+    fn king_safety_table_monotonic_nondecreasing() {
+        for i in 0..KING_SAFETY_TABLE.len() - 1 {
+            assert!(
+                KING_SAFETY_TABLE[i] <= KING_SAFETY_TABLE[i + 1],
+                "S-curve must be non-decreasing: TABLE[{i}]={} > TABLE[{}]={}",
+                KING_SAFETY_TABLE[i],
+                i + 1,
+                KING_SAFETY_TABLE[i + 1]
+            );
+        }
+        assert_eq!(
+            KING_SAFETY_TABLE[99], 500,
+            "S-curve saturates at 500 in the flat tail"
+        );
+    }
+
+    /// The 4 per-kind attacker multipliers are at their literature CPW values.
+    /// Anchors the activation itself — an accidental re-zero fails here.
+    #[test]
+    fn king_safety_multipliers_literature_pinned() {
+        assert_eq!(
+            (
+                KING_ATTACK_WEIGHT_N,
+                KING_ATTACK_WEIGHT_B,
+                KING_ATTACK_WEIGHT_R,
+                KING_ATTACK_WEIGHT_Q
+            ),
+            (2, 2, 3, 4),
+            "literature CPW attacker multipliers N/B/R/Q = 2/2/3/4"
+        );
+    }
+
+    /// Activation anchor (bare literal, NOT recomputed from `eval::data`).
+    ///
+    /// Fixture: White Kg1 under attack by Black Nd3 + Qe4 (Ka8 elsewhere). The
+    /// gate passes (2 attackers + queen); Nd3 hits 1 zone square, Qe4 hits 3, so
+    /// `units = KING_ATTACK_WEIGHT_N·1 + KING_ATTACK_WEIGHT_Q·3 = 2 + 12 = 14`
+    /// and `KING_SAFETY_TABLE[14] = 35` ⇒ a white-POV S-curve penalty of −35,
+    /// layered on the M6.I open-file delta (white −95 vs black −57 = −38). Total
+    /// white-POV `(mg, eg) = (−73, 0)`.
+    ///
+    /// The expected value is a **hardcoded literal**: against the pre-M6.K
+    /// zeroed table the S-curve contributes 0 and the term would be `(−38, 0)`
+    /// (open-file only), so this assertion fails unless the S-curve is genuinely
+    /// active. (The sibling `king_safety_attack_units_symbolic_from_data` covers
+    /// the auto-tracking exact-arithmetic angle; this is its literal complement.)
+    #[test]
+    fn king_safety_activated_penalty_is_negative() {
+        let pos = pos_of("k7/8/8/8/4q3/3n4/8/6K1 w - - 0 1");
+        assert_eq!(
+            king_safety_term_white(&pos),
+            (-73, 0),
+            "activated literature S-curve: TABLE[14] = −35 on top of the −38 \
+             open-file delta ⇒ (−73, 0); the non-activated table gives (−38, 0)"
+        );
+    }
+
+    /// The S-curve is MG-only (ADR-0033 §2/§5): firing it must not touch EG.
+    /// Differential test — remove the queen so the gate fires (S-curve → 0)
+    /// while the pawnless open-file / shield geometry is unchanged; the only
+    /// difference is then the S-curve MG term, of exactly −KING_SAFETY_TABLE[14].
+    #[test]
+    fn king_safety_scurve_is_mg_only() {
+        // `firing`: 2 attackers (Nd3 + Qe4) + queen ⇒ gate passes, units = 14.
+        // `gated`: drop the queen ⇒ BOTH gate conditions fire (1 attacker AND no
+        // queen) ⇒ units = 0. Pawnless and same king squares in both, so the
+        // open-file and shield contributions are identical and cancel in the
+        // difference, leaving only the S-curve MG term.
+        let firing = pos_of("k7/8/8/8/4q3/3n4/8/6K1 w - - 0 1");
+        let gated = pos_of("k7/8/8/8/8/3n4/8/6K1 w - - 0 1");
+        let (mg_f, eg_f) = king_safety_term_white(&firing);
+        let (mg_g, eg_g) = king_safety_term_white(&gated);
+        assert_eq!(
+            eg_f, 0,
+            "S-curve must not contribute to EG (firing position)"
+        );
+        assert_eq!(eg_g, 0, "gated position EG also 0");
+        assert_eq!(
+            mg_f - mg_g,
+            -35,
+            "firing the S-curve adds exactly −KING_SAFETY_TABLE[14] = −35 to MG \
+             only (open-file/shield identical between the two positions)"
+        );
+    }
+
+    /// Saturation-clamp behavioral pin at a SECOND operating point (the flat
+    /// tail), via the live `king_safety_term_white` path — complements the
+    /// index-14 `king_safety_activated_penalty_is_negative` anchor.
+    ///
+    /// `saturated`: White Ke1 swamped by three black queens (d3/e3/f3) AND three
+    /// rooks (d4/e4/f4). The exact unit count is irrelevant — three adjacent
+    /// queens alone clear ~60 units and the rooks push far past the index-61
+    /// saturation knee, so the S-curve pegs at `KING_SAFETY_TABLE[99] = 500`
+    /// regardless of the precise sum (deliberately avoids fragile hand-counting
+    /// of a dense position). `gated`: queens replaced by knights ⇒ no enemy
+    /// queen ⇒ gate fires ⇒ S-curve = 0, with identical (pawnless) open-file /
+    /// shield geometry. The difference isolates the saturated S-curve as a bare
+    /// literal `−500` — fails against any non-saturating or zeroed table.
+    #[test]
+    fn king_safety_scurve_saturates_at_table_tail() {
+        let saturated = pos_of("k7/8/8/8/3rrr2/3qqq2/8/4K3 w - - 0 1");
+        let gated = pos_of("k7/8/8/8/3rrr2/3nnn2/8/4K3 w - - 0 1");
+        let (mg_s, eg_s) = king_safety_term_white(&saturated);
+        let (mg_g, eg_g) = king_safety_term_white(&gated);
+        assert_eq!(eg_s, 0, "S-curve is MG-only (saturated position EG = 0)");
+        assert_eq!(eg_g, 0, "gated position EG = 0");
+        assert_eq!(
+            mg_s - mg_g,
+            -500,
+            "a saturating attacker pile pegs the S-curve at KING_SAFETY_TABLE[99] \
+             = 500 (white-POV −500); open-file/shield identical between the two"
         );
     }
 

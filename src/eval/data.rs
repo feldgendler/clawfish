@@ -297,20 +297,34 @@ pub(crate) const QUEEN_MOBILITY_EG: [i32; 28] = [-28, -34, -34, -33, -31, -24, -
 // `.cargo/mutants.toml` alongside the PST/mobility arrays.
 // ---------------------------------------------------------------------------
 
-/// King-zone attacker-unit multiplier, knight. Zeroed (score-neutral, M6.F re-tunes).
-pub(crate) const KING_ATTACK_WEIGHT_N: i32 = 0; // lit 2
-/// King-zone attacker-unit multiplier, bishop. Zeroed — see `KING_ATTACK_WEIGHT_N`.
-pub(crate) const KING_ATTACK_WEIGHT_B: i32 = 0; // lit 2
-/// King-zone attacker-unit multiplier, rook. Zeroed — see `KING_ATTACK_WEIGHT_N`.
-pub(crate) const KING_ATTACK_WEIGHT_R: i32 = 0; // lit 3
-/// King-zone attacker-unit multiplier, queen. Zeroed — see `KING_ATTACK_WEIGHT_N`.
-pub(crate) const KING_ATTACK_WEIGHT_Q: i32 = 0; // lit 4
+/// King-zone attacker-unit multiplier, knight. Literature CPW value (M6.K
+/// activation — stage 1, SPRT-pending vs `M6.J`; see ADR-0038).
+pub(crate) const KING_ATTACK_WEIGHT_N: i32 = 2;
+/// King-zone attacker-unit multiplier, bishop. Literature CPW value — see `KING_ATTACK_WEIGHT_N`.
+pub(crate) const KING_ATTACK_WEIGHT_B: i32 = 2;
+/// King-zone attacker-unit multiplier, rook. Literature CPW value — see `KING_ATTACK_WEIGHT_N`.
+pub(crate) const KING_ATTACK_WEIGHT_R: i32 = 3;
+/// King-zone attacker-unit multiplier, queen. Literature CPW value — see `KING_ATTACK_WEIGHT_N`.
+pub(crate) const KING_ATTACK_WEIGHT_Q: i32 = 4;
 
 /// CPW-Engine 100-entry S-curve SafetyTable. Indexed by accumulated attack
-/// units; clamped to [0, 99]. Zeroed — see block comment (M6.F re-derives).
-/// The literature defaults are recorded verbatim in the block comment above.
+/// units; clamped to [0, 99]. Activated to the literature Glaurung-1.2-lineage
+/// curve at M6.K (stage 1, SPRT-pending vs `M6.J`; ADR-0038). Slow rise 0–10,
+/// steeper 10–60, flat 500 from index 61. Frozen (excluded from the Texel core
+/// vector — ADR-0037 §3); a future SPSA-deflate (stage 2) re-scales it as data.
 #[rustfmt::skip]
-pub(crate) const KING_SAFETY_TABLE: [i32; 100] = [0; 100];
+pub(crate) const KING_SAFETY_TABLE: [i32; 100] = [
+      0,   0,   1,   2,   3,   5,   7,   9,  12,  15,
+     18,  22,  26,  30,  35,  39,  44,  50,  56,  62,
+     68,  75,  82,  85,  89,  97, 105, 113, 122, 131,
+    140, 150, 169, 180, 191, 202, 213, 225, 237, 248,
+    260, 272, 283, 295, 307, 319, 330, 342, 354, 366,
+    377, 389, 401, 412, 424, 436, 448, 459, 471, 483,
+    494, 500, 500, 500, 500, 500, 500, 500, 500, 500,
+    500, 500, 500, 500, 500, 500, 500, 500, 500, 500,
+    500, 500, 500, 500, 500, 500, 500, 500, 500, 500,
+    500, 500, 500, 500, 500, 500, 500, 500, 500, 500,
+];
 
 // TEXEL-TUNABLE-BEGIN: king_safety_shield_file
 /// Pawn-shield bonus: friendly pawn on king's 2nd rank, middlegame. Zeroed.

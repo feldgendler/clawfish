@@ -238,7 +238,9 @@ Run order is forced (not a preference): **A first** — it is M6.I's committed d
 
 ### M6.I king-safety attacker S-curve — SPSA-deflate + SPRT (post-M6.I; the one M6 term Texel left off)
 
-**Status.** Deferred at the M6.I harness landing (2026-05-24). M6.I tuned the *linear* king-safety terms (pawn-shield + open/semi-open-file) but **excluded the attacker-count S-curve** (the 100-entry `KING_SAFETY_TABLE` + the 4 per-kind `KING_ATTACK_WEIGHT_*` multipliers) — it ships at zero (off), identical to M6.F. ADR-0037 §3 / `docs/milestones/m6.i.md`. This entry is how the residual gets closed *if* it's worth closing.
+**Status.** **PROMOTED to milestone M6.K (candidate landed 2026-05-29; stage-1 literature-activation SPRT vs `M6.J` operator-gated/pending).** This backlog entry is superseded by M6.K — see ADR-0038 + `docs/milestones/m6.k.md`. Stage 1 (literature on/off probe) is implemented as a pure `eval::data` activation (multipliers `2/2/3/4` + the Glaurung-1.2 table); stage 2 (SPSA-deflate, only if stage 1 H0/regresses) is realized as a pre-scaled-table grid rather than a runtime gain knob. Kept here for the structural/semantic rationale, which M6.K inherits verbatim.
+
+_Original deferral note (M6.I harness landing, 2026-05-24):_ M6.I tuned the *linear* king-safety terms (pawn-shield + open/semi-open-file) but **excluded the attacker-count S-curve** (the 100-entry `KING_SAFETY_TABLE` + the 4 per-kind `KING_ATTACK_WEIGHT_*` multipliers) — it shipped at zero (off), identical to M6.F. ADR-0037 §3 / `docs/milestones/m6.i.md`.
 
 **Why Texel-on-quiet-positions can't do it (so a different tool is needed).**
 - **Structural:** the term is non-linear — `score = TABLE[Σ multiplier·attackers]`. M6.I's speed comes from a linear feature-cached model; a non-linear term doesn't fit it, and with the multipliers frozen at their shipped zero the table index freezes to 0 (only `TABLE[0]` reachable). Making the index live needs non-zero multipliers, which either break linearity (tunable) or break the M6.I faithfulness cross-check (frozen-at-literature ≠ the shipped-zero `static_eval`).

@@ -548,16 +548,25 @@ mod tests {
 
     /// `model_score_white(extract(pos), w) ≈ reference_score_white(pos,
     /// shipped().with_core(w))` within ≤2cp, for several seeded random `w` AND
-    /// a literature-magnitude `w`, over the battery. THE test that validates
-    /// the tuned regime (ADR-0037 §7 Tier 2).
+    /// the shipped core vec, over the battery. THE test that validates the tuned
+    /// regime (ADR-0037 §7 Tier 2).
+    ///
+    /// The fast linear model (`extract` / `model_score_white`) deliberately
+    /// EXCLUDES the king-safety attacker S-curve (ADR-0037 §3 — the excluded
+    /// nonlinear term that keeps the gradient solve linear). Since M6.K
+    /// activated that S-curve to non-zero literature values, the reference
+    /// scorer now carries a non-zero `king_safety_scurve_mg` addend the linear
+    /// model cannot represent. This Tier-2 test validates the LINEAR core
+    /// fidelity, so the S-curve is zeroed in the comparison params here; the
+    /// S-curve term itself is validated against `evaluate` by
+    /// `reference_matches_static_eval_at_shipped` (Tier 1).
     #[test]
     fn model_matches_reference_at_random_and_literature_weights() {
         const TOL_CP: f64 = 2.0;
         let shipped = EvalParams::shipped();
         let positions = battery();
 
-        // Several seeded random vectors + the shipped core vec (literature
-        // magnitude: CONN live, the rest zero).
+        // Several seeded random vectors + the shipped core vec.
         let mut weight_vecs: Vec<Vec<f64>> = (1u64..=5).map(seeded_core_weights).collect();
         weight_vecs.push(shipped.core_to_vec());
 
@@ -565,7 +574,14 @@ mod tests {
             // Identity scale: with_core leaves the (shipped-identity) scale
             // numerators untouched, so the reference scorer runs at identity
             // scale and matches the linear fast model.
-            let params = shipped.with_core(w);
+            let mut params = shipped.with_core(w);
+            // Isolate the linear core: zero the frozen, non-linear S-curve that
+            // the fast model excludes by construction (see the doc comment).
+            params.king_attack_weight_n = 0.0;
+            params.king_attack_weight_b = 0.0;
+            params.king_attack_weight_r = 0.0;
+            params.king_attack_weight_q = 0.0;
+            params.king_safety_table = [0.0; 100];
             for pos in &positions {
                 let model = model_score_white(&extract(pos), w);
                 let reference = reference_score_white(pos, &params) as f64;
