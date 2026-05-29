@@ -266,55 +266,12 @@ Run order is forced (not a preference): **A first** — it is M6.I's committed d
 
 ---
 
-### Corpus-mixture meta-tune (post-M6.I) — RE-RUN PRECONDITIONS (campaign aborted 2026-05-26)
-
-**Status.** A first attempt to beat `M6.I` via a corpus-mixture meta-tune
-(`texel-tune mixture`: bi-level Nelder–Mead over the four lane proportions, inner
-Adam Texel solve per candidate, warm-started from `M6.I`) was launched on a 16M
-corpus rebuilt under dedup-against-committed (II) and **aborted after ~9 h
-without completing**. Full post-mortem: [`../milestones/meta-tune-postmortem.md`](../milestones/meta-tune-postmortem.md).
-The infra it spun off shipped CI-green (corpus (II)+extend `25b943e`,
-suspend-tolerant watchdog `c8f2cb7`, meta-tune observability `5caf723`).
-
-**Two of the four root causes are now fixed in-tree** (so this is a *re-run*, not
-a from-scratch campaign):
-
-- Inner optimizer no longer re-streams the on-disk cache every epoch
-  (`optimizer::load_split_records` — records loaded once, iterated in memory).
-  Order-of-magnitude inner-tune speedup; behaviour-preserving (bit-identical).
-- `mixture::simplex_search` now checkpoints after every inner tune
-  (`<out-params>.mixckpt`, bit-exact binary codec) and resumes — a kill/suspend
-  no longer forfeits the run.
-- Observability already shipped (`5caf723`): per-epoch log + `<out-params>.progress`.
-
-**Still open before re-running (do these first):**
-
-1. **Cap the inner-tune `--max-iter` low** (e.g. 100–200). The headline reason
-   the run ballooned: full-batch held-out loss is too smooth for `patience=5`
-   (absolute `1e-12` improvement test) or the integer-quantization floor to fire,
-   so each inner tune ran toward `max-iter=1000`. The warm start from `M6.I` is
-   near-optimal ⇒ inner tunes need few epochs. **Cheapest, highest-leverage
-   lever.** Optionally also a *relative*-improvement patience threshold and/or
-   minibatch/subsample for honest early-stop. Validate the chosen mix is stable
-   vs a longer run on a small corpus before trusting the cap.
-2. **(Optional) parallelize the five seed-vertex inner tunes** — they are
-   independent (reflections are sequential). A deterministic parallel seed phase
-   would cut wall-clock further.
-
-**Re-run recipe.** Build a release binary that includes the above (and the
-already-landed perf/checkpoint/observability code); launch `texel-tune mixture`
-at background QoS + `nice` with the low `--max-iter`; watch
-`<out-params>.progress` and the `.mixckpt`. Confirm the winning mix by mixed-TC
-+ virtual-clock SPRT vs the `M6.I` tag; ship only if it beats `M6.I` (+93.86).
-
-**Hard rejection / decay.** Same opportunity-cost decay as the other pre-M11
-eval items: NNUE (M11) re-trains the eval from scratch and obsoletes the
-classical-weight mixture. A pre-M11 opportunity only; deprioritize as M11
-approaches.
-
-**Cross-references.** [`../milestones/meta-tune-postmortem.md`](../milestones/meta-tune-postmortem.md);
-ADR-0037 §8 (bi-level mixture); `src/texel/mixture.rs` / `src/texel/optimizer.rs`.
+*Active queue ends here. New items append above this line.*
 
 ---
 
-*Active queue ends here. New items append above this line.*
+## Done
+
+### ~~Corpus-mixture meta-tune (post-M6.I) — RE-RUN PRECONDITIONS~~ — DELIVERED by M6.J 2026-05-29
+
+The bi-level corpus-mixture meta-tune (aborted 2026-05-26 post-mortem at [`../milestones/meta-tune-postmortem.md`](../milestones/meta-tune-postmortem.md)) was re-run as part of M6.J. **Shipped:** mix `[0.32, 0.15, 0.23, 0.31]` at val_loss 0.142749, K = 0.005690 (cold-start from zero weights, not the warm-start the original entry called for — exposed that warm-start near-optimum and cold-start global optimum were 2 µ-loss apart but **+41 Elo** apart in play). Algorithmic root cause beyond the postmortem's three was a fourth: the M6.I "coarse N-M-style" simplex was **reflect-only**, which structurally stalls on flat surfaces (any time the reflection is rejected, the simplex is unchanged and the next iteration recomputes the same number). M6.J's `b1c4b74` replaced it with the full textbook Nelder–Mead (reflect / expand / contract / shrink) + softmax R³ reparameterization (removes the `clamp + renormalize` discontinuity at the simplex boundary) + Kelley sufficient-decrease restart (guards McKinnon-1998 degeneracy). The cold-start retune **converged at iter 8/30 via `obj_spread < EPS_F = 1e-6`** — the convergence stop, not the iter cap. SPRT vs `M6.I`: verdict=continue at 400-game cap, pentanomial CI **+41.01 Elo [+18.26, +64.12]** ⇒ rung-1 ship by CI. See [`../milestones/m6.j.md`](../milestones/m6.j.md).
