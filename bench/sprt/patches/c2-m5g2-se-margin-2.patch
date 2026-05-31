@@ -1,0 +1,31 @@
+diff --git a/src/search.rs b/src/search.rs
+index e5d658d..432a458 100644
+--- a/src/search.rs
++++ b/src/search.rs
+@@ -520,9 +520,11 @@ const _: () = assert!(FFP_MAX_DEPTH < LMR_MIN_DEPTH);
+ pub(crate) const SE_MIN_DEPTH: u32 = 6;
+ 
+ /// M5.G singular-extension margin per ply. `singular_beta = tt_score - depth *
+-/// SE_MARGIN_PER_DEPTH`. Xiphos / Ethereal defaults; conservative starting
+-/// value. Post-landing SPRT-tune candidate (tuning backlog: try 2). ADR-0029 §2.
+-pub(crate) const SE_MARGIN_PER_DEPTH: i32 = 1;
++/// SE_MARGIN_PER_DEPTH`. Value `2` is the Stockfish-historical default (was `1`,
++/// the Xiphos/Ethereal conservative value); a wider margin tightens SE
++/// eligibility (fewer extensions, less verification cost). On-trial via the
++/// M5.G-2 tuning campaign vs M6.J (tuning-backlog M5.G item 2). ADR-0029 §2.
++pub(crate) const SE_MARGIN_PER_DEPTH: i32 = 2;
+ 
+ /// M5.G singular-extension TT-entry depth tolerance. SE fires only when the
+ /// TT entry's stored depth is at least `depth - SE_TT_DEPTH_DELTA`, i.e. the
+@@ -17849,7 +17851,10 @@ mod tests {
+         // and `score_to_tt`/`score_from_tt` are identity transforms.
+         let s_beta_value: i32 = 50;
+         let s_beta_delta: i32 = 5;
+-        let tt_score_raw: i32 = s_beta_value + depth as i32;
++        // Symbolic in SE_MARGIN_PER_DEPTH so the boundary fixture holds at any
++        // margin (singular_beta = tt_score - depth*MARGIN = s_beta_value for all
++        // MARGIN). Was `s_beta_value + depth` which silently assumed MARGIN=1.
++        let tt_score_raw: i32 = s_beta_value + depth as i32 * SE_MARGIN_PER_DEPTH;
+         assert_eq!(
+             singular_beta(tt_score_raw, depth),
+             s_beta_value,

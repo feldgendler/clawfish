@@ -76,6 +76,26 @@ The modest tactical lean (WAC +7, STS +50) is consistent with the SPRT's +1.74 E
 
 ### M5.F qsearch-in-TT — bound semantics, PV suppression, path gating
 
+**STATUS (2026-05-31 overnight qsearch-TT tuning campaign — `docs/plans/tuning-m5f-m5g-overnight.md`):**
+- **Item 1 (Exact at completed-loop, "M5.F.1") — SHIPPED.** Δ Elo **+37.49
+  [+15.71, +59.58]** vs `M6.J`, mixed-TC + virtual-clock, 400 games. Three-way
+  `qsearch_tt_bound_for_completed_node` (Exact when `alpha_entry < best < beta`);
+  sound here because negamax delegates to qsearch at depth 0 before its TT
+  cutoff, so a depth-0 qsearch-Exact is only ever consumed by qsearch's own
+  (window-independent) re-probe. `bench/sprt/2026-05-30-c3-m5f1-*.md`.
+- **Item 3 (Path-A stand-pat store gating, "M5.F.3") — VALIDATED but DEFERRED.**
+  Δ Elo **+37.49 [+12.46, +62.92]** vs `M6.J` *standalone*, BUT it does **not
+  compose with M5.F.1**: the combined C1+C3 went flat (+9.56 [−17.18, +36.41]),
+  with a real, seed-confirmed destructive interaction at 40+0.4 (combined −58 Elo
+  there across two seeds). Both are qsearch-TT changes that trade accuracy for
+  speed; combined, the speed saturates while the inaccuracies compound (H1, the
+  leading hypothesis). **Re-queued:** a future session could (a) ship M5.F.3
+  *instead of* M5.F.1 (it was fast-TC-amplifying; M5.F.1 is depth-amplifying, so
+  M5.F.1 was preferred per the ELOH.D mandate), or (b) bisect the interaction and
+  re-tune so they compose. Patch: `bench/sprt/patches/c1-m5f3-path-a-suppress.patch`;
+  data: `bench/sprt/2026-05-30-c1-m5f3-*.md` + `bench/sprt/2026-05-30-c1c3-combined-*.md`.
+- Items 2, 4–8 below remain untried.
+
 **Why active.** M5.F vs M5.E mixed-TC SPRT was inconclusive: Δ Elo +13.03 [−10.92, +37.12], `verdict=continue`, with a bimodal per-TC pattern (10+0.1 strong-positive, 60+0.6 slight-negative). Landed as "small-but-not-regression" per plan §11. The post-landing probe-only experiment (`bench/sprt/2026-05-09-m5.f-probe-only-vs-probe-and-store.md`) ruled out per-probe overhead as the cause of the slow-TC slight-regression, leaving Upper-bound looseness and TT-pressure pollution as the leading hypotheses.
 
 **Tunable space.** Ranked by expected leverage on the slow-TC slight-regression (fast-TC gains are already strong; the goal is to recover the slow-TC end without losing the fast-TC end).
@@ -104,6 +124,18 @@ The modest tactical lean (WAC +7, STS +50) is consistent with the SPRT's +1.74 E
 ---
 
 ### M5.G singular-extensions — verification-window boundary mutants + tunable-space sweep
+
+**STATUS (2026-05-31 tuning campaign):**
+- **Item 2 (`SE_MARGIN_PER_DEPTH = 2`) — REVERTED (flat).** SPRT vs `M6.J`
+  (mixed-TC + virtual-clock, 400 games): Δ Elo **+20.87 [−3.30, +45.24]** — point
+  estimate positive but CI straddles 0, and sharply bimodal per-TC (strong at
+  mid-TC, negative at the extremes — the M5.G-v1/M5.H2 instability signature).
+  Not a ship; `SE_MARGIN_PER_DEPTH` stays `1`. `bench/sprt/2026-05-30-c2-m5g2-*.md`.
+  A future revisit could try `SE_MARGIN=2` *gated to mid-depth* or co-tuned with
+  `SE_MIN_DEPTH`, but no single-knob value clears the gate now.
+- **Item 3 (`SE_MIN_DEPTH 8→6`) — ALREADY SHIPPED / STALE.** The constant is
+  already `6` (the M5.G v2 retune shipped it; see the `M5.G` tag annotation).
+  This item was written pre-v2 and is moot; dropped.
 
 **Why active.** M5.G's `cargo mutants --in-diff` campaign caught 58/60 viable mutants (96.7%). The two missed mutants are **both at `src/search.rs:1770:24`** — the `s_beta - 1` expression in the verification call's alpha argument:
 1. `replace - with +` → window becomes `(s_beta + 1, s_beta)` (alpha > beta, inverted/degenerate).

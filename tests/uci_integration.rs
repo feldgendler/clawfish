@@ -1129,10 +1129,19 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
     // anchor, not a no-regression signal.
     // History: M6.K-g0.5 `113_158`; M6.K-g1 `117_941`; M6.J `112_497`;
     // M6.I `111_498`; M6.B–F `90_591`; M5.F `89_080`.
-    const M6J_DEPTH4_BENCH_NODES: u64 = 112_497;
+    // M5.F.1 (SHIPPED 2026-05-31, Δ Elo +37.49 [+15.71,+59.58] vs M6.J): storing
+    // Exact at completed-loop qsearch nodes (alpha_entry < best < beta) lets
+    // qsearch's OWN re-probe cut on the Exact entry (negamax never cuts on a
+    // depth-0 qsearch entry — it delegates to qsearch at depth 0 before its
+    // TT-cutoff probe), changing node counts; the depth-4 anchor moved
+    // 112_497 -> 112_020. (The sibling M5.F.3 Path-A-store-suppression ship also
+    // SPRT-validated +37.49 alone but did NOT compose with M5.F.1 — combined
+    // −58 Elo at 40+0.4 — so it was deferred, not shipped; see tuning-backlog.)
+    // History prepend: M5.F.1 `112_020`.
+    const DEPTH4_BENCH_NODES: u64 = 112_020;
     assert_eq!(
-        nodes1, M6J_DEPTH4_BENCH_NODES,
-        "E51: bench node count changed from the M6.J pin ({M6J_DEPTH4_BENCH_NODES} at depth=4); \
+        nodes1, DEPTH4_BENCH_NODES,
+        "E51: bench node count changed from the M5.F.1 pin ({DEPTH4_BENCH_NODES} at depth=4); \
          re-pin if intentional; got {nodes1}"
     );
 }

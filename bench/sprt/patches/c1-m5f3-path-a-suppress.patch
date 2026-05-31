@@ -1,0 +1,120 @@
+diff --git a/src/search.rs b/src/search.rs
+index e5d658d..1221664 100644
+--- a/src/search.rs
++++ b/src/search.rs
+@@ -2462,8 +2462,14 @@ impl AlphaBetaMover {
+         let best_init = if !in_chk {
+             let sp = evaluate_cached(pos, &mut self.pawn_hash);
+             if sp >= beta {
+-                // Path A: stand-pat fail-high → Lower bound (M5.F).
+-                return self.qsearch_store_and_return(pos, sp, TtBound::Lower, 0, ply);
++                // Path A: stand-pat fail-high. Store SUPPRESSED (M5.F.3 tuning
++                // campaign vs M6.J). Stand-pat is just `evaluate_cached(pos)`,
++                // recomputed cheaply on the next visit, so the Lower store this
++                // path used to write (the single most frequent qsearch store
++                // path) is near-pure TT pressure. Suppressing it targets the
++                // documented M5.F slow-TC slight-regression (tuning-backlog
++                // M5.F item 3); the fast-TC gains do not depend on it.
++                return sp;
+             }
+             if sp > alpha {
+                 alpha = sp;
+@@ -15297,25 +15303,30 @@ mod tests {
+     }
+ 
+     // -----------------------------------------------------------------------
+-    // M5.F §6.5 — Store behavior tests (6 tests, one per real-result path)
++    // M5.F §6.5 — Store behavior tests (one per real-result path)
+     //
+-    // Each test verifies that qsearch produces a TT entry at the correct
+-    // (score, bound, best_move) for its specific return path. WITHOUT the
+-    // production store block, ALL six tests fail: `qsearch_tt_stores_for_test()`
+-    // stays 0 and `tt.probe(key)` returns None.
++    // Paths B–F verify that qsearch produces a TT entry at the correct
++    // (score, bound, best_move) for their return path: WITHOUT the production
++    // store block, those tests fail (`qsearch_tt_stores_for_test()` stays 0 and
++    // `tt.probe(key)` returns None). Path A is the EXCEPTION since the M5.F.3
++    // tuning campaign: stand-pat fail-high deliberately suppresses its store
++    // (see `qsearch_path_a_stand_pat_fail_high_suppresses_store`).
+     // -----------------------------------------------------------------------
+ 
+-    /// Path A: stand-pat fail-high. Fixture has no captures (filter empty);
+-    /// static eval is clearly positive and exceeds beta. The stand-pat cutoff
+-    /// fires at step 4, and qsearch must store a Lower entry with score=stand_pat,
+-    /// best_move=0.
++    /// Path A: stand-pat fail-high. M5.F.3 tuning campaign (vs M6.J) suppresses
++    /// the Lower store this path used to write — stand-pat is recomputed cheaply
++    /// on re-visit, so the store was near-pure TT pressure. qsearch must still
++    /// RETURN stand_pat, but must produce ZERO TT stores and leave no entry.
+     ///
+     /// Fixture: KvKR (white K+R vs black K). Eval ≈ +477 cp (well above any
+     /// plausible low beta). Window: alpha=0, beta=10 (stand_pat >> beta).
++    /// This test is the mutation tripwire for the suppression: reinstating a
++    /// store on Path A (the pre-M5.F.3 behavior) flips both store-count and
++    /// probe assertions.
+     #[test]
+-    fn qsearch_tt_store_stand_pat_fail_high_lower() {
++    fn qsearch_path_a_stand_pat_fail_high_suppresses_store() {
+         use crate::eval::evaluate;
+-        use crate::tt::{TranspositionTable, score_from_tt};
++        use crate::tt::TranspositionTable;
+         let pos =
+             Position::from_fen("4k3/8/8/8/8/8/8/2R1K3 w - - 0 1").expect("KvKR FEN must parse");
+         let expected_eval = evaluate(&pos);
+@@ -15339,28 +15350,17 @@ mod tests {
+             "qsearch must return stand_pat on fail-high; expected {expected_eval}, got {score}"
+         );
+ 
+-        // Without store block: stores=0 and probe returns None.
++        // M5.F.3: Path A suppresses its store entirely.
+         assert_eq!(
+             ab.qsearch_tt_stores_for_test(),
+-            1,
+-            "path A (stand-pat fail-high) must produce exactly one TT store; got {}",
++            0,
++            "path A (stand-pat fail-high) must produce ZERO TT stores post-M5.F.3; got {}",
+             ab.qsearch_tt_stores_for_test()
+         );
+-        let entry = tt
+-            .probe(pos.zobrist())
+-            .expect("stand-pat fail-high must create TT entry");
+-        assert_eq!(entry.depth, 0, "qsearch stores at depth=0");
+-        assert_eq!(
+-            entry.bound(),
+-            TtBound::Lower,
+-            "stand-pat fail-high is a lower bound"
+-        );
+-        assert_eq!(
+-            score_from_tt(entry.score as i32, ply as i32),
+-            expected_eval,
+-            "stored score must round-trip to stand_pat"
++        assert!(
++            tt.probe(pos.zobrist()).is_none(),
++            "path A must leave no TT entry post-M5.F.3 (store suppressed)"
+         );
+-        assert_eq!(entry.best_move, 0, "stand-pat has no best_move");
+     }
+ 
+     /// Path B: true stalemate. The position is a stalemate for the side to move.
+diff --git a/tests/uci_integration.rs b/tests/uci_integration.rs
+index baeb402..95b9011 100644
+--- a/tests/uci_integration.rs
++++ b/tests/uci_integration.rs
+@@ -1129,10 +1129,14 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
+     // anchor, not a no-regression signal.
+     // History: M6.K-g0.5 `113_158`; M6.K-g1 `117_941`; M6.J `112_497`;
+     // M6.I `111_498`; M6.B–F `90_591`; M5.F `89_080`.
+-    const M6J_DEPTH4_BENCH_NODES: u64 = 112_497;
++    // M5.F.3 tuning campaign: suppressing the Path-A stand-pat-fail-high qsearch
++    // TT store changes qsearch node counts (lost re-visit cutoffs), moving the
++    // depth-4 anchor 112_497 -> 112_467 (on-trial vs M6.J; reverts with the
++    // candidate if its SPRT regresses). History prepend: M5.F.3 `112_467`.
++    const DEPTH4_BENCH_NODES: u64 = 112_467;
+     assert_eq!(
+-        nodes1, M6J_DEPTH4_BENCH_NODES,
+-        "E51: bench node count changed from the M6.J pin ({M6J_DEPTH4_BENCH_NODES} at depth=4); \
++        nodes1, DEPTH4_BENCH_NODES,
++        "E51: bench node count changed from the M5.F.3 candidate pin ({DEPTH4_BENCH_NODES} at depth=4); \
+          re-pin if intentional; got {nodes1}"
+     );
+ }

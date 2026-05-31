@@ -800,14 +800,31 @@ fn tt_bound_for_completed_node(
     })
 }
 
-/// Classify the bound for a completed qsearch result.
+/// Classify the bound for a completed qsearch result (three-way, M5.F.1).
 ///
-/// Per Stockfish commit 45e5e65: qsearch's restricted move set (captures,
-/// EP, queen-promo, plus in-check evasions) does not produce a true minimax
-/// value over all legal moves. Calling `Exact` on a non-terminal qsearch
-/// result overstates precision; storing it can short-circuit a future
-/// negamax PV-node probe with an unsound score. M5.F therefore stores
-/// **only Lower / Upper** for non-terminal qsearch results.
+/// `alpha_entry` is the node's window alpha at entry (after mate-distance
+/// pruning, BEFORE the stand-pat raise) — i.e. the caller-facing lower bound.
+///
+/// - `best >= beta`: `Lower` (fail-high cutoff).
+/// - `alpha_entry < best < beta`: `Exact` (improved the entry alpha without a
+///   cutoff — a fully-searched fail-soft value).
+/// - otherwise (`best <= alpha_entry`): `Upper` (fail-low).
+///
+/// **Why `Exact` is sound here, despite Stockfish 45e5e65.** That commit keeps
+/// qsearch to Lower/Upper because a qsearch `Exact` (restricted to captures /
+/// evasions, not all legal moves) could short-circuit a future *negamax* probe
+/// with a value that isn't a true all-moves minimax. In *this* engine that
+/// path does not exist: `negamax` delegates to `qsearch` at `depth == 0`
+/// (`search.rs` step ~1480) **before** its TT-cutoff probe, and that probe only
+/// cuts when `entry.depth >= depth` — unreachable for a depth-0 qsearch entry
+/// at any `depth >= 1`. So a qsearch entry never triggers a negamax cutoff
+/// (negamax only reads its `best_move` for ordering). The only consumer of a
+/// qsearch `Exact` is qsearch's own re-probe, which returns it unconditionally;
+/// that is correct because a completed fail-soft loop with `alpha_entry < best
+/// < beta` searched every capture full-window (no PVS null-window) and the
+/// move that set `best` returned its exact value — window-independent within
+/// qsearch's own (captures + stand-pat) value model. M5.F.1 tuning campaign vs
+/// M6.J (tuning-backlog M5.F item 1).
 ///
 /// Terminal cases (handled at their own call sites with a forced
 /// `Exact` bound, NOT this helper): true stalemate (returns 0) and mate
@@ -820,13 +837,19 @@ fn tt_bound_for_completed_node(
 /// returns `-(MATE - ply)` directly via path D — that path stores
 /// before reaching the post-loop classifier and never invokes this
 /// helper. Pinned by debug_assert.
-pub(crate) fn qsearch_tt_bound_for_completed_node(best: i32, beta: i32) -> TtBound {
+pub(crate) fn qsearch_tt_bound_for_completed_node(
+    best: i32,
+    alpha_entry: i32,
+    beta: i32,
+) -> TtBound {
     debug_assert!(
         best != -INF,
         "qsearch_tt_bound_for_completed_node: best == -INF unreachable at production sites"
     );
     if best >= beta {
         TtBound::Lower
+    } else if best > alpha_entry {
+        TtBound::Exact
     } else {
         TtBound::Upper
     }
@@ -2424,6 +2447,12 @@ impl AlphaBetaMover {
             }
         }
 
+        // M5.F.1: snapshot the entry-window alpha (post-mate-distance-pruning,
+        // before the stand-pat raise below) for the three-way completed-node
+        // bound classifier. A completed loop with `alpha_entry < best < beta`
+        // is Exact (see `qsearch_tt_bound_for_completed_node`).
+        let alpha_entry = alpha;
+
         // 2.5. TT probe (M5.F — ADR-0028). No depth comparison: qsearch's
         //      notional depth is 0; any stored entry is at least as deep
         //      (negamax entries: depth ≥ 1; qsearch entries: depth = 0).
@@ -2542,7 +2571,7 @@ impl AlphaBetaMover {
 
                 // Path C: single-reply extension result. M5.F stores with
                 // best_move = only_mv.bits() and bound from helper.
-                let bound = qsearch_tt_bound_for_completed_node(score, beta);
+                let bound = qsearch_tt_bound_for_completed_node(score, alpha_entry, beta);
                 return self.qsearch_store_and_return(pos, score, bound, only_mv.bits(), ply);
             }
 
@@ -2664,9 +2693,12 @@ impl AlphaBetaMover {
             }
         }
 
-        let bound = qsearch_tt_bound_for_completed_node(best, beta);
+        let bound = qsearch_tt_bound_for_completed_node(best, alpha_entry, beta);
         let best_move_packed = match bound {
             TtBound::Lower => cutoff_move.map(|m| m.bits()).unwrap_or(0),
+            // Exact/Upper: no cutoff move recorded. (Exact entries store no PV
+            // move for now — the bound itself is the M5.F.1 lever; ordering via
+            // a stored Exact PV move is a possible future refinement.)
             _ => 0,
         };
         self.qsearch_store_and_return(pos, best, bound, best_move_packed, ply)
@@ -14941,73 +14973,114 @@ mod tests {
     // ===========================================================================
 
     // -----------------------------------------------------------------------
-    // M5.F §6.3 — Helper unit tests for `qsearch_tt_bound_for_completed_node`
+    // M5.F.1 §6.3 — Helper unit tests for `qsearch_tt_bound_for_completed_node`
     //
-    // The helper classifies a completed (non-terminal) qsearch node:
-    //   - `best >= beta` → Lower
-    //   - `best < beta`  → Upper
-    //   - NEVER Exact (Stockfish 45e5e65 — non-terminal qsearch)
+    // The helper is now a THREE-way classifier (M5.F.1 tuning campaign relaxes
+    // the M5.F Stockfish-45e5e65 no-Exact rule — sound here because negamax
+    // delegates to qsearch at depth 0 before its TT-cutoff probe, so a depth-0
+    // qsearch entry never triggers a negamax cutoff; see the helper doc):
+    //   - `best >= beta`        → Lower
+    //   - `alpha_entry < best`  → Exact  (improved entry alpha, no cutoff)
+    //   - else                  → Upper  (`best <= alpha_entry`, fail-low)
     //
-    // The boundary case `best == beta` must be Lower (inclusive, kills
-    // `>= → >` mutation). The "would-be-Exact zone" (`original_alpha <
-    // best < beta`) must return Upper (kills any mutation that re-introduces
-    // Exact for non-terminal qsearch).
+    // Boundary kills:
+    //   - `best == beta`        → Lower (inclusive `>=`, kills `>= → >`)
+    //   - `best == alpha_entry` → Upper (strict `>`, kills `> → >=` on Exact)
     // -----------------------------------------------------------------------
 
-    /// `qsearch_tt_bound_for_completed_node(best, beta)` returns `Lower`
-    /// when `best > beta` and when `best == beta` (inclusive boundary).
-    /// Sister cases:
+    /// Returns `Lower` when `best >= beta`, regardless of `alpha_entry`
+    /// (the Lower test precedes the Exact/Upper split). Sister cases:
     ///   - `best = beta + 1` → Lower (strict fail-high)
     ///   - `best = beta`     → Lower (boundary — kills `>= → >` mutation)
     ///   - `best = beta + 100` → Lower (clear fail-high)
     #[test]
     fn qsearch_tt_bound_lower_when_best_geq_beta() {
         let beta = 500;
+        let alpha_entry = 0; // < beta; irrelevant to the Lower branch
 
         // Strict fail-high (best > beta).
         assert_eq!(
-            qsearch_tt_bound_for_completed_node(beta + 1, beta),
+            qsearch_tt_bound_for_completed_node(beta + 1, alpha_entry, beta),
             TtBound::Lower,
             "best > beta must be Lower"
         );
         assert_eq!(
-            qsearch_tt_bound_for_completed_node(beta + 100, beta),
+            qsearch_tt_bound_for_completed_node(beta + 100, alpha_entry, beta),
             TtBound::Lower,
             "best >> beta must be Lower"
         );
 
         // Boundary: `best == beta` must be Lower (inclusive `>=` not `>`).
-        // This kills the `>= → >` mutation: with `>`, this case would be Upper.
+        // This kills the `>= → >` mutation: with `>`, this case would be Exact.
         assert_eq!(
-            qsearch_tt_bound_for_completed_node(beta, beta),
+            qsearch_tt_bound_for_completed_node(beta, alpha_entry, beta),
             TtBound::Lower,
             "best == beta must be Lower (inclusive boundary — kills >= → > mutation)"
         );
     }
 
-    /// `qsearch_tt_bound_for_completed_node(best, beta)` returns `Upper`
-    /// when `best < beta`. Sister case: `best = beta - 1` (just below boundary).
+    /// Returns `Upper` when `best <= alpha_entry` (fail-low: did not beat the
+    /// entry-window lower bound). Includes the `best == alpha_entry` boundary,
+    /// which must be Upper (kills the `best > alpha_entry → best >= alpha_entry`
+    /// mutation that would mis-classify the boundary as Exact).
     #[test]
-    fn qsearch_tt_bound_upper_when_best_lt_beta() {
+    fn qsearch_tt_bound_upper_when_best_leq_alpha_entry() {
         let beta = 500;
+        let alpha_entry = 400;
 
-        // Just below boundary — kills `< → <=` mutation (with `<=`, `best = beta`
-        // would be Upper, contradicting the `lower_at_boundary_zero` test).
+        // Boundary: best == alpha_entry must be Upper (strict `>` for Exact).
         assert_eq!(
-            qsearch_tt_bound_for_completed_node(beta - 1, beta),
+            qsearch_tt_bound_for_completed_node(alpha_entry, alpha_entry, beta),
             TtBound::Upper,
-            "best = beta - 1 must be Upper"
+            "best == alpha_entry must be Upper (kills > → >= on the Exact test)"
+        );
+        // Strict fail-low.
+        assert_eq!(
+            qsearch_tt_bound_for_completed_node(alpha_entry - 1, alpha_entry, beta),
+            TtBound::Upper,
+            "best = alpha_entry - 1 must be Upper"
         );
         assert_eq!(
-            qsearch_tt_bound_for_completed_node(0, beta),
+            qsearch_tt_bound_for_completed_node(0, alpha_entry, beta),
             TtBound::Upper,
-            "best = 0 (stand-pat fail-low) must be Upper"
+            "best = 0 (well below alpha_entry) must be Upper"
         );
         assert_eq!(
-            qsearch_tt_bound_for_completed_node(-200, beta),
+            qsearch_tt_bound_for_completed_node(-200, alpha_entry, beta),
             TtBound::Upper,
             "negative best must be Upper"
         );
+    }
+
+    /// Returns `Exact` when `alpha_entry < best < beta` (improved the entry
+    /// alpha without a beta cutoff — a fully-searched fail-soft value). This is
+    /// the M5.F.1 relaxation; the M5.F version of this zone returned Upper.
+    /// Includes the `best == alpha_entry + 1` and `best == beta - 1` boundaries.
+    #[test]
+    fn qsearch_tt_bound_exact_in_improved_alpha_zone() {
+        // Triples: (best, alpha_entry, beta) with `alpha_entry < best < beta`.
+        let cases: &[(i32, i32, i32)] = &[
+            (1, 0, 100),           // best just above alpha_entry
+            (50, 0, 100),          // midpoint
+            (99, 0, 100),          // just below beta
+            (401, 400, 500),       // best == alpha_entry + 1 (lower Exact boundary)
+            (499, 0, 500),         // best == beta - 1 (upper Exact boundary)
+            (150, 100, 200),       // positive window
+            (-50, -100, 0),        // negative best, still > alpha_entry
+            (-1, -100, 0),         // negative window
+            (1500, 1000, 2000),    // large values
+            (-4999, -5000, -4000), // large negatives, best > alpha_entry
+        ];
+
+        for &(best, alpha_entry, beta) in cases {
+            let result = qsearch_tt_bound_for_completed_node(best, alpha_entry, beta);
+            assert_eq!(
+                result,
+                TtBound::Exact,
+                "alpha_entry={alpha_entry} < best={best} < beta={beta}: helper must return \
+                 Exact (M5.F.1); got {result:?}"
+            );
+        }
     }
 
     /// In debug builds, calling the helper with `best == -INF` panics due to
@@ -15015,68 +15088,25 @@ mod tests {
     /// `-INF` is structurally unreachable at every production call site
     /// (see helper doc for full audit). `#[should_panic]` fires only in
     /// debug builds; in release the assert is stripped and the function
-    /// returns `Upper` (since `-INF < any_beta`). The project runs
-    /// `cargo test --release` by default per docs/workflow.md, so gate
+    /// returns `Upper` (since `-INF < any alpha_entry < beta`). The project
+    /// runs `cargo test --release` by default per docs/workflow.md, so gate
     /// the test with `cfg(debug_assertions)`.
     #[test]
     #[should_panic]
     #[cfg(debug_assertions)]
     fn qsearch_tt_bound_panics_in_debug_when_best_is_neg_inf() {
-        let _ = qsearch_tt_bound_for_completed_node(-INF, 0);
+        let _ = qsearch_tt_bound_for_completed_node(-INF, 0, 100);
     }
 
-    /// Boundary at `best = 0, beta = 0` → `Lower` (0 >= 0 is true).
-    /// Complements the generic `lower_when_best_geq_beta` test with an
-    /// all-zero input that pinpoints the inclusive `>=` without the positive
-    /// beta context.
+    /// Boundary at `best = 0, beta = 0` → `Lower` (0 >= 0 is true), regardless
+    /// of `alpha_entry`. Pinpoints the inclusive `>=` without positive context.
     #[test]
     fn qsearch_tt_bound_lower_at_boundary_zero() {
         assert_eq!(
-            qsearch_tt_bound_for_completed_node(0, 0),
+            qsearch_tt_bound_for_completed_node(0, -1, 0),
             TtBound::Lower,
             "best=0, beta=0 must be Lower (0 >= 0 is true)"
         );
-    }
-
-    /// The "would-be-Exact zone" (`original_alpha < best < beta`) must
-    /// return `Upper` — never `Exact`. This pins the core no-Exact rule
-    /// (Stockfish 45e5e65) that distinguishes M5.F's qsearch bound from
-    /// negamax's three-way classification. The helper doesn't receive
-    /// `original_alpha`, so it can only produce Lower/Upper; the test
-    /// verifies that for representative triples in the zone, `Upper` is
-    /// always returned.
-    ///
-    /// ~12 sample triples covering varied alpha/beta/best relationships:
-    #[test]
-    fn qsearch_tt_bound_non_exact_ever_in_would_be_exact_zone() {
-        // Triples: (best, beta) where `some_alpha < best < beta`.
-        // In a real search, original_alpha would be in (−∞, best); the helper
-        // only sees (best, beta), so we verify it returns Upper for all
-        // `best < beta` cases (the "would be Exact" zone is a subset of Upper).
-        let cases: &[(i32, i32)] = &[
-            (1, 100),       // small positive best, moderately positive beta
-            (50, 100),      // midpoint
-            (99, 100),      // just below boundary
-            (100, 200),     // positive with large gap
-            (-50, 0),       // negative best, zero beta
-            (-100, -1),     // both negative, best < beta
-            (0, 1),         // zero best, unit beta
-            (499, 500),     // near boundary
-            (1000, 2000),   // large values
-            (-5000, -4999), // large negative values
-            (MATE - MAX_PLY as i32 - 1, MATE - MAX_PLY as i32), // near mate boundary
-            (100, MATE_IN_MAX_PLY), // just below MATE_IN_MAX_PLY
-        ];
-
-        for &(best, beta) in cases {
-            let result = qsearch_tt_bound_for_completed_node(best, beta);
-            assert_eq!(
-                result,
-                TtBound::Upper,
-                "best={best} < beta={beta}: helper must return Upper (no Exact in qsearch); \
-                 got {result:?}"
-            );
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -15561,28 +15591,24 @@ mod tests {
         );
     }
 
-    /// Path F: completed move loop with no cutoff — Upper bound.
-    /// Multiple captures available, none reach beta. The TT entry must record
-    /// Upper bound and best_move=0 (no cutoff move to store).
+    /// Path F: completed move loop with no beta cutoff. Under M5.F.1 the bound
+    /// depends on the entry-window alpha:
+    ///   - if the loop value improved over `alpha_entry` → **Exact**
+    ///   - if it failed low (`best <= alpha_entry`)       → **Upper**
     ///
-    /// Fixture: Both pieces trade for equal material — `4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1`.
-    /// White exd5 wins a pawn, but black response also recaptures: in qsearch, after exd5,
-    /// black's response is also a pawn recapture (if legal) giving ~0 net. We need a position
-    /// where the captures don't score above beta.
-    ///
-    /// Simpler fixture: KvKP (white king + pawn vs black king pawn position where
-    /// no captures are available from white's side, so only stand-pat runs).
-    ///
-    /// Actually, we need CAPTURES to be available but NONE reaching beta. Use:
-    /// `4k3/8/8/8/8/8/4p3/4K3 w - - 0 1` — White king can capture black pawn on e2.
-    /// Window: alpha=-1000, beta=1000. After Kxe2, qsearch recurses; the captured
-    /// pawn gives ~+82 cp < beta=1000. No cutoff → Upper.
+    /// Fixture: `4k3/8/8/8/8/8/4p3/4K3 w - - 0 1` — White king can capture the
+    /// black pawn on e2. The capture gain is small (~ one pawn), well below
+    /// `beta = 1000`, so no cutoff fires; the loop completes. We drive both
+    /// bounds off the same fixture by varying only `alpha`:
+    ///   - Phase 1 `alpha = -INF`: any finite loop value beats `alpha_entry`
+    ///     ⇒ Exact (this is the M5.F → M5.F.1 behavior change; M5.F stored
+    ///     Upper here).
+    ///   - Phase 2 `alpha = 900` (< beta, above any KxP capture value): the
+    ///     loop fails low (`best <= 900`) ⇒ Upper.
     #[test]
-    fn qsearch_tt_store_completed_loop_upper() {
+    fn qsearch_tt_store_completed_loop_exact_and_upper() {
         use crate::eval::evaluate;
         use crate::tt::{TranspositionTable, score_from_tt};
-        // White king e1 can capture black pawn e2. beta=1000 is above any
-        // realistic capture gain (~82 cp for a pawn), so no cutoff fires.
         let pos =
             Position::from_fen("4k3/8/8/8/8/8/4p3/4K3 w - - 0 1").expect("KxP FEN must parse");
 
@@ -15597,56 +15623,84 @@ mod tests {
         );
 
         let stand_pat = evaluate(&pos);
-        let alpha = -INF;
         let beta = 1000;
         assert!(
             stand_pat < beta,
             "fixture invariant: stand_pat={stand_pat} must be < beta={beta} so move loop runs"
         );
 
-        let tt = Arc::new(TranspositionTable::new(1));
-        let mut ab = AlphaBetaMover::new();
-        ab.history = vec![pos.zobrist()];
-        ab.set_tt_for_test(Some(Arc::clone(&tt)));
         let (ctx, _stop) = non_aborting_ctx();
         let ply: u32 = 1;
 
-        let score = ab.qsearch_for_test(&mut pos.clone(), alpha, beta, ply, &ctx);
-        assert!(
-            score < beta,
-            "fixture must NOT produce a beta cutoff (all captures score < beta); got score={score}"
-        );
+        // Phase 1: alpha = -INF ⇒ improved-alpha ⇒ Exact (M5.F.1).
+        {
+            let tt = Arc::new(TranspositionTable::new(1));
+            let mut ab = AlphaBetaMover::new();
+            ab.history = vec![pos.zobrist()];
+            ab.set_tt_for_test(Some(Arc::clone(&tt)));
 
-        // Without store block: stores=0. With impl: at least 1 (current frame),
-        // possibly more from recursive children's stores at post-capture
-        // positions. Probe-based check below is the discriminator.
-        assert!(
-            ab.qsearch_tt_stores_for_test() >= 1,
-            "path F (completed loop, no cutoff) must produce at least one TT store; got {}",
-            ab.qsearch_tt_stores_for_test()
-        );
-        let entry = tt
-            .probe(pos.zobrist())
-            .expect("completed-loop upper must create TT entry");
-        assert_eq!(entry.depth, 0);
-        assert_eq!(
-            entry.bound(),
-            TtBound::Upper,
-            "no-cutoff completed loop → Upper bound"
-        );
-        assert_eq!(
-            entry.best_move, 0,
-            "Upper bound entry must have best_move=0 (no cutoff move)"
-        );
-        let recovered = score_from_tt(entry.score as i32, ply as i32);
-        assert_eq!(
-            recovered, score,
-            "stored score must round-trip exactly to the returned score; got {recovered}, expected {score}"
-        );
-        assert!(
-            recovered < beta,
-            "stored score must remain < beta after round-trip (Upper bound semantic)"
-        );
+            let score = ab.qsearch_for_test(&mut pos.clone(), -INF, beta, ply, &ctx);
+            assert!(
+                score < beta,
+                "phase 1: fixture must NOT produce a beta cutoff; got score={score}"
+            );
+            assert!(
+                ab.qsearch_tt_stores_for_test() >= 1,
+                "phase 1: completed loop must produce at least one TT store; got {}",
+                ab.qsearch_tt_stores_for_test()
+            );
+            let entry = tt
+                .probe(pos.zobrist())
+                .expect("phase 1: completed-loop must create TT entry");
+            assert_eq!(entry.depth, 0);
+            assert_eq!(
+                entry.bound(),
+                TtBound::Exact,
+                "phase 1: no-cutoff loop that improved alpha_entry=-INF → Exact (M5.F.1)"
+            );
+            assert_eq!(
+                entry.best_move, 0,
+                "Exact path-F entry stores best_move=0 (M5.F.1 minimal form)"
+            );
+            let recovered = score_from_tt(entry.score as i32, ply as i32);
+            assert_eq!(
+                recovered, score,
+                "phase 1: stored score must round-trip exactly; got {recovered}, expected {score}"
+            );
+        }
+
+        // Phase 2: alpha = 900 (< beta, above any KxP value) ⇒ fail-low ⇒ Upper.
+        {
+            let alpha = 900;
+            assert!(
+                stand_pat < alpha,
+                "phase 2 invariant: stand_pat must be below alpha"
+            );
+            let tt = Arc::new(TranspositionTable::new(1));
+            let mut ab = AlphaBetaMover::new();
+            ab.history = vec![pos.zobrist()];
+            ab.set_tt_for_test(Some(Arc::clone(&tt)));
+
+            let score = ab.qsearch_for_test(&mut pos.clone(), alpha, beta, ply, &ctx);
+            assert!(
+                score < beta,
+                "phase 2: fixture must NOT produce a beta cutoff; got score={score}"
+            );
+            let entry = tt
+                .probe(pos.zobrist())
+                .expect("phase 2: completed-loop must create TT entry");
+            assert_eq!(
+                entry.bound(),
+                TtBound::Upper,
+                "phase 2: no-cutoff loop that failed below alpha_entry=900 → Upper"
+            );
+            assert_eq!(entry.best_move, 0, "Upper path-F entry stores best_move=0");
+            let recovered = score_from_tt(entry.score as i32, ply as i32);
+            assert!(
+                recovered < beta,
+                "phase 2: stored score must remain < beta (Upper semantic); got {recovered}"
+            );
+        }
     }
 
     /// MAX_PLY ceiling guard (path X) — no TT store.
@@ -15707,9 +15761,10 @@ mod tests {
     }
 
     /// Path C (M5.E #1 single-reply extension): `!in_chk && moves_vec.is_empty()
-    /// && ml.len() == 1`. Recurse on the unique forced quiet; M5.F stores the
+    /// && ml.len() == 1`. Recurse on the unique forced quiet; stores the
     /// recursed-and-negated score with `best_move = only_mv.bits()` and bound
-    /// classified by `qsearch_tt_bound_for_completed_node(score, beta)`. Plan
+    /// classified by `qsearch_tt_bound_for_completed_node(score, alpha_entry,
+    /// beta)` — under M5.F.1 a wide-window single reply classifies Exact. Plan
     /// §4.2 row C; addresses test-suite-review pass-1 must-fix gap.
     ///
     /// Fixture from M5.E `qsearch_single_reply_fires_when_filter_empty_and_one_legal_quiet`:
@@ -15765,15 +15820,15 @@ mod tests {
             entry.depth, 0,
             "qsearch entries are at depth=0 (Option A discriminator)"
         );
-        // Bound: classified by qsearch_tt_bound_for_completed_node(score, beta).
-        // With beta = INF, score (centipawn-bounded) is always < INF, so bound = Upper.
-        // Verify against the helper directly to keep the test robust to score
-        // changes from eval / pst tunings.
-        let expected_bound = qsearch_tt_bound_for_completed_node(score, beta);
+        // Bound (M5.F.1): the window is (alpha=-INF, beta=INF). Mate-distance
+        // pruning widens `alpha_entry` to ~-(MATE) and `beta` to ~MATE, so any
+        // finite (centipawn-bounded) single-reply score satisfies
+        // `alpha_entry < score < beta` ⇒ Exact. (Under M5.F this was Upper.)
+        // Exact is robust to eval/pst score tunings since the score stays finite.
         assert_eq!(
             entry.bound(),
-            expected_bound,
-            "path C bound must match qsearch_tt_bound_for_completed_node(score, beta)"
+            TtBound::Exact,
+            "path C single-reply with a wide window must classify Exact (M5.F.1)"
         );
         // best_move: the unique forced quiet's bits.
         assert_eq!(
