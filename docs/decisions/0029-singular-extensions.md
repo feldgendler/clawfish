@@ -111,16 +111,16 @@ Detailed SPRT logs: `bench/sprt/2026-05-09-m5.g-vs-m5f-mixed-tc.md` (v1), `bench
 
 ## Open / tuning backlog
 
-- Lower+Exact gate.
+- ~~Lower+Exact gate.~~ **NO SHIP 2026-06-02** (−15.65 [−41.21, +9.76]; +15% d10 verification cost without payoff). Lower-only gate stands. `docs/plans/tuning-m5g-se-items-4-8.md`.
 - `SE_MARGIN_PER_DEPTH = 2` retune at `SE_MIN_DEPTH = 6` (v3 tested margin=2 at SE_MIN_DEPTH=8; the v2-baseline equivalent retune is unexplored).
 - `SE_MIN_DEPTH = 4` retune (further-lower; risks pushing too much verification cost into shallow nodes).
 - ~~`SE_MIN_DEPTH = 6` retune~~ — done at v2, adopted as landed configuration.
 - ~~`SE_MARGIN_PER_DEPTH = 2` retune~~ — done at v3 (with SE_MIN_DEPTH=8); rejected.
-- Multi-cut on verification fail-high.
-- Double extensions.
-- PV-SE (extend SE eligibility to PV nodes).
+- ~~Multi-cut on verification fail-high.~~ **NO SHIP 2026-06-02** (flat +1.74 [−21.76, +25.25]). Sound form = return actual `verif_score` when `>= beta`, no TT store (the "return `s_beta` + store" form was plan-review-rejected as unsound). Prunes hard (d10 −30%) but speed offsets heuristic errors. Alt (g) stays deferred.
+- ~~Double extensions.~~ **REVERT 2026-06-01** (≈ −46 Elo / 91 games). Double-extending regresses at current strength even with a consecutive-double-ext cap. Alt (f) stays deferred.
+- ~~PV-SE (extend SE eligibility to PV nodes).~~ **NO SHIP 2026-06-02** (−21.74 [−47.60, +3.87]). Verification cost on hot PV nodes without payoff. Clause 3 (`!is_pv`) / §8 stand.
 - Excluded-move TT-key separation.
-- Propagated `singular_ext_active` flag through `search_child` (revisit if verification-subtree NPS regression observed at deep TC).
+- ~~Propagated `singular_ext_active` flag through `search_child`~~ — **CLOSED analytically 2026-06-02**: no standalone strength mechanism; release-NPS canary shows no deep-TC verification-subtree regression (5.50 Mnps@d10 / 5.20@d12) + the §5 chain bound (≤3) ⇒ nothing to recover. Re-open only on a measured deep-TC NPS regression.
 - ~~Boundary test `negamax_se_extension_at_singular_beta_boundary` — closes the two missed mutants on the `s_beta - 1` window expression.~~ **Done 2026-05-14**: landed at `src/search.rs::tests::negamax_se_extension_at_singular_beta_boundary`; verified via `cargo mutants` to catch all four mutants on the verification window expression (the two `s_beta - 1` arithmetic mutants + both `verif_score < s_beta` comparison mutants). `docs/tuning-backlog.md` item 4.1 marked done.
 
 ## References
