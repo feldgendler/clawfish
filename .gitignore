@@ -43,3 +43,6 @@ fuzz/artifacts/
 /bench/*.mixckpt
 /bench/*.progress
 /bench/*.json
+
+# Campaign worktrees (M5.F qsearch tuning) — transient, do not track
+.worktrees/
