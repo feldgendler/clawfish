@@ -94,6 +94,18 @@ The modest tactical lean (WAC +7, STS +50) is consistent with the SPRT's +1.74 E
   M5.F.1 was preferred per the ELOH.D mandate), or (b) bisect the interaction and
   re-tune so they compose. Patch: `bench/sprt/patches/c1-m5f3-path-a-suppress.patch`;
   data: `bench/sprt/2026-05-30-c1-m5f3-*.md` + `bench/sprt/2026-05-30-c1c3-combined-*.md`.
+  - **Option (b) attempted 2026-06-02 (campaign item A(a)) — NO SHIP for the
+    margin-gate lever.** Made the Path-A `Lower` store value-conditional (store
+    only when *decisive*, `sp − beta ≥ 100`; suppress *marginal* fail-highs),
+    hypothesizing the slow-TC collapse came from losing high-value re-probe
+    entries. SPRT vs `M5.F.1` (mixed-TC + virtual-clock, 400 games, seed `…E0A0`):
+    **Δ Elo −7.82 [−33.43, +17.71]**, CI-lower < 0 → no ship, and **40+0.4
+    collapses again (39.9%)** — the same bucket as the unconditional combine. The
+    margin gate does not fix the interaction ⇒ the **substitutes-not-complements**
+    reading is reinforced. A qsearch-local-depth gate remains untried but is
+    lower-prior now. `bench/sprt/2026-06-02-aa-margin-gate-vs-m5f1.md`;
+    `bench/sprt/patches/aa-margin-gate.patch`. Option (a) (ship M5.F.3 instead)
+    is unaffected but trades down per ELOH.D.
 - **Items 2, 4–8 — ALL CLOSED, 0 ships (2026-06-01 campaign — `docs/plans/tuning-m5f-qsearch-items-2-4-8.md`).** Run against the `M5.F.1` tag (current production), mixed-TC + virtual-clock, 400-game cap, elo1=10:
   - **Item 2 (PV-node loose-store suppression) — REVERT.** Δ Elo **−31.35 [−55.91, −7.10]** (CI fully <0). Implemented the *refined* form (suppress Lower/Upper on PV nodes, KEEP `Exact` so M5.F.1's lever survives); review-approved + mutation-clean, but suppressing the loose PV-leaf stores removes net-useful TT entries. ADR-0028 §6 (no `is_pv` store-gating) stands. `bench/sprt/2026-06-01-item2-pv-store-suppress-vs-m5f1.md`.
   - **Item 4 (qsearch must not evict negamax cross-generation) — NO SHIP (flat).** Δ Elo **+6.08 [−16.44, +28.65]** (straddles 0). The backlog's "depth=−1 sentinel" premise was stale (`depth` is `u8`; negamax never stores depth 0), so the real lever was the cross-generation case. Sound + bench-inert + faintly-positive; **re-visit as a free-rider in a future TT-replacement change** (bucketed-TT / aging) rather than solo. `bench/sprt/2026-06-01-item4-ttrepl-crossgen-vs-m5f1.md`.
@@ -220,7 +232,7 @@ Three SPSA-tunable params. Empirically this baseline captures 60-80% of the ML m
 **When to land.** Four-tier escalation, each tier proceeding only if the previous shows ≥ +5 Elo of remaining headroom worth chasing:
 
 1. **Fixed schedule (M4.D)** — ±50 default, width-tuned via mixed-TC SPRT. Ships at M4.D close.
-2. **TC- or depth-adaptive parametric (post-M5, pre-M11)** — `base · max(min_factor, 1 - α·(depth - threshold))`. SPSA-tuned. Cheapest validation of the depth/TC interaction motif.
+2. **TC- or depth-adaptive parametric (post-M5, pre-M11)** — `base · max(min_factor, 1 - α·(depth - threshold))`. SPSA-tuned. Cheapest validation of the depth/TC interaction motif. **ATTEMPTED 2026-06-02 (campaign item B) — NO SHIP (flat).** Linear depth-adaptive first-try width (`BASE=50, SLOPE=4, MIN=16`; depth 6 = 50 unchanged, narrowing to 16 by depth ~14.5), hand-picked defaults (no SPSA harness). SPRT vs `M5.F.1` (mixed-TC + virtual-clock, 400 games, seed `…E0B0`): **Δ Elo −9.56 [−32.51, +13.32]**, CI-lower < 0. Per-TC noisy/bimodal with **no depth-amplifying trend** (10+0.1, where width ≈ base, was the *worst* bucket) ⇒ the narrowing itself is net-neutral-to-harmful at current strength, not a tuning-magnitude issue. Consistent with the ~+2–4 Elo ceiling being below the CI bar. A gentler-slope variant is unmotivated (no per-TC direction to tune toward). `bench/sprt/2026-06-02-b-depth-adaptive-aspiration-vs-m5f1.md`; `bench/sprt/patches/b-depth-adaptive-aspiration.patch`. Tier 3/4 (delta-baseline / MLP) stay gated on tier-2 showing ≥+5 Elo headroom — which it did **not** — so they sink further down the queue (revisit post-M11/NNUE).
 3. **Cheap delta-baseline (post-M11 or earlier if (2) saturates)** — `window = clamp(k · |score(d-1) − score(d-2)|, MIN, MAX)`. Three SPSA-tunable params.
 4. **MLP (post-M11, only if (2)+(3) saturate)** — full feature set + hidden layer.
 
@@ -253,7 +265,14 @@ These survive because the M6.I tune used only ridge-toward-shipped + light monot
 
 **Recommended approach at promotion.** Warm-start from the shipped `M6.I` vector. Add per-term sign constraints (penalty terms ≤ 0; passed/connected bonuses ≥ 0 and rank-monotone) as projected-gradient clamps or strong one-sided ridge. Pick the constraint strength by held-out validation loss; SPRT the winner vs `M6.I`. **Baseline = the `M6.I` tag.** Abandon if (a) constrained validation loss is materially worse (the corpus genuinely wants the unconstrained shapes), or (b) M11/NNUE lands first (obsoletes classical weights).
 
-**Cross-references.** `docs/milestones/m6.i.md` ("Counterintuitive term shapes"); ADR-0037 §5 (ridge-toward-shipped + monotonicity, the regularization that was *not* hard-constraining); the Arm-B item below (natural merge target — both re-open the eval-weight surface against the corpus).
+**Update 2026-06-02 (campaign item C — examined, NOT run; folded into Arm-B per user decision).** Inspected the Texel harness (`src/bin/texel-tune.rs`, `src/texel/{optimizer,loss}.rs`):
+- `tune` warm-starts from `EvalParams::shipped()` ✓.
+- `Reg` already supports **L2 ridge toward shipped** (`l2_lambda`) + **monotonicity** (`mono_lambda`); both wired into `loss_and_grad` but **hardcoded to 0.0 in `cmd_tune`** (no CLI flag — ~6 LOC to expose).
+- **No hard sign constraint** (projected-gradient clamp) exists, and the L2 ridge "pulls toward production, never toward literature" — so it pulls toward the *wrong-signed* shipped value (`ISO_MG=+5`), i.e. does **not** fix the sign violations that are this item's defining target.
+
+⇒ Doing this item *faithfully* (sign **and** monotonicity) needs **new constrained-optimizer numerics** (sign-projection + tests + review), not a config run. The monotonicity half is cheap; the sign half is not. Given the small expected delta + the 2026-06-02 campaign's two same-night no-ships (A(a), B) indicating a local optimum at current strength, the user chose to **defer and fold this into the Arm-B PST co-tune** (both re-open the eval-weight surface; Arm-B can add sign/monotonicity projection once). When promoted: implement sign-projection in `optimizer.rs` + expose `--l2-lambda`/`--mono-lambda` in `cmd_tune`, warm-start from shipped, select constraint strength by held-out val-loss, SPRT vs current production.
+
+**Cross-references.** `docs/milestones/m6.i.md` ("Counterintuitive term shapes"); ADR-0037 §5 (ridge-toward-shipped + monotonicity, the regularization that was *not* hard-constraining); the Arm-B item below (natural merge target — both re-open the eval-weight surface against the corpus); `docs/plans/tuning-overnight-2026-06-02.md` (the campaign + C scoping discovery).
 
 ---
 

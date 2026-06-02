@@ -1,0 +1,209 @@
+diff --git a/src/search.rs b/src/search.rs
+index 03f2ca2..6b99def 100644
+--- a/src/search.rs
++++ b/src/search.rs
+@@ -419,11 +419,23 @@ pub(crate) const MATE_IN_MAX_PLY: i32 = MATE - MAX_PLY as i32; // 29_936
+ /// re-search overhead).
+ const ASPIRATION_MIN_DEPTH: u32 = 6;
+ 
+-/// First-try aspiration half-width in centipawns. Window is
+-/// `(prior - HALF_WIDTH, prior + HALF_WIDTH)`. CPW workhorse default;
+-/// roadmap §M4.D pins ±50 with a documented post-merge width-tune campaign
+-/// over ±25 / ±75 / ±100.
+-const ASPIRATION_HALF_WIDTH: i32 = 50;
++/// Base first-try aspiration half-width in centipawns, at the threshold depth
++/// (`ASPIRATION_MIN_DEPTH`). CPW workhorse default ±50 (M4.D). The effective
++/// half-width narrows with depth from this base — see `aspiration_half_width`.
++const ASPIRATION_BASE_HALF_WIDTH: i32 = 50;
++
++/// Depth-adaptive narrowing: centipawns the first-try half-width shrinks per
++/// ply of depth beyond `ASPIRATION_MIN_DEPTH`. Item B (depth-adaptive aspiration,
++/// tuning-backlog "ML-tuned aspiration window sizing" tier 2). Deeper iterations
++/// have more stable prior scores, so a tighter window saves more nodes on a hit
++/// while a miss costs only one (cheap-at-depth) re-search. Linear form of the
++/// backlog's `base · max(min_factor, 1 − α·(depth − threshold))`. Tuning value
++/// = SPRT vs `M5.F.1`.
++const ASPIRATION_WIDTH_SLOPE: i32 = 4;
++
++/// Floor for the depth-adaptive first-try half-width (centipawns). The window
++/// never narrows below this regardless of depth, bounding the re-search rate.
++const ASPIRATION_MIN_HALF_WIDTH: i32 = 16;
+ 
+ /// Minimum depth at which NMP is attempted. Below this, the null-search's
+ /// `depth - 1 - R` would be ≤ 0, dispatching to qsearch — defeating the
+@@ -574,6 +586,23 @@ fn negate_window(alpha: i32, beta: i32) -> (i32, i32) {
+     (-beta, -alpha)
+ }
+ 
++/// Depth-adaptive first-try aspiration half-width (centipawns). Starts at
++/// `ASPIRATION_BASE_HALF_WIDTH` at the threshold depth and narrows by
++/// `ASPIRATION_WIDTH_SLOPE` per ply beyond it, clamped at
++/// `ASPIRATION_MIN_HALF_WIDTH`. Item B (tuning-backlog, depth-adaptive tier).
++///
++/// Monotone non-increasing in `depth`; equals the base at `depth ==
++/// ASPIRATION_MIN_DEPTH` (so the threshold behavior is unchanged from M4.D's
++/// fixed ±50). `depth < ASPIRATION_MIN_DEPTH` never reaches here (the caller
++/// short-circuits to the full window first), but the `saturating_sub` keeps the
++/// function total and well-defined for any input.
++///
++/// Pure function.
++fn aspiration_half_width(depth: u32) -> i32 {
++    let steps = depth.saturating_sub(ASPIRATION_MIN_DEPTH) as i32;
++    (ASPIRATION_BASE_HALF_WIDTH - ASPIRATION_WIDTH_SLOPE * steps).max(ASPIRATION_MIN_HALF_WIDTH)
++}
++
+ /// First-try aspiration window. Returns `(-INF, INF)` (equivalent to no
+ /// aspiration) when:
+ ///
+@@ -582,10 +611,11 @@ fn negate_window(alpha: i32, beta: i32) -> (i32, i32) {
+ /// 2. `prior_score == None` — no prior iteration to seed from (the first
+ ///    ID iteration of the current `go`).
+ ///
+-/// Otherwise returns `(prior - ASPIRATION_HALF_WIDTH, prior + ASPIRATION_HALF_WIDTH)`.
+-/// Mate-score `prior_score` values produce a window straddling the mate
+-/// boundary; `widen_after_fail` handles the resulting first-try fail via
+-/// the asymmetric full-window re-search (research §7.2).
++/// Otherwise returns `(prior - hw, prior + hw)` where `hw =
++/// aspiration_half_width(depth)` (depth-adaptive, item B). Mate-score
++/// `prior_score` values produce a window straddling the mate boundary;
++/// `widen_after_fail` handles the resulting first-try fail via the asymmetric
++/// full-window re-search (research §7.2).
+ ///
+ /// Pure function. Pinned by AS1–AS5b.
+ fn aspiration_window(prior_score: Option<i32>, depth: u32) -> (i32, i32) {
+@@ -595,7 +625,8 @@ fn aspiration_window(prior_score: Option<i32>, depth: u32) -> (i32, i32) {
+     let Some(prior) = prior_score else {
+         return (-INF, INF);
+     };
+-    (prior - ASPIRATION_HALF_WIDTH, prior + ASPIRATION_HALF_WIDTH)
++    let hw = aspiration_half_width(depth);
++    (prior - hw, prior + hw)
+ }
+ 
+ /// Two-tier asymmetric widening on aspiration failure. Computes the
+@@ -9274,7 +9305,8 @@ mod tests {
+         );
+     }
+ 
+-    /// At depth ≥ ASPIRATION_MIN_DEPTH=6 with prior=0, the window is `(-50, 50)`.
++    /// At the threshold depth (ASPIRATION_MIN_DEPTH=6) with prior=0, the window
++    /// is `(-50, 50)` (base half-width; depth-adaptive narrowing is zero here).
+     /// Anti-stub: checks both endpoints to catch a formula that ignores the lower bound.
+     #[test]
+     fn aspiration_window_above_threshold_with_zero_prior_is_centered_at_zero() {
+@@ -9285,18 +9317,21 @@ mod tests {
+         );
+     }
+ 
+-    /// Positive priors at various depths above threshold (>= 6).
++    /// Positive priors at depths above threshold (>= 6). Widths are
++    /// depth-adaptive (item B): depth 7 → hw 46, depth 10 → hw 34.
+     #[test]
+     fn aspiration_window_above_threshold_with_positive_prior_centered_correctly() {
++        // depth 7: hw = 50 - 4*1 = 46.
+         assert_eq!(
+             aspiration_window(Some(123), 7),
+-            (73, 173),
+-            "prior=123, depth=7 must yield (73, 173)"
++            (77, 169),
++            "prior=123, depth=7 must yield (77, 169) at the depth-adaptive hw=46"
+         );
++        // depth 10: hw = 50 - 4*4 = 34.
+         assert_eq!(
+             aspiration_window(Some(1000), 10),
+-            (950, 1050),
+-            "prior=1000, depth=10 must yield (950, 1050)"
++            (966, 1034),
++            "prior=1000, depth=10 must yield (966, 1034) at the depth-adaptive hw=34"
+         );
+     }
+ 
+@@ -9317,14 +9352,87 @@ mod tests {
+     fn aspiration_window_with_mate_score_prior_does_not_special_case() {
+         for prior in [MATE - 1, MATE - 10, -(MATE - 5)] {
+             let result = aspiration_window(Some(prior), 8);
++            let hw = aspiration_half_width(8);
+             assert_eq!(
+                 result,
+-                (prior - ASPIRATION_HALF_WIDTH, prior + ASPIRATION_HALF_WIDTH),
++                (prior - hw, prior + hw),
+                 "mate-score prior={prior} must yield centered window, not full window"
+             );
+         }
+     }
+ 
++    // -----------------------------------------------------------------------
++    // Item B — aspiration_half_width (depth-adaptive first-try width).
++    // Constants referenced symbolically so a future re-tune of the values does
++    // not falsely fail the SHAPE contract (base-at-threshold, monotone, floored).
++    // -----------------------------------------------------------------------
++
++    /// At the threshold depth the half-width equals the base (so threshold
++    /// behavior is identical to M4.D's fixed width).
++    #[test]
++    fn aspiration_half_width_equals_base_at_threshold() {
++        assert_eq!(
++            aspiration_half_width(ASPIRATION_MIN_DEPTH),
++            ASPIRATION_BASE_HALF_WIDTH,
++            "half-width at the threshold depth must equal the base"
++        );
++    }
++
++    /// `saturating_sub` => 0 narrowing steps for any depth at or below the
++    /// threshold, so the half-width is the base (the function is total even
++    /// though the caller never invokes it below threshold).
++    #[test]
++    fn aspiration_half_width_at_or_below_threshold_is_base() {
++        for d in 0..=ASPIRATION_MIN_DEPTH {
++            assert_eq!(
++                aspiration_half_width(d),
++                ASPIRATION_BASE_HALF_WIDTH,
++                "depth {d} <= threshold must give the base half-width"
++            );
++        }
++    }
++
++    /// Narrows by exactly `ASPIRATION_WIDTH_SLOPE` per ply beyond the threshold
++    /// (before the floor bites). Pins the slope and the `-`/`*` arithmetic.
++    #[test]
++    fn aspiration_half_width_narrows_by_slope_per_ply() {
++        assert_eq!(
++            aspiration_half_width(ASPIRATION_MIN_DEPTH + 1),
++            ASPIRATION_BASE_HALF_WIDTH - ASPIRATION_WIDTH_SLOPE,
++            "one ply beyond threshold: base - slope"
++        );
++        assert_eq!(
++            aspiration_half_width(ASPIRATION_MIN_DEPTH + 4),
++            ASPIRATION_BASE_HALF_WIDTH - 4 * ASPIRATION_WIDTH_SLOPE,
++            "four plies beyond threshold: base - 4*slope"
++        );
++    }
++
++    /// Monotone non-increasing across a wide depth range, always within
++    /// `[MIN_HALF_WIDTH, BASE_HALF_WIDTH]`, and saturated at the floor for large
++    /// depth. Pins the `.max(MIN)` clamp and the overall shape.
++    #[test]
++    fn aspiration_half_width_is_monotone_and_floored() {
++        let mut prev = i32::MAX;
++        for d in 0..=64u32 {
++            let hw = aspiration_half_width(d);
++            assert!(
++                hw <= prev,
++                "must be monotone non-increasing: depth {d} hw {hw} > prev {prev}"
++            );
++            assert!(
++                (ASPIRATION_MIN_HALF_WIDTH..=ASPIRATION_BASE_HALF_WIDTH).contains(&hw),
++                "depth {d}: hw {hw} outside [{ASPIRATION_MIN_HALF_WIDTH}, {ASPIRATION_BASE_HALF_WIDTH}]"
++            );
++            prev = hw;
++        }
++        assert_eq!(
++            aspiration_half_width(64),
++            ASPIRATION_MIN_HALF_WIDTH,
++            "deep iterations saturate at the floor"
++        );
++    }
++
+     // -----------------------------------------------------------------------
+     // M4.D — widen_after_fail unit tests (AS6–AS9b).
+     // -----------------------------------------------------------------------

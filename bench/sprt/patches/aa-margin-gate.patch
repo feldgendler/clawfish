@@ -1,0 +1,211 @@
+diff --git a/src/search.rs b/src/search.rs
+index 03f2ca2..7a0938c 100644
+--- a/src/search.rs
++++ b/src/search.rs
+@@ -800,6 +800,16 @@ fn tt_bound_for_completed_node(
+     })
+ }
+ 
++/// Margin (cp) above `beta` at which a qsearch stand-pat fail-high (Path A) is
++/// considered *decisive* and its `Lower` entry worth storing. A marginal
++/// fail-high (`stand_pat - beta < QS_PATHA_KEEP_MARGIN`) is low-value /
++/// high-volume / cheaply recomputed, so its store is suppressed (the M5.F.3
++/// rationale). A(a) tuning campaign (2026-06-02, vs `M5.F.1`): unconditional
++/// M5.F.3 suppression did not compose with M5.F.1's completed-loop `Exact` —
++/// the slow-TC collapse is the leading suspect for losing exactly the
++/// re-probe-cutoff entries this margin gate now keeps. Gate value = SPRT.
++const QS_PATHA_KEEP_MARGIN: i32 = 100;
++
+ /// Classify the bound for a completed qsearch result (three-way, M5.F.1).
+ ///
+ /// `alpha_entry` is the node's window alpha at entry (after mate-distance
+@@ -2491,8 +2501,20 @@ impl AlphaBetaMover {
+         let best_init = if !in_chk {
+             let sp = evaluate_cached(pos, &mut self.pawn_hash);
+             if sp >= beta {
+-                // Path A: stand-pat fail-high → Lower bound (M5.F).
+-                return self.qsearch_store_and_return(pos, sp, TtBound::Lower, 0, ply);
++                // Path A: stand-pat fail-high. A(a) tuning campaign vs M5.F.1
++                // (margin-gated M5.F.3). Decisive fail-high (sp - beta >=
++                // QS_PATHA_KEEP_MARGIN): a high-value Lower bound worth storing
++                // for re-probe cutoffs → store (the pre-M5.F.3 behavior).
++                // Marginal fail-high: low-value, high-volume, cheaply
++                // recomputed from `evaluate_cached` next visit → suppress the
++                // store (near-pure TT pressure). Keeping the decisive entries
++                // is the lever this campaign tests for recomposing M5.F.3 with
++                // M5.F.1's completed-loop Exact (which unconditional
++                // suppression collapsed at slow TC).
++                if sp - beta >= QS_PATHA_KEEP_MARGIN {
++                    return self.qsearch_store_and_return(pos, sp, TtBound::Lower, 0, ply);
++                }
++                return sp;
+             }
+             if sp > alpha {
+                 alpha = sp;
+@@ -15327,21 +15349,25 @@ mod tests {
+     }
+ 
+     // -----------------------------------------------------------------------
+-    // M5.F §6.5 — Store behavior tests (6 tests, one per real-result path)
++    // M5.F §6.5 — Store behavior tests (one per real-result path; Path A has
++    // three since the A(a) margin gate, 2026-06-02)
+     //
+-    // Each test verifies that qsearch produces a TT entry at the correct
+-    // (score, bound, best_move) for its specific return path. WITHOUT the
+-    // production store block, ALL six tests fail: `qsearch_tt_stores_for_test()`
+-    // stays 0 and `tt.probe(key)` returns None.
++    // Paths B–F verify that qsearch produces a TT entry at the correct
++    // (score, bound, best_move) for their return path: WITHOUT the production
++    // store block those tests fail (`qsearch_tt_stores_for_test()` stays 0 and
++    // `tt.probe(key)` returns None). Path A is value-conditional since the A(a)
++    // tuning campaign: a DECISIVE stand-pat fail-high stores a Lower entry; a
++    // MARGINAL one suppresses the store (see the three `..._fail_high_..` tests).
+     // -----------------------------------------------------------------------
+ 
+-    /// Path A: stand-pat fail-high. Fixture has no captures (filter empty);
+-    /// static eval is clearly positive and exceeds beta. The stand-pat cutoff
+-    /// fires at step 4, and qsearch must store a Lower entry with score=stand_pat,
+-    /// best_move=0.
++    /// Path A, DECISIVE fail-high (A(a) tuning campaign): stand-pat exceeds beta
++    /// by >= QS_PATHA_KEEP_MARGIN, so the Lower store is KEPT. Fixture has no
++    /// captures (filter empty); static eval clearly exceeds beta. qsearch must
++    /// store a Lower entry with score=stand_pat, best_move=0.
+     ///
+-    /// Fixture: KvKR (white K+R vs black K). Eval ≈ +477 cp (well above any
+-    /// plausible low beta). Window: alpha=0, beta=10 (stand_pat >> beta).
++    /// Fixture: KvKR (white K+R vs black K). Eval ≈ +580 cp. Window: alpha=0,
++    /// beta=10 → margin = 570 >= 100 (decisive). This is the store-branch
++    /// tripwire for the margin gate.
+     #[test]
+     fn qsearch_tt_store_stand_pat_fail_high_lower() {
+         use crate::eval::evaluate;
+@@ -15369,11 +15395,11 @@ mod tests {
+             "qsearch must return stand_pat on fail-high; expected {expected_eval}, got {score}"
+         );
+ 
+-        // Without store block: stores=0 and probe returns None.
++        // Decisive fail-high (margin 570 >= 100): store kept.
+         assert_eq!(
+             ab.qsearch_tt_stores_for_test(),
+             1,
+-            "path A (stand-pat fail-high) must produce exactly one TT store; got {}",
++            "path A decisive fail-high must produce exactly one TT store; got {}",
+             ab.qsearch_tt_stores_for_test()
+         );
+         let entry = tt
+@@ -15393,6 +15419,89 @@ mod tests {
+         assert_eq!(entry.best_move, 0, "stand-pat has no best_move");
+     }
+ 
++    /// Path A, MARGINAL fail-high (A(a) tuning campaign): stand-pat exceeds beta
++    /// but by < QS_PATHA_KEEP_MARGIN, so the Lower store is SUPPRESSED. qsearch
++    /// must still RETURN stand_pat, but produce ZERO TT stores and leave no
++    /// entry. Suppress-branch tripwire for the margin gate.
++    ///
++    /// Fixture: KvKR (eval ≈ +580). beta = eval − (margin−1) → margin = 99 < 100
++    /// (just-marginal). beta < eval so Path A still fires; the gate suppresses.
++    #[test]
++    fn qsearch_path_a_marginal_fail_high_suppresses_store() {
++        use crate::eval::evaluate;
++        use crate::tt::TranspositionTable;
++        let pos =
++            Position::from_fen("4k3/8/8/8/8/8/8/2R1K3 w - - 0 1").expect("KvKR FEN must parse");
++        let expected_eval = evaluate(&pos);
++        // Just below the keep margin: fail-high fires (beta <= eval) but the
++        // gap is < QS_PATHA_KEEP_MARGIN, so the store is suppressed.
++        let beta = expected_eval - (QS_PATHA_KEEP_MARGIN - 1);
++        assert!(
++            expected_eval >= beta && expected_eval - beta < QS_PATHA_KEEP_MARGIN,
++            "fixture invariant: marginal fail-high (beta <= eval < beta+margin); \
++             eval={expected_eval}, beta={beta}, margin={QS_PATHA_KEEP_MARGIN}"
++        );
++
++        let tt = Arc::new(TranspositionTable::new(1));
++        let mut ab = AlphaBetaMover::new();
++        ab.history = vec![pos.zobrist()];
++        ab.set_tt_for_test(Some(Arc::clone(&tt)));
++        let (ctx, _stop) = non_aborting_ctx();
++        let ply: u32 = 1;
++
++        let score = ab.qsearch_for_test(&mut pos.clone(), 0, beta, ply, &ctx);
++        assert_eq!(
++            score, expected_eval,
++            "qsearch must still return stand_pat on a suppressed fail-high; \
++             expected {expected_eval}, got {score}"
++        );
++        assert_eq!(
++            ab.qsearch_tt_stores_for_test(),
++            0,
++            "path A marginal fail-high must produce ZERO TT stores; got {}",
++            ab.qsearch_tt_stores_for_test()
++        );
++        assert!(
++            tt.probe(pos.zobrist()).is_none(),
++            "path A marginal fail-high must leave no TT entry (store suppressed)"
++        );
++    }
++
++    /// Path A, BOUNDARY fail-high (A(a) tuning campaign): stand-pat exceeds beta
++    /// by EXACTLY QS_PATHA_KEEP_MARGIN, so the `>=` gate KEEPS the store. Kills
++    /// the `>= → >` boundary mutant on the margin comparison.
++    ///
++    /// Fixture: KvKR (eval ≈ +580). beta chosen so margin == QS_PATHA_KEEP_MARGIN
++    /// exactly.
++    #[test]
++    fn qsearch_path_a_boundary_margin_stores() {
++        use crate::eval::evaluate;
++        use crate::tt::TranspositionTable;
++        let pos =
++            Position::from_fen("4k3/8/8/8/8/8/8/2R1K3 w - - 0 1").expect("KvKR FEN must parse");
++        let expected_eval = evaluate(&pos);
++        let beta = expected_eval - QS_PATHA_KEEP_MARGIN;
++        let tt = Arc::new(TranspositionTable::new(1));
++        let mut ab = AlphaBetaMover::new();
++        ab.history = vec![pos.zobrist()];
++        ab.set_tt_for_test(Some(Arc::clone(&tt)));
++        let (ctx, _stop) = non_aborting_ctx();
++        let ply: u32 = 1;
++
++        let score = ab.qsearch_for_test(&mut pos.clone(), 0, beta, ply, &ctx);
++        assert_eq!(score, expected_eval, "qsearch must return stand_pat");
++        assert_eq!(
++            ab.qsearch_tt_stores_for_test(),
++            1,
++            "margin == QS_PATHA_KEEP_MARGIN must KEEP the store (>= boundary); got {}",
++            ab.qsearch_tt_stores_for_test()
++        );
++        assert!(
++            tt.probe(pos.zobrist()).is_some(),
++            "boundary fail-high must leave a TT entry"
++        );
++    }
++
+     /// Path B: true stalemate. The position is a stalemate for the side to move.
+     /// qsearch must return 0 and store an Exact entry with score=0, best_move=0.
+     ///
+diff --git a/tests/uci_integration.rs b/tests/uci_integration.rs
+index 846a4ce..482b527 100644
+--- a/tests/uci_integration.rs
++++ b/tests/uci_integration.rs
+@@ -1137,11 +1137,18 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
+     // 112_497 -> 112_020. (The sibling M5.F.3 Path-A-store-suppression ship also
+     // SPRT-validated +37.49 alone but did NOT compose with M5.F.1 — combined
+     // −58 Elo at 40+0.4 — so it was deferred, not shipped; see tuning-backlog.)
+-    // History prepend: M5.F.1 `112_020`.
+-    const DEPTH4_BENCH_NODES: u64 = 112_020;
++    // A(a) tuning campaign (2026-06-02, ON-TRIAL vs M5.F.1): margin-gated Path-A
++    // store suppression — a stand-pat fail-high stores its Lower entry only when
++    // decisive (sp - beta >= QS_PATHA_KEEP_MARGIN=100); marginal fail-highs
++    // suppress the store. At the shallow d4 bench positions almost all Path-A
++    // fail-highs are marginal, so the gate suppresses most of them and the
++    // anchor moves 112_020 -> 111_993. REVERTS with the candidate if its SPRT
++    // does not clear the gate (CI-lower>0).
++    // History prepend: A(a) `111_993`; M5.F.1 `112_020`.
++    const DEPTH4_BENCH_NODES: u64 = 111_993;
+     assert_eq!(
+         nodes1, DEPTH4_BENCH_NODES,
+-        "E51: bench node count changed from the M5.F.1 pin ({DEPTH4_BENCH_NODES} at depth=4); \
++        "E51: bench node count changed from the A(a) candidate pin ({DEPTH4_BENCH_NODES} at depth=4); \
+          re-pin if intentional; got {nodes1}"
+     );
+ }
