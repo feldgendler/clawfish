@@ -221,6 +221,10 @@ pub struct TuneConfig {
     /// held-out evaluation. `None` is silent (default; existing callers and
     /// tests stay quiet).
     pub progress_label: Option<String>,
+    /// After each Adam step, project each core parameter into its expected-sign
+    /// halfspace (clamp bonuses ≥ 0, penalties ≤ 0; ambiguous indices are left
+    /// free). See `texel::layout::expected_sign`.
+    pub sign_project: bool,
 }
 
 /// The tune result: tuned params + the fitted K + the final held-out objective.
@@ -234,6 +238,19 @@ pub struct TuneResult {
     pub val_loss: f64,
     /// Iterations actually run.
     pub iters: u64,
+}
+
+/// Projects each core parameter into its expected-sign halfspace: bonuses are
+/// clamped ≥ 0, penalties ≤ 0, and ambiguous parameters are left free.
+/// Called after each Adam step when `TuneConfig::sign_project` is `true`.
+pub fn project_sign(w: &mut [f64]) {
+    for (i, wi) in w.iter_mut().enumerate() {
+        match crate::texel::layout::expected_sign(i) {
+            1 if *wi < 0.0 => *wi = 0.0,
+            -1 if *wi > 0.0 => *wi = 0.0,
+            _ => {}
+        }
+    }
 }
 
 /// Runs the Adam weight solve over the cached features (R3 resumable). K is
@@ -321,6 +338,9 @@ pub fn tune(
             let m_hat = state.m[i] / bc1;
             let v_hat = state.v[i] / bc2;
             state.w[i] -= cfg.lr * m_hat / (v_hat.sqrt() + EPSILON);
+        }
+        if cfg.sign_project {
+            project_sign(&mut state.w);
         }
 
         // Periodic held-out eval + stopping checks.
@@ -651,6 +671,7 @@ mod tests {
             checkpoint_path: None,
             checkpoint_every: 10,
             progress_label: None,
+            sign_project: false,
         }
     }
 

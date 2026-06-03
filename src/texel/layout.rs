@@ -186,6 +186,34 @@ pub fn parity(idx: usize) -> Parity {
     if mg { Parity::Mg } else { Parity::Eg }
 }
 
+/// Structurally-expected sign of core parameter `idx` for the item-7
+/// sign-projection constraint: +1 = bonus (>= 0), -1 = penalty (<= 0),
+/// 0 = unconstrained (ambiguous OR centered/relative — left free).
+///
+/// Conservative: only the unambiguous, structurally one-signed scalar
+/// penalties/bonuses (and the PASSED rank table — the documented sign-violation
+/// target) are constrained. The **mobility and connected-pawn tables are
+/// CENTERED/relative** (a piece with few legal moves is legitimately *negative*
+/// vs the baseline — a trapped-piece penalty, not a sign violation), so forcing
+/// them >= 0 would destroy real eval structure via a gauge shift; they are left
+/// unconstrained and their ordering is handled by `mono_lambda` instead. This
+/// is the corrected scope after the 2026-06-03 over-broad first pass mangled the
+/// low-mobility entries (see docs/plans/tuning-overnight-2026-06-03.md item 7).
+pub fn expected_sign(idx: usize) -> i32 {
+    match idx {
+        0..6 => -1,     // IsoDblBwd: isolated/doubled/backward pawn PENALTIES
+        6..18 => 0,     // Conn: centered/relative rank table — UNCONSTRAINED (mono handles order)
+        18..29 => 1, // Passed: PASSED_MG[18..23] + PASSED_EG[23..29] rank BONUSES (documented violation)
+        29..37 => 0, // Passed: FREE_EG_DELTA[29..35] + KDIST_OWN[35] + KDIST_ENEMY[36] — AMBIGUOUS
+        37..169 => 0, // MobN/MobB/MobR/MobQ: CENTERED tables (neg at low popcount) — UNCONSTRAINED
+        169..173 => 1, // KsShieldFile: pawn-shield BONUSES (SHIELD_1_MG, SHIELD_1_EG, SHIELD_2_MG, SHIELD_2_EG)
+        173..177 => -1, // KsShieldFile: king open/semi-open-file PENALTIES
+        177..189 => 1, // Outpost BONUSES
+        189..193 => 1, // RookFile: rook-on-open/semi-open-file BONUSES
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +257,80 @@ mod tests {
         // MG entries: IsoDblBwd 3, Conn 6, Passed 5, MobN 9, MobB 14, MobR 15,
         // MobQ 28, KsShieldFile 6, Outpost 6, RookFile 2 = 94.
         assert_eq!(mg, 94, "MG-parity count drifted");
+    }
+
+    /// `expected_sign` returns the correct sign for a representative index in
+    /// each group and constrains every index in 0..N_CORE to one of {-1, 0, +1}.
+    #[test]
+    fn expected_sign_table_covers_all_193_and_signs_groups() {
+        // Per-group representative spot checks.
+        // IsoDblBwd (0..6): penalties → -1
+        assert_eq!(expected_sign(0), -1, "IsoDblBwd start");
+        assert_eq!(expected_sign(5), -1, "IsoDblBwd end");
+        // Conn (6..18): centered/relative rank table → 0 (unconstrained)
+        assert_eq!(expected_sign(6), 0, "Conn (centered) unconstrained");
+        assert_eq!(expected_sign(17), 0, "Conn end (centered) unconstrained");
+        // Passed rank bonuses (18..29): → +1 (documented sign-violation target)
+        assert_eq!(expected_sign(18), 1, "Passed MG start");
+        assert_eq!(expected_sign(28), 1, "Passed EG end");
+        // Passed ambiguous tail (29..37): → 0
+        assert_eq!(expected_sign(29), 0, "FREE_EG_DELTA start");
+        assert_eq!(expected_sign(36), 0, "KDIST_ENEMY");
+        // Mobility (37..169): centered tables (neg at low popcount) → 0 (unconstrained)
+        assert_eq!(expected_sign(37), 0, "MobN (centered) unconstrained");
+        assert_eq!(expected_sign(168), 0, "MobQ (centered) unconstrained");
+        // KsShieldFile shield bonuses (169..173): → +1
+        assert_eq!(expected_sign(169), 1, "KsShieldFile shield start");
+        assert_eq!(expected_sign(172), 1, "KsShieldFile shield end");
+        // KsShieldFile open-file penalties (173..177): → -1
+        assert_eq!(expected_sign(173), -1, "KsShieldFile open-file start");
+        assert_eq!(expected_sign(176), -1, "KsShieldFile open-file end");
+        // Outpost (177..189): → +1
+        assert_eq!(expected_sign(177), 1, "Outpost start");
+        // RookFile (189..193): → +1
+        assert_eq!(expected_sign(189), 1, "RookFile start");
+        assert_eq!(expected_sign(192), 1, "RookFile end");
+
+        // Every index must return exactly one of {-1, 0, +1}.
+        for i in 0..N_CORE {
+            let s = expected_sign(i);
+            assert!(
+                s == -1 || s == 0 || s == 1,
+                "expected_sign({i}) = {s} not in {{-1, 0, +1}}"
+            );
+        }
+    }
+
+    /// `project_sign` (the optimizer helper) clamps penalty indices ≤ 0, bonus
+    /// indices ≥ 0, and leaves ambiguous indices unchanged.
+    #[test]
+    fn sign_projection_clamps_penalty_and_bonus() {
+        use crate::texel::optimizer::project_sign;
+
+        let mut w = vec![0.0f64; N_CORE];
+        // idx 0: IsoDblBwd penalty — set positive, must be clamped to 0
+        w[0] = 5.0;
+        // idx 18: Passed MG bonus — set negative, must be clamped to 0
+        w[18] = -5.0;
+        // idx 36: KDIST_ENEMY — ambiguous (sign 0), must remain unchanged
+        w[36] = -5.0;
+
+        project_sign(&mut w);
+
+        assert!(
+            w[0] <= 0.0,
+            "penalty idx 0 must be clamped to ≤ 0 after projection; got {}",
+            w[0]
+        );
+        assert!(
+            w[18] >= 0.0,
+            "bonus idx 18 must be clamped to ≥ 0 after projection; got {}",
+            w[18]
+        );
+        assert!(
+            (w[36] - (-5.0)).abs() < f64::EPSILON,
+            "ambiguous idx 36 must be left unchanged at -5.0; got {}",
+            w[36]
+        );
     }
 }

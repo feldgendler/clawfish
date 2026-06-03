@@ -8,6 +8,35 @@ This file also tracks **deferred features awaiting a precondition** — items re
 
 ---
 
+### 2026-06-03 overnight backlog sweep — 0 ships (full plan: [`docs/plans/tuning-overnight-2026-06-03.md`](plans/tuning-overnight-2026-06-03.md))
+
+Walked the whole active queue in order. Dispositions:
+- **M5.I / M5.H2 depth gate RE-MEASURED, still not met** — `scripts/depth-probe.sh` at literal 20+0.2 (fresh clock, the 8 midgame `src/bench.rs` FENs): depths `10 11 11 11 12 13 15 16`, **median ≈ 11.5 < 14**. Both stay deferred on fresh empirical basis (was the stale "~8-12" figure).
+- **M5.F qsearch-TT last lever (qsearch-local-depth gate) — NO SHIP** (+11.30 [−13.86,+36.57]). Real per-TC lever: fixes 40+0.4 (the bucket M5.F.3 collapsed) but regresses extremes; net flat at `QS_PATHA_SUPPRESS_DEPTH=2`. A threshold sweep (1/3/4) is a low-prior micro-follow-up; patch `bench/sprt/patches/item3-*.patch`. **M5.F now fully explored — close.**
+- **M5.G SE — confirmed closed** (no untried lever).
+- **ML-aspiration tier 3 (delta-baseline) — NO SHIP but the night's best lead** → promoted to its own item below.
+- **sign/monotonicity retune — numerics LANDED** (sign-projection + `--l2-lambda`/`--mono-lambda`/`--sign-project` CLI; tuner-only). Constrained retune was val-loss-neutral (+0.38%); the actual retune+SPRT deferred into the Arm-B/sign-mono campaign (which now has the projected-gradient infra it needed). Corrected-scope lesson: mobility/conn are **centered** tables (legitimately negative at low popcount) — do NOT sign-constrain them; only the scalar penalties/bonuses + the PASSED rank table.
+- **Arm-B PST co-tune — sensitivity gate-checked → NO-GO / deprioritized.** `texel-tune sensitivity` on shipped params (16M-record cache) shows the deferred terms (mobility/passed/rook-file/shield) are the **most** sensitive, NOT pinned-near-zero; only sparse dead cells (data-coverage). Gate condition 2 unmet ⇒ frozen-PST double-count bias is small ⇒ Arm-B sinks down the queue (as the gate specifies). Evidence: `bench/tune/2026-06-03-sensitivity-shipped.json`.
+- **King-safety S-curve — confirmed closed-negative** (M6.K).
+
+**Net:** three consecutive 0-ship campaigns (06-01/02/03) ⇒ the search layer is at a local optimum at current strength/TC. Remaining headroom is in the eval surface (gated on Arm-B's now-deprioritized gate) and NNUE (M11).
+
+---
+
+### Delta-baseline aspiration, TC/depth-gated + SPSA — NEW (2026-06-03; the closest-to-ship lead)
+
+**Status.** The 2026-06-03 ML-aspiration tier-3 delta-baseline (`half = clamp(K·|score(d-1)−score(d-2)|, MIN, MAX)`, hand-picked `K=2, MIN=25, MAX=250`) SPRT'd **combined +13.03 [−3.78, +29.91] over 800 games (2 seeds)** vs `M5.F.1` — no-ship by the strict CI-lower>0 rule, but **rung-2 "ship with note"** by ADR-0037 §9, and **robustly positive at 20+0.2 across both seeds** (+23 / +20) while flat-to-negative at the extremes (10+0.1 too shallow for a stable d-1/d-2 delta; 60+0.6 deep enough that fixed-50 already suffices). The mechanism is sound and the mid-TC win is real; the net is dragged to borderline by the extreme buckets.
+
+**Why promoted (closest the search layer has come to a ship in three campaigns).** Two levers to capture the 20+0.2 win without the extreme-bucket drag:
+1. **TC- or depth-gate the volatility width** — apply the delta-baseline only in the mid-depth band (e.g. `ASPIRATION_MIN_DEPTH ≤ depth ≤ ~12`), keep fixed-50 at shallow/deep. The 10+0.1 and 60+0.6 losses suggest the width should *not* deviate from 50 at the depth extremes.
+2. **SPSA-tune `K / MIN / MAX`** (hand-picked, never optimized). A proper tune of the three params — ideally jointly with the depth-gate band — is the natural next step. Needs the SPSA harness (a small extension of `elo-iterate`; same dependency as the ML-aspiration items below).
+
+**Validation.** Mixed-TC + virtual-clock SPRT vs `M5.F.1`. Decision: combined ≥2-seed confirm at CI-lower>0 (or rung-2 with an explicit ship-with-note). **Baseline = `M5.F.1`.** Patch: `bench/sprt/patches/item5-delta-baseline-aspiration.patch`; data: `bench/sprt/2026-06-03-item5-delta-baseline-aspiration-vs-m5f1.md`. Cross-ref the "ML-tuned aspiration window sizing" item below (this is its tier-3 made concrete + a mid-band gate).
+
+**Open user decision (from the 2026-06-03 campaign):** whether to take the rung-2 ship-with-note on the *ungated* +13.03 candidate now (patch preserved), vs waiting for the gated/SPSA-tuned version. Default taken at campaign close: revert (reversible), pursue the gated version.
+
+---
+
 ### M5.I aspiration third tier — DEFERRED 2026-05-11 (Elo-neutral; no per-TC signal to anchor follow-up tuning)
 
 **Status (2026-05-11).** M5.I v1 (`ASPIRATION_INTERMEDIATE_HALF_WIDTH = 150`, fires at all `depth >= ASPIRATION_MIN_DEPTH = 6`) ran mixed-TC SPRT vs `M5.H1` (seed `0xC1ABF15AE10DD011`).

@@ -69,6 +69,7 @@ fn print_help() {
          \x20 tune         --cache <CACHE> --out-params <JSON> --checkpoint <CKPT>\n\
          \x20              --max-iter <N> --seed <S> --eval-every <E>\n\
          \x20              --patience <P> --val-fraction <F>\n\
+         \x20              --l2-lambda <L> --mono-lambda <M> --sign-project\n\
          \x20 mixture      --lanes <DIR>×4 --out-params <JSON> [tune flags]\n\
          \x20 apply        --params <JSON> --data <data.rs>\n\
          \x20 crosscheck   --lanes <DIR>×4\n\
@@ -189,6 +190,9 @@ fn cmd_tune(args: &Args) -> Result<(), String> {
     let eval_every = args.parse_u64("eval-every", 100)?;
     let patience = args.parse_u32("patience", 5)?;
     let val_fraction = args.parse_f64("val-fraction", 0.1)?;
+    let l2_lambda = args.parse_f64("l2-lambda", 0.0)?;
+    let mono_lambda = args.parse_f64("mono-lambda", 0.0)?;
+    let sign_project = args.get("sign-project").is_some();
 
     let meta = reconstruct_meta(&cache)?;
     let split = dataset::split_by_game(&meta, val_fraction, seed);
@@ -200,15 +204,16 @@ fn cmd_tune(args: &Args) -> Result<(), String> {
         patience,
         eval_every,
         reg: Reg {
-            l2_lambda: 0.0,
+            l2_lambda,
             init: init.core_to_vec(),
-            mono_lambda: 0.0,
+            mono_lambda,
         },
         seed,
         val_fraction,
         checkpoint_path: checkpoint.clone(),
         checkpoint_every: eval_every,
         progress_label: None,
+        sign_project,
     };
 
     // Resume from a valid checkpoint if one exists (a torn `.tmp` is ignored by
@@ -230,7 +235,8 @@ fn cmd_tune(args: &Args) -> Result<(), String> {
         seed,
     )?;
     eprintln!(
-        "texel-tune tune: {} iters, K={}, val_loss={}, wrote {}",
+        "texel-tune tune: {} iters, K={}, val_loss={}, wrote {}  \
+         [l2={l2_lambda} mono={mono_lambda} sign_project={sign_project}]",
         result.iters,
         result.k,
         result.val_loss,
@@ -273,6 +279,7 @@ fn cmd_mixture(args: &Args) -> Result<(), String> {
         checkpoint_path: None,
         checkpoint_every: eval_every,
         progress_label: None,
+        sign_project: false,
     };
 
     let progress_path = out_params.with_extension("progress");

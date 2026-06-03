@@ -1060,6 +1060,7 @@ mod tests {
             checkpoint_path: None,
             checkpoint_every: 10,
             progress_label: None,
+            sign_project: false,
         }
     }
 

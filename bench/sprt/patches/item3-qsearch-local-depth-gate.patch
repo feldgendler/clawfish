@@ -1,0 +1,227 @@
+diff --git a/src/search.rs b/src/search.rs
+index 03f2ca2..aa9565a 100644
+--- a/src/search.rs
++++ b/src/search.rs
+@@ -530,6 +530,13 @@ pub(crate) const SE_MARGIN_PER_DEPTH: i32 = 1;
+ /// default. ADR-0029 §3.
+ pub(crate) const SE_TT_DEPTH_DELTA: u32 = 3;
+ 
++/// Item-3 tuning lever (M5.F.3 recompose): qsearch-local depth at/above which
++/// Path-A (stand-pat fail-high) `Lower` stores are SUPPRESSED. Shallow frames
++/// (qs_depth < this) still store — those are the highest-value entries that
++/// co-exist with M5.F.1's completed-loop `Exact` entries. Deep frames are
++/// staler / mid-capture-chain and contribute mostly TT pressure.
++pub(crate) const QS_PATHA_SUPPRESS_DEPTH: u32 = 2;
++
+ // Depth-disjointness invariants. These are load-bearing tripwires: a future
+ // tuning that moves FFP_MAX_DEPTH or SE_MIN_DEPTH into overlap MUST update
+ // the corresponding ADRs and remove the violated assertion.
+@@ -1501,7 +1508,7 @@ impl AlphaBetaMover {
+         //    Preserves M3.C's "1 leaf = 1 node" budget under `go nodes <N>`.
+         //    Qsearch does not consult the TT in M4.A (ADR-0018 §6).
+         if depth == 0 {
+-            return self.qsearch(pos, alpha, beta, ply, ctx, clock);
++            return self.qsearch(pos, alpha, beta, ply, 0, ctx, clock);
+         }
+ 
+         // 3. Per-frame nodes increment + cancellation poll (non-leaf only).
+@@ -2390,12 +2397,14 @@ impl AlphaBetaMover {
+     /// Stand-pat (static eval as lower bound) is used when not in check.
+     /// In check, all legal evasions are searched; no stand-pat (unsound in check).
+     /// Captures + queen promotions only outside of check; full move list in check.
++    #[allow(clippy::too_many_arguments)]
+     fn qsearch(
+         &mut self,
+         pos: &mut Position,
+         mut alpha: i32,
+         mut beta: i32,
+         ply: u32,
++        qs_depth: u32,
+         ctx: &SearchContext,
+         clock: &SearchClock,
+     ) -> i32 {
+@@ -2491,7 +2500,13 @@ impl AlphaBetaMover {
+         let best_init = if !in_chk {
+             let sp = evaluate_cached(pos, &mut self.pawn_hash);
+             if sp >= beta {
+-                // Path A: stand-pat fail-high → Lower bound (M5.F).
++                // Path A: stand-pat fail-high → Lower bound (M5.F). Item-3 lever:
++                // suppress the store on DEEP qsearch frames (qs_depth >=
++                // QS_PATHA_SUPPRESS_DEPTH) — staler / mid-chain, mostly TT pressure;
++                // keep shallow-frame stores (co-exist with M5.F.1 Exact entries).
++                if qs_depth >= QS_PATHA_SUPPRESS_DEPTH {
++                    return sp;
++                }
+                 return self.qsearch_store_and_return(pos, sp, TtBound::Lower, 0, ply);
+             }
+             if sp > alpha {
+@@ -2561,7 +2576,15 @@ impl AlphaBetaMover {
+                 let undo = pos.make_move(only_mv);
+                 self.history.push(pos.zobrist());
+                 let (child_alpha, child_beta) = negate_window(alpha, beta);
+-                let score = -self.qsearch(pos, child_alpha, child_beta, ply + 1, ctx, clock);
++                let score = -self.qsearch(
++                    pos,
++                    child_alpha,
++                    child_beta,
++                    ply + 1,
++                    qs_depth + 1,
++                    ctx,
++                    clock,
++                );
+                 self.history.pop();
+                 pos.unmake_move(only_mv, undo);
+ 
+@@ -2618,7 +2641,15 @@ impl AlphaBetaMover {
+             };
+ 
+             let (child_alpha, child_beta) = negate_window(alpha, beta);
+-            let score = -self.qsearch(pos, child_alpha, child_beta, ply + 1, ctx, clock);
++            let score = -self.qsearch(
++                pos,
++                child_alpha,
++                child_beta,
++                ply + 1,
++                qs_depth + 1,
++                ctx,
++                clock,
++            );
+             self.history.pop();
+             pos.unmake_move(mv, undo);
+ 
+@@ -2655,7 +2686,7 @@ impl AlphaBetaMover {
+                     let undo2 = pos.make_move(under_mv);
+                     self.history.push(pos.zobrist());
+                     let (ca, cb) = negate_window(alpha, beta);
+-                    let under_score = -self.qsearch(pos, ca, cb, ply + 1, ctx, clock);
++                    let under_score = -self.qsearch(pos, ca, cb, ply + 1, qs_depth + 1, ctx, clock);
+                     self.history.pop();
+                     pos.unmake_move(under_mv, undo2);
+ 
+@@ -2763,7 +2794,28 @@ impl AlphaBetaMover {
+         self.qsearch_tt_probes = 0;
+         self.qsearch_tt_stores = 0;
+         let clock = SearchClock::start_for(ctx.virtual_clock, ctx.caps);
+-        self.qsearch(pos, alpha, beta, ply, ctx, &clock)
++        self.qsearch(pos, alpha, beta, ply, 0, ctx, &clock)
++    }
++
++    /// Test-only entry that forwards to `qsearch` at a chosen qsearch-local depth,
++    /// for exercising the item-3 Path-A suppression gate. Resets the same per-entry
++    /// counters as `qsearch_for_test`.
++    #[cfg(test)]
++    pub(super) fn qsearch_at_qs_depth_for_test(
++        &mut self,
++        pos: &mut Position,
++        alpha: i32,
++        beta: i32,
++        ply: u32,
++        qs_depth: u32,
++        ctx: &SearchContext,
++    ) -> i32 {
++        self.qsearch_single_reply_firings = 0;
++        self.qsearch_under_promo_firings = 0;
++        self.qsearch_tt_probes = 0;
++        self.qsearch_tt_stores = 0;
++        let clock = SearchClock::start_for(ctx.virtual_clock, ctx.caps);
++        self.qsearch(pos, alpha, beta, ply, qs_depth, ctx, &clock)
+     }
+ 
+     /// Test-only accessor for the per-`go` qsearch single-reply firings
+@@ -3369,7 +3421,7 @@ impl QSearcher {
+         };
+         let clock = SearchClock::start_for(false, caps);
+         let mut work = *pos;
+-        let stm_score = self.inner.qsearch(&mut work, -INF, INF, 0, &ctx, &clock);
++        let stm_score = self.inner.qsearch(&mut work, -INF, INF, 0, 0, &ctx, &clock);
+         if pos.side_to_move() == crate::Color::White {
+             stm_score
+         } else {
+@@ -15393,6 +15445,87 @@ mod tests {
+         assert_eq!(entry.best_move, 0, "stand-pat has no best_move");
+     }
+ 
++    /// Item-3 gate: Path-A stand-pat fail-high is SUPPRESSED (no TT store) at
++    /// qs_depth >= QS_PATHA_SUPPRESS_DEPTH, but still RETURNS stand_pat. At
++    /// qs_depth == QS_PATHA_SUPPRESS_DEPTH - 1 (shallow) it still stores.
++    ///
++    /// Uses the same KvKR fixture as `qsearch_tt_store_stand_pat_fail_high_lower`
++    /// (stand-pat > beta is guaranteed by the fixture invariant check).
++    #[test]
++    fn qsearch_path_a_suppressed_at_deep_qs_depth() {
++        use crate::eval::evaluate;
++        use crate::tt::TranspositionTable;
++        let pos =
++            Position::from_fen("4k3/8/8/8/8/8/8/2R1K3 w - - 0 1").expect("KvKR FEN must parse");
++        let expected_eval = evaluate(&pos);
++        let beta = 10;
++        assert!(
++            expected_eval >= beta,
++            "fixture invariant: eval must be >= beta so stand-pat fail-high fires; \
++             eval={expected_eval}, beta={beta}"
++        );
++
++        let (ctx, _stop) = non_aborting_ctx();
++        let ply: u32 = 1;
++
++        // --- Shallow frame (qs_depth = QS_PATHA_SUPPRESS_DEPTH - 1): stores exactly 1.
++        let tt_shallow = Arc::new(TranspositionTable::new(1));
++        let mut ab_shallow = AlphaBetaMover::new();
++        ab_shallow.history = vec![pos.zobrist()];
++        ab_shallow.set_tt_for_test(Some(Arc::clone(&tt_shallow)));
++        let score_shallow = ab_shallow.qsearch_at_qs_depth_for_test(
++            &mut pos.clone(),
++            0,
++            beta,
++            ply,
++            QS_PATHA_SUPPRESS_DEPTH - 1,
++            &ctx,
++        );
++        assert_eq!(
++            score_shallow, expected_eval,
++            "shallow frame must still return stand_pat; expected {expected_eval}, got {score_shallow}"
++        );
++        assert_eq!(
++            ab_shallow.qsearch_tt_stores_for_test(),
++            1,
++            "shallow frame (qs_depth < SUPPRESS_DEPTH) must store exactly 1 TT entry; got {}",
++            ab_shallow.qsearch_tt_stores_for_test()
++        );
++        assert!(
++            tt_shallow.probe(pos.zobrist()).is_some(),
++            "shallow frame must leave a TT entry for the position"
++        );
++
++        // --- Deep frame (qs_depth = QS_PATHA_SUPPRESS_DEPTH): no store, but still returns stand_pat.
++        let tt_deep = Arc::new(TranspositionTable::new(1));
++        let mut ab_deep = AlphaBetaMover::new();
++        ab_deep.history = vec![pos.zobrist()];
++        ab_deep.set_tt_for_test(Some(Arc::clone(&tt_deep)));
++        let score_deep = ab_deep.qsearch_at_qs_depth_for_test(
++            &mut pos.clone(),
++            0,
++            beta,
++            ply,
++            QS_PATHA_SUPPRESS_DEPTH,
++            &ctx,
++        );
++        assert_eq!(
++            score_deep, expected_eval,
++            "deep frame must still return stand_pat even when store is suppressed; \
++             expected {expected_eval}, got {score_deep}"
++        );
++        assert_eq!(
++            ab_deep.qsearch_tt_stores_for_test(),
++            0,
++            "deep frame (qs_depth >= SUPPRESS_DEPTH) must NOT store a TT entry; got {}",
++            ab_deep.qsearch_tt_stores_for_test()
++        );
++        assert!(
++            tt_deep.probe(pos.zobrist()).is_none(),
++            "deep frame must leave NO TT entry for the position"
++        );
++    }
++
+     /// Path B: true stalemate. The position is a stalemate for the side to move.
+     /// qsearch must return 0 and store an Exact entry with score=0, best_move=0.
+     ///
