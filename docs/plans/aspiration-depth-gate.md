@@ -4,6 +4,16 @@
 **Parent item:** `docs/tuning-backlog.md` §"Delta-baseline aspiration, TC/depth-gated + SPSA", **lever 1** (TC-/depth-gate the volatility width). Lever 2 (SPSA-tune K/MIN/MAX) was ruled out empirically low-signal on 2026-06-06 (harness shakedown + calibration; see backlog "Update 2026-06-06 (later)").
 **Baseline:** `M5.F.1` (production HEAD). **Builds on:** Unit 1 (`fd1be1a`, runtime-tunable adaptive aspiration via `Aspiration_*` UCI options).
 
+## 0. Outcome — CLOSED NEGATIVE (2026-06-06)
+
+The `[8,12]`-banded candidate SPRT'd **≈ −34.9 Elo over 800 games (2 seeds, both
+CIs fully negative)** vs `M5.F.1`. The band hypothesis is **refuted**: the
+regression concentrates in the 20+0.2 bucket the band was designed to protect.
+Lever 1 closed, no band re-pick (M5.I lesson). Code `89e4dad` kept as a
+default-OFF runtime feature (bench byte-identical). Full writeup:
+`bench/sprt/2026-06-06-depth-gate-aspiration-vs-m5f1.md`; backlog updated. The
+sections below are the as-executed plan, retained for the record.
+
 ## 1. Motivation
 
 The 2026-06-03 delta-baseline candidate (`half = clamp(K·|score(d-1)−score(d-2)|, MIN, MAX)`, K=2/MIN=25/MAX=250) SPRT'd **combined +13.03 [−3.78, +29.91]** vs `M5.F.1` — rung-2 ship-with-note, no-ship by strict CI-lower>0. The net was dragged borderline by the **depth extremes**: robustly positive at 20+0.2 (+23/+20 across two seeds, median depth ~11.5) but **flat-to-negative at 10+0.1 (too shallow for a stable d-1/d-2 delta) and 60+0.6 (deep enough that fixed-±50 already suffices)**.
