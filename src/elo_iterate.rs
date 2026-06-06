@@ -27,6 +27,7 @@ pub(crate) mod prng;
 pub(crate) mod progress;
 pub(crate) mod sigma;
 pub(crate) mod sprt;
+pub(crate) mod spsa;
 pub(crate) mod summary;
 pub(crate) mod tc_sample;
 
@@ -108,6 +109,20 @@ pub fn main() -> ExitCode {
         virtual_clock: args.virtual_clock,
     };
 
+    let out_dir = std::path::Path::new(&args.out_dir).to_owned();
+
+    // SPSA mode: `run_spsa` owns the tuning loop and does not use the worker pool
+    // for Elo estimation — it builds its own pair config per-iteration.
+    if args.spsa {
+        return match controller::run_spsa(&args, &out_dir) {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: run_spsa: {e:?}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
     let mut pool = match controller::spawn_workers(args.concurrency, cfg) {
         Ok(p) => p,
         Err(e) => {
@@ -116,7 +131,6 @@ pub fn main() -> ExitCode {
         }
     };
 
-    let out_dir = std::path::Path::new(&args.out_dir).to_owned();
     match controller::run_iteration(&mut pool, &args, &out_dir) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
@@ -787,6 +801,142 @@ mod e2e_smoke {
         assert!(
             out_dir.join("match.pgn").exists(),
             "match.pgn must be created by the run-end concatenation step"
+        );
+    }
+
+    // ---- 2.6.i SPSA end-to-end smoke ----
+
+    #[test]
+    #[ignore = "spawns clawfish; opt-in via cargo test --release -- --ignored"]
+    fn end_to_end_spsa_smoke_3_iters_2_games_per_iter() {
+        use std::process::Command;
+
+        let engine = resolve_bin(CLAWFISH_EXE, "clawfish");
+        let harness = resolve_bin(ELO_ITERATE_EXE, "elo-iterate");
+        let out_dir = std::env::temp_dir().join("elo-iterate-spsa-smoke");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let run = |out: &std::path::Path| {
+            Command::new(&harness)
+                .args([
+                    "--engine",
+                    &engine,
+                    "--opponent",
+                    &engine,
+                    "--tc",
+                    "1+0.05",
+                    "--spsa",
+                    "--spsa-iters",
+                    "3",
+                    "--spsa-games-per-iter",
+                    "2",
+                    "--spsa-param",
+                    "Aspiration_K:200:0:1000:20:centik",
+                    "--spsa-param",
+                    "Aspiration_Min:25:0:1000:4:cp",
+                    "--spsa-param",
+                    "Aspiration_Max:250:0:2000:12:cp",
+                    "--seed",
+                    "42",
+                    "--out-dir",
+                    out.to_str().unwrap(),
+                ])
+                .status()
+                .expect("spawn harness")
+        };
+
+        let status = run(&out_dir);
+        assert!(status.success(), "SPSA harness must exit 0; got {status}");
+
+        // Verify spsa-trajectory.tsv has exactly 3 rows (one per iteration).
+        let traj_path = out_dir.join("spsa-trajectory.tsv");
+        assert!(traj_path.exists(), "spsa-trajectory.tsv must exist");
+        let traj = std::fs::read_to_string(&traj_path).unwrap();
+        let traj_rows: Vec<&str> = traj.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            traj_rows.len(),
+            3,
+            "spsa-trajectory.tsv must have 3 rows; got {}: {traj:?}",
+            traj_rows.len()
+        );
+
+        // Verify spsa-final.txt exists with a parseable option block.
+        let final_path = out_dir.join("spsa-final.txt");
+        assert!(final_path.exists(), "spsa-final.txt must exist");
+        let final_content = std::fs::read_to_string(&final_path).unwrap();
+        assert!(
+            final_content.contains("Aspiration_Adaptive=true"),
+            "spsa-final.txt must contain Aspiration_Adaptive=true; got: {final_content:?}"
+        );
+        assert!(
+            final_content.contains("Aspiration_K="),
+            "spsa-final.txt must contain Aspiration_K=; got: {final_content:?}"
+        );
+
+        // Structural validation: each row must have the expected column count
+        // and parseable numeric fields.
+        //
+        // For 3 params the TSV column layout per row is:
+        //   [0]k  [1..3]theta  [4..6]plus_vals  [7..9]minus_vals
+        //   [10]match  [11]a_k  [12..14]c_k  [15]pair_score  → 16 columns total
+        const EXPECTED_COLS: usize = 16;
+        for (row_idx, row) in traj_rows.iter().enumerate() {
+            let cols: Vec<&str> = row.split('\t').collect();
+            assert_eq!(
+                cols.len(),
+                EXPECTED_COLS,
+                "trajectory row {row_idx} must have {EXPECTED_COLS} columns; got {}: {row:?}",
+                cols.len()
+            );
+            let k: u64 = cols[0].parse().expect("col 0 (k) must be u64");
+            assert_eq!(
+                k, row_idx as u64,
+                "row {row_idx} k-field must equal row index"
+            );
+            // All remaining columns must be parseable as f64.
+            for (ci, &col) in cols[1..].iter().enumerate() {
+                col.parse::<f64>().unwrap_or_else(|_| {
+                    panic!(
+                        "trajectory row {row_idx} col {} '{col}' must be f64",
+                        ci + 1
+                    )
+                });
+            }
+        }
+
+        // Same-seed iteration-0 Δ reproducibility: since iteration 0's θ⁺/θ⁻ values
+        // are computed from the *initial* θ (independent of any game outcome), they
+        // must be identical across two runs with the same seed. Subsequent iterations
+        // perturb the *current* θ (which evolves with game outcomes) so only iter-0
+        // is strictly seed-determined.
+        let out_dir2 = std::env::temp_dir().join("elo-iterate-spsa-smoke-2");
+        let _ = std::fs::remove_dir_all(&out_dir2);
+        std::fs::create_dir_all(&out_dir2).unwrap();
+        let status2 = run(&out_dir2);
+        assert!(status2.success(), "second SPSA run must exit 0");
+
+        let traj2 = std::fs::read_to_string(out_dir2.join("spsa-trajectory.tsv")).unwrap();
+        let iter0_cols = |tsv: &str| -> Vec<String> {
+            let row = tsv
+                .lines()
+                .find(|l| !l.is_empty())
+                .expect("at least one row");
+            let cols: Vec<&str> = row.split('\t').collect();
+            // plus_vals (cols 4-6), minus_vals (cols 7-9), schedule (cols 11-14)
+            [4, 5, 6, 7, 8, 9, 11, 12, 13, 14]
+                .iter()
+                .filter(|&&c| c < cols.len())
+                .map(|&c| cols[c].to_owned())
+                .collect()
+        };
+        assert_eq!(
+            iter0_cols(&traj),
+            iter0_cols(&traj2),
+            "same-seed iter-0 Δ/schedule columns must be identical; \
+             run-1 row-0:\n{}\nrun-2 row-0:\n{}",
+            traj.lines().next().unwrap_or(""),
+            traj2.lines().next().unwrap_or("")
         );
     }
 }

@@ -22,6 +22,21 @@ pub(crate) enum WorkerCmd {
         /// `--opponent-tc-override` is absent; override value otherwise.
         opponent_tc: super::cli::TimeControl,
     },
+    /// Play one SPSA CRN color-pair (2 games, color-swapped).
+    ///
+    /// Both engines point at the same clawfish binary. `engine_options` are
+    /// the θ⁺ setoptions; `opponent_options` are the θ⁻ setoptions. Both
+    /// option sets include `Aspiration_Adaptive=true`. No `UCI_Elo` is sent
+    /// (full-strength self-play). The setoption block is sent before
+    /// `ucinewgame` within the pair per the existing invariant.
+    PlaySpsaPair {
+        pair_index: u32,
+        /// θ⁺ setoption lines, sent to the "engine" side.
+        engine_options: Vec<(String, String)>,
+        /// θ⁻ setoption lines, sent to the "opponent" side.
+        opponent_options: Vec<(String, String)>,
+        tc: super::cli::TimeControl,
+    },
     /// Tell the worker to exit its recv loop and clean up.
     Quit,
 }
@@ -446,6 +461,129 @@ fn production_worker_fn(
                         white_name,
                         black_name,
                         tc: engine_tc,
+                    });
+                }
+
+                if pair_failed {
+                    break;
+                }
+                let _ = rpt_tx.send(WorkerReport::PairComplete { worker_id });
+            }
+            WorkerCmd::PlaySpsaPair {
+                pair_index,
+                engine_options,
+                opponent_options,
+                tc,
+            } => {
+                // **SPSA per-pair setoption ordering invariant:**
+                // Send θ⁺/θ⁻ setoptions to each engine BEFORE `ucinewgame`,
+                // for the same reason as the UCI_Elo block in PlayPair (see
+                // above). No UCI_Elo / UCI_LimitStrength is sent — full-strength
+                // self-play. `isready`-sync after the setoption block.
+                for (name, value) in &engine_options {
+                    let _ = super::driver::send_line(
+                        &mut engine,
+                        &format!("setoption name {name} value {value}"),
+                    );
+                }
+                if super::driver::wait_for_readyok(&mut engine, isready_to).is_err() {
+                    let _ = rpt_tx.send(WorkerReport::Failure(format!(
+                        "worker {worker_id}: SPSA readyok after engine setoption"
+                    )));
+                    break;
+                }
+                for (name, value) in &opponent_options {
+                    let _ = super::driver::send_line(
+                        &mut opponent,
+                        &format!("setoption name {name} value {value}"),
+                    );
+                }
+                if super::driver::wait_for_readyok(&mut opponent, isready_to).is_err() {
+                    let _ = rpt_tx.send(WorkerReport::Failure(format!(
+                        "worker {worker_id}: SPSA readyok after opponent setoption"
+                    )));
+                    break;
+                }
+
+                // Color-swap 2-game loop — identical to PlayPair loop but with no UCI_Elo.
+                let mut pair_failed = false;
+                for game_in_pair in 0..2u32 {
+                    let clawfish_white = game_in_pair == 0;
+                    let game_index = pair_index * 2 + game_in_pair + 1;
+
+                    // ucinewgame + isready for both engines.
+                    let _ = super::driver::send_line(&mut engine, "ucinewgame");
+                    let engine_ready =
+                        super::driver::wait_for_readyok(&mut engine, isready_to).is_ok();
+                    let _ = super::driver::send_line(&mut opponent, "ucinewgame");
+                    let opponent_ready =
+                        super::driver::wait_for_readyok(&mut opponent, isready_to).is_ok();
+                    if either_per_game_readyok_failed(engine_ready, opponent_ready) {
+                        let _ = rpt_tx.send(WorkerReport::Failure(format!(
+                            "worker {worker_id}: SPSA readyok after ucinewgame"
+                        )));
+                        pair_failed = true;
+                        break;
+                    }
+
+                    // Both sides use the same TC in SPSA self-play.
+                    let (white_tc, black_tc) = (tc, tc);
+                    let white_clock = crate::PerSideClock {
+                        remaining_ms: i64::from(white_tc.initial_ms),
+                        increment_ms: white_tc.increment_ms,
+                    };
+                    let black_clock = crate::PerSideClock {
+                        remaining_ms: i64::from(black_tc.initial_ms),
+                        increment_ms: black_tc.increment_ms,
+                    };
+
+                    // engine side is θ⁺; when clawfish_white==true, engine is white.
+                    let (white_engine_index, white_name, black_name) = if clawfish_white {
+                        (
+                            0usize,
+                            cfg.engine_spec.name.clone(),
+                            cfg.opponent_spec.name.clone(),
+                        )
+                    } else {
+                        (
+                            1usize,
+                            cfg.opponent_spec.name.clone(),
+                            cfg.engine_spec.name.clone(),
+                        )
+                    };
+
+                    let mut ctx = super::match_loop::GameContext {
+                        game_index,
+                        white_engine_index,
+                        engine: &mut engine,
+                        opponent: &mut opponent,
+                        engine_tc: tc,
+                        opponent_tc: tc,
+                        harness_overhead_ms: cfg.harness_overhead_ms,
+                        watchdog: cfg.watchdog,
+                        mode: cfg.mode,
+                        max_plies: cfg.max_plies,
+                        starting_fen: None,
+                        white_clock,
+                        black_clock,
+                        thresholds: cfg.thresholds.clone(),
+                    };
+
+                    let (outcome, pgn_moves) = super::match_loop::play_one_game(&mut ctx);
+                    // clawfish_score here is θ⁺'s POV: engine (θ⁺) is
+                    // white when clawfish_white, black otherwise.
+                    let clawfish_score = compute_clawfish_score(&outcome, clawfish_white);
+
+                    let _ = rpt_tx.send(WorkerReport::GameComplete {
+                        worker_id,
+                        game_index,
+                        opponent_uci_elo: 0, // unused in SPSA mode
+                        clawfish_score,
+                        outcome,
+                        pgn_moves,
+                        white_name,
+                        black_name,
+                        tc,
                     });
                 }
 
@@ -998,6 +1136,281 @@ pub(crate) fn write_match_pgn(
     Ok(())
 }
 
+/// Drive the SPSA tuning loop to completion.
+///
+/// Spawns one worker per `args.concurrency`; each iteration dispatches
+/// `args.spsa_games_per_iter / 2` CRN pairs (all with the same θ⁺/θ⁻ and Δ),
+/// barriers on their results, computes the match score, and steps θ.
+///
+/// Determinism contract: Δ, colors (already fixed by color-swap), and TC
+/// (when `--tc-sample`) are all drawn from the single seeded Prng in the
+/// sequential driver in that fixed per-pair order, before dispatch.
+///
+/// Appends one row per iteration to `<out_dir>/spsa-trajectory.tsv`.
+/// Writes tail-averaged final θ to `<out_dir>/spsa-final.txt`.
+#[allow(dead_code)]
+pub(crate) fn run_spsa(
+    args: &super::cli::Args,
+    out_dir: &std::path::Path,
+) -> Result<(), super::driver::HarnessError> {
+    use super::spsa::{
+        SpsaSchedule, accumulate_tail, build_setoption_lines, draw_rademacher,
+        format_final_option_block, format_trajectory_row, pair_sum_to_match, spsa_step,
+        tail_averaged_values,
+    };
+    use std::io::Write;
+
+    let _ = std::fs::create_dir_all(out_dir);
+    let games_dir = out_dir.join("games");
+    let _ = std::fs::create_dir_all(&games_dir);
+
+    // spsa_iters is guaranteed Some by parse_args when spsa=true.
+    let n_iters = args
+        .spsa_iters
+        .expect("run_spsa: spsa_iters must be Some when spsa=true");
+    let pairs_per_iter = (args.spsa_games_per_iter / 2) as u64;
+    let tail_window = args.spsa_tail_average.unwrap_or((n_iters / 10).max(1));
+
+    let mut params = args.spsa_params.clone();
+    let sched = SpsaSchedule::new(&params, n_iters, args.spsa_r_end, args.spsa_a_override);
+
+    // The Prng drives: Δ (n_params draws), then TC (when --tc-sample).
+    // Colors are fixed (game 0 = θ⁺ white, game 1 = θ⁻ white).
+    let mut rng = super::prng::Prng::new(args.seed.unwrap_or(super::prng::DEFAULT_SEED));
+
+    // Open trajectory log (truncate on fresh run).
+    let traj_path = out_dir.join("spsa-trajectory.tsv");
+    let _ = std::fs::remove_file(&traj_path);
+
+    // Build a WorkerConfig for the SPSA self-play (both engines are args.engine).
+    let engine_name = std::path::Path::new(&args.engine)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("engine")
+        .to_owned();
+    let cfg = WorkerConfig {
+        engine_spec: super::driver::EngineSpec {
+            name: format!("{engine_name}+"),
+            path: args.engine.clone(),
+            launch_prefix: args.engine_launch_prefix.clone(),
+        },
+        opponent_spec: super::driver::EngineSpec {
+            name: format!("{engine_name}-"),
+            path: args.engine.clone(),
+            launch_prefix: args.engine_launch_prefix.clone(),
+        },
+        engine_options: args.engine_options.clone(),
+        opponent_options: args.engine_options.clone(), // both sides same static options
+        mode: crate::MatchTimeMode::Wallclock,
+        harness_overhead_ms: args.harness_overhead_ms,
+        watchdog: std::time::Duration::from_millis(args.watchdog_ms),
+        max_plies: args.max_moves,
+        thresholds: args.thresholds.clone(),
+        virtual_clock: args.virtual_clock,
+    };
+
+    let mut pool = spawn_workers(args.concurrency, cfg)?;
+
+    for k in 0..n_iters {
+        let a_k = sched.a_k(k);
+        let c_k: Vec<f64> = (0..params.len()).map(|i| sched.c_k(i, k)).collect();
+
+        // Draw Δ from the sequential Prng (deterministic; workers don't touch rng).
+        let delta = draw_rademacher(&mut rng, params.len());
+
+        // Compute θ⁺ and θ⁻ integer values for each param.
+        let plus_vals: Vec<i64> = params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| p.plus_value(p.theta, c_k[i], delta[i]))
+            .collect();
+        let minus_vals: Vec<i64> = params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| p.minus_value(p.theta, c_k[i], delta[i]))
+            .collect();
+
+        // Build setoption option vectors (Vec<(name, value)>).
+        let engine_opts: Vec<(String, String)> = {
+            let lines = build_setoption_lines(&params, &plus_vals);
+            lines
+                .into_iter()
+                .filter_map(|l| {
+                    // parse "setoption name NAME value VALUE" → (NAME, VALUE)
+                    let rest = l.strip_prefix("setoption name ")?;
+                    let (name, val) = rest.split_once(" value ")?;
+                    Some((name.to_owned(), val.to_owned()))
+                })
+                .collect()
+        };
+        let opponent_opts: Vec<(String, String)> = {
+            let lines = build_setoption_lines(&params, &minus_vals);
+            lines
+                .into_iter()
+                .filter_map(|l| {
+                    let rest = l.strip_prefix("setoption name ")?;
+                    let (name, val) = rest.split_once(" value ")?;
+                    Some((name.to_owned(), val.to_owned()))
+                })
+                .collect()
+        };
+
+        // Dispatch pairs_per_iter PlaySpsaPair commands.
+        // TC is drawn from the sequential rng (per determinism contract).
+        let base_pair_index = (k * pairs_per_iter) as u32;
+        let n_workers = pool.senders.len();
+        let mut pairs_completed = 0u64;
+        let mut dispatch_count = 0usize;
+
+        for pair_offset in 0..pairs_per_iter {
+            let tc = match &args.tc_sample {
+                Some(dist) => dist.sample(&mut rng),
+                None => args
+                    .tc
+                    .expect("post-parse: exactly one of tc/tc_sample set"),
+            };
+            let worker_id = (pair_offset % n_workers as u64) as usize;
+            let pair_index = base_pair_index + pair_offset as u32;
+            if pool.senders[worker_id]
+                .send(WorkerCmd::PlaySpsaPair {
+                    pair_index,
+                    engine_options: engine_opts.clone(),
+                    opponent_options: opponent_opts.clone(),
+                    tc,
+                })
+                .is_err()
+            {
+                // Worker exited unexpectedly.
+                return Err(super::driver::HarnessError::EngineExit);
+            }
+            dispatch_count += 1;
+        }
+
+        // Barrier: drain reports until all dispatched pairs complete.
+        let mut game_scores_this_iter: Vec<f64> = Vec::new();
+        let mut pairs_complete_this_iter = 0usize;
+
+        while pairs_complete_this_iter < dispatch_count {
+            let report = match pool.reports.recv() {
+                Ok(r) => r,
+                Err(_) => return Err(super::driver::HarnessError::EngineExit),
+            };
+            match report {
+                WorkerReport::GameComplete {
+                    clawfish_score,
+                    game_index,
+                    pgn_moves,
+                    outcome,
+                    white_name,
+                    black_name,
+                    tc: game_tc,
+                    ..
+                } => {
+                    game_scores_this_iter.push(clawfish_score);
+
+                    // Write per-game PGN.
+                    let (result, termination_str) =
+                        crate::elo_iterate::outcome_to_pgn_result(&outcome);
+                    let tc_str = crate::elo_iterate::format_tc(game_tc);
+                    let pgn_header = super::pgn::PgnHeader {
+                        event: args.event_tag.clone(),
+                        site: crate::elo_iterate::current_hostname(),
+                        date: crate::elo_iterate::current_date_str(),
+                        round: game_index,
+                        white: white_name,
+                        black: black_name,
+                        result,
+                        time_control: Some(tc_str),
+                        termination: Some(termination_str),
+                        setup_fen: None,
+                    };
+                    let pgn_str = super::pgn::format_pgn(&pgn_header, &pgn_moves);
+                    let _ = std::fs::write(games_dir.join(format!("{game_index}.pgn")), &pgn_str);
+                }
+                WorkerReport::PairComplete { .. } => {
+                    pairs_complete_this_iter += 1;
+                    pairs_completed += 1;
+                }
+                WorkerReport::Failure(msg) => {
+                    eprintln!("spsa worker failure: {msg}");
+                    return Err(super::driver::HarnessError::EngineExit);
+                }
+            }
+        }
+
+        // Aggregate θ⁺ pair scores.
+        // game_scores_this_iter holds alternating θ⁺-POV scores (game 0 = θ⁺ white,
+        // game 1 = θ⁺ black, game 2 = θ⁺ white, ...).
+        let pair_score_sum: f64 = game_scores_this_iter.iter().sum();
+        let avg_pair_sum = if pairs_completed > 0 {
+            pair_score_sum / pairs_completed as f64
+        } else {
+            1.0 // neutral if no pairs completed
+        };
+        let match_val = pair_sum_to_match(avg_pair_sum);
+
+        // Gradient step.
+        spsa_step(&mut params, a_k, &c_k, &delta, match_val);
+
+        // Tail accumulation (last tail_window iterations).
+        if k >= n_iters.saturating_sub(tail_window) {
+            accumulate_tail(&mut params);
+        }
+
+        // Write trajectory row.
+        let thetas: Vec<f64> = params.iter().map(|p| p.theta).collect();
+        let row = format_trajectory_row(
+            k,
+            &thetas,
+            &plus_vals,
+            &minus_vals,
+            match_val,
+            a_k,
+            &c_k,
+            pair_score_sum,
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&traj_path)
+        {
+            let _ = writeln!(f, "{row}");
+        }
+    }
+
+    // Send Quit and drain workers.
+    for s in &pool.senders {
+        let _ = s.send(WorkerCmd::Quit);
+    }
+    pool.senders.clear();
+    for h in pool.join_handles.drain(..) {
+        if let Err(panic) = h.join() {
+            eprintln!("spsa worker panicked: {panic:?}");
+        }
+    }
+
+    // Write final output.
+    let avg_values = tail_averaged_values(&params);
+    let option_block = format_final_option_block(&params, &avg_values);
+    let final_path = out_dir.join("spsa-final.txt");
+    let mut final_file = std::fs::File::create(&final_path).map_err(|_| {
+        super::driver::HarnessError::Io(std::io::Error::other("create spsa-final.txt"))
+    })?;
+    writeln!(final_file, "# SPSA tail-averaged final parameters").ok();
+    writeln!(final_file, "# Apply via: elo-iterate ... {option_block}").ok();
+    writeln!(final_file, "{option_block}").ok();
+    for (param, val) in params.iter().zip(avg_values.iter()) {
+        writeln!(
+            final_file,
+            "# {} = {} (final theta = {:.2})",
+            param.name, val, param.theta
+        )
+        .ok();
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -1082,6 +1495,9 @@ mod tests {
                 for cmd in &cmd_rx {
                     match cmd {
                         WorkerCmd::Quit => break,
+                        WorkerCmd::PlaySpsaPair { .. } => {
+                            unreachable!("SPSA pair sent to synthetic SPRT worker")
+                        }
                         WorkerCmd::PlayPair { .. } => {
                             for report in &reports {
                                 // Reports are pre-constructed; we can only clone
@@ -1156,6 +1572,9 @@ mod tests {
                 for cmd in &cmd_rx {
                     match cmd {
                         WorkerCmd::Quit => break,
+                        WorkerCmd::PlaySpsaPair { .. } => {
+                            unreachable!("SPSA pair sent to synthetic SPRT worker")
+                        }
                         WorkerCmd::PlayPair {
                             pair_index,
                             opponent_uci_elo,
@@ -1528,6 +1947,9 @@ mod tests {
                 for cmd in &cmd_rx {
                     match cmd {
                         WorkerCmd::Quit => break,
+                        WorkerCmd::PlaySpsaPair { .. } => {
+                            unreachable!("SPSA pair sent to synthetic SPRT worker")
+                        }
                         WorkerCmd::PlayPair {
                             pair_index,
                             opponent_uci_elo,
@@ -1728,6 +2150,9 @@ mod tests {
                 for cmd in &cmd_rx {
                     match cmd {
                         WorkerCmd::Quit => break,
+                        WorkerCmd::PlaySpsaPair { .. } => {
+                            unreachable!("SPSA pair sent to synthetic SPRT worker")
+                        }
                         WorkerCmd::PlayPair { .. } => {
                             if slow {
                                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1957,6 +2382,9 @@ mod tests {
             for cmd in &cmd_rx {
                 match cmd {
                     WorkerCmd::Quit => break,
+                    WorkerCmd::PlaySpsaPair { .. } => {
+                        unreachable!("SPSA pair sent to synthetic SPRT worker")
+                    }
                     WorkerCmd::PlayPair {
                         pair_index,
                         opponent_uci_elo,
@@ -2049,6 +2477,9 @@ mod tests {
             for cmd in &cmd_rx {
                 match cmd {
                     WorkerCmd::Quit => break,
+                    WorkerCmd::PlaySpsaPair { .. } => {
+                        unreachable!("SPSA pair sent to synthetic SPRT worker")
+                    }
                     WorkerCmd::PlayPair {
                         pair_index,
                         opponent_uci_elo,
@@ -2154,6 +2585,9 @@ mod tests {
             for cmd in &cmd_rx {
                 match cmd {
                     WorkerCmd::Quit => break,
+                    WorkerCmd::PlaySpsaPair { .. } => {
+                        unreachable!("SPSA pair sent to synthetic SPRT worker")
+                    }
                     WorkerCmd::PlayPair {
                         pair_index,
                         opponent_uci_elo,
@@ -2240,6 +2674,9 @@ mod tests {
             for cmd in &cmd_rx {
                 match cmd {
                     WorkerCmd::Quit => break,
+                    WorkerCmd::PlaySpsaPair { .. } => {
+                        unreachable!("SPSA pair sent to synthetic SPRT worker")
+                    }
                     WorkerCmd::PlayPair {
                         pair_index,
                         opponent_uci_elo,
@@ -2346,6 +2783,9 @@ mod tests {
             for cmd in &cmd_rx {
                 match cmd {
                     WorkerCmd::Quit => break,
+                    WorkerCmd::PlaySpsaPair { .. } => {
+                        unreachable!("SPSA pair sent to synthetic SPRT worker")
+                    }
                     WorkerCmd::PlayPair {
                         pair_index,
                         opponent_uci_elo,
@@ -2801,6 +3241,9 @@ mod tests {
                 for cmd in &cmd_rx {
                     match cmd {
                         WorkerCmd::Quit => break,
+                        WorkerCmd::PlaySpsaPair { .. } => {
+                            unreachable!("SPSA pair sent to synthetic SPRT worker")
+                        }
                         WorkerCmd::PlayPair {
                             pair_index,
                             opponent_uci_elo,
@@ -3489,6 +3932,9 @@ mod tests {
             for cmd in &cmd_rx {
                 match cmd {
                     WorkerCmd::Quit => break,
+                    WorkerCmd::PlaySpsaPair { .. } => {
+                        unreachable!("SPSA pair sent to synthetic SPRT worker")
+                    }
                     WorkerCmd::PlayPair { pair_index, .. } => {
                         log.lock().unwrap().push(pair_index);
                         pair_counter += 1;
@@ -4309,6 +4755,259 @@ mod tests {
                 outcome.games[1].black_name, "engine-mock",
                 "second game's black_name must be `engine-mock`; got {:?}",
                 outcome.games[1].black_name
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // 2.6.h — SPSA per-pair setoption wiring
+        // -------------------------------------------------------------------
+
+        /// Drive `production_worker_fn` through one `PlaySpsaPair` against two
+        /// mock-engine instances and return their recordings.
+        fn run_one_spsa_pair_against_mocks(
+            engine_options: Vec<(String, String)>,
+            opponent_options: Vec<(String, String)>,
+        ) -> PairOutcome {
+            let mock = resolve_mock_engine_bin();
+
+            static SPSA_COUNTER: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let unique = format!(
+                "eloh_spsa_pworker_{}_{}_{}",
+                std::process::id(),
+                SPSA_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            let temp_dir = std::env::temp_dir().join(unique);
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            std::fs::create_dir_all(&temp_dir).expect("create temp_dir");
+            let engine_record = temp_dir.join("engine.log");
+            let opponent_record = temp_dir.join("opponent.log");
+
+            let engine_spec =
+                build_engine_spec_for_mock("engine-mock", &mock, &engine_record, false);
+            let opponent_spec =
+                build_engine_spec_for_mock("opponent-mock", &mock, &opponent_record, false);
+
+            let cfg = WorkerConfig {
+                engine_spec,
+                opponent_spec,
+                engine_options: vec![], // static options empty — per-pair via PlaySpsaPair
+                opponent_options: vec![],
+                mode: crate::MatchTimeMode::Wallclock,
+                harness_overhead_ms: 0,
+                watchdog: std::time::Duration::from_secs(10),
+                max_plies: 100,
+                thresholds: super::super::super::cli::Thresholds::default(),
+                virtual_clock: false,
+            };
+
+            let mut pool = spawn_workers(1, cfg).expect("spawn_workers");
+
+            let tc = super::super::super::cli::TimeControl {
+                initial_ms: 1000,
+                increment_ms: 0,
+            };
+            pool.senders[0]
+                .send(WorkerCmd::PlaySpsaPair {
+                    pair_index: 0,
+                    engine_options,
+                    opponent_options,
+                    tc,
+                })
+                .expect("send PlaySpsaPair");
+
+            let report_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut games: Vec<GameInfo> = Vec::new();
+            loop {
+                let remaining =
+                    report_deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    panic!(
+                        "SPSA report drain timed out after 20 s; got {} GameComplete reports",
+                        games.len()
+                    );
+                }
+                match pool.reports.recv_timeout(remaining) {
+                    Ok(WorkerReport::GameComplete {
+                        game_index,
+                        white_name,
+                        black_name,
+                        ..
+                    }) => {
+                        games.push(GameInfo {
+                            game_index,
+                            white_name,
+                            black_name,
+                        });
+                    }
+                    Ok(WorkerReport::PairComplete { .. }) => break,
+                    Ok(WorkerReport::Failure(msg)) => {
+                        panic!("SPSA worker reported failure before PairComplete: {msg}");
+                    }
+                    Err(e) => panic!("SPSA report drain error: {e:?}"),
+                }
+            }
+            assert_eq!(
+                games.len(),
+                2,
+                "PlaySpsaPair must produce 2 GameComplete reports"
+            );
+
+            pool.senders.clear();
+            let handles = std::mem::take(&mut pool.join_handles);
+            join_workers_with_watchdog(handles, std::time::Duration::from_secs(10));
+            drop(pool);
+
+            let engine_log = read_log(&engine_record);
+            let opponent_log = read_log(&opponent_record);
+            let _ = std::fs::remove_dir_all(&temp_dir);
+
+            PairOutcome {
+                engine_log,
+                opponent_log,
+                games,
+            }
+        }
+
+        /// T-SPSA-1: PlaySpsaPair sends θ⁺ setoptions to engine BEFORE ucinewgame;
+        /// sends θ⁻ setoptions to opponent BEFORE ucinewgame; sends NO UCI_Elo
+        /// to either engine; correct split (engine gets θ⁺, opponent gets θ⁻).
+        #[test]
+        fn production_worker_fn_spsa_pair_sends_setoptions_before_ucinewgame_no_uci_elo() {
+            let engine_opts = vec![
+                ("Aspiration_Adaptive".to_string(), "true".to_string()),
+                ("Aspiration_K".to_string(), "210".to_string()),
+                ("Aspiration_Min".to_string(), "29".to_string()),
+            ];
+            let opponent_opts = vec![
+                ("Aspiration_Adaptive".to_string(), "true".to_string()),
+                ("Aspiration_K".to_string(), "190".to_string()),
+                ("Aspiration_Min".to_string(), "21".to_string()),
+            ];
+
+            let outcome =
+                run_one_spsa_pair_against_mocks(engine_opts.clone(), opponent_opts.clone());
+
+            let find_exact = |label: &str, log: &Vec<String>, target: &str| -> usize {
+                log.iter()
+                    .position(|l| l == target)
+                    .unwrap_or_else(|| panic!("{label}: missing `{target}` line; got {log:?}"))
+            };
+
+            // Engine received θ⁺ options before first ucinewgame.
+            let eng_k_plus_idx = find_exact(
+                "engine_log",
+                &outcome.engine_log,
+                "setoption name Aspiration_K value 210",
+            );
+            let eng_first_ucn = outcome
+                .engine_log
+                .iter()
+                .position(|l| l == "ucinewgame")
+                .expect("engine_log has at least one ucinewgame");
+            assert!(
+                eng_k_plus_idx < eng_first_ucn,
+                "engine: Aspiration_K θ⁺ setoption (idx {eng_k_plus_idx}) must precede \
+                 first ucinewgame (idx {eng_first_ucn})"
+            );
+
+            // Opponent received θ⁻ options before first ucinewgame.
+            let opp_k_minus_idx = find_exact(
+                "opponent_log",
+                &outcome.opponent_log,
+                "setoption name Aspiration_K value 190",
+            );
+            let opp_first_ucn = outcome
+                .opponent_log
+                .iter()
+                .position(|l| l == "ucinewgame")
+                .expect("opponent_log has at least one ucinewgame");
+            assert!(
+                opp_k_minus_idx < opp_first_ucn,
+                "opponent: Aspiration_K θ⁻ setoption (idx {opp_k_minus_idx}) must precede \
+                 first ucinewgame (idx {opp_first_ucn})"
+            );
+
+            // Engine log must NOT contain θ⁻ value 190.
+            assert!(
+                !outcome
+                    .engine_log
+                    .iter()
+                    .any(|l| l.contains("Aspiration_K value 190")),
+                "engine_log must not contain θ⁻ value 190; got {eng_log:?}",
+                eng_log = outcome.engine_log
+            );
+
+            // Opponent log must NOT contain θ⁺ value 210.
+            assert!(
+                !outcome
+                    .opponent_log
+                    .iter()
+                    .any(|l| l.contains("Aspiration_K value 210")),
+                "opponent_log must not contain θ⁺ value 210; got {opp_log:?}",
+                opp_log = outcome.opponent_log
+            );
+
+            // Neither engine log should mention UCI_Elo (full-strength self-play).
+            assert!(
+                !outcome.engine_log.iter().any(|l| l.contains("UCI_Elo")),
+                "engine_log must NOT mention UCI_Elo in SPSA mode; got {eng_log:?}",
+                eng_log = outcome.engine_log
+            );
+            assert!(
+                !outcome.opponent_log.iter().any(|l| l.contains("UCI_Elo")),
+                "opponent_log must NOT mention UCI_Elo in SPSA mode; got {opp_log:?}",
+                opp_log = outcome.opponent_log
+            );
+        }
+
+        /// T-SPSA-2: The existing PlayPair (SPRT) path is byte-for-byte unchanged —
+        /// the handshake-time options test from §4078 still passes with PlaySpsaPair
+        /// present.
+        #[test]
+        fn production_worker_fn_play_pair_path_unchanged_with_spsa_variant_present() {
+            // Re-run the handshake-time test: handshake options precede first ucinewgame.
+            let outcome = run_one_pair_against_mocks(
+                vec![("EngineOnlyOption".to_string(), "engine_value".to_string())],
+                vec![("OpponentOnlyOption".to_string(), "opp_value".to_string())],
+                false,
+                false,
+                false,
+                2400,
+                0,
+            );
+
+            let find_exact = |label: &str, log: &Vec<String>, target: &str| -> usize {
+                log.iter()
+                    .position(|l| l == target)
+                    .unwrap_or_else(|| panic!("{label}: missing `{target}` line; got {log:?}"))
+            };
+
+            let engine_opt_idx = find_exact(
+                "engine_log",
+                &outcome.engine_log,
+                "setoption name EngineOnlyOption value engine_value",
+            );
+            let engine_first_ucn = outcome
+                .engine_log
+                .iter()
+                .position(|l| l == "ucinewgame")
+                .expect("engine_log has at least one ucinewgame");
+            assert!(
+                engine_opt_idx < engine_first_ucn,
+                "PlayPair: engine option must precede first ucinewgame"
+            );
+
+            // No UCI_Elo setoption in engine log for the PlayPair path
+            // (only opponent gets UCI_Elo in SPRT mode).
+            assert!(
+                !outcome.engine_log.iter().any(|l| l.contains("UCI_Elo")),
+                "engine_log must not receive UCI_Elo in PlayPair; got {eng_log:?}",
+                eng_log = outcome.engine_log
             );
         }
     }

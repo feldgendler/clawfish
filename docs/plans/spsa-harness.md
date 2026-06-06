@@ -381,7 +381,9 @@ Pure, engine-agnostic, fully unit-testable. Holds no I/O.
 ### 2.4 Trajectory logging and final-θ output
 
 - **Per-iteration trajectory line** appended to `<out_dir>/spsa-trajectory.tsv`:
-  `k  <theta_i...>  <plus_i...>  <minus_i...>  match  R_k  c_k_i...  pair_score`.
+  `k  <theta_i...>  <plus_i...>  <minus_i...>  match  a_k  c_k_i...  pair_score`.
+  (Emits the scalar step gain `a_k`, not a relative `R_k` — see §2.3's
+  dropped-`(k+1)^{2γ}`-factor note.)
   Machine-parseable; this is the operator's plateau-monitoring input
   (research §5 "visual trajectory monitoring").
 - **Tail-averaged final θ** (research §3/§5): output both the last θ and the

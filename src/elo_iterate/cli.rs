@@ -99,6 +99,23 @@ pub(crate) struct Args {
     /// and external cooling for tighter results. See ADR-0021 /
     /// `docs/research/tooling-cpu-cycle-counters.md` for the reasoning.
     pub virtual_clock: bool,
+
+    // SPSA tuning fields. Active when `spsa` is true.
+    /// `--spsa` — activate SPSA mode.
+    /// Mutually exclusive with `--sprt-*` and K-update/σ-stopping flags.
+    pub spsa: bool,
+    /// Per-parameter specs parsed from `--spsa-param NAME:THETA0:LO:HI:CEND:ENC`.
+    pub spsa_params: Vec<super::spsa::SpsaParam>,
+    /// Total SPSA iteration budget.
+    pub spsa_iters: Option<u64>,
+    /// Number of games per iteration (must be even; default 2).
+    pub spsa_games_per_iter: u32,
+    /// Desired relative apply factor at the last iteration (default 0.002).
+    pub spsa_r_end: f64,
+    /// Spall stability constant override. When `None`, defaults to `0.1 * spsa_iters`.
+    pub spsa_a_override: Option<f64>,
+    /// Tail-averaging window (last T iterates). Default: 10% of `spsa_iters`.
+    pub spsa_tail_average: Option<u64>,
 }
 
 /// Threshold adjudication parameters matching fastchess defaults.
@@ -199,6 +216,58 @@ fn parse_u64_seed(s: &str) -> Result<u64, CliError> {
     v.map_err(|_| CliError::InvalidValue(format!("--seed: not a valid u64: {s}")))
 }
 
+/// Parse a `NAME:THETA0:LO:HI:CEND:ENC` SPSA parameter spec.
+///
+/// `ENC` must be `cp` or `centik` (case-insensitive).
+pub(crate) fn parse_spsa_param(s: &str) -> Result<super::spsa::SpsaParam, CliError> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return Err(CliError::InvalidValue(format!(
+            "--spsa-param must be NAME:THETA0:LO:HI:CEND:ENC, got: {s}"
+        )));
+    }
+    let name = parts[0].to_owned();
+    let theta: f64 = parts[1].parse().map_err(|_| {
+        CliError::InvalidValue(format!("--spsa-param THETA0 not a number: {}", parts[1]))
+    })?;
+    let lo: f64 = parts[2].parse().map_err(|_| {
+        CliError::InvalidValue(format!("--spsa-param LO not a number: {}", parts[2]))
+    })?;
+    let hi: f64 = parts[3].parse().map_err(|_| {
+        CliError::InvalidValue(format!("--spsa-param HI not a number: {}", parts[3]))
+    })?;
+    let c_end: f64 = parts[4].parse().map_err(|_| {
+        CliError::InvalidValue(format!("--spsa-param CEND not a number: {}", parts[4]))
+    })?;
+    let encoding = match parts[5].to_ascii_lowercase().as_str() {
+        "cp" => super::spsa::Encoding::IntCp,
+        "centik" => super::spsa::Encoding::CentiK,
+        other => {
+            return Err(CliError::InvalidValue(format!(
+                "--spsa-param ENC must be 'cp' or 'centik', got: {other}"
+            )));
+        }
+    };
+    if lo > hi {
+        return Err(CliError::InvalidValue(format!(
+            "--spsa-param LO ({lo}) must be <= HI ({hi}) for param '{name}'"
+        )));
+    }
+    if !(lo <= theta && theta <= hi) {
+        return Err(CliError::InvalidValue(format!(
+            "--spsa-param THETA0 ({theta}) must be in [LO={lo}, HI={hi}] for param '{name}'"
+        )));
+    }
+    if c_end <= 0.0 {
+        return Err(CliError::InvalidValue(format!(
+            "--spsa-param CEND must be > 0, got: {c_end} for param '{name}'"
+        )));
+    }
+    Ok(super::spsa::SpsaParam::new(
+        name, theta, lo, hi, c_end, encoding,
+    ))
+}
+
 /// Parse a `NAME=VALUE` option string into `(name, value)`.
 fn parse_option(s: &str) -> Result<(String, String), CliError> {
     if let Some((name, value)) = s.split_once('=') {
@@ -253,6 +322,15 @@ pub(crate) fn parse_args(argv: Vec<String>) -> Result<Args, CliError> {
     let mut sprt_elo1: Option<f64> = None;
     let mut sprt_alpha: Option<f64> = None;
     let mut sprt_beta: Option<f64> = None;
+
+    // SPSA fields.
+    let mut spsa: bool = false;
+    let mut spsa_params: Vec<super::spsa::SpsaParam> = Vec::new();
+    let mut spsa_iters: Option<u64> = None;
+    let mut spsa_games_per_iter: u32 = 2;
+    let mut spsa_r_end: f64 = 0.002;
+    let mut spsa_a_override: Option<f64> = None;
+    let mut spsa_tail_average: Option<u64> = None;
 
     let mut i = 0usize;
     while i < argv.len() {
@@ -508,6 +586,69 @@ pub(crate) fn parse_args(argv: Vec<String>) -> Result<Args, CliError> {
                         .map_err(|_| CliError::InvalidValue(format!("--sprt-beta: {s}")))?,
                 );
             }
+            // SPSA mode flags.
+            "--spsa" => {
+                spsa = true;
+            }
+            "--spsa-param" => {
+                let s = next_val!();
+                spsa_params.push(
+                    parse_spsa_param(s)
+                        .map_err(|e| CliError::InvalidValue(format!("--spsa-param: {e}")))?,
+                );
+            }
+            "--spsa-iters" => {
+                let s = next_val!();
+                let v: u64 = s
+                    .parse()
+                    .map_err(|_| CliError::InvalidValue(format!("--spsa-iters: {s}")))?;
+                if v < 1 {
+                    return Err(CliError::InvalidValue("--spsa-iters must be >= 1".into()));
+                }
+                spsa_iters = Some(v);
+            }
+            "--spsa-games-per-iter" => {
+                let s = next_val!();
+                let v: u32 = s
+                    .parse()
+                    .map_err(|_| CliError::InvalidValue(format!("--spsa-games-per-iter: {s}")))?;
+                if v < 2 || !v.is_multiple_of(2) {
+                    return Err(CliError::InvalidValue(
+                        "--spsa-games-per-iter must be even and >= 2".into(),
+                    ));
+                }
+                spsa_games_per_iter = v;
+            }
+            "--spsa-r-end" => {
+                let s = next_val!();
+                let v: f64 = s
+                    .parse()
+                    .map_err(|_| CliError::InvalidValue(format!("--spsa-r-end: {s}")))?;
+                if v <= 0.0 {
+                    return Err(CliError::InvalidValue("--spsa-r-end must be > 0".into()));
+                }
+                spsa_r_end = v;
+            }
+            "--spsa-A" => {
+                let s = next_val!();
+                let v: f64 = s
+                    .parse()
+                    .map_err(|_| CliError::InvalidValue(format!("--spsa-A: {s}")))?;
+                if v < 0.0 {
+                    return Err(CliError::InvalidValue("--spsa-A must be >= 0".into()));
+                }
+                spsa_a_override = Some(v);
+            }
+            "--tail-average" => {
+                let s = next_val!();
+                let v: u64 = s
+                    .parse()
+                    .map_err(|_| CliError::InvalidValue(format!("--tail-average: {s}")))?;
+                if v < 1 {
+                    return Err(CliError::InvalidValue("--tail-average must be >= 1".into()));
+                }
+                spsa_tail_average = Some(v);
+            }
             other => {
                 // Reject the --virtual-clock=VALUE form: the rest of the CLI uses
                 // no-equals conventions for boolean flags.
@@ -524,7 +665,12 @@ pub(crate) fn parse_args(argv: Vec<String>) -> Result<Args, CliError> {
 
     let engine = engine.ok_or_else(|| CliError::MissingFlag("--engine".into()))?;
     let opponent = opponent.ok_or_else(|| CliError::MissingFlag("--opponent".into()))?;
-    let max_games = max_games.ok_or_else(|| CliError::MissingFlag("--max-games".into()))?;
+    // --max-games is required in SPRT/Elo mode but not in SPSA mode (which uses --spsa-iters).
+    let max_games = if spsa {
+        max_games.unwrap_or(2)
+    } else {
+        max_games.ok_or_else(|| CliError::MissingFlag("--max-games".into()))?
+    };
 
     let tc_sample = tc_sample_raw;
     let seed = seed_raw;
@@ -541,7 +687,12 @@ pub(crate) fn parse_args(argv: Vec<String>) -> Result<Args, CliError> {
         }
         _ => {}
     }
-    let initial_elo = initial_elo.ok_or_else(|| CliError::MissingFlag("--initial-elo".into()))?;
+    // --initial-elo is required in Elo mode but not in SPSA mode.
+    let initial_elo = if spsa {
+        initial_elo.unwrap_or(2000.0)
+    } else {
+        initial_elo.ok_or_else(|| CliError::MissingFlag("--initial-elo".into()))?
+    };
 
     // Sentinel composition: --k0 0 requires --target-sigma 0.
     // With K=0 the estimate trail is constant, so σ=0 always, and σ-stopping
@@ -600,6 +751,41 @@ pub(crate) fn parse_args(argv: Vec<String>) -> Result<Args, CliError> {
         ));
     }
 
+    // SPSA mutex: --spsa is incompatible with --sprt-* flags and with the
+    // K-update / σ-stopping flags. SPSA drives θ via match outcomes, not
+    // Elo tracking; combining modes is methodologically incoherent.
+    if spsa {
+        for (flag, is_set) in [
+            ("--sprt-elo0", sprt_elo0.is_some()),
+            ("--sprt-elo1", sprt_elo1.is_some()),
+            ("--sprt-alpha", sprt_alpha.is_some()),
+            ("--sprt-beta", sprt_beta.is_some()),
+        ] {
+            if is_set {
+                return Err(CliError::InvalidValue(format!(
+                    "--spsa and {flag} are mutually exclusive"
+                )));
+            }
+        }
+        let k_update_default = k0 == K0_DEFAULT && tau == TAU_DEFAULT;
+        let sigma_stopping_default = target_sigma == TARGET_SIGMA_DEFAULT
+            && stop_window == STOP_WINDOW_DEFAULT
+            && stop_window_confirm == STOP_WINDOW_CONFIRM_DEFAULT;
+        if !(k_update_default && sigma_stopping_default) {
+            return Err(CliError::InvalidValue(
+                "--spsa is incompatible with K-update / σ-stopping flags \
+                 (--k0, --tau, --target-sigma, --stop-window, --stop-window-confirm). \
+                 Remove the offending flags and re-run."
+                    .into(),
+            ));
+        }
+        if spsa_iters.is_none() {
+            return Err(CliError::MissingFlag(
+                "--spsa-iters is required when --spsa is set".into(),
+            ));
+        }
+    }
+
     // Defaults computed here so parse_args returns a fully-resolved Args.
     let watchdog_ms = watchdog_ms.unwrap_or_else(|| {
         let initial_ms = tc.map_or(10_000, |t| t.initial_ms);
@@ -650,6 +836,13 @@ pub(crate) fn parse_args(argv: Vec<String>) -> Result<Args, CliError> {
         sprt_elo1,
         sprt_alpha,
         sprt_beta,
+        spsa,
+        spsa_params,
+        spsa_iters,
+        spsa_games_per_iter,
+        spsa_r_end,
+        spsa_a_override,
+        spsa_tail_average,
     })
 }
 
@@ -1509,5 +1702,211 @@ mod tests {
             result.is_err(),
             "invalid --tc-sample grammar must be rejected"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 2.6.g — SPSA CLI parsing tests
+    // -----------------------------------------------------------------------
+
+    /// Minimal valid SPSA argv (no --max-games, no --initial-elo required).
+    fn spsa_argv() -> Vec<String> {
+        vec![
+            "--engine".into(),
+            "/bin/clawfish".into(),
+            "--opponent".into(),
+            "/bin/clawfish".into(),
+            "--tc".into(),
+            "1+0.05".into(),
+            "--spsa".into(),
+            "--spsa-iters".into(),
+            "100".into(),
+            "--spsa-param".into(),
+            "Aspiration_K:200:0:1000:20:centik".into(),
+            "--spsa-param".into(),
+            "Aspiration_Min:25:0:1000:4:cp".into(),
+            "--spsa-param".into(),
+            "Aspiration_Max:250:0:2000:12:cp".into(),
+        ]
+    }
+
+    #[test]
+    fn parse_spsa_param_round_trips_centik() {
+        let p = parse_spsa_param("Aspiration_K:200:0:1000:20:centik").expect("parse ok");
+        assert_eq!(p.name, "Aspiration_K");
+        assert!((p.theta - 200.0).abs() < 1e-9);
+        assert!((p.lo - 0.0).abs() < 1e-9);
+        assert!((p.hi - 1000.0).abs() < 1e-9);
+        assert!((p.c_end - 20.0).abs() < 1e-9);
+        assert_eq!(p.encoding, crate::elo_iterate::spsa::Encoding::CentiK);
+    }
+
+    #[test]
+    fn parse_spsa_param_round_trips_cp() {
+        let p = parse_spsa_param("Aspiration_Min:25:0:1000:4:cp").expect("parse ok");
+        assert_eq!(p.name, "Aspiration_Min");
+        assert!((p.theta - 25.0).abs() < 1e-9);
+        assert_eq!(p.encoding, crate::elo_iterate::spsa::Encoding::IntCp);
+    }
+
+    #[test]
+    fn parse_spsa_param_rejects_bad_enc() {
+        let err = parse_spsa_param("P:100:0:500:10:badunit").unwrap_err();
+        assert!(
+            matches!(err, CliError::InvalidValue(_)),
+            "bad ENC must produce InvalidValue, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_spsa_param_rejects_bad_numeric_field() {
+        // THETA0 = "abc" → parse error
+        let err = parse_spsa_param("P:abc:0:500:10:cp").unwrap_err();
+        assert!(matches!(err, CliError::InvalidValue(_)));
+    }
+
+    #[test]
+    fn parse_spsa_param_rejects_lo_gt_hi() {
+        let err = parse_spsa_param("P:100:500:0:10:cp").unwrap_err();
+        assert!(
+            matches!(err, CliError::InvalidValue(_)),
+            "LO > HI must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_spsa_param_rejects_theta_below_lo() {
+        // theta0=5 < lo=10: out of box
+        let err = parse_spsa_param("P:5:10:500:10:cp").unwrap_err();
+        assert!(
+            matches!(err, CliError::InvalidValue(_)),
+            "theta0 below lo must be rejected; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_spsa_param_rejects_theta_above_hi() {
+        // theta0=600 > hi=500: out of box
+        let err = parse_spsa_param("P:600:0:500:10:cp").unwrap_err();
+        assert!(
+            matches!(err, CliError::InvalidValue(_)),
+            "theta0 above hi must be rejected; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_spsa_param_rejects_zero_c_end() {
+        let err = parse_spsa_param("P:100:0:500:0:cp").unwrap_err();
+        assert!(
+            matches!(err, CliError::InvalidValue(_)),
+            "c_end=0 must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_spsa_param_rejects_wrong_field_count() {
+        let err = parse_spsa_param("P:100:0:500").unwrap_err();
+        assert!(matches!(err, CliError::InvalidValue(_)));
+    }
+
+    #[test]
+    fn parse_args_spsa_accepts_valid_argv() {
+        let args = parse_args(spsa_argv()).expect("valid SPSA argv must parse ok");
+        assert!(args.spsa, "spsa flag must be set");
+        assert_eq!(args.spsa_params.len(), 3);
+        assert_eq!(args.spsa_iters, Some(100));
+        assert_eq!(args.spsa_games_per_iter, 2, "default games-per-iter is 2");
+        assert!(
+            (args.spsa_r_end - 0.002).abs() < 1e-9,
+            "default r_end is 0.002"
+        );
+    }
+
+    #[test]
+    fn parse_args_spsa_and_sprt_are_mutually_exclusive() {
+        let mut argv = spsa_argv();
+        argv.extend([
+            "--sprt-elo0".into(),
+            "0".into(),
+            "--sprt-elo1".into(),
+            "10".into(),
+            "--sprt-alpha".into(),
+            "0.05".into(),
+            "--sprt-beta".into(),
+            "0.05".into(),
+        ]);
+        let err = parse_args(argv).unwrap_err();
+        assert!(
+            matches!(err, CliError::InvalidValue(_)),
+            "--spsa and --sprt-* must be mutually exclusive; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_args_spsa_and_k_update_flags_incompatible() {
+        let mut argv = spsa_argv();
+        argv.extend(["--k0".into(), "20".into()]);
+        let err = parse_args(argv).unwrap_err();
+        assert!(
+            matches!(err, CliError::InvalidValue(_)),
+            "--spsa and --k0 must be mutually exclusive; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_args_spsa_and_sigma_flags_incompatible() {
+        let mut argv = spsa_argv();
+        argv.extend(["--target-sigma".into(), "10".into()]);
+        let err = parse_args(argv).unwrap_err();
+        assert!(
+            matches!(err, CliError::InvalidValue(_)),
+            "--spsa and --target-sigma must be mutually exclusive; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_args_spsa_requires_spsa_iters() {
+        let argv: Vec<String> = vec![
+            "--engine".into(),
+            "/bin/clawfish".into(),
+            "--opponent".into(),
+            "/bin/clawfish".into(),
+            "--tc".into(),
+            "1+0.05".into(),
+            "--spsa".into(),
+            "--spsa-param".into(),
+            "P:100:0:500:10:cp".into(),
+        ];
+        let err = parse_args(argv).unwrap_err();
+        assert!(
+            matches!(err, CliError::MissingFlag(_)),
+            "--spsa without --spsa-iters must fail; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_args_spsa_games_per_iter_must_be_even() {
+        let mut argv = spsa_argv();
+        argv.extend(["--spsa-games-per-iter".into(), "3".into()]);
+        let err = parse_args(argv).unwrap_err();
+        assert!(
+            matches!(err, CliError::InvalidValue(_)),
+            "odd --spsa-games-per-iter must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_args_spsa_games_per_iter_parsed() {
+        let mut argv = spsa_argv();
+        argv.extend(["--spsa-games-per-iter".into(), "4".into()]);
+        let args = parse_args(argv).expect("parse ok");
+        assert_eq!(args.spsa_games_per_iter, 4);
+    }
+
+    #[test]
+    fn parse_args_spsa_tail_average_parsed() {
+        let mut argv = spsa_argv();
+        argv.extend(["--tail-average".into(), "10".into()]);
+        let args = parse_args(argv).expect("parse ok");
+        assert_eq!(args.spsa_tail_average, Some(10));
     }
 }
