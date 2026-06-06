@@ -20,8 +20,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::search::{
-    AlphaBetaMover, AspirationParams, Search, SearchContext, SearchLimits, SearchResult, TimeCaps,
-    compute_caps,
+    ASPIRATION_MIN_DEPTH, AlphaBetaMover, AspirationParams, MAX_PLY, Search, SearchContext,
+    SearchLimits, SearchResult, TimeCaps, compute_caps,
 };
 use crate::{Command, DebugMode, GoParams, Move, Position, PositionSpec, Register, parse_uci_line};
 
@@ -125,6 +125,12 @@ pub struct Engine<W: Write + Send + 'static, S: Search + Send + 'static> {
     aspiration_k_centi: i32,
     aspiration_min: i32,
     aspiration_max: i32,
+    /// Unit 2: adaptive-aspiration depth-band bounds. The adaptive formula is
+    /// applied only when `adaptive_min_depth ≤ depth ≤ adaptive_max_depth`.
+    /// Defaults to `[ASPIRATION_MIN_DEPTH, MAX_PLY]` = `[6, 64]`, a structural
+    /// no-op gate covering the entire reachable depth domain.
+    aspiration_adaptive_min_depth: u32,
+    aspiration_adaptive_max_depth: u32,
 }
 
 impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
@@ -150,6 +156,8 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
             aspiration_k_centi: AspirationParams::default().k_centi,
             aspiration_min: AspirationParams::default().min,
             aspiration_max: AspirationParams::default().max,
+            aspiration_adaptive_min_depth: AspirationParams::default().adaptive_min_depth,
+            aspiration_adaptive_max_depth: AspirationParams::default().adaptive_max_depth,
         }
     }
 
@@ -192,6 +200,17 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         self.aspiration_max
     }
 
+    /// Test-only accessors for the two Unit-2 adaptive depth-band fields.
+    #[cfg(test)]
+    pub(crate) fn aspiration_adaptive_min_depth(&self) -> u32 {
+        self.aspiration_adaptive_min_depth
+    }
+
+    #[cfg(test)]
+    pub(crate) fn aspiration_adaptive_max_depth(&self) -> u32 {
+        self.aspiration_adaptive_max_depth
+    }
+
     /// Construct an `AspirationParams` from the current engine fields and push
     /// it into the search mover under the lock. Caller must have already joined
     /// any in-flight worker (same discipline as `set_seed`).
@@ -201,6 +220,8 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
             k_centi: self.aspiration_k_centi,
             min: self.aspiration_min,
             max: self.aspiration_max,
+            adaptive_min_depth: self.aspiration_adaptive_min_depth,
+            adaptive_max_depth: self.aspiration_adaptive_max_depth,
         };
         self.search.lock().unwrap().set_aspiration_params(params);
     }
@@ -264,6 +285,11 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         self.write_line("option name Aspiration_K type spin default 200 min 0 max 1000");
         self.write_line("option name Aspiration_Min type spin default 25 min 0 max 1000");
         self.write_line("option name Aspiration_Max type spin default 250 min 0 max 2000");
+        // Unit 2: depth band for the adaptive formula. Default [6,64] = no-op gate.
+        self.write_line("option name Aspiration_AdaptiveMinDepth type spin default 6 min 6 max 64");
+        self.write_line(
+            "option name Aspiration_AdaptiveMaxDepth type spin default 64 min 6 max 64",
+        );
         self.write_line("uciok");
     }
 
@@ -610,6 +636,58 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
                     let msg = match value.as_deref() {
                         Some(v) => format!("Aspiration_Max: rejected value '{v}'"),
                         None => "Aspiration_Max: rejected (no value given)".to_string(),
+                    };
+                    self.info_string_debug(&msg);
+                }
+            }
+            return;
+        }
+
+        // Unit 2: depth-band bounds. Accept only values in [ASPIRATION_MIN_DEPTH,
+        // MAX_PLY as u32] = [6, 64], matching the spin `min 6 max 64` advertisement.
+        // Values outside the range are rejected (not clamped), consistent with the
+        // codebase-wide setoption reject convention.
+        if name.eq_ignore_ascii_case("aspiration_adaptivemindepth") {
+            let parsed: Option<u32> = value
+                .as_deref()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&n| (ASPIRATION_MIN_DEPTH..=MAX_PLY as u32).contains(&n));
+            match parsed {
+                Some(n) => {
+                    self.join_in_flight_worker();
+                    self.aspiration_adaptive_min_depth = n;
+                    self.push_aspiration_params();
+                }
+                None => {
+                    let msg = match value.as_deref() {
+                        Some(v) => format!("Aspiration_AdaptiveMinDepth: rejected value '{v}'"),
+                        None => {
+                            "Aspiration_AdaptiveMinDepth: rejected (no value given)".to_string()
+                        }
+                    };
+                    self.info_string_debug(&msg);
+                }
+            }
+            return;
+        }
+
+        if name.eq_ignore_ascii_case("aspiration_adaptivemaxdepth") {
+            let parsed: Option<u32> = value
+                .as_deref()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&n| (ASPIRATION_MIN_DEPTH..=MAX_PLY as u32).contains(&n));
+            match parsed {
+                Some(n) => {
+                    self.join_in_flight_worker();
+                    self.aspiration_adaptive_max_depth = n;
+                    self.push_aspiration_params();
+                }
+                None => {
+                    let msg = match value.as_deref() {
+                        Some(v) => format!("Aspiration_AdaptiveMaxDepth: rejected value '{v}'"),
+                        None => {
+                            "Aspiration_AdaptiveMaxDepth: rejected (no value given)".to_string()
+                        }
                     };
                     self.info_string_debug(&msg);
                 }
@@ -4553,6 +4631,309 @@ mod tests {
             "adaptive ON must produce a different node count than OFF: \
              setoption did not reach the search mover. \
              off={nodes_off} on={nodes_on}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit 2 — Aspiration_AdaptiveMinDepth / _AdaptiveMaxDepth UCI option tests.
+    // -----------------------------------------------------------------------
+
+    /// Helper: run setoption commands and return the two new depth-band fields.
+    fn drive_capturing_depth_band(commands: &[&str]) -> (String, u32, u32) {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
+
+        let (tx, rx) = mpsc::channel::<Command>();
+        for line in commands {
+            tx.send(parse_uci_line(line)).unwrap();
+        }
+        tx.send(Command::Quit).unwrap();
+        engine.run(rx);
+
+        let bytes = buf.lock().unwrap().clone();
+        let stdout = String::from_utf8(bytes).expect("output must be valid UTF-8");
+        (
+            stdout,
+            engine.aspiration_adaptive_min_depth(),
+            engine.aspiration_adaptive_max_depth(),
+        )
+    }
+
+    /// Default depth-band fields must match `AspirationParams::default()`.
+    #[test]
+    fn engine_default_depth_band_fields_match_defaults() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let engine = Engine::new(writer, AlphaBetaMover::new());
+        assert_eq!(
+            engine.aspiration_adaptive_min_depth(),
+            6,
+            "default adaptive_min_depth must be 6 (ASPIRATION_MIN_DEPTH)"
+        );
+        assert_eq!(
+            engine.aspiration_adaptive_max_depth(),
+            64,
+            "default adaptive_max_depth must be 64 (MAX_PLY)"
+        );
+    }
+
+    /// `handle_uci` must advertise both new depth-band options.
+    #[test]
+    fn handle_uci_advertises_depth_band_options() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
+        let (tx, rx) = mpsc::channel::<Command>();
+        tx.send(parse_uci_line("uci")).unwrap();
+        tx.send(Command::Quit).unwrap();
+        engine.run(rx);
+        let bytes = buf.lock().unwrap().clone();
+        let stdout = String::from_utf8(bytes).unwrap();
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert!(
+            lines.contains(
+                &"option name Aspiration_AdaptiveMinDepth type spin default 6 min 6 max 64"
+            ),
+            "Aspiration_AdaptiveMinDepth option line missing; got stdout:\n{stdout}"
+        );
+        assert!(
+            lines.contains(
+                &"option name Aspiration_AdaptiveMaxDepth type spin default 64 min 6 max 64"
+            ),
+            "Aspiration_AdaptiveMaxDepth option line missing; got stdout:\n{stdout}"
+        );
+    }
+
+    /// Setting `Aspiration_AdaptiveMinDepth` and `_AdaptiveMaxDepth` accepts
+    /// interior values as well as the advertised boundary values 6 and 64.
+    #[test]
+    fn setoption_depth_band_accepts_valid_values() {
+        // Interior values.
+        let (_stdout, min_d, max_d) = drive_capturing_depth_band(&[
+            "setoption name Aspiration_AdaptiveMinDepth value 8",
+            "setoption name Aspiration_AdaptiveMaxDepth value 12",
+        ]);
+        assert_eq!(min_d, 8, "AdaptiveMinDepth 8 must be accepted");
+        assert_eq!(max_d, 12, "AdaptiveMaxDepth 12 must be accepted");
+
+        // Lower boundary: 6 (= ASPIRATION_MIN_DEPTH). A strict-interior filter
+        // (`n > 6`) would reject this, exposing an off-by-one.
+        let (_stdout, min_d, _max_d) =
+            drive_capturing_depth_band(&["setoption name Aspiration_AdaptiveMinDepth value 6"]);
+        assert_eq!(
+            min_d, 6,
+            "AdaptiveMinDepth=6 (lower boundary) must be accepted"
+        );
+
+        // Upper boundary: 64 (= MAX_PLY). A strict-interior filter (`n < 64`)
+        // would reject this.
+        let (_stdout, _min_d, max_d) =
+            drive_capturing_depth_band(&["setoption name Aspiration_AdaptiveMaxDepth value 64"]);
+        assert_eq!(
+            max_d, 64,
+            "AdaptiveMaxDepth=64 (upper boundary) must be accepted"
+        );
+    }
+
+    /// `Aspiration_AdaptiveMinDepth` with a value below `ASPIRATION_MIN_DEPTH=6`
+    /// must be **rejected** — field unchanged. Uses an intermediate sentinel value
+    /// (10) so a clamping impl (which would land on 6 == default) is distinguishable
+    /// from a reject impl.
+    #[test]
+    fn setoption_depth_band_rejects_below_min() {
+        let (stdout, min_d, _max_d) = drive_capturing_depth_band(&[
+            "debug on", // enable debug so reject msgs appear
+            "setoption name Aspiration_AdaptiveMinDepth value 10", // sentinel: valid
+            "setoption name Aspiration_AdaptiveMinDepth value 5", // out-of-range: must reject
+        ]);
+        assert_eq!(
+            min_d, 10,
+            "AdaptiveMinDepth=5 (below 6) must be rejected; field must remain at sentinel 10, \
+             not clamp to 6"
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l.starts_with("info string Aspiration_AdaptiveMinDepth:")),
+            "rejected value must produce info string; got stdout:\n{stdout}"
+        );
+    }
+
+    /// `Aspiration_AdaptiveMinDepth` with a value above `MAX_PLY=64` must be
+    /// rejected — field unchanged. Sentinel 10 distinguishes reject from clamp.
+    #[test]
+    fn setoption_depth_band_rejects_min_above_max_ply() {
+        let (stdout, min_d, _max_d) = drive_capturing_depth_band(&[
+            "debug on",
+            "setoption name Aspiration_AdaptiveMinDepth value 10", // sentinel: valid
+            "setoption name Aspiration_AdaptiveMinDepth value 65", // above MAX_PLY: must reject
+        ]);
+        assert_eq!(
+            min_d, 10,
+            "AdaptiveMinDepth=65 (above 64) must be rejected; field must remain at sentinel 10"
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l.starts_with("info string Aspiration_AdaptiveMinDepth:")),
+            "rejected value must produce info string; got stdout:\n{stdout}"
+        );
+    }
+
+    /// `Aspiration_AdaptiveMaxDepth` with a value above `MAX_PLY=64` must be
+    /// **rejected** — field unchanged. Uses an intermediate sentinel value (50)
+    /// so a clamping impl (which would land on 64 == default) is distinguishable.
+    #[test]
+    fn setoption_depth_band_rejects_above_max() {
+        let (stdout, _min_d, max_d) = drive_capturing_depth_band(&[
+            "debug on",
+            "setoption name Aspiration_AdaptiveMaxDepth value 50", // sentinel: valid
+            "setoption name Aspiration_AdaptiveMaxDepth value 65", // out-of-range: must reject
+        ]);
+        assert_eq!(
+            max_d, 50,
+            "AdaptiveMaxDepth=65 (above 64) must be rejected; field must remain at sentinel 50, \
+             not clamp to 64"
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l.starts_with("info string Aspiration_AdaptiveMaxDepth:")),
+            "rejected value must produce info string; got stdout:\n{stdout}"
+        );
+    }
+
+    /// `Aspiration_AdaptiveMaxDepth` with a value below `ASPIRATION_MIN_DEPTH=6`
+    /// must be rejected — field unchanged. Sentinel 50 distinguishes reject from
+    /// clamp.
+    #[test]
+    fn setoption_depth_band_rejects_max_below_aspiration_min_depth() {
+        let (stdout, _min_d, max_d) = drive_capturing_depth_band(&[
+            "debug on",
+            "setoption name Aspiration_AdaptiveMaxDepth value 50", // sentinel: valid
+            "setoption name Aspiration_AdaptiveMaxDepth value 5",  // below ASPIRATION_MIN_DEPTH
+        ]);
+        assert_eq!(
+            max_d, 50,
+            "AdaptiveMaxDepth=5 (below 6) must be rejected; field must remain at sentinel 50"
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l.starts_with("info string Aspiration_AdaptiveMaxDepth:")),
+            "rejected value must produce info string; got stdout:\n{stdout}"
+        );
+    }
+
+    /// Behavioral test: `Aspiration_AdaptiveMinDepth=6` + `_AdaptiveMaxDepth=8`
+    /// with `Aspiration_Adaptive=true` and depth=7 (in-band) must change search
+    /// behavior versus adaptive OFF — kills the "band gate ignored" mutant by
+    /// verifying in-band nodes differ from OFF.
+    ///
+    /// This test must PASS even before the band gate is added (because the in-band
+    /// path uses the adaptive formula regardless, matching Unit-1 behavior).
+    #[test]
+    fn setoption_depth_band_in_band_depth_changes_behavior_vs_off() {
+        // KPK endgame — same fixture as the Unit-1 behavioral test.
+        let fen = "5k2/8/2K5/2P5/8/8/8/8 w - - 0 1";
+        let depth = 7;
+
+        // Baseline: adaptive OFF (default — no setoptions).
+        let stdout_off = drive_go_depth_on_fen(&[], fen, depth);
+
+        // Candidate: adaptive ON, band [6,8] — depth 7 is in-band.
+        let stdout_on = drive_go_depth_on_fen(
+            &[
+                "setoption name Aspiration_Adaptive value true",
+                "setoption name Aspiration_AdaptiveMinDepth value 6",
+                "setoption name Aspiration_AdaptiveMaxDepth value 8",
+            ],
+            fen,
+            depth,
+        );
+
+        let depth_prefix = format!("info depth {depth} ");
+        let nodes_off = stdout_off
+            .lines()
+            .rfind(|l| l.starts_with(&depth_prefix))
+            .and_then(parse_nodes_from_info_depth_line)
+            .unwrap_or_else(|| {
+                panic!(
+                    "adaptive-OFF run must emit info depth {depth} with nodes field;\
+                     \nstdout:\n{stdout_off}"
+                )
+            });
+        let nodes_on = stdout_on
+            .lines()
+            .rfind(|l| l.starts_with(&depth_prefix))
+            .and_then(parse_nodes_from_info_depth_line)
+            .unwrap_or_else(|| {
+                panic!(
+                    "banded-ON run must emit info depth {depth} with nodes field;\
+                     \nstdout:\n{stdout_on}"
+                )
+            });
+        assert_ne!(
+            nodes_off, nodes_on,
+            "adaptive ON with depth={depth} in band [6,8] must differ from OFF: \
+             off={nodes_off} on={nodes_on}"
+        );
+    }
+
+    /// **RED test** (depth-gate Unit 2): `Aspiration_AdaptiveMinDepth=8` with
+    /// depth=7 (below band) must produce the SAME node count as adaptive OFF,
+    /// because the band gate should suppress the adaptive formula for out-of-band
+    /// depths. Without the gate logic this test FAILS (the gate is not yet
+    /// implemented, so depth=7 still uses the adaptive formula → nodes_on ≠
+    /// nodes_off).
+    ///
+    /// Expected state: FAIL before gate implementation, PASS after.
+    #[test]
+    fn setoption_depth_band_excludes_depth_equals_off() {
+        // KPK endgame fixture; depth=7 is below the min=8 band.
+        let fen = "5k2/8/2K5/2P5/8/8/8/8 w - - 0 1";
+        let depth = 7;
+
+        // Baseline: adaptive OFF (default).
+        let stdout_off = drive_go_depth_on_fen(&[], fen, depth);
+
+        // Candidate: adaptive ON, but with min_depth=8 so depth=7 is out-of-band.
+        let stdout_on = drive_go_depth_on_fen(
+            &[
+                "setoption name Aspiration_Adaptive value true",
+                "setoption name Aspiration_AdaptiveMinDepth value 8",
+            ],
+            fen,
+            depth,
+        );
+
+        let depth_prefix = format!("info depth {depth} ");
+        let nodes_off = stdout_off
+            .lines()
+            .rfind(|l| l.starts_with(&depth_prefix))
+            .and_then(parse_nodes_from_info_depth_line)
+            .unwrap_or_else(|| {
+                panic!(
+                    "adaptive-OFF run must emit info depth {depth} with nodes field;\
+                     \nstdout:\n{stdout_off}"
+                )
+            });
+        let nodes_on = stdout_on
+            .lines()
+            .rfind(|l| l.starts_with(&depth_prefix))
+            .and_then(parse_nodes_from_info_depth_line)
+            .unwrap_or_else(|| {
+                panic!(
+                    "banded-ON run must emit info depth {depth} with nodes field;\
+                     \nstdout:\n{stdout_on}"
+                )
+            });
+        // depth=7 is out-of-band (min=8) → adaptive formula suppressed → same as OFF.
+        assert_eq!(
+            nodes_off, nodes_on,
+            "adaptive ON with depth={depth} outside band [8,64] must equal OFF \
+             (band gate not yet suppressing adaptive): off={nodes_off} on={nodes_on}"
         );
     }
 }

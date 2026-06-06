@@ -398,7 +398,7 @@ pub trait Search: Send {
 // ---------------------------------------------------------------------------
 
 /// Maximum search depth in plies. PV table is sized to this constant.
-const MAX_PLY: usize = 64;
+pub(crate) const MAX_PLY: usize = 64;
 
 /// Mate score: returned when a side is delivering mate. Ply-adjusted so faster
 /// mates compare higher.
@@ -422,7 +422,7 @@ pub(crate) const MATE_IN_MAX_PLY: i32 = MATE - MAX_PLY as i32; // 29_936
 /// against the same baseline — fast-TC-only games reach ~depth 7, so
 /// threshold=4 exposed too many shallow iterations to aspiration's
 /// re-search overhead).
-const ASPIRATION_MIN_DEPTH: u32 = 6;
+pub(crate) const ASPIRATION_MIN_DEPTH: u32 = 6;
 
 /// First-try aspiration half-width in centipawns. Window is
 /// `(prior - HALF_WIDTH, prior + HALF_WIDTH)`. CPW workhorse default;
@@ -452,6 +452,22 @@ const ASPIRATION_MAX_DEFAULT: i32 = 250;
 /// byte-identical to the pre-Unit-1 baseline.
 const ASPIRATION_ADAPTIVE_DEFAULT: bool = false;
 
+/// Default lower bound of the adaptive-aspiration depth band. The adaptive
+/// half-width formula is applied only when
+/// `adaptive_min_depth ≤ depth ≤ adaptive_max_depth`. Defaults to
+/// `ASPIRATION_MIN_DEPTH` (6) — the shallowest depth at which aspiration is
+/// active at all — so the default band covers the entire aspiration domain.
+/// UCI `Aspiration_AdaptiveMinDepth default 6`.
+const ASPIRATION_ADAPTIVE_MIN_DEPTH_DEFAULT: u32 = ASPIRATION_MIN_DEPTH;
+
+/// Default upper bound of the adaptive-aspiration depth band. Set to
+/// `MAX_PLY as u32` (64) — tied to the symbol so a future `MAX_PLY` bump keeps
+/// the default band a no-gate by construction. The ID loop hard-clamps to
+/// `MAX_PLY − 1 = 63` on every path, so `[6, 64]` covers the entire reachable
+/// depth domain and is a structural no-op gate. UCI
+/// `Aspiration_AdaptiveMaxDepth default 64`.
+const ASPIRATION_ADAPTIVE_MAX_DEPTH_DEFAULT: u32 = MAX_PLY as u32;
+
 /// Parameters for the adaptive aspiration half-width feature. Stored in
 /// `AlphaBetaMover` and set by `Engine::handle_setoption` via the
 /// `set_aspiration_params` method (same worker-join discipline as `set_seed`).
@@ -459,6 +475,11 @@ const ASPIRATION_ADAPTIVE_DEFAULT: bool = false;
 /// When `adaptive == false` the feature is entirely inactive: every call to
 /// `aspiration_half_width` returns the fixed `ASPIRATION_HALF_WIDTH` constant,
 /// making the search byte-identical to the pre-Unit-1 baseline.
+///
+/// The `adaptive_min_depth`/`adaptive_max_depth` band gate (Unit 2) is only
+/// consulted when `adaptive == true` and `score_d2` is `Some` — the `!adaptive`
+/// and `score_d2.is_none()` early-returns precede the band check, preserving
+/// the OFF-path byte-identity invariant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AspirationParams {
     /// When `false`, `aspiration_half_width` returns the fixed fallback for
@@ -470,6 +491,18 @@ pub struct AspirationParams {
     pub min: i32,
     /// Maximum adaptive half-width in centipawns. UCI `Aspiration_Max default 250`.
     pub max: i32,
+    /// Lower bound of the adaptive-width depth band (inclusive). The formula is
+    /// only applied at `depth ≥ adaptive_min_depth`. UCI
+    /// `Aspiration_AdaptiveMinDepth default 6`.
+    pub adaptive_min_depth: u32,
+    /// Upper bound of the adaptive-width depth band (inclusive). The formula is
+    /// only applied at `depth ≤ adaptive_max_depth`. UCI
+    /// `Aspiration_AdaptiveMaxDepth default 64`.
+    ///
+    /// When `adaptive_min_depth > adaptive_max_depth` (inverted band), the
+    /// band check is always true → fixed-50 everywhere. Accepted degenerate;
+    /// falls back to baseline behavior.
+    pub adaptive_max_depth: u32,
 }
 
 impl Default for AspirationParams {
@@ -479,6 +512,8 @@ impl Default for AspirationParams {
             k_centi: ASPIRATION_K_CENTI_DEFAULT,
             min: ASPIRATION_MIN_DEFAULT,
             max: ASPIRATION_MAX_DEFAULT,
+            adaptive_min_depth: ASPIRATION_ADAPTIVE_MIN_DEPTH_DEFAULT,
+            adaptive_max_depth: ASPIRATION_ADAPTIVE_MAX_DEPTH_DEFAULT,
         }
     }
 }
@@ -632,20 +667,37 @@ fn negate_window(alpha: i32, beta: i32) -> (i32, i32) {
     (-beta, -alpha)
 }
 
-/// Volatility-responsive first-try aspiration half-width (SPSA Unit 1).
+/// Volatility-responsive first-try aspiration half-width (Unit 1 + Unit 2).
 ///
-/// When `!params.adaptive` OR `score_d2` is `None`, returns the fixed
-/// `ASPIRATION_HALF_WIDTH` fallback — identical to pre-Unit-1 behavior.
-///
-/// Otherwise returns
-/// `clamp((params.k_centi * |score_d1 - d2| + 50) / 100, params.min, params.max)`.
-/// The `+ 50` before integer-dividing by 100 rounds half-away-from-zero on the
-/// non-negative numerator, yielding deterministic platform-independent arithmetic.
-fn aspiration_half_width(score_d1: i32, score_d2: Option<i32>, params: &AspirationParams) -> i32 {
+/// Early-return order is load-bearing — each guard preserves a byte-identical
+/// sub-path from prior milestones:
+/// 1. `score_d2.is_none()` → fixed-50 (no completed prior-prior iteration to
+///    delta against; first adaptive-eligible ID iteration always falls here).
+/// 2. `!params.adaptive` → fixed-50 (OFF-path byte-identical to pre-Unit-1;
+///    this guard precedes the band check so the default `adaptive=false` bench
+///    never touches the band fields).
+/// 3. Band gate (`depth < adaptive_min_depth || depth > adaptive_max_depth`) →
+///    fixed-50 (Unit 2: restrict the adaptive formula to the `[min_depth,
+///    max_depth]` closed interval). An inverted band (`min > max`) makes this
+///    predicate permanently true, falling back to fixed-50 everywhere — the
+///    accepted degenerate documented in plan §2.3.
+/// 4. Adaptive formula:
+///    `clamp((k_centi * |score_d1 - d2| + 50) / 100, min, max)`.
+///    The `+ 50` rounds half-away-from-zero before the integer division by 100,
+///    giving deterministic platform-independent arithmetic.
+fn aspiration_half_width(
+    score_d1: i32,
+    score_d2: Option<i32>,
+    params: &AspirationParams,
+    depth: u32,
+) -> i32 {
     let Some(d2) = score_d2 else {
         return ASPIRATION_HALF_WIDTH;
     };
     if !params.adaptive {
+        return ASPIRATION_HALF_WIDTH;
+    }
+    if depth < params.adaptive_min_depth || depth > params.adaptive_max_depth {
         return ASPIRATION_HALF_WIDTH;
     }
     ((params.k_centi * (score_d1 - d2).abs() + 50) / 100).clamp(params.min, params.max)
@@ -683,7 +735,7 @@ fn aspiration_window(
     let Some(prior) = prior_score else {
         return (-INF, INF);
     };
-    let half = aspiration_half_width(prior, prior_prior_score, params);
+    let half = aspiration_half_width(prior, prior_prior_score, params, depth);
     (prior - half, prior + half)
 }
 
@@ -9464,14 +9516,14 @@ mod tests {
 
         // None d2
         assert_eq!(
-            aspiration_half_width(0, None, &off),
+            aspiration_half_width(0, None, &off, 10),
             ASPIRATION_HALF_WIDTH,
             "adaptive OFF, no d2 → fixed 50"
         );
         // Some d2 — the guard that distinguishes Unit 1 from the item-5 prototype
         for (d1, d2) in [(0, 0), (100, 75), (0, 200), (500, 100), (-50, 50)] {
             assert_eq!(
-                aspiration_half_width(d1, Some(d2), &off),
+                aspiration_half_width(d1, Some(d2), &off, 10),
                 ASPIRATION_HALF_WIDTH,
                 "adaptive OFF with d1={d1} d2={d2} → fixed 50"
             );
@@ -9525,32 +9577,33 @@ mod tests {
             k_centi: 200,
             min: 25,
             max: 250,
+            ..AspirationParams::default()
         };
 
         // k=200, |Δ|=25 → (200*25+50)/100 = 5050/100 = 50 (calibration point)
         assert_eq!(
-            aspiration_half_width(100, Some(75), &on),
+            aspiration_half_width(100, Some(75), &on, 10),
             50,
             "k=200 |Δ|=25 → 50 (median calibration point)"
         );
 
         // k=200, |Δ|=40 → (200*40+50)/100 = 8050/100 = 80
         assert_eq!(
-            aspiration_half_width(100, Some(60), &on),
+            aspiration_half_width(100, Some(60), &on, 10),
             80,
             "k=200 |Δ|=40 → 80"
         );
 
         // Clamp to MIN: k=200, |Δ|=5 → (200*5+50)/100 = 1050/100 = 10 < 25 → 25
         assert_eq!(
-            aspiration_half_width(100, Some(95), &on),
+            aspiration_half_width(100, Some(95), &on, 10),
             25,
             "k=200 |Δ|=5 → clamped to min=25"
         );
 
         // Clamp to MAX: k=200, |Δ|=200 → (200*200+50)/100 = 40050/100 = 400 > 250 → 250
         assert_eq!(
-            aspiration_half_width(0, Some(200), &on),
+            aspiration_half_width(0, Some(200), &on, 10),
             250,
             "k=200 |Δ|=200 → clamped to max=250"
         );
@@ -9561,9 +9614,10 @@ mod tests {
             k_centi: 100,
             min: 1,
             max: 250,
+            ..AspirationParams::default()
         };
         assert_eq!(
-            aspiration_half_width(0, Some(1), &on_k100),
+            aspiration_half_width(0, Some(1), &on_k100, 10),
             1,
             "k=100 |Δ|=1 → 1 (integer division of 150/100)"
         );
@@ -9576,9 +9630,10 @@ mod tests {
             k_centi: 150,
             min: 1,
             max: 250,
+            ..AspirationParams::default()
         };
         assert_eq!(
-            aspiration_half_width(0, Some(1), &on_k150),
+            aspiration_half_width(0, Some(1), &on_k150, 10),
             2,
             "k=150 |Δ|=1 → (150+50)/100 = 200/100 = 2"
         );
@@ -9598,16 +9653,17 @@ mod tests {
             k_centi: 1_000, // ASPIRATION_K_MAX
             min: 25,
             max: 250,
+            ..AspirationParams::default()
         };
         // score_d1 = +MATE, score_d2 = -MATE: |delta| = 2*MATE = 60000
         // numerator = 1000 * 60000 + 50 = 60_000_050 << i32::MAX; result → clamped to max
-        let result = aspiration_half_width(MATE, Some(-MATE), &extreme);
+        let result = aspiration_half_width(MATE, Some(-MATE), &extreme, 10);
         assert_eq!(
             result, 250,
             "extreme inputs (k=1000, |Δ|=2*MATE=60000) must clamp to max=250 without overflow"
         );
         // Opposite sign order: same |delta|
-        let result2 = aspiration_half_width(-MATE, Some(MATE), &extreme);
+        let result2 = aspiration_half_width(-MATE, Some(MATE), &extreme, 10);
         assert_eq!(
             result2, 250,
             "sign-flipped extreme inputs must also clamp to max=250"
@@ -9626,6 +9682,7 @@ mod tests {
             k_centi: 200,
             min: 25,
             max: 250,
+            ..AspirationParams::default()
         };
 
         // delta 40 → half = (200*40+50)/100 = 80 → window (100-80, 100+80) = (20, 180)
@@ -9673,6 +9730,7 @@ mod tests {
             k_centi: 200,
             min: 10,
             max: 250,
+            ..AspirationParams::default()
         };
 
         // Adaptive OFF: baseline node count at depth 7.
@@ -9763,6 +9821,7 @@ mod tests {
             k_centi: 200,
             min: 10, // narrow window → more re-searches, exercises abort more aggressively
             max: 250,
+            ..AspirationParams::default()
         });
         let result = ab.go(&pos, &ctx, &info_sink);
 
@@ -9795,10 +9854,11 @@ mod tests {
             k_centi: 200,
             min: 25,
             max: 250,
+            ..AspirationParams::default()
         };
         // Scores that differ by only 5 cp (very stable) → half = (200*5+50)/100 = 10 → clamped to 25
         assert_eq!(
-            aspiration_half_width(100, Some(95), &on),
+            aspiration_half_width(100, Some(95), &on, 10),
             25,
             "stable position (Δ=5) with k=200 → clamp to min=25, narrower than ±50"
         );
@@ -9819,10 +9879,11 @@ mod tests {
             k_centi: 200,
             min: 25,
             max: 250,
+            ..AspirationParams::default()
         };
         // Scores that differ by 100 cp (volatile) → half = (200*100+50)/100 = 200 > 50
         assert_eq!(
-            aspiration_half_width(0, Some(100), &on),
+            aspiration_half_width(0, Some(100), &on, 10),
             200,
             "volatile position (Δ=100) with k=200 → 200 > ASPIRATION_HALF_WIDTH=50"
         );
@@ -9832,6 +9893,259 @@ mod tests {
                 "computed half=200 must be wider than ASPIRATION_HALF_WIDTH=50"
             )
         };
+    }
+
+    // -----------------------------------------------------------------------
+    // Depth-gate Unit 2 — adaptive aspiration depth-band tests (DG1–DG8).
+    // -----------------------------------------------------------------------
+
+    /// DG1. When `depth` is strictly inside the band
+    /// (`adaptive_min_depth ≤ depth ≤ adaptive_max_depth`) and `adaptive == true`,
+    /// the adaptive formula is applied (not the fixed-50 fallback).
+    ///
+    /// Uses band [8, 12], depth 10 (interior), large delta so the adaptive half
+    /// diverges from 50.
+    #[test]
+    fn dg1_band_interior_returns_adaptive_value() {
+        let params = AspirationParams {
+            adaptive: true,
+            k_centi: 200,
+            min: 25,
+            max: 250,
+            adaptive_min_depth: 8,
+            adaptive_max_depth: 12,
+        };
+        // delta=100 → (200*100+50)/100 = 200 ≠ ASPIRATION_HALF_WIDTH=50
+        let half = aspiration_half_width(0, Some(100), &params, 10);
+        assert_ne!(
+            half, ASPIRATION_HALF_WIDTH,
+            "DG1: depth=10 inside band [8,12] with large delta must return adaptive value, not fixed 50"
+        );
+        assert_eq!(half, 200, "DG1: k=200 |Δ|=100 → 200");
+    }
+
+    /// DG2. When `depth` is strictly below the band (`depth < adaptive_min_depth`),
+    /// the function falls back to the fixed `ASPIRATION_HALF_WIDTH` even when
+    /// `adaptive == true` and `score_d2` is `Some`.
+    ///
+    /// Uses band [8, 12], depth 7 (one below min), large delta.
+    #[test]
+    fn dg2_below_band_returns_fixed_50() {
+        let params = AspirationParams {
+            adaptive: true,
+            k_centi: 200,
+            min: 25,
+            max: 250,
+            adaptive_min_depth: 8,
+            adaptive_max_depth: 12,
+        };
+        // depth 7 is below the band min of 8 → must return fixed 50
+        assert_eq!(
+            aspiration_half_width(0, Some(100), &params, 7),
+            ASPIRATION_HALF_WIDTH,
+            "DG2: depth=7 below band [8,12] must return fixed 50 even with adaptive=true"
+        );
+    }
+
+    /// DG3. When `depth` is strictly above the band (`depth > adaptive_max_depth`),
+    /// the function falls back to the fixed `ASPIRATION_HALF_WIDTH`.
+    ///
+    /// Uses band [8, 12], depth 13 (one above max), large delta.
+    #[test]
+    fn dg3_above_band_returns_fixed_50() {
+        let params = AspirationParams {
+            adaptive: true,
+            k_centi: 200,
+            min: 25,
+            max: 250,
+            adaptive_min_depth: 8,
+            adaptive_max_depth: 12,
+        };
+        // depth 13 is above the band max of 12 → must return fixed 50
+        assert_eq!(
+            aspiration_half_width(0, Some(100), &params, 13),
+            ASPIRATION_HALF_WIDTH,
+            "DG3: depth=13 above band [8,12] must return fixed 50 even with adaptive=true"
+        );
+    }
+
+    /// DG4. The band is a **closed interval**: both endpoints (`depth == min` and
+    /// `depth == max`) return the adaptive value, not fixed-50.
+    ///
+    /// Uses band [8, 12]. Checks depth=8 and depth=12 both return adaptive.
+    #[test]
+    fn dg4_band_boundaries_inclusive_return_adaptive() {
+        let params = AspirationParams {
+            adaptive: true,
+            k_centi: 200,
+            min: 25,
+            max: 250,
+            adaptive_min_depth: 8,
+            adaptive_max_depth: 12,
+        };
+        // Large delta → adaptive half = 200 ≠ 50.
+        for depth in [8u32, 12] {
+            let half = aspiration_half_width(0, Some(100), &params, depth);
+            assert_eq!(
+                half, 200,
+                "DG4: depth={depth} at band boundary [8,12] must return adaptive value 200, not fixed 50"
+            );
+        }
+    }
+
+    /// DG5. With the **default band** `[6, 64]`, `adaptive=true`, and every
+    /// reachable depth `6..=63` (the ID loop clamps to `MAX_PLY-1 = 63`), the
+    /// result is byte-identical to the ungated Unit-1 adaptive path.
+    ///
+    /// This regression-guards the +13.03 SPRT candidate's reproducibility: the
+    /// default band must be a structural no-op gate. Sweeping the full reachable
+    /// domain (not just 6..=20) makes the high-depth no-op self-evident — the
+    /// default `max=64` never gates at the deepest reachable iteration.
+    #[test]
+    fn dg5_default_band_is_noop_across_reachable_depths() {
+        // delta=40 → adaptive half formula with default K/MIN/MAX. The oracle is
+        // computed via the function itself at a known-in-band depth (6) rather
+        // than by inlining the arithmetic literals, so a default-constant change
+        // can't silently desync the oracle from the implementation.
+        let params = AspirationParams {
+            adaptive: true,
+            ..AspirationParams::default()
+        };
+        // Depth 6 is in-band under the default [6,64] band; use it as the oracle.
+        let expected_half = aspiration_half_width(100, Some(60), &params, 6);
+        // Confirm the oracle itself is not the fixed fallback (i.e., the adaptive
+        // formula fired — delta=40 > 0 so K*|Δ|/100 with default K=200 yields 80,
+        // which is above MIN=25 and below MAX=250).
+        assert_ne!(
+            expected_half, ASPIRATION_HALF_WIDTH,
+            "DG5 oracle sanity: default K/MIN/MAX with delta=40 must produce a half ≠ 50"
+        );
+
+        // Every reachable depth 6..=63 is in the default [6,64] band — all agree.
+        for depth in 6u32..=63 {
+            let half = aspiration_half_width(100, Some(60), &params, depth);
+            assert_eq!(
+                half, expected_half,
+                "DG5: default band: depth={depth} must return adaptive half={expected_half}"
+            );
+        }
+    }
+
+    /// DG6. When `adaptive == false`, the fixed-50 fallback is returned for
+    /// **any** depth, regardless of band configuration or delta. The `!adaptive`
+    /// early-return precedes the band check.
+    #[test]
+    fn dg6_adaptive_false_always_returns_fixed_50_regardless_of_band() {
+        // Narrow band with adaptive=false — the band should never be consulted.
+        let params = AspirationParams {
+            adaptive: false,
+            adaptive_min_depth: 8,
+            adaptive_max_depth: 12,
+            ..AspirationParams::default()
+        };
+        for depth in [6u32, 7, 8, 10, 12, 13, 20, 63] {
+            assert_eq!(
+                aspiration_half_width(0, Some(100), &params, depth),
+                ASPIRATION_HALF_WIDTH,
+                "DG6: adaptive=false at depth={depth} must return fixed 50"
+            );
+        }
+    }
+
+    /// DG7. `aspiration_window` integration: verifies that `aspiration_window`
+    /// correctly threads `depth` into `aspiration_half_width`.
+    ///
+    /// Uses band [8, 12] and delta=40 (|100−60|=40 → adaptive half=(200·40+50)/100=80
+    /// ≠ 50) so out-of-band assertions are meaningful — a gate that silently
+    /// ignores depth would return 80 instead of 50.
+    ///
+    /// Assertions that PASS pre-gate (no gate needed):
+    /// - Below `ASPIRATION_MIN_DEPTH`: always (-INF, INF).
+    /// - In-band with `prior=None`: still (-INF, INF).
+    /// - In-band with `prior=Some`: adaptive half → (20, 180).
+    ///
+    /// Assertions that are RED pre-gate (require the band gate):
+    /// - Out-of-band below min (depth=7): must yield (50, 150), not (20, 180).
+    /// - Out-of-band above max (depth=13): must yield (50, 150), not (20, 180).
+    ///
+    /// Expected state (out-of-band assertions): FAIL before gate implementation,
+    /// PASS after.
+    #[test]
+    fn dg7_aspiration_window_integration_in_band_and_out_of_band() {
+        let params = AspirationParams {
+            adaptive: true,
+            k_centi: 200,
+            min: 25,
+            max: 250,
+            adaptive_min_depth: 8,
+            adaptive_max_depth: 12,
+        };
+
+        // Below ASPIRATION_MIN_DEPTH (=6): always (-INF, INF), band irrelevant.
+        for depth in [1u32, 2, 3, 4, 5] {
+            assert_eq!(
+                aspiration_window(Some(100), Some(60), &params, depth),
+                (-INF, INF),
+                "DG7: depth={depth} < ASPIRATION_MIN_DEPTH → full window"
+            );
+        }
+
+        // In-band: prior=None → still full window (no score to centre on).
+        assert_eq!(
+            aspiration_window(None, Some(60), &params, 10),
+            (-INF, INF),
+            "DG7: depth=10 in-band, prior=None → (-INF, INF)"
+        );
+
+        // In-band: depth=10, delta=40 → half=80 → (100-80, 100+80) = (20, 180).
+        assert_eq!(
+            aspiration_window(Some(100), Some(60), &params, 10),
+            (20, 180),
+            "DG7: depth=10 in band [8,12], delta=40 → half=80 → (20, 180)"
+        );
+
+        // Out-of-band (below min): depth=7, delta=40 → fixed-50 → (50, 150).
+        // RED pre-gate: without the gate, aspiration_half_width ignores depth and
+        // returns 80, so aspiration_window returns (20, 180) instead.
+        assert_eq!(
+            aspiration_window(Some(100), Some(60), &params, 7),
+            (100 - ASPIRATION_HALF_WIDTH, 100 + ASPIRATION_HALF_WIDTH),
+            "DG7: depth=7 below band min=8 → fixed-50 → (50, 150)"
+        );
+
+        // Out-of-band (above max): depth=13, delta=40 → fixed-50 → (50, 150).
+        // RED pre-gate: same reasoning.
+        assert_eq!(
+            aspiration_window(Some(100), Some(60), &params, 13),
+            (100 - ASPIRATION_HALF_WIDTH, 100 + ASPIRATION_HALF_WIDTH),
+            "DG7: depth=13 above band max=12 → fixed-50 → (50, 150)"
+        );
+    }
+
+    /// DG8. **Inverted band** degenerate (`adaptive_min_depth > adaptive_max_depth`):
+    /// the band predicate `depth < min || depth > max` is always true, so the
+    /// function falls back to fixed-50 at every depth. Documents the accepted
+    /// behavior per plan §2.3.
+    ///
+    /// Expected state: FAIL before gate implementation, PASS after.
+    #[test]
+    fn dg8_inverted_band_always_returns_fixed_50() {
+        let params = AspirationParams {
+            adaptive: true,
+            k_centi: 200,
+            min: 25,
+            max: 250,
+            adaptive_min_depth: 12,
+            adaptive_max_depth: 8, // inverted: min > max
+        };
+        // At every depth, the band check fires and returns fixed-50.
+        for depth in [6u32, 7, 8, 9, 10, 11, 12, 13, 20, 63] {
+            assert_eq!(
+                aspiration_half_width(0, Some(100), &params, depth),
+                ASPIRATION_HALF_WIDTH,
+                "DG8: inverted band [12,8] at depth={depth} must return fixed 50"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
