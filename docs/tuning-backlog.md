@@ -43,7 +43,7 @@ Walked the whole active queue in order. Dispositions:
 
 **Validation.** Mixed-TC + virtual-clock SPRT vs `M5.F.1`. Decision: combined ≥2-seed confirm at CI-lower>0 (or rung-2 with an explicit ship-with-note). **Baseline = `M5.F.1`.** Patch: `bench/sprt/patches/item5-delta-baseline-aspiration.patch`; data: `bench/sprt/2026-06-03-item5-delta-baseline-aspiration-vs-m5f1.md`. Cross-ref the "ML-tuned aspiration window sizing" item below (this is its tier-3 made concrete + a mid-band gate).
 
-**Open user decision (from the 2026-06-03 campaign):** whether to take the rung-2 ship-with-note on the *ungated* +13.03 candidate now (patch preserved), vs waiting for the gated/SPSA-tuned version. Default taken at campaign close: revert (reversible), pursue the gated version.
+**Open user decision (from the 2026-06-03 campaign):** ~~whether to take the rung-2 ship-with-note on the *ungated* +13.03 candidate now (patch preserved), vs waiting for the gated/SPSA-tuned version.~~ **RESOLVED 2026-06-06 — SHIPPED as `M5.K`** (`55c8fae`). After both improvement levers failed (SPSA low-signal; depth-gate refuted −34.9 Elo), the user chose the **rung-2 ship-with-note on the ungated candidate**: `Aspiration_Adaptive` flipped ON by default, bench d4 `112020` / d7 `1326598`, new production HEAD (search). The whole delta-baseline aspiration item is now **CLOSED — shipped at its confirmed ceiling.** See `docs/milestones/m5.k.md`. The `item5-*.patch` is fully superseded (the mechanism is the shipped default) and may be deleted.
 
 ---
 
