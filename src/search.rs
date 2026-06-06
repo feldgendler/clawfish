@@ -447,10 +447,11 @@ const ASPIRATION_MIN_DEFAULT: i32 = 25;
 /// hand-pick `MAX=250`.
 const ASPIRATION_MAX_DEFAULT: i32 = 250;
 
-/// Default for the `Aspiration_Adaptive` UCI option. `false` means the
-/// adaptive half-width path is completely inactive and every node-count is
-/// byte-identical to the pre-Unit-1 baseline.
-const ASPIRATION_ADAPTIVE_DEFAULT: bool = false;
+/// Default for the `Aspiration_Adaptive` UCI option. `true` enables the
+/// SPRT-confirmed (+13.03 Elo) adaptive half-width path. Set to `false`
+/// explicitly (via `setoption name Aspiration_Adaptive value false`) to
+/// restore the fixed-±50 OFF path for comparison or diagnostics.
+const ASPIRATION_ADAPTIVE_DEFAULT: bool = true;
 
 /// Default lower bound of the adaptive-aspiration depth band. The adaptive
 /// half-width formula is applied only when
@@ -472,9 +473,11 @@ const ASPIRATION_ADAPTIVE_MAX_DEPTH_DEFAULT: u32 = MAX_PLY as u32;
 /// `AlphaBetaMover` and set by `Engine::handle_setoption` via the
 /// `set_aspiration_params` method (same worker-join discipline as `set_seed`).
 ///
-/// When `adaptive == false` the feature is entirely inactive: every call to
-/// `aspiration_half_width` returns the fixed `ASPIRATION_HALF_WIDTH` constant,
-/// making the search byte-identical to the pre-Unit-1 baseline.
+/// **Production default: `adaptive == true`** (SPRT-confirmed +13.03 Elo).
+/// When `adaptive == false` (explicit `setoption name Aspiration_Adaptive
+/// value false`), `aspiration_half_width` returns the fixed
+/// `ASPIRATION_HALF_WIDTH` constant for every input — byte-identical to the
+/// pre-Unit-1 baseline.
 ///
 /// The `adaptive_min_depth`/`adaptive_max_depth` band gate (Unit 2) is only
 /// consulted when `adaptive == true` and `score_d2` is `Some` — the `!adaptive`
@@ -674,7 +677,7 @@ fn negate_window(alpha: i32, beta: i32) -> (i32, i32) {
 /// 1. `score_d2.is_none()` → fixed-50 (no completed prior-prior iteration to
 ///    delta against; first adaptive-eligible ID iteration always falls here).
 /// 2. `!params.adaptive` → fixed-50 (OFF-path byte-identical to pre-Unit-1;
-///    this guard precedes the band check so the default `adaptive=false` bench
+///    this guard precedes the band check so an explicit `adaptive=false` bench
 ///    never touches the band fields).
 /// 3. Band gate (`depth < adaptive_min_depth || depth > adaptive_max_depth`) →
 ///    fixed-50 (Unit 2: restrict the adaptive formula to the `[min_depth,
@@ -718,7 +721,7 @@ fn aspiration_half_width(
 /// resulting first-try fail via the asymmetric full-window re-search
 /// (research §7.2).
 ///
-/// When `params.adaptive == false` (the default), `aspiration_half_width`
+/// When `params.adaptive == false` (explicit OFF), `aspiration_half_width`
 /// returns exactly `ASPIRATION_HALF_WIDTH` for any input, so this function is
 /// byte-identical to the pre-Unit-1 signature for every (prior, depth) pair.
 ///
@@ -1189,9 +1192,9 @@ pub(crate) struct AlphaBetaMover {
     pawn_hash: crate::eval::pawns::PawnHashTable,
     /// SPSA Unit 1: runtime-tunable adaptive aspiration parameters. Set by the
     /// engine via `set_aspiration_params` under the search lock (same
-    /// `set_seed` worker-join discipline). When `adaptive == false` (the
-    /// default), the feature is entirely inactive and search behavior is
-    /// byte-identical to the pre-Unit-1 baseline.
+    /// `set_seed` worker-join discipline). Production default: `adaptive ==
+    /// true`; set `adaptive = false` explicitly to restore the fixed-±50
+    /// OFF path (byte-identical to the pre-Unit-1 baseline).
     aspiration_params: AspirationParams,
     /// M5.A: per-`go` count of NMP firings (number of times the null sub-search
     /// was attempted, regardless of cutoff). Test-only instrumentation for the
@@ -9413,11 +9416,14 @@ mod tests {
 
     /// Depths 1–5 always return the full window (below ASPIRATION_MIN_DEPTH=6),
     /// regardless of prior score. Migrated to 4-arg signature (§1.5.d2):
-    /// passes `&AspirationParams::default()` (adaptive OFF) and `None` for
-    /// prior_prior — asserts unchanged results.
+    /// passes explicit `adaptive=false` params and `None` for prior_prior —
+    /// asserts unchanged results.
     #[test]
     fn aspiration_window_below_threshold_is_full_window_at_depth_1_2_3() {
-        let off = AspirationParams::default();
+        let off = AspirationParams {
+            adaptive: false,
+            ..AspirationParams::default()
+        };
         for depth in [1u32, 2, 3, 4, 5] {
             for prior in [None, Some(0i32), Some(50), Some(-50)] {
                 assert_eq!(
@@ -9433,7 +9439,10 @@ mod tests {
     /// Migrated to 4-arg signature (§1.5.d2).
     #[test]
     fn aspiration_window_at_threshold_with_no_prior_is_full_window() {
-        let off = AspirationParams::default();
+        let off = AspirationParams {
+            adaptive: false,
+            ..AspirationParams::default()
+        };
         assert_eq!(
             aspiration_window(None, None, &off, 6),
             (-INF, INF),
@@ -9446,7 +9455,10 @@ mod tests {
     /// Migrated to 4-arg signature (§1.5.d2).
     #[test]
     fn aspiration_window_above_threshold_with_zero_prior_is_centered_at_zero() {
-        let off = AspirationParams::default();
+        let off = AspirationParams {
+            adaptive: false,
+            ..AspirationParams::default()
+        };
         assert_eq!(
             aspiration_window(Some(0), None, &off, 6),
             (-50, 50),
@@ -9458,7 +9470,10 @@ mod tests {
     /// Migrated to 4-arg signature (§1.5.d2).
     #[test]
     fn aspiration_window_above_threshold_with_positive_prior_centered_correctly() {
-        let off = AspirationParams::default();
+        let off = AspirationParams {
+            adaptive: false,
+            ..AspirationParams::default()
+        };
         assert_eq!(
             aspiration_window(Some(123), None, &off, 7),
             (73, 173),
@@ -9475,7 +9490,10 @@ mod tests {
     /// Migrated to 4-arg signature (§1.5.d2).
     #[test]
     fn aspiration_window_above_threshold_with_negative_prior_centered_correctly() {
-        let off = AspirationParams::default();
+        let off = AspirationParams {
+            adaptive: false,
+            ..AspirationParams::default()
+        };
         assert_eq!(
             aspiration_window(Some(-200), None, &off, 6),
             (-250, -150),
@@ -9489,7 +9507,10 @@ mod tests {
     /// Migrated to 4-arg signature (§1.5.d2).
     #[test]
     fn aspiration_window_with_mate_score_prior_does_not_special_case() {
-        let off = AspirationParams::default();
+        let off = AspirationParams {
+            adaptive: false,
+            ..AspirationParams::default()
+        };
         for prior in [MATE - 1, MATE - 10, -(MATE - 5)] {
             let result = aspiration_window(Some(prior), None, &off, 8);
             assert_eq!(
@@ -9506,13 +9527,24 @@ mod tests {
 
     // ----- §1.5.a: adaptive-OFF is the fixed path ---------------------------
 
-    /// With `adaptive == false` (the default), `aspiration_half_width` returns
+    /// Shipped default: `AspirationParams::default()` has `adaptive == true`.
+    #[test]
+    fn default_params_adaptive_is_true() {
+        assert!(
+            AspirationParams::default().adaptive,
+            "shipped: default params are adaptive=true"
+        );
+    }
+
+    /// With `adaptive == false` (explicit OFF), `aspiration_half_width` returns
     /// `ASPIRATION_HALF_WIDTH` for ALL (d1, d2) inputs including `Some(_)` for
     /// both. This is the unit-level proof that the OFF path is byte-identical.
     #[test]
     fn adaptive_off_half_width_always_returns_fixed_50() {
-        let off = AspirationParams::default();
-        assert!(!off.adaptive, "default params must have adaptive=false");
+        let off = AspirationParams {
+            adaptive: false,
+            ..AspirationParams::default()
+        };
 
         // None d2
         assert_eq!(
@@ -9530,13 +9562,16 @@ mod tests {
         }
     }
 
-    /// `aspiration_window` with OFF params equals the legacy output across all
-    /// three legacy branches: depth<6 → (-INF, INF); prior None → (-INF, INF);
+    /// `aspiration_window` with explicit OFF params equals the legacy output across
+    /// all three legacy branches: depth<6 → (-INF, INF); prior None → (-INF, INF);
     /// else → (prior-50, prior+50). The oracle is the branch behavior, NOT a
     /// blanket ±50 — the two full-window branches are distinct from ±50.
     #[test]
     fn adaptive_off_aspiration_window_byte_identical_to_legacy() {
-        let off = AspirationParams::default();
+        let off = AspirationParams {
+            adaptive: false,
+            ..AspirationParams::default()
+        };
 
         // Branch 1: depth < ASPIRATION_MIN_DEPTH → full window regardless of prior
         for depth in [1u32, 2, 3, 4, 5] {
@@ -9733,12 +9768,12 @@ mod tests {
             ..AspirationParams::default()
         };
 
-        // Adaptive OFF: baseline node count at depth 7.
+        // Default (adaptive ON, min=25): baseline node count at depth 7.
         let mut ab_off = AlphaBetaMover::new();
         let (ctx_off, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(7)));
         let (result_off, _) = drive_go(&mut ab_off, &pos, &ctx_off);
 
-        // Adaptive ON: same position, same depth.
+        // Adaptive ON with min=10 (narrower than default min=25): same position, same depth.
         let mut ab_on = AlphaBetaMover::new();
         ab_on.set_aspiration_params(adaptive_params);
         let (ctx_on, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(7)));
@@ -9747,23 +9782,22 @@ mod tests {
         // Both searches must complete and find a bestmove.
         assert!(
             result_off.bestmove.is_some(),
-            "adaptive-OFF depth-7 search must produce a bestmove"
+            "default (adaptive ON, min=25) depth-7 search must produce a bestmove"
         );
         assert!(
             result_on.bestmove.is_some(),
-            "adaptive-ON depth-7 search must produce a bestmove"
+            "adaptive ON (min=10) depth-7 search must produce a bestmove"
         );
 
-        // The node counts must differ: adaptive ON uses a narrower first-try
-        // window (min=10 < 50), causing additional re-searches compared to OFF.
-        // If prev_prev_score were always None (not threaded), adaptive ON would
-        // fall back to the fixed ±50 and produce the same count as OFF.
+        // The node counts must differ: min=10 forces a narrower first-try window
+        // than the default min=25, causing more re-searches once d-2 is available.
+        // If prev_prev_score were always None (not threaded), the formula's delta
+        // term would be absent and both runs would produce identical counts.
         assert_ne!(
             result_off.nodes, result_on.nodes,
-            "adaptive ON must produce a different node count than OFF \
-             (min=10 forces a narrower first-try window than ±50, triggering \
-             extra re-searches once d-2 is available); \
-             off_nodes={} on_nodes={}",
+            "adaptive ON with min=10 must produce a different node count than default min=25 \
+             (narrower first-try window triggers extra re-searches once d-2 is available); \
+             default_nodes={} min10_nodes={}",
             result_off.nodes, result_on.nodes
         );
     }

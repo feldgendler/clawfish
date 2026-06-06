@@ -119,8 +119,8 @@ pub struct Engine<W: Write + Send + 'static, S: Search + Send + 'static> {
     virtual_clock: bool,
     /// SPSA Unit 1: mirrors the four `Aspiration_*` UCI options. The engine
     /// pushes the full `AspirationParams` to the search mover whenever any of
-    /// these fields changes. Defaults match the `AspirationParams::default()`
-    /// values so `adaptive = false` (OFF by default) and bench is byte-identical.
+    /// these fields changes. Defaults match `AspirationParams::default()`:
+    /// `adaptive = true` (ON by default — SPRT-confirmed +13 Elo).
     aspiration_adaptive: bool,
     aspiration_k_centi: i32,
     aspiration_min: i32,
@@ -280,8 +280,8 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         // service the option (POSIX `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`).
         #[cfg(unix)]
         self.write_line("option name VirtualClock type check default false");
-        // SPSA Unit 1: adaptive aspiration window (default OFF → bench-neutral).
-        self.write_line("option name Aspiration_Adaptive type check default false");
+        // SPSA Unit 1: adaptive aspiration window (default ON — SPRT-confirmed +13 Elo).
+        self.write_line("option name Aspiration_Adaptive type check default true");
         self.write_line("option name Aspiration_K type spin default 200 min 0 max 1000");
         self.write_line("option name Aspiration_Min type spin default 25 min 0 max 1000");
         self.write_line("option name Aspiration_Max type spin default 250 min 0 max 2000");
@@ -4305,8 +4305,8 @@ mod tests {
         let writer = CapturedWriter(Arc::clone(&buf));
         let engine = Engine::new(writer, AlphaBetaMover::new());
         assert!(
-            !engine.aspiration_adaptive(),
-            "default adaptive must be false (OFF-by-default bench invariant)"
+            engine.aspiration_adaptive(),
+            "default adaptive must be true (ON-by-default — SPRT-confirmed +13 Elo)"
         );
         assert_eq!(
             engine.aspiration_k_centi(),
@@ -4324,7 +4324,7 @@ mod tests {
 
         // Exact text for each option line
         assert!(
-            lines.contains(&"option name Aspiration_Adaptive type check default false"),
+            lines.contains(&"option name Aspiration_Adaptive type check default true"),
             "Aspiration_Adaptive option line missing; got stdout:\n{stdout}"
         );
         assert!(
@@ -4397,7 +4397,7 @@ mod tests {
             "debug on",
             "setoption name Aspiration_Adaptive value bogus",
         ]);
-        assert!(!adaptive, "invalid value must leave field at default false");
+        assert!(adaptive, "invalid value must leave field at default true");
         assert!(
             stdout
                 .lines()
@@ -4496,8 +4496,8 @@ mod tests {
         let (_stdout, adaptive, k, min_val, max_val) =
             drive_capturing_aspiration(&["setoption name Aspiration_K value 150"]);
         assert!(
-            !adaptive,
-            "adaptive must remain false (default) after K-only update"
+            adaptive,
+            "adaptive must remain true (default) after K-only update"
         );
         assert_eq!(k, 150, "K updated to 150");
         assert_eq!(
@@ -4589,15 +4589,15 @@ mod tests {
         let fen = "5k2/8/2K5/2P5/8/8/8/8 w - - 0 1";
         let depth = 7;
 
-        // Baseline: adaptive OFF (default — no setoptions).
-        let stdout_off = drive_go_depth_on_fen(&[], fen, depth);
-
-        // Candidate: adaptive ON with default K/Min/Max.
-        let stdout_on = drive_go_depth_on_fen(
-            &["setoption name Aspiration_Adaptive value true"],
+        // Baseline: adaptive OFF (explicit — default is now ON).
+        let stdout_off = drive_go_depth_on_fen(
+            &["setoption name Aspiration_Adaptive value false"],
             fen,
             depth,
         );
+
+        // Candidate: adaptive ON with default K/Min/Max.
+        let stdout_on = drive_go_depth_on_fen(&[], fen, depth);
 
         // Extract the node count from the final `info depth N` line of each run.
         let depth_prefix = format!("info depth {depth} ");
@@ -4839,8 +4839,12 @@ mod tests {
         let fen = "5k2/8/2K5/2P5/8/8/8/8 w - - 0 1";
         let depth = 7;
 
-        // Baseline: adaptive OFF (default — no setoptions).
-        let stdout_off = drive_go_depth_on_fen(&[], fen, depth);
+        // Baseline: adaptive OFF (explicit — default is now ON).
+        let stdout_off = drive_go_depth_on_fen(
+            &["setoption name Aspiration_Adaptive value false"],
+            fen,
+            depth,
+        );
 
         // Candidate: adaptive ON, band [6,8] — depth 7 is in-band.
         let stdout_on = drive_go_depth_on_fen(
@@ -4895,8 +4899,12 @@ mod tests {
         let fen = "5k2/8/2K5/2P5/8/8/8/8 w - - 0 1";
         let depth = 7;
 
-        // Baseline: adaptive OFF (default).
-        let stdout_off = drive_go_depth_on_fen(&[], fen, depth);
+        // Baseline: adaptive OFF (explicit — default is now ON).
+        let stdout_off = drive_go_depth_on_fen(
+            &["setoption name Aspiration_Adaptive value false"],
+            fen,
+            depth,
+        );
 
         // Candidate: adaptive ON, but with min_depth=8 so depth=7 is out-of-band.
         let stdout_on = drive_go_depth_on_fen(
