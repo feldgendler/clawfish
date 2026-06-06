@@ -20,7 +20,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::search::{
-    AlphaBetaMover, Search, SearchContext, SearchLimits, SearchResult, TimeCaps, compute_caps,
+    AlphaBetaMover, AspirationParams, Search, SearchContext, SearchLimits, SearchResult, TimeCaps,
+    compute_caps,
 };
 use crate::{Command, DebugMode, GoParams, Move, Position, PositionSpec, Register, parse_uci_line};
 
@@ -50,6 +51,19 @@ pub(crate) const MIN_HASH_MIB: usize = 1;
 /// and is a safer hedge than Stockfish's 10 ms default for typical macOS
 /// scheduling jitter.
 const DEFAULT_MOVE_OVERHEAD: u64 = 50;
+
+/// Maximum value for the `Aspiration_K` UCI option (SPSA Unit 1). Stored as
+/// centi-K; 1000 = K of 10.00. Must match the `max` in the `option name
+/// Aspiration_K …` line emitted by `handle_uci`.
+const ASPIRATION_K_MAX: i32 = 1_000;
+
+/// Maximum value for the `Aspiration_Min` UCI option (SPSA Unit 1). Must
+/// match the `max` in the `option name Aspiration_Min …` line.
+const ASPIRATION_MIN_MAX: i32 = 1_000;
+
+/// Maximum value for the `Aspiration_Max` UCI option (SPSA Unit 1). Must
+/// match the `max` in the `option name Aspiration_Max …` line.
+const ASPIRATION_MAX_MAX: i32 = 2_000;
 
 /// Compute nodes-per-second for the `bench` summary line (M3.F).
 ///
@@ -103,6 +117,14 @@ pub struct Engine<W: Write + Send + 'static, S: Search + Send + 'static> {
     /// On non-unix platforms this field exists but cannot be set to `true`
     /// (the option is not advertised and `handle_setoption` rejects the value).
     virtual_clock: bool,
+    /// SPSA Unit 1: mirrors the four `Aspiration_*` UCI options. The engine
+    /// pushes the full `AspirationParams` to the search mover whenever any of
+    /// these fields changes. Defaults match the `AspirationParams::default()`
+    /// values so `adaptive = false` (OFF by default) and bench is byte-identical.
+    aspiration_adaptive: bool,
+    aspiration_k_centi: i32,
+    aspiration_min: i32,
+    aspiration_max: i32,
 }
 
 impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
@@ -124,6 +146,10 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
             tt,
             hash_mib: DEFAULT_HASH_MIB,
             virtual_clock: false,
+            aspiration_adaptive: AspirationParams::default().adaptive,
+            aspiration_k_centi: AspirationParams::default().k_centi,
+            aspiration_min: AspirationParams::default().min,
+            aspiration_max: AspirationParams::default().max,
         }
     }
 
@@ -141,6 +167,42 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
     #[cfg(test)]
     pub(crate) fn virtual_clock(&self) -> bool {
         self.virtual_clock
+    }
+
+    /// Test-only accessors for the four `Aspiration_*` UCI option fields
+    /// (SPSA Unit 1). Required for the option round-trip tests to verify
+    /// field updates without driving an actual `go`.
+    #[cfg(test)]
+    pub(crate) fn aspiration_adaptive(&self) -> bool {
+        self.aspiration_adaptive
+    }
+
+    #[cfg(test)]
+    pub(crate) fn aspiration_k_centi(&self) -> i32 {
+        self.aspiration_k_centi
+    }
+
+    #[cfg(test)]
+    pub(crate) fn aspiration_min(&self) -> i32 {
+        self.aspiration_min
+    }
+
+    #[cfg(test)]
+    pub(crate) fn aspiration_max(&self) -> i32 {
+        self.aspiration_max
+    }
+
+    /// Construct an `AspirationParams` from the current engine fields and push
+    /// it into the search mover under the lock. Caller must have already joined
+    /// any in-flight worker (same discipline as `set_seed`).
+    fn push_aspiration_params(&mut self) {
+        let params = AspirationParams {
+            adaptive: self.aspiration_adaptive,
+            k_centi: self.aspiration_k_centi,
+            min: self.aspiration_min,
+            max: self.aspiration_max,
+        };
+        self.search.lock().unwrap().set_aspiration_params(params);
     }
 
     /// Drive the engine. Returns when `Quit` is received from `rx`.
@@ -197,6 +259,11 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
         // service the option (POSIX `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`).
         #[cfg(unix)]
         self.write_line("option name VirtualClock type check default false");
+        // SPSA Unit 1: adaptive aspiration window (default OFF → bench-neutral).
+        self.write_line("option name Aspiration_Adaptive type check default false");
+        self.write_line("option name Aspiration_K type spin default 200 min 0 max 1000");
+        self.write_line("option name Aspiration_Min type spin default 25 min 0 max 1000");
+        self.write_line("option name Aspiration_Max type spin default 250 min 0 max 2000");
         self.write_line("uciok");
     }
 
@@ -449,6 +516,102 @@ impl<W: Write + Send + 'static, S: Search + Send + 'static> Engine<W, S> {
                         None => "VirtualClock: rejected (no value given)".to_string(),
                     };
                     self.info_string_always(&msg);
+                }
+            }
+            return;
+        }
+
+        // SPSA Unit 1: Aspiration_Adaptive (check-typed boolean, like VirtualClock).
+        // Requires worker-join because aspiration params are consumed inside the
+        // running search (same `set_seed` discipline).
+        if name.eq_ignore_ascii_case("aspiration_adaptive") {
+            let parsed: Option<bool> =
+                value
+                    .as_deref()
+                    .map(|s| s.to_ascii_lowercase())
+                    .and_then(|s| match s.as_str() {
+                        "true" => Some(true),
+                        "false" => Some(false),
+                        _ => None,
+                    });
+            match parsed {
+                Some(b) => {
+                    self.join_in_flight_worker();
+                    self.aspiration_adaptive = b;
+                    self.push_aspiration_params();
+                }
+                None => {
+                    let msg = match value.as_deref() {
+                        Some(v) => format!("Aspiration_Adaptive: rejected value '{v}'"),
+                        None => "Aspiration_Adaptive: rejected (no value given)".to_string(),
+                    };
+                    self.info_string_debug(&msg);
+                }
+            }
+            return;
+        }
+
+        if name.eq_ignore_ascii_case("aspiration_k") {
+            let parsed: Option<i32> = value
+                .as_deref()
+                .and_then(|s| s.parse::<i32>().ok())
+                .filter(|&n| (0..=ASPIRATION_K_MAX).contains(&n));
+            match parsed {
+                Some(n) => {
+                    self.join_in_flight_worker();
+                    self.aspiration_k_centi = n;
+                    self.push_aspiration_params();
+                }
+                None => {
+                    let msg = match value.as_deref() {
+                        Some(v) => format!("Aspiration_K: rejected value '{v}'"),
+                        None => "Aspiration_K: rejected (no value given)".to_string(),
+                    };
+                    self.info_string_debug(&msg);
+                }
+            }
+            return;
+        }
+
+        if name.eq_ignore_ascii_case("aspiration_min") {
+            let parsed: Option<i32> = value
+                .as_deref()
+                .and_then(|s| s.parse::<i32>().ok())
+                .filter(|&n| (0..=ASPIRATION_MIN_MAX).contains(&n));
+            match parsed {
+                Some(n) => {
+                    self.join_in_flight_worker();
+                    self.aspiration_min = n;
+                    self.push_aspiration_params();
+                }
+                None => {
+                    let msg = match value.as_deref() {
+                        Some(v) => format!("Aspiration_Min: rejected value '{v}'"),
+                        None => "Aspiration_Min: rejected (no value given)".to_string(),
+                    };
+                    self.info_string_debug(&msg);
+                }
+            }
+            return;
+        }
+
+        if name.eq_ignore_ascii_case("aspiration_max") {
+            let parsed: Option<i32> = value
+                .as_deref()
+                .and_then(|s| s.parse::<i32>().ok())
+                .filter(|&n| (0..=ASPIRATION_MAX_MAX).contains(&n));
+            match parsed {
+                Some(n) => {
+                    self.join_in_flight_worker();
+                    self.aspiration_max = n;
+                    self.push_aspiration_params();
+                }
+                None => {
+                    let msg = match value.as_deref() {
+                        Some(v) => format!("Aspiration_Max: rejected value '{v}'"),
+                        None => "Aspiration_Max: rejected (no value given)".to_string(),
+                    };
+                    self.info_string_debug(&msg);
                 }
             }
             return;
@@ -4027,5 +4190,369 @@ mod tests {
                 "value {variant:?} must be parsed case-insensitively as true"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // SPSA Unit 1 — Aspiration_* UCI option round-trip tests (§1.5.e).
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an Engine with captured stdout, run commands, return
+    /// stdout + the four aspiration field values via the test-only accessors.
+    fn drive_capturing_aspiration(commands: &[&str]) -> (String, bool, i32, i32, i32) {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
+
+        let (tx, rx) = mpsc::channel::<Command>();
+        for line in commands {
+            tx.send(parse_uci_line(line)).unwrap();
+        }
+        tx.send(Command::Quit).unwrap();
+        engine.run(rx);
+
+        let bytes = buf.lock().unwrap().clone();
+        let stdout = String::from_utf8(bytes).expect("output must be valid UTF-8");
+        (
+            stdout,
+            engine.aspiration_adaptive(),
+            engine.aspiration_k_centi(),
+            engine.aspiration_min(),
+            engine.aspiration_max(),
+        )
+    }
+
+    #[test]
+    fn engine_default_aspiration_fields_match_defaults() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let engine = Engine::new(writer, AlphaBetaMover::new());
+        assert!(
+            !engine.aspiration_adaptive(),
+            "default adaptive must be false (OFF-by-default bench invariant)"
+        );
+        assert_eq!(
+            engine.aspiration_k_centi(),
+            200,
+            "default k_centi must be 200"
+        );
+        assert_eq!(engine.aspiration_min(), 25, "default min must be 25");
+        assert_eq!(engine.aspiration_max(), 250, "default max must be 250");
+    }
+
+    #[test]
+    fn handle_uci_advertises_all_four_aspiration_options() {
+        let (stdout, _) = drive(&["uci"]);
+        let lines: Vec<&str> = stdout.lines().collect();
+
+        // Exact text for each option line
+        assert!(
+            lines.contains(&"option name Aspiration_Adaptive type check default false"),
+            "Aspiration_Adaptive option line missing; got stdout:\n{stdout}"
+        );
+        assert!(
+            lines.contains(&"option name Aspiration_K type spin default 200 min 0 max 1000"),
+            "Aspiration_K option line missing; got stdout:\n{stdout}"
+        );
+        assert!(
+            lines.contains(&"option name Aspiration_Min type spin default 25 min 0 max 1000"),
+            "Aspiration_Min option line missing; got stdout:\n{stdout}"
+        );
+        assert!(
+            lines.contains(&"option name Aspiration_Max type spin default 250 min 0 max 2000"),
+            "Aspiration_Max option line missing; got stdout:\n{stdout}"
+        );
+
+        // All four must appear before uciok
+        let uciok_idx = lines
+            .iter()
+            .position(|l| *l == "uciok")
+            .expect("uciok line present");
+        for option_prefix in &[
+            "option name Aspiration_Adaptive",
+            "option name Aspiration_K",
+            "option name Aspiration_Min",
+            "option name Aspiration_Max",
+        ] {
+            let idx = lines
+                .iter()
+                .position(|l| l.starts_with(option_prefix))
+                .unwrap_or_else(|| panic!("{option_prefix} not found in uci output"));
+            assert!(idx < uciok_idx, "{option_prefix} must appear before uciok");
+        }
+    }
+
+    #[test]
+    fn setoption_aspiration_adaptive_true_sets_field() {
+        let (_stdout, adaptive, _, _, _) =
+            drive_capturing_aspiration(&["setoption name Aspiration_Adaptive value true"]);
+        assert!(adaptive, "Aspiration_Adaptive true must set field to true");
+    }
+
+    #[test]
+    fn setoption_aspiration_adaptive_false_resets_field() {
+        let (_stdout, adaptive, _, _, _) = drive_capturing_aspiration(&[
+            "setoption name Aspiration_Adaptive value true",
+            "setoption name Aspiration_Adaptive value false",
+        ]);
+        assert!(
+            !adaptive,
+            "Aspiration_Adaptive false must reset field to false"
+        );
+    }
+
+    #[test]
+    fn setoption_aspiration_adaptive_case_insensitive_value() {
+        for variant in &["TRUE", "True", "tRuE"] {
+            let (_stdout, adaptive, _, _, _) = drive_capturing_aspiration(&[&format!(
+                "setoption name Aspiration_Adaptive value {variant}"
+            )]);
+            assert!(
+                adaptive,
+                "Aspiration_Adaptive value {variant:?} must be case-insensitively true"
+            );
+        }
+    }
+
+    #[test]
+    fn setoption_aspiration_adaptive_invalid_rejected() {
+        let (stdout, adaptive, _, _, _) = drive_capturing_aspiration(&[
+            "debug on",
+            "setoption name Aspiration_Adaptive value bogus",
+        ]);
+        assert!(!adaptive, "invalid value must leave field at default false");
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l.starts_with("info string Aspiration_Adaptive:")),
+            "rejection must emit info string; got stdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn setoption_aspiration_k_accepts_and_rejects() {
+        // Accept in-range
+        let (_stdout, _, k, _, _) =
+            drive_capturing_aspiration(&["setoption name Aspiration_K value 300"]);
+        assert_eq!(k, 300, "value 300 must be accepted");
+
+        // Accept min
+        let (_stdout, _, k_min, _, _) =
+            drive_capturing_aspiration(&["setoption name Aspiration_K value 0"]);
+        assert_eq!(k_min, 0, "value 0 (min) must be accepted");
+
+        // Accept max
+        let (_stdout, _, k_max, _, _) =
+            drive_capturing_aspiration(&["setoption name Aspiration_K value 1000"]);
+        assert_eq!(k_max, 1000, "value 1000 (max) must be accepted");
+
+        // Reject above max
+        let (_stdout, _, k_oor, _, _) =
+            drive_capturing_aspiration(&["setoption name Aspiration_K value 1001"]);
+        assert_eq!(
+            k_oor, 200,
+            "value 1001 > max must be rejected; default preserved"
+        );
+    }
+
+    #[test]
+    fn setoption_aspiration_min_accepts_and_rejects() {
+        // Accept lower bound (0)
+        let (_stdout, _, _, min_zero, _) =
+            drive_capturing_aspiration(&["setoption name Aspiration_Min value 0"]);
+        assert_eq!(min_zero, 0, "value 0 (lower bound) must be accepted");
+
+        // Accept in-range
+        let (_stdout, _, _, min_val, _) =
+            drive_capturing_aspiration(&["setoption name Aspiration_Min value 50"]);
+        assert_eq!(min_val, 50, "value 50 must be accepted");
+
+        // Accept upper bound (1000)
+        let (_stdout, _, _, min_max, _) =
+            drive_capturing_aspiration(&["setoption name Aspiration_Min value 1000"]);
+        assert_eq!(min_max, 1000, "value 1000 (upper bound) must be accepted");
+
+        // Reject above max
+        let (_stdout, _, _, min_oor, _) =
+            drive_capturing_aspiration(&["setoption name Aspiration_Min value 1001"]);
+        assert_eq!(
+            min_oor, 25,
+            "value 1001 > max must be rejected; default preserved"
+        );
+    }
+
+    #[test]
+    fn setoption_aspiration_max_accepts_and_rejects() {
+        let (_stdout, _, _, _, max_val) =
+            drive_capturing_aspiration(&["setoption name Aspiration_Max value 500"]);
+        assert_eq!(max_val, 500, "value 500 must be accepted");
+
+        let (_stdout, _, _, _, max_oor) =
+            drive_capturing_aspiration(&["setoption name Aspiration_Max value 2001"]);
+        assert_eq!(
+            max_oor, 250,
+            "value 2001 > max must be rejected; default preserved"
+        );
+    }
+
+    #[test]
+    fn setoption_aspiration_option_names_case_insensitive() {
+        // All four option names should work case-insensitively
+        let (_stdout, adaptive, k, min_val, max_val) = drive_capturing_aspiration(&[
+            "setoption name aspiration_adaptive value true",
+            "setoption name ASPIRATION_K value 300",
+            "setoption name Aspiration_Min value 30",
+            "setoption name ASPIRATION_MAX value 300",
+        ]);
+        assert!(adaptive, "aspiration_adaptive (lowercase) must be accepted");
+        assert_eq!(k, 300, "ASPIRATION_K (uppercase) must be accepted");
+        assert_eq!(min_val, 30, "Aspiration_Min must be accepted");
+        assert_eq!(max_val, 300, "ASPIRATION_MAX (uppercase) must be accepted");
+    }
+
+    #[test]
+    fn setoption_aspiration_partial_update_pushes_full_params() {
+        // Verify that setting just K doesn't lose the other defaults: the
+        // engine's fields remain consistent and the full AspirationParams is
+        // pushed. Since we can't inspect the search mover directly from engine
+        // tests without a go, we verify consistency through the field accessors.
+        let (_stdout, adaptive, k, min_val, max_val) =
+            drive_capturing_aspiration(&["setoption name Aspiration_K value 150"]);
+        assert!(
+            !adaptive,
+            "adaptive must remain false (default) after K-only update"
+        );
+        assert_eq!(k, 150, "K updated to 150");
+        assert_eq!(
+            min_val, 25,
+            "min must remain 25 (default) after K-only update"
+        );
+        assert_eq!(
+            max_val, 250,
+            "max must remain 250 (default) after K-only update"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SPSA Unit 1 — engine→search wiring behavioral test (§1 mutation survivor).
+    //
+    // Kills the `push_aspiration_params → ()` mutant: proves that `setoption`
+    // actually reaches the search mover and changes search behavior. Mirrors the
+    // `Random_Seed`/`Hash` go-driven precedent.
+    // -----------------------------------------------------------------------
+
+    /// Parse the `nodes` field from an `info depth N …` line of the form
+    /// `info depth N score … nodes M time … pv …`.
+    fn parse_nodes_from_info_depth_line(line: &str) -> Option<u64> {
+        // Find "nodes " then read the next whitespace-delimited token.
+        let after = line.split(" nodes ").nth(1)?;
+        after.split_whitespace().next()?.parse::<u64>().ok()
+    }
+
+    /// Drive `position <fen> + go depth N` through a background-thread engine
+    /// and return the stdout (including all `info depth` lines).
+    fn drive_go_depth_on_fen(extra_setoptions: &[&str], fen: &str, depth: u32) -> String {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(Arc::clone(&buf));
+        let mut engine = Engine::new(writer, AlphaBetaMover::new());
+        let (tx, rx) = mpsc::channel::<Command>();
+
+        let buf_clone = Arc::clone(&buf);
+        let handle = thread::spawn(move || engine.run(rx));
+
+        for line in extra_setoptions {
+            tx.send(parse_uci_line(line)).unwrap();
+        }
+        tx.send(parse_uci_line(&format!("position fen {fen}")))
+            .unwrap();
+        tx.send(parse_uci_line(&format!("go depth {depth}")))
+            .unwrap();
+
+        // Poll until the final `info depth N` line appears, confirming the
+        // search ran to the requested depth.
+        let expected_prefix = format!("info depth {depth} ");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let snap = snapshot_output(&buf_clone);
+            if snap.lines().any(|l| l.starts_with(&expected_prefix)) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "info depth {depth} did not appear within 60s;\nstdout:\n{snap}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        tx.send(Command::Quit).unwrap();
+        handle.join().expect("engine thread should not panic");
+
+        snapshot_output(&buf_clone)
+    }
+
+    /// §1 mutation survivor: `setoption name Aspiration_Adaptive value true` must
+    /// actually reach the search mover and change search behavior.
+    ///
+    /// Uses the fail-high fixture (KPK endgame with queen-promo discovery). At
+    /// depth 7, the score delta between the two most recently completed iterations
+    /// is large enough that the adaptive half-width clamps to `max=250` instead of
+    /// the fixed `50`. This wider first-try window changes which positions are
+    /// explored, producing a different total node count.
+    ///
+    /// FAILS if:
+    /// - `push_aspiration_params` is a no-op (the mutation survivor target)
+    /// - `AlphaBetaMover::set_aspiration_params` is a no-op
+    /// - `aspiration_half_width` ignores `params.adaptive`
+    ///
+    /// Because all three of those would leave the search using the fixed ±50
+    /// window, making both runs byte-identical (same node count).
+    #[test]
+    fn setoption_aspiration_adaptive_true_reaches_search_and_changes_behavior() {
+        // fail_high_fixture FEN (KPK with c-pawn, white to move — queen promo at depth 5+)
+        let fen = "5k2/8/2K5/2P5/8/8/8/8 w - - 0 1";
+        let depth = 7;
+
+        // Baseline: adaptive OFF (default — no setoptions).
+        let stdout_off = drive_go_depth_on_fen(&[], fen, depth);
+
+        // Candidate: adaptive ON with default K/Min/Max.
+        let stdout_on = drive_go_depth_on_fen(
+            &["setoption name Aspiration_Adaptive value true"],
+            fen,
+            depth,
+        );
+
+        // Extract the node count from the final `info depth N` line of each run.
+        let depth_prefix = format!("info depth {depth} ");
+
+        let nodes_off = stdout_off
+            .lines()
+            .rfind(|l| l.starts_with(&depth_prefix))
+            .and_then(parse_nodes_from_info_depth_line)
+            .unwrap_or_else(|| {
+                panic!(
+                    "adaptive-OFF run must emit info depth {depth} with nodes field;\
+                     \nstdout:\n{stdout_off}"
+                )
+            });
+
+        let nodes_on = stdout_on
+            .lines()
+            .rfind(|l| l.starts_with(&depth_prefix))
+            .and_then(parse_nodes_from_info_depth_line)
+            .unwrap_or_else(|| {
+                panic!(
+                    "adaptive-ON run must emit info depth {depth} with nodes field;\
+                     \nstdout:\n{stdout_on}"
+                )
+            });
+
+        // If push_aspiration_params were a no-op, both runs would use the fixed ±50
+        // window (adaptive OFF path) and produce identical node counts.
+        assert_ne!(
+            nodes_off, nodes_on,
+            "adaptive ON must produce a different node count than OFF: \
+             setoption did not reach the search mover. \
+             off={nodes_off} on={nodes_on}"
+        );
     }
 }

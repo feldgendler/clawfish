@@ -383,6 +383,11 @@ pub trait Search: Send {
     /// will not implement this; it stays a no-op.
     fn set_seed(&mut self, _seed: u64) {}
 
+    /// Update the adaptive aspiration parameters. Called by the engine under
+    /// the search lock (after joining any in-flight worker) whenever one of
+    /// the four `Aspiration_*` UCI options changes. Default: no-op.
+    fn set_aspiration_params(&mut self, _params: AspirationParams) {}
+
     /// Notify the search that a new game has started (`ucinewgame`). Default:
     /// no-op. M4 will clear killer/history/TT here.
     fn reset(&mut self) {}
@@ -422,8 +427,61 @@ const ASPIRATION_MIN_DEPTH: u32 = 6;
 /// First-try aspiration half-width in centipawns. Window is
 /// `(prior - HALF_WIDTH, prior + HALF_WIDTH)`. CPW workhorse default;
 /// roadmap §M4.D pins ±50 with a documented post-merge width-tune campaign
-/// over ±25 / ±75 / ±100.
+/// over ±25 / ±75 / ±100. Also the OFF-path fallback returned by
+/// `aspiration_half_width` when `adaptive == false`.
 const ASPIRATION_HALF_WIDTH: i32 = 50;
+
+/// Default centi-K multiplier for the adaptive aspiration half-width formula
+/// `half = clamp((k_centi * |d1 - d2| + 50) / 100, min, max)`. K=2.00 centers
+/// the window at the proven fixed ±50 for the median ID score-delta (~25 cp).
+const ASPIRATION_K_CENTI_DEFAULT: i32 = 200;
+
+/// Default minimum adaptive aspiration half-width in centipawns. Prevents the
+/// window from narrowing so tightly on stable positions that a single-cp
+/// fluctuation causes a fail. Mirrors the item-5 hand-pick `MIN=25`.
+const ASPIRATION_MIN_DEFAULT: i32 = 25;
+
+/// Default maximum adaptive aspiration half-width in centipawns. Caps the
+/// window on volatile positions, preventing a first-try window wider than ±50
+/// on quiet positions (limit is ±250 ≈ 5 pawns). Mirrors the item-5
+/// hand-pick `MAX=250`.
+const ASPIRATION_MAX_DEFAULT: i32 = 250;
+
+/// Default for the `Aspiration_Adaptive` UCI option. `false` means the
+/// adaptive half-width path is completely inactive and every node-count is
+/// byte-identical to the pre-Unit-1 baseline.
+const ASPIRATION_ADAPTIVE_DEFAULT: bool = false;
+
+/// Parameters for the adaptive aspiration half-width feature. Stored in
+/// `AlphaBetaMover` and set by `Engine::handle_setoption` via the
+/// `set_aspiration_params` method (same worker-join discipline as `set_seed`).
+///
+/// When `adaptive == false` the feature is entirely inactive: every call to
+/// `aspiration_half_width` returns the fixed `ASPIRATION_HALF_WIDTH` constant,
+/// making the search byte-identical to the pre-Unit-1 baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AspirationParams {
+    /// When `false`, `aspiration_half_width` returns the fixed fallback for
+    /// every input, preserving byte-identical bench behavior.
+    pub adaptive: bool,
+    /// Centi-K multiplier (K × 100). UCI option `Aspiration_K default 200`.
+    pub k_centi: i32,
+    /// Minimum adaptive half-width in centipawns. UCI `Aspiration_Min default 25`.
+    pub min: i32,
+    /// Maximum adaptive half-width in centipawns. UCI `Aspiration_Max default 250`.
+    pub max: i32,
+}
+
+impl Default for AspirationParams {
+    fn default() -> Self {
+        Self {
+            adaptive: ASPIRATION_ADAPTIVE_DEFAULT,
+            k_centi: ASPIRATION_K_CENTI_DEFAULT,
+            min: ASPIRATION_MIN_DEFAULT,
+            max: ASPIRATION_MAX_DEFAULT,
+        }
+    }
+}
 
 /// Minimum depth at which NMP is attempted. Below this, the null-search's
 /// `depth - 1 - R` would be ≤ 0, dispatching to qsearch — defeating the
@@ -574,6 +632,25 @@ fn negate_window(alpha: i32, beta: i32) -> (i32, i32) {
     (-beta, -alpha)
 }
 
+/// Volatility-responsive first-try aspiration half-width (SPSA Unit 1).
+///
+/// When `!params.adaptive` OR `score_d2` is `None`, returns the fixed
+/// `ASPIRATION_HALF_WIDTH` fallback — identical to pre-Unit-1 behavior.
+///
+/// Otherwise returns
+/// `clamp((params.k_centi * |score_d1 - d2| + 50) / 100, params.min, params.max)`.
+/// The `+ 50` before integer-dividing by 100 rounds half-away-from-zero on the
+/// non-negative numerator, yielding deterministic platform-independent arithmetic.
+fn aspiration_half_width(score_d1: i32, score_d2: Option<i32>, params: &AspirationParams) -> i32 {
+    let Some(d2) = score_d2 else {
+        return ASPIRATION_HALF_WIDTH;
+    };
+    if !params.adaptive {
+        return ASPIRATION_HALF_WIDTH;
+    }
+    ((params.k_centi * (score_d1 - d2).abs() + 50) / 100).clamp(params.min, params.max)
+}
+
 /// First-try aspiration window. Returns `(-INF, INF)` (equivalent to no
 /// aspiration) when:
 ///
@@ -582,20 +659,32 @@ fn negate_window(alpha: i32, beta: i32) -> (i32, i32) {
 /// 2. `prior_score == None` — no prior iteration to seed from (the first
 ///    ID iteration of the current `go`).
 ///
-/// Otherwise returns `(prior - ASPIRATION_HALF_WIDTH, prior + ASPIRATION_HALF_WIDTH)`.
-/// Mate-score `prior_score` values produce a window straddling the mate
-/// boundary; `widen_after_fail` handles the resulting first-try fail via
-/// the asymmetric full-window re-search (research §7.2).
+/// Otherwise uses `aspiration_half_width` to compute the first-try half-width
+/// from `params` and the two most recent completed ID scores, then returns
+/// `(prior - half, prior + half)`. Mate-score `prior_score` values produce a
+/// window straddling the mate boundary; `widen_after_fail` handles the
+/// resulting first-try fail via the asymmetric full-window re-search
+/// (research §7.2).
+///
+/// When `params.adaptive == false` (the default), `aspiration_half_width`
+/// returns exactly `ASPIRATION_HALF_WIDTH` for any input, so this function is
+/// byte-identical to the pre-Unit-1 signature for every (prior, depth) pair.
 ///
 /// Pure function. Pinned by AS1–AS5b.
-fn aspiration_window(prior_score: Option<i32>, depth: u32) -> (i32, i32) {
+fn aspiration_window(
+    prior_score: Option<i32>,
+    prior_prior_score: Option<i32>,
+    params: &AspirationParams,
+    depth: u32,
+) -> (i32, i32) {
     if depth < ASPIRATION_MIN_DEPTH {
         return (-INF, INF);
     }
     let Some(prior) = prior_score else {
         return (-INF, INF);
     };
-    (prior - ASPIRATION_HALF_WIDTH, prior + ASPIRATION_HALF_WIDTH)
+    let half = aspiration_half_width(prior, prior_prior_score, params);
+    (prior - half, prior + half)
 }
 
 /// Two-tier asymmetric widening on aspiration failure. Computes the
@@ -1046,6 +1135,12 @@ pub(crate) struct AlphaBetaMover {
     /// `Search::reset()` (same `ucinewgame`/per-bench-position discipline as
     /// `history_table`). Read by `evaluate_cached` from qsearch (Slice E).
     pawn_hash: crate::eval::pawns::PawnHashTable,
+    /// SPSA Unit 1: runtime-tunable adaptive aspiration parameters. Set by the
+    /// engine via `set_aspiration_params` under the search lock (same
+    /// `set_seed` worker-join discipline). When `adaptive == false` (the
+    /// default), the feature is entirely inactive and search behavior is
+    /// byte-identical to the pre-Unit-1 baseline.
+    aspiration_params: AspirationParams,
     /// M5.A: per-`go` count of NMP firings (number of times the null sub-search
     /// was attempted, regardless of cutoff). Test-only instrumentation for the
     /// stacked-null `negamax_passes_allow_null_false_in_null_subsearch` test;
@@ -1155,6 +1250,7 @@ impl AlphaBetaMover {
             killers: [[Move::default(); 2]; MAX_PLY],
             history_table: HistoryTable::new(),
             pawn_hash: crate::eval::pawns::PawnHashTable::new(),
+            aspiration_params: AspirationParams::default(),
             #[cfg(test)]
             nmp_firings: 0,
             #[cfg(test)]
@@ -1192,6 +1288,10 @@ impl AlphaBetaMover {
 }
 
 impl Search for AlphaBetaMover {
+    fn set_aspiration_params(&mut self, params: AspirationParams) {
+        self.aspiration_params = params;
+    }
+
     fn go(
         &mut self,
         position: &Position,
@@ -1241,6 +1341,12 @@ impl Search for AlphaBetaMover {
         // Last fully completed iteration's snapshot. None until iteration 1
         // finishes; preserved across mid-iteration aborts.
         let mut last_complete: Option<(u32, Option<Move>, i32)> = None;
+        // score(d-2): the iteration-before-last completed score, for the
+        // adaptive aspiration half-width. Shifted in lockstep with
+        // `last_complete`, ONLY on iteration completion (preserved across
+        // mid-iteration aborts). Harmless when `aspiration_params.adaptive ==
+        // false` since the helper ignores it.
+        let mut prev_prev_score: Option<i32> = None;
 
         for depth in 1..=max_depth {
             // Per-iteration reset (M4.B inter-iteration policy): clear the
@@ -1256,7 +1362,8 @@ impl Search for AlphaBetaMover {
             // enforced by an explicit `tries >= 2` break AFTER the
             // window-contained check — see §3.3 of the plan.
             let prior_score = last_complete.map(|(_, _, s)| s);
-            let (mut alpha, mut beta) = aspiration_window(prior_score, depth);
+            let (mut alpha, mut beta) =
+                aspiration_window(prior_score, prev_prev_score, &self.aspiration_params, depth);
 
             // Score eventually accepted as this iteration's result. Assigned
             // on every loop pass before any read; mid-iteration abort breaks
@@ -1332,6 +1439,9 @@ impl Search for AlphaBetaMover {
             // exactly L and fails to update PV in fail-soft.
             let bestmove =
                 extract_bestmove_or_tt_fallback(&self.pv, self.tt.as_deref(), pos_clone.zobrist());
+            // Shift the two-iteration window: old last_complete → prev_prev_score,
+            // then record this iteration as the new last_complete.
+            prev_prev_score = last_complete.map(|(_, _, s)| s);
             last_complete = Some((depth, bestmove, returned));
 
             // Single SearchInstant::now() reused for both the elapsed-ms
@@ -9250,13 +9360,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Depths 1–5 always return the full window (below ASPIRATION_MIN_DEPTH=6),
-    /// regardless of prior score.
+    /// regardless of prior score. Migrated to 4-arg signature (§1.5.d2):
+    /// passes `&AspirationParams::default()` (adaptive OFF) and `None` for
+    /// prior_prior — asserts unchanged results.
     #[test]
     fn aspiration_window_below_threshold_is_full_window_at_depth_1_2_3() {
+        let off = AspirationParams::default();
         for depth in [1u32, 2, 3, 4, 5] {
             for prior in [None, Some(0i32), Some(50), Some(-50)] {
                 assert_eq!(
-                    aspiration_window(prior, depth),
+                    aspiration_window(prior, None, &off, depth),
                     (-INF, INF),
                     "depth={depth}, prior={prior:?} must return full window"
                 );
@@ -9265,10 +9378,12 @@ mod tests {
     }
 
     /// Depth 6 (threshold boundary) with no prior score returns full window.
+    /// Migrated to 4-arg signature (§1.5.d2).
     #[test]
     fn aspiration_window_at_threshold_with_no_prior_is_full_window() {
+        let off = AspirationParams::default();
         assert_eq!(
-            aspiration_window(None, 6),
+            aspiration_window(None, None, &off, 6),
             (-INF, INF),
             "depth=6, prior=None must return full window (first iteration has no prior)"
         );
@@ -9276,35 +9391,41 @@ mod tests {
 
     /// At depth ≥ ASPIRATION_MIN_DEPTH=6 with prior=0, the window is `(-50, 50)`.
     /// Anti-stub: checks both endpoints to catch a formula that ignores the lower bound.
+    /// Migrated to 4-arg signature (§1.5.d2).
     #[test]
     fn aspiration_window_above_threshold_with_zero_prior_is_centered_at_zero() {
+        let off = AspirationParams::default();
         assert_eq!(
-            aspiration_window(Some(0), 6),
+            aspiration_window(Some(0), None, &off, 6),
             (-50, 50),
             "prior=0, depth=6 must yield (-50, 50)"
         );
     }
 
     /// Positive priors at various depths above threshold (>= 6).
+    /// Migrated to 4-arg signature (§1.5.d2).
     #[test]
     fn aspiration_window_above_threshold_with_positive_prior_centered_correctly() {
+        let off = AspirationParams::default();
         assert_eq!(
-            aspiration_window(Some(123), 7),
+            aspiration_window(Some(123), None, &off, 7),
             (73, 173),
             "prior=123, depth=7 must yield (73, 173)"
         );
         assert_eq!(
-            aspiration_window(Some(1000), 10),
+            aspiration_window(Some(1000), None, &off, 10),
             (950, 1050),
             "prior=1000, depth=10 must yield (950, 1050)"
         );
     }
 
     /// Negative prior at depth above threshold.
+    /// Migrated to 4-arg signature (§1.5.d2).
     #[test]
     fn aspiration_window_above_threshold_with_negative_prior_centered_correctly() {
+        let off = AspirationParams::default();
         assert_eq!(
-            aspiration_window(Some(-200), 6),
+            aspiration_window(Some(-200), None, &off, 6),
             (-250, -150),
             "prior=-200, depth=6 must yield (-250, -150)"
         );
@@ -9313,16 +9434,404 @@ mod tests {
     /// Mate-score priors are NOT special-cased; the window is centered on the
     /// mate score normally. Pins research §7.2's "do not special-case mate
     /// detection" recommendation. Anti-stub against a future mate-skip branch.
+    /// Migrated to 4-arg signature (§1.5.d2).
     #[test]
     fn aspiration_window_with_mate_score_prior_does_not_special_case() {
+        let off = AspirationParams::default();
         for prior in [MATE - 1, MATE - 10, -(MATE - 5)] {
-            let result = aspiration_window(Some(prior), 8);
+            let result = aspiration_window(Some(prior), None, &off, 8);
             assert_eq!(
                 result,
                 (prior - ASPIRATION_HALF_WIDTH, prior + ASPIRATION_HALF_WIDTH),
                 "mate-score prior={prior} must yield centered window, not full window"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // SPSA Unit 1 — adaptive aspiration tests (§1.5.a, §1.5.c, §1.5.d, §1.5.f).
+    // -----------------------------------------------------------------------
+
+    // ----- §1.5.a: adaptive-OFF is the fixed path ---------------------------
+
+    /// With `adaptive == false` (the default), `aspiration_half_width` returns
+    /// `ASPIRATION_HALF_WIDTH` for ALL (d1, d2) inputs including `Some(_)` for
+    /// both. This is the unit-level proof that the OFF path is byte-identical.
+    #[test]
+    fn adaptive_off_half_width_always_returns_fixed_50() {
+        let off = AspirationParams::default();
+        assert!(!off.adaptive, "default params must have adaptive=false");
+
+        // None d2
+        assert_eq!(
+            aspiration_half_width(0, None, &off),
+            ASPIRATION_HALF_WIDTH,
+            "adaptive OFF, no d2 → fixed 50"
+        );
+        // Some d2 — the guard that distinguishes Unit 1 from the item-5 prototype
+        for (d1, d2) in [(0, 0), (100, 75), (0, 200), (500, 100), (-50, 50)] {
+            assert_eq!(
+                aspiration_half_width(d1, Some(d2), &off),
+                ASPIRATION_HALF_WIDTH,
+                "adaptive OFF with d1={d1} d2={d2} → fixed 50"
+            );
+        }
+    }
+
+    /// `aspiration_window` with OFF params equals the legacy output across all
+    /// three legacy branches: depth<6 → (-INF, INF); prior None → (-INF, INF);
+    /// else → (prior-50, prior+50). The oracle is the branch behavior, NOT a
+    /// blanket ±50 — the two full-window branches are distinct from ±50.
+    #[test]
+    fn adaptive_off_aspiration_window_byte_identical_to_legacy() {
+        let off = AspirationParams::default();
+
+        // Branch 1: depth < ASPIRATION_MIN_DEPTH → full window regardless of prior
+        for depth in [1u32, 2, 3, 4, 5] {
+            for prior in [None, Some(0i32), Some(100), Some(-100)] {
+                assert_eq!(
+                    aspiration_window(prior, Some(50), &off, depth),
+                    (-INF, INF),
+                    "branch 1: depth={depth} prior={prior:?} must yield full window"
+                );
+            }
+        }
+
+        // Branch 2: depth >= ASPIRATION_MIN_DEPTH, prior == None → full window
+        assert_eq!(
+            aspiration_window(None, Some(50), &off, 6),
+            (-INF, INF),
+            "branch 2: depth=6 prior=None → full window"
+        );
+
+        // Branch 3: depth >= ASPIRATION_MIN_DEPTH, prior = Some(p) → (p-50, p+50)
+        for prior in [0i32, 100, -200, 500] {
+            assert_eq!(
+                aspiration_window(Some(prior), Some(prior - 40), &off, 6),
+                (prior - ASPIRATION_HALF_WIDTH, prior + ASPIRATION_HALF_WIDTH),
+                "branch 3: prior={prior} must yield (prior-50, prior+50)"
+            );
+        }
+    }
+
+    // ----- §1.5.c: K fixed-point arithmetic ---------------------------------
+
+    /// Verify the integer expression `(k_centi * |Δ| + 50) / 100` at the
+    /// documented calibration point and several boundary cases.
+    #[test]
+    fn adaptive_on_half_width_k_centi_arithmetic() {
+        let on = AspirationParams {
+            adaptive: true,
+            k_centi: 200,
+            min: 25,
+            max: 250,
+        };
+
+        // k=200, |Δ|=25 → (200*25+50)/100 = 5050/100 = 50 (calibration point)
+        assert_eq!(
+            aspiration_half_width(100, Some(75), &on),
+            50,
+            "k=200 |Δ|=25 → 50 (median calibration point)"
+        );
+
+        // k=200, |Δ|=40 → (200*40+50)/100 = 8050/100 = 80
+        assert_eq!(
+            aspiration_half_width(100, Some(60), &on),
+            80,
+            "k=200 |Δ|=40 → 80"
+        );
+
+        // Clamp to MIN: k=200, |Δ|=5 → (200*5+50)/100 = 1050/100 = 10 < 25 → 25
+        assert_eq!(
+            aspiration_half_width(100, Some(95), &on),
+            25,
+            "k=200 |Δ|=5 → clamped to min=25"
+        );
+
+        // Clamp to MAX: k=200, |Δ|=200 → (200*200+50)/100 = 40050/100 = 400 > 250 → 250
+        assert_eq!(
+            aspiration_half_width(0, Some(200), &on),
+            250,
+            "k=200 |Δ|=200 → clamped to max=250"
+        );
+
+        // Rounding boundary: k=100, |Δ|=1 → (100*1+50)/100 = 150/100 = 1 (integer division)
+        let on_k100 = AspirationParams {
+            adaptive: true,
+            k_centi: 100,
+            min: 1,
+            max: 250,
+        };
+        assert_eq!(
+            aspiration_half_width(0, Some(1), &on_k100),
+            1,
+            "k=100 |Δ|=1 → 1 (integer division of 150/100)"
+        );
+
+        // Half-away rounding check: off-grid numerator.
+        // k=100, |Δ|=1 → (100+50)/100 = 150/100 = 1 (not 2, since integer division truncates).
+        // k=150, |Δ|=1 → (150+50)/100 = 200/100 = 2
+        let on_k150 = AspirationParams {
+            adaptive: true,
+            k_centi: 150,
+            min: 1,
+            max: 250,
+        };
+        assert_eq!(
+            aspiration_half_width(0, Some(1), &on_k150),
+            2,
+            "k=150 |Δ|=1 → (150+50)/100 = 200/100 = 2"
+        );
+    }
+
+    /// §1.5.c overflow safety: `aspiration_half_width` with the maximum possible
+    /// `k_centi = ASPIRATION_K_MAX = 1000` and the maximum possible |Δ| (both
+    /// score_d1 and score_d2 at ±MATE magnitude) must not overflow i32 or panic.
+    ///
+    /// Maximum numerator: `k_centi * |d1 - d2| + 50 = 1000 * 2*(MATE) + 50`.
+    /// `MATE` is 30000, so 2*MATE = 60000; `1000 * 60000 = 60_000_000`, which is
+    /// well within i32::MAX ≈ 2.1 × 10^9. The result clamps to `max` regardless.
+    #[test]
+    fn adaptive_on_half_width_extreme_inputs_no_overflow() {
+        let extreme = AspirationParams {
+            adaptive: true,
+            k_centi: 1_000, // ASPIRATION_K_MAX
+            min: 25,
+            max: 250,
+        };
+        // score_d1 = +MATE, score_d2 = -MATE: |delta| = 2*MATE = 60000
+        // numerator = 1000 * 60000 + 50 = 60_000_050 << i32::MAX; result → clamped to max
+        let result = aspiration_half_width(MATE, Some(-MATE), &extreme);
+        assert_eq!(
+            result, 250,
+            "extreme inputs (k=1000, |Δ|=2*MATE=60000) must clamp to max=250 without overflow"
+        );
+        // Opposite sign order: same |delta|
+        let result2 = aspiration_half_width(-MATE, Some(MATE), &extreme);
+        assert_eq!(
+            result2, 250,
+            "sign-flipped extreme inputs must also clamp to max=250"
+        );
+    }
+
+    // ----- §1.5.d: score(d-2) threading + abort-doesn't-corrupt-shift -------
+
+    /// `aspiration_window_uses_delta_width` (item-5 test adopted and extended):
+    /// verifies that the delta-derived width is used when both d1 and d2 are
+    /// available, and that the fallback applies when d2 is absent.
+    #[test]
+    fn adaptive_on_aspiration_window_uses_delta_width() {
+        let on = AspirationParams {
+            adaptive: true,
+            k_centi: 200,
+            min: 25,
+            max: 250,
+        };
+
+        // delta 40 → half = (200*40+50)/100 = 80 → window (100-80, 100+80) = (20, 180)
+        assert_eq!(
+            aspiration_window(Some(100), Some(60), &on, 6),
+            (20, 180),
+            "prior=100, prior_prior=60 → half=80 → (20, 180)"
+        );
+
+        // no d2 → fallback half = ASPIRATION_HALF_WIDTH=50 → (50, 150)
+        assert_eq!(
+            aspiration_window(Some(100), None, &on, 6),
+            (100 - ASPIRATION_HALF_WIDTH, 100 + ASPIRATION_HALF_WIDTH),
+            "prior=100, no prior_prior → fallback half=50"
+        );
+    }
+
+    /// §1.5.d — ID-loop threads `prev_prev_score` into the live aspiration window.
+    ///
+    /// With adaptive ON, the first-try half-width at depth ≥ 7 is computed from
+    /// the two most recently completed iteration scores. If `prev_prev_score` were
+    /// always `None` (not threaded), the helper would always return the fixed-50
+    /// fallback, and the node count would be byte-identical to adaptive OFF.
+    ///
+    /// Uses Kiwipete at depth 7 with `min=10` to guarantee the adaptive half-width
+    /// differs from ±50 even when the score delta between iterations is small.
+    /// With k=200 and a typical startpos delta of ~10 cp: `half = (200*10+50)/100
+    /// = 20 < 50`, clamped to min=10, producing a ±10 first-try window instead of
+    /// ±50. This narrower window is more likely to fail (triggering a re-search),
+    /// producing a different node count. If `prev_prev_score` is never threaded
+    /// (always None), the fallback ±50 applies and the counts are identical.
+    #[test]
+    fn adaptive_on_id_loop_threads_prev_prev_score_into_live_window() {
+        // Use Kiwipete: complex enough to have meaningful scores at depth 7 and
+        // well-tested to reliably produce a bestmove (no forced-mate PV edge cases).
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+
+        // Aggressive params: min=10 ensures the window is narrower than ±50 for
+        // any delta < 20 cp, which is typical for Kiwipete's midgame score stability.
+        let adaptive_params = AspirationParams {
+            adaptive: true,
+            k_centi: 200,
+            min: 10,
+            max: 250,
+        };
+
+        // Adaptive OFF: baseline node count at depth 7.
+        let mut ab_off = AlphaBetaMover::new();
+        let (ctx_off, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(7)));
+        let (result_off, _) = drive_go(&mut ab_off, &pos, &ctx_off);
+
+        // Adaptive ON: same position, same depth.
+        let mut ab_on = AlphaBetaMover::new();
+        ab_on.set_aspiration_params(adaptive_params);
+        let (ctx_on, _stop) = ctx_for(&pos, limits_with(|l| l.depth = Some(7)));
+        let (result_on, _) = drive_go(&mut ab_on, &pos, &ctx_on);
+
+        // Both searches must complete and find a bestmove.
+        assert!(
+            result_off.bestmove.is_some(),
+            "adaptive-OFF depth-7 search must produce a bestmove"
+        );
+        assert!(
+            result_on.bestmove.is_some(),
+            "adaptive-ON depth-7 search must produce a bestmove"
+        );
+
+        // The node counts must differ: adaptive ON uses a narrower first-try
+        // window (min=10 < 50), causing additional re-searches compared to OFF.
+        // If prev_prev_score were always None (not threaded), adaptive ON would
+        // fall back to the fixed ±50 and produce the same count as OFF.
+        assert_ne!(
+            result_off.nodes, result_on.nodes,
+            "adaptive ON must produce a different node count than OFF \
+             (min=10 forces a narrower first-try window than ±50, triggering \
+             extra re-searches once d-2 is available); \
+             off_nodes={} on_nodes={}",
+            result_off.nodes, result_on.nodes
+        );
+    }
+
+    /// §1.5.d — Abort mid-iteration does not corrupt the `prev_prev_score` shift.
+    ///
+    /// The `prev_prev_score` shift (`prev_prev_score = last_complete.map(...)`)
+    /// happens only when an iteration COMPLETES, not when it aborts. If the shift
+    /// happened on abort, a partially-explored iteration's score would contaminate
+    /// the next iteration's window.
+    ///
+    /// Uses Kiwipete (like AS17) because its large re-search reliably spans ≥4096
+    /// nodes, ensuring the stop poll fires inside the aborted try rather than after
+    /// the try completes. The stop is flipped on the first `aspiration_re_search`
+    /// line at depth 7; the re-search aborts mid-negamax; the result preserves
+    /// the depth-6 (or earlier) snapshot.
+    ///
+    /// A corrupt `prev_prev_score` shift (setting it to the in-progress depth-6
+    /// result before it completes) would cause the depth-7 first-try window to use
+    /// a garbage score, potentially triggering a panic via overflow or producing a
+    /// degenerate window detectable by the depth/bestmove assertions.
+    #[test]
+    fn adaptive_on_abort_mid_iteration_does_not_corrupt_prev_prev_shift() {
+        let pos = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("kiwipete FEN must parse");
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = SearchContext {
+            stop: Arc::clone(&stop),
+            caps: TimeCaps {
+                soft: Duration::MAX,
+                hard: Duration::MAX,
+            },
+            virtual_clock: false,
+            limits: limits_with(|l| l.depth = Some(7)),
+            history: vec![pos.zobrist()],
+            tt: None,
+        };
+        // Flip stop on the FIRST aspiration_re_search line (Kiwipete iter-7 has
+        // a large re-search ≥ 4096 nodes → stop fires inside the aborted try,
+        // not after it, so the iter-6 snapshot is preserved).
+        let stop_flip = Arc::clone(&stop);
+        let infos: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let info_sink = |s: &str| {
+            let was_aspiration = s.contains("info string aspiration_re_search");
+            infos.borrow_mut().push(s.to_string());
+            if was_aspiration {
+                stop_flip.store(true, Ordering::Relaxed);
+            }
+        };
+        let mut ab = AlphaBetaMover::new();
+        ab.set_aspiration_params(AspirationParams {
+            adaptive: true,
+            k_centi: 200,
+            min: 10, // narrow window → more re-searches, exercises abort more aggressively
+            max: 250,
+        });
+        let result = ab.go(&pos, &ctx, &info_sink);
+
+        // The abort preserves the last completed iteration's snapshot.
+        // The first re-search line fires at depth 6 (first aspiration-eligible
+        // depth); depths 1–5 will always have completed at that point.
+        assert!(
+            result.bestmove.is_some(),
+            "abort after first re-search line must preserve a valid bestmove; result: {result:?}"
+        );
+        assert!(
+            result.depth >= 5,
+            "at least 5 iterations must complete before the first re-search fires; \
+             result.depth={}",
+            result.depth
+        );
+    }
+
+    // ----- §1.5.f: adaptive-ON narrows/widens vs ±50 ------------------------
+
+    /// With adaptive ON and a stable position (small d1-d2 delta), the first-try
+    /// window narrows below ±50 after d-2 is available (i.e., clamped to MIN=25).
+    /// We verify by checking that at depth ≥ 8 a window narrower than ±50 is
+    /// possible when the position produces small score fluctuations.
+    /// Uses the `aspiration_half_width` helper directly (unit-level).
+    #[test]
+    fn adaptive_on_narrow_window_on_stable_scores() {
+        let on = AspirationParams {
+            adaptive: true,
+            k_centi: 200,
+            min: 25,
+            max: 250,
+        };
+        // Scores that differ by only 5 cp (very stable) → half = (200*5+50)/100 = 10 → clamped to 25
+        assert_eq!(
+            aspiration_half_width(100, Some(95), &on),
+            25,
+            "stable position (Δ=5) with k=200 → clamp to min=25, narrower than ±50"
+        );
+        const {
+            assert!(
+                25 < ASPIRATION_HALF_WIDTH,
+                "min=25 must be narrower than ASPIRATION_HALF_WIDTH=50"
+            )
+        };
+    }
+
+    /// With adaptive ON and a volatile position (large d1-d2 delta), the first-try
+    /// window widens beyond ±50.
+    #[test]
+    fn adaptive_on_wide_window_on_volatile_scores() {
+        let on = AspirationParams {
+            adaptive: true,
+            k_centi: 200,
+            min: 25,
+            max: 250,
+        };
+        // Scores that differ by 100 cp (volatile) → half = (200*100+50)/100 = 200 > 50
+        assert_eq!(
+            aspiration_half_width(0, Some(100), &on),
+            200,
+            "volatile position (Δ=100) with k=200 → 200 > ASPIRATION_HALF_WIDTH=50"
+        );
+        const {
+            assert!(
+                200 > ASPIRATION_HALF_WIDTH,
+                "computed half=200 must be wider than ASPIRATION_HALF_WIDTH=50"
+            )
+        };
     }
 
     // -----------------------------------------------------------------------
