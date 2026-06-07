@@ -128,8 +128,9 @@ regress — qsearch wants *more* accurate TT data and tight tactical focus, not
 less; M5.F.1 (add `Exact`) was the right direction and apparently captured the
 available gain. (b) The suspend-tolerance of the elo-iterate harness was
 confirmed empirically (item-2 SPRT ran through a laptop suspend to a clean
-verdict). Branches `tune/m5f-item{2,4,5,6}-*` retained for record; production
-HEAD unchanged at `M5.F.1`.
+verdict). The per-item `tune/m5f-item{2,4,5,6}-*` branches were deleted 2026-06-07
+(this plan + the per-item `bench/sprt/` result docs are the record, not branches);
+production HEAD unchanged at `M5.F.1`.
 | C-4 | _pending_ | queued after C-2 | — | review-APPROVED, 12/12 mutants, bench-inert |
 | C-5 | — | **CLOSED on bench canary (no SPRT)** | ceiling ~0 | probe-gating strictly adds nodes (d4 +12%@thr4, +4.4%@thr8); no favorable mechanism |
 

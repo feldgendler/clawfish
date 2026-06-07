@@ -325,7 +325,7 @@ not stacked builds + engine-spawning canaries.)
 4. **Close-out** (see below): update `docs/tuning-backlog.md` §M5.G + ADR-0029
    "Open / tuning backlog" with per-item dispositions; **expected 0 ships ⇒ no
    combined-confirm, no commit of engine changes, production stays `M5.F.1`**;
-   retain `tune/m5g-se-item{4,5,6,7}-*` branches for the record; clean up worktrees.
+   the per-item branches' record lives in this plan + `bench/sprt/`; clean up worktrees.
 5. If C-7 unexpectedly ships (CI-lower>0): it's the only ship ⇒ still no
    combined-confirm needed (single change); then commit + tag + docs.
 
@@ -343,4 +343,5 @@ and resume hourly cadence.
 - If any ship: combined-confirm SPRT, commit (conventional message), tag if a new
   production HEAD, update `CLAUDE.md` status block + `README.md` bench/strength,
   write `docs/milestones/` note if it rises to a milestone-class ship.
-- Retain `tune/m5g-se-item{4,5,6,7,8}-*` branches for the record.
+- The per-item `tune/m5g-se-item{4,5,6,7}-*` branches were deleted 2026-06-07 — the
+  record is this plan + the per-item `bench/sprt/` result docs, not branches.
