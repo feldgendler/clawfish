@@ -820,4 +820,17 @@ exclude_re = [
     # V>::expecting -> fmt::Result with Ok(Default::default())` — match on the
     # distinctive `::expecting` path fragment.)
     "replace .*::expecting -> fmt::Result with Ok\\(Default::default\\(\\)\\)",
+
+    # texel::features::endgame_scale `if hmc > FIFTY_MOVE_TAPER_FROM` → `>=`.
+    # EQUIVALENT: the only difference is at exactly hmc == FIFTY_MOVE_TAPER_FROM
+    # (80), where the mutant ENTERS the taper branch but `prog =
+    # clamp(80-80, 0, span) = 0`, so `tapered = DEN - (DEN-floor)*0/span = DEN`
+    # and `scale = min(DEN, DEN) = DEN` — identical to not tapering. For hmc>80
+    # both true; for hmc<80 both false. No reachable input distinguishes them.
+    # The OTHER mutations on this `>` (`> with ==`, `> with <`) are NOT
+    # equivalent and ARE caught by the asymmetric (nonzero-blend) taper fixtures
+    # in `reference_scale_matches_eval_at_boundary_fixtures`; this rule's
+    # `with >=` replacement text matches ONLY the equivalent variant, so it does
+    # not suppress them. (M6.I/J texel backstop, 2026-06-08.)
+    "src/texel/features\\.rs:\\d+:\\d+: replace > with >= in endgame_scale",
 ]

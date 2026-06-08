@@ -431,6 +431,49 @@ mod tests {
             .collect()
     }
 
+    /// Asymmetric passed-pawn fixtures: passers at varied ranks for BOTH
+    /// colors, with free / enemy-blocked / friendly-blocked path states and
+    /// differing king-promotion distances, plus a rook-on-open-file + knight
+    /// position. Added to close the M6.I/J mutation-backstop gap — the random
+    /// battery and the special fixtures rarely contain passed pawns, so the
+    /// `passed_term` (Tier 1) / `passed_features` (Tier 2) arithmetic (per-rank
+    /// bonus, 3-state path delta, per-step king tropism) went unexercised and
+    /// its mutants survived. These positions activate every passed-pawn branch.
+    fn passer_fixtures() -> Vec<Position> {
+        const FENS: &[&str] = &[
+            // White free passers at two ranks (Pd5 rel 4, Pb4 rel 3); kings far.
+            "7k/8/8/3P4/1P6/8/8/K7 w - - 0 1",
+            // Black free passers at two ranks (Pg5 rel 3, Pd4 rel 4).
+            "k7/8/8/6p1/3p4/8/8/7K w - - 0 1",
+            // Enemy-blocked white passer: Pd5 with black Rd6 in its path.
+            "7k/8/3r4/3P4/8/8/8/K7 w - - 0 1",
+            // Friendly-blocked white passer: Pd5 with white Nd6 in its path.
+            "7k/8/3N4/3P4/8/8/8/K7 w - - 0 1",
+            // Mixed colors: advanced black passer near promotion (Pc2 rel 6) +
+            // white passer Pe4 (rel 3); kings at differing promo distances.
+            "8/8/1k6/8/4P3/8/2p5/4K3 w - - 0 1",
+            // Rich: passed Pd5 + both rooks on the open e-file + white Nc3
+            // (also feeds the rook-file / outpost terms in reference_score_white).
+            "4r1k1/5ppp/8/3P4/8/2N5/5PPP/4R1K1 w - - 0 1",
+            // Own king HUGGING its passer's promo square: Pd7 (rel 6) with
+            // Kc6 → own_d = cheb(c6,d8) = 2 < cap(5), so (cap − own_d) ≠ 0 and
+            // the per-step own-king-tropism term is live. Black Kg2 is far, so
+            // the enemy-king term is exercised at saturation on the same pawn.
+            "8/3P4/2K5/8/8/8/6k1/8 w - - 0 1",
+            // Enemy king HUGGING our passer's promo: Pd7 (rel 6) with black
+            // Kd8 → enemy_d = 0 < cap, so (enemy_d − cap) ≠ 0; own Kd1 far.
+            "3k4/3P4/8/8/8/8/8/3K4 w - - 0 1",
+            // Outpost: white Nd5 supported by c4+e4 with no black c/e pawns ⇒
+            // op_mg/op_eg ≠ 0. Catches the `+ op_mg`/`+ op_eg` terms in
+            // reference_score_white, which the rook-file fixture's 3rd-rank
+            // knight left at zero. (c4/e4 are also passers — harmless overlap.)
+            "4k3/8/8/3N4/2P1P3/8/8/4K3 w - - 0 1",
+        ];
+        FENS.iter()
+            .map(|f| Position::from_fen(f).expect("passer fixture FEN must parse"))
+            .collect()
+    }
+
     /// A seeded core-weight vector at literature magnitude (`scale` ~ tens of
     /// cp). The exact values are immaterial — only that they are diverse and
     /// non-degenerate so the model-vs-reference check exercises the tuned
@@ -455,6 +498,7 @@ mod tests {
         let shipped = EvalParams::shipped();
         let mut positions = battery();
         positions.extend(special_fixtures());
+        positions.extend(passer_fixtures());
         for pos in &positions {
             let reference = reference_score_white(pos, &shipped);
             let engine = static_eval_white(pos);
@@ -493,7 +537,8 @@ mod tests {
     fn model_matches_reference_at_random_and_literature_weights() {
         const TOL_CP: f64 = 2.0;
         let shipped = EvalParams::shipped();
-        let positions = battery();
+        let mut positions = battery();
+        positions.extend(passer_fixtures());
 
         // Several seeded random vectors + the shipped core vec.
         let mut weight_vecs: Vec<Vec<f64>> = (1u64..=5).map(seeded_core_weights).collect();
@@ -562,6 +607,17 @@ mod tests {
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 80 45",
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 81 45",
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 100 51",
+            // ASYMMETRIC taper boundaries (black missing the h-pawn ⇒ white up
+            // ~1 pawn ⇒ blended ≠ 0; full phase=24 ≥ 5 ⇒ mop_up=0). The
+            // symmetric startpos fixtures above have blended ≈ 0, which
+            // nullifies the scale multiplier (blended·scale/DEN = 0 for any
+            // scale) and lets every taper mutation survive. These nonzero-blend
+            // fixtures make the tapered scale actually move the result, so
+            // endgame_scale's `hmc > 80` gate (caught at hmc 80 vs 81) and its
+            // span/prog/taper arithmetic (caught at hmc 100) are exercised.
+            "rnbqkbnr/ppppppp1/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 80 45",
+            "rnbqkbnr/ppppppp1/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 81 45",
+            "rnbqkbnr/ppppppp1/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 100 51",
         ];
 
         for fen in FENS {

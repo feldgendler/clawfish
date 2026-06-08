@@ -1,0 +1,7 @@
+Found 218 mutants to test
+ok       Unmutated baseline in 15s build + 1s test
+ INFO Auto-set test timeout to 20s
+MISSED   src/texel/features.rs:63:77: replace + with - in reference_score_white in 1s build + 1s test
+MISSED   src/texel/features.rs:65:77: replace + with - in reference_score_white in 2s build + 1s test
+MISSED   src/texel/features.rs:243:12: replace > with >= in endgame_scale in 10s build + 2s test
+218 mutants tested in 36m: 3 missed, 214 caught, 1 unviable
