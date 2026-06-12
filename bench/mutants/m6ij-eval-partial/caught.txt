@@ -1,0 +1,328 @@
+src/eval/king_safety.rs:26:5: replace king_zone -> Bitboard with Default::default()
+src/eval/king_safety.rs:31:10: replace | with & in king_zone
+src/eval/king_safety.rs:31:10: replace | with ^ in king_zone
+src/eval/king_safety.rs:31:17: replace & with | in king_zone
+src/eval/king_safety.rs:31:17: replace & with ^ in king_zone
+src/eval/king_safety.rs:31:19: delete ! in king_zone
+src/eval/king_safety.rs:41:5: replace shield_open_file_signed_counts -> [i32; 8] with [0; 8]
+src/eval/king_safety.rs:41:5: replace shield_open_file_signed_counts -> [i32; 8] with [1; 8]
+src/eval/king_safety.rs:41:5: replace shield_open_file_signed_counts -> [i32; 8] with [-1; 8]
+src/eval/king_safety.rs:43:49: replace | with & in shield_open_file_signed_counts
+src/eval/king_safety.rs:48:63: delete - in shield_open_file_signed_counts
+src/eval/king_safety.rs:57:20: replace || with && in shield_open_file_signed_counts
+src/eval/king_safety.rs:57:15: replace >= with < in shield_open_file_signed_counts
+src/eval/king_safety.rs:57:26: replace <= with > in shield_open_file_signed_counts
+src/eval/king_safety.rs:63:26: replace + with - in shield_open_file_signed_counts
+src/eval/king_safety.rs:63:26: replace + with * in shield_open_file_signed_counts
+src/eval/king_safety.rs:68:31: replace += with -= in shield_open_file_signed_counts
+src/eval/king_safety.rs:68:31: replace += with *= in shield_open_file_signed_counts
+src/eval/king_safety.rs:71:31: replace += with -= in shield_open_file_signed_counts
+src/eval/king_safety.rs:71:31: replace += with *= in shield_open_file_signed_counts
+src/eval/king_safety.rs:72:31: replace += with -= in shield_open_file_signed_counts
+src/eval/king_safety.rs:72:31: replace += with *= in shield_open_file_signed_counts
+src/eval/king_safety.rs:82:12: delete ! in shield_open_file_signed_counts
+src/eval/king_safety.rs:83:23: replace += with -= in shield_open_file_signed_counts
+src/eval/king_safety.rs:83:23: replace += with *= in shield_open_file_signed_counts
+src/eval/king_safety.rs:84:19: delete ! in shield_open_file_signed_counts
+src/eval/king_safety.rs:85:23: replace += with -= in shield_open_file_signed_counts
+src/eval/king_safety.rs:85:23: replace += with *= in shield_open_file_signed_counts
+src/eval/king_safety.rs:87:62: replace < with == in shield_open_file_signed_counts
+src/eval/king_safety.rs:87:62: replace < with > in shield_open_file_signed_counts
+src/eval/king_safety.rs:87:62: replace < with <= in shield_open_file_signed_counts
+src/eval/king_safety.rs:87:76: replace + with - in shield_open_file_signed_counts
+src/eval/king_safety.rs:87:76: replace + with * in shield_open_file_signed_counts
+src/eval/king_safety.rs:90:16: delete ! in shield_open_file_signed_counts
+src/eval/king_safety.rs:91:27: replace += with -= in shield_open_file_signed_counts
+src/eval/king_safety.rs:91:27: replace += with *= in shield_open_file_signed_counts
+src/eval/king_safety.rs:92:26: replace += with -= in shield_open_file_signed_counts
+src/eval/king_safety.rs:110:5: replace shield_open_file_features -> Vec<(u16, i32)> with vec![]
+src/eval/king_safety.rs:110:5: replace shield_open_file_features -> Vec<(u16, i32)> with vec![(0, 0)]
+src/eval/king_safety.rs:110:5: replace shield_open_file_features -> Vec<(u16, i32)> with vec![(0, 1)]
+src/eval/king_safety.rs:110:5: replace shield_open_file_features -> Vec<(u16, i32)> with vec![(0, -1)]
+src/eval/king_safety.rs:110:5: replace shield_open_file_features -> Vec<(u16, i32)> with vec![(1, 0)]
+src/eval/king_safety.rs:110:5: replace shield_open_file_features -> Vec<(u16, i32)> with vec![(1, 1)]
+src/eval/king_safety.rs:110:5: replace shield_open_file_features -> Vec<(u16, i32)> with vec![(1, -1)]
+src/eval/king_safety.rs:115:18: replace != with == in shield_open_file_features
+src/eval/king_safety.rs:116:30: replace + with - in shield_open_file_features
+src/eval/king_safety.rs:116:30: replace + with * in shield_open_file_features
+src/eval/king_safety.rs:127:5: replace shield_open_file_term_white -> (i32, i32) with (0, 0)
+src/eval/king_safety.rs:127:5: replace shield_open_file_term_white -> (i32, i32) with (0, 1)
+src/eval/king_safety.rs:127:5: replace shield_open_file_term_white -> (i32, i32) with (0, -1)
+src/eval/king_safety.rs:127:5: replace shield_open_file_term_white -> (i32, i32) with (1, 0)
+src/eval/king_safety.rs:127:5: replace shield_open_file_term_white -> (i32, i32) with (1, 1)
+src/eval/king_safety.rs:127:5: replace shield_open_file_term_white -> (i32, i32) with (1, -1)
+src/eval/king_safety.rs:127:5: replace shield_open_file_term_white -> (i32, i32) with (-1, 0)
+src/eval/king_safety.rs:127:5: replace shield_open_file_term_white -> (i32, i32) with (-1, 1)
+src/eval/king_safety.rs:127:5: replace shield_open_file_term_white -> (i32, i32) with (-1, -1)
+src/eval/king_safety.rs:134:9: replace + with - in shield_open_file_term_white
+src/eval/king_safety.rs:134:9: replace + with * in shield_open_file_term_white
+src/eval/king_safety.rs:133:9: replace + with - in shield_open_file_term_white
+src/eval/king_safety.rs:133:9: replace + with * in shield_open_file_term_white
+src/eval/king_safety.rs:132:9: replace + with - in shield_open_file_term_white
+src/eval/king_safety.rs:132:9: replace + with * in shield_open_file_term_white
+src/eval/king_safety.rs:131:9: replace + with - in shield_open_file_term_white
+src/eval/king_safety.rs:131:9: replace + with * in shield_open_file_term_white
+src/eval/king_safety.rs:130:9: replace + with - in shield_open_file_term_white
+src/eval/king_safety.rs:130:9: replace + with * in shield_open_file_term_white
+src/eval/king_safety.rs:129:26: replace * with + in shield_open_file_term_white
+src/eval/king_safety.rs:129:26: replace * with / in shield_open_file_term_white
+src/eval/king_safety.rs:130:23: replace * with + in shield_open_file_term_white
+src/eval/king_safety.rs:130:23: replace * with / in shield_open_file_term_white
+src/eval/king_safety.rs:131:33: replace * with + in shield_open_file_term_white
+src/eval/king_safety.rs:131:33: replace * with / in shield_open_file_term_white
+src/eval/king_safety.rs:132:28: replace * with + in shield_open_file_term_white
+src/eval/king_safety.rs:132:28: replace * with / in shield_open_file_term_white
+src/eval/king_safety.rs:133:31: replace * with + in shield_open_file_term_white
+src/eval/king_safety.rs:133:31: replace * with / in shield_open_file_term_white
+src/eval/king_safety.rs:134:36: replace * with + in shield_open_file_term_white
+src/eval/king_safety.rs:134:36: replace * with / in shield_open_file_term_white
+src/eval/king_safety.rs:135:33: replace + with - in shield_open_file_term_white
+src/eval/king_safety.rs:135:33: replace + with * in shield_open_file_term_white
+src/eval/king_safety.rs:135:26: replace * with + in shield_open_file_term_white
+src/eval/king_safety.rs:135:26: replace * with / in shield_open_file_term_white
+src/eval/king_safety.rs:135:47: replace * with + in shield_open_file_term_white
+src/eval/king_safety.rs:135:47: replace * with / in shield_open_file_term_white
+src/eval/king_safety.rs:144:5: replace king_safety_term_white -> (i32, i32) with (0, 0)
+src/eval/king_safety.rs:144:5: replace king_safety_term_white -> (i32, i32) with (0, 1)
+src/eval/king_safety.rs:144:5: replace king_safety_term_white -> (i32, i32) with (0, -1)
+src/eval/king_safety.rs:144:5: replace king_safety_term_white -> (i32, i32) with (1, 0)
+src/eval/king_safety.rs:144:5: replace king_safety_term_white -> (i32, i32) with (1, 1)
+src/eval/king_safety.rs:144:5: replace king_safety_term_white -> (i32, i32) with (1, -1)
+src/eval/king_safety.rs:144:5: replace king_safety_term_white -> (i32, i32) with (-1, 0)
+src/eval/king_safety.rs:144:5: replace king_safety_term_white -> (i32, i32) with (-1, 1)
+src/eval/king_safety.rs:144:5: replace king_safety_term_white -> (i32, i32) with (-1, -1)
+src/eval/king_safety.rs:146:49: replace | with & in king_safety_term_white
+src/eval/king_safety.rs:149:63: delete - in king_safety_term_white
+src/eval/king_safety.rs:163:30: replace || with && in king_safety_term_white
+src/eval/king_safety.rs:163:15: replace >= with < in king_safety_term_white
+src/eval/king_safety.rs:163:36: replace <= with > in king_safety_term_white
+src/eval/king_safety.rs:171:26: replace + with * in king_safety_term_white
+src/eval/king_safety.rs:176:27: replace += with -= in king_safety_term_white
+src/eval/king_safety.rs:176:27: replace += with *= in king_safety_term_white
+src/eval/king_safety.rs:177:27: replace += with -= in king_safety_term_white
+src/eval/king_safety.rs:177:27: replace += with *= in king_safety_term_white
+src/eval/king_safety.rs:179:27: replace += with -= in king_safety_term_white
+src/eval/king_safety.rs:179:27: replace += with *= in king_safety_term_white
+src/eval/king_safety.rs:180:27: replace += with -= in king_safety_term_white
+src/eval/king_safety.rs:180:27: replace += with *= in king_safety_term_white
+src/eval/king_safety.rs:192:12: delete ! in king_safety_term_white
+src/eval/king_safety.rs:193:19: replace += with -= in king_safety_term_white
+src/eval/king_safety.rs:193:19: replace += with *= in king_safety_term_white
+src/eval/king_safety.rs:194:19: delete ! in king_safety_term_white
+src/eval/king_safety.rs:195:19: replace += with -= in king_safety_term_white
+src/eval/king_safety.rs:195:19: replace += with *= in king_safety_term_white
+src/eval/king_safety.rs:198:62: replace < with == in king_safety_term_white
+src/eval/king_safety.rs:198:62: replace < with > in king_safety_term_white
+src/eval/king_safety.rs:198:62: replace < with <= in king_safety_term_white
+src/eval/king_safety.rs:198:76: replace + with * in king_safety_term_white
+src/eval/king_safety.rs:201:16: delete ! in king_safety_term_white
+src/eval/king_safety.rs:202:23: replace += with -= in king_safety_term_white
+src/eval/king_safety.rs:202:23: replace += with *= in king_safety_term_white
+src/eval/king_safety.rs:203:26: replace += with *= in king_safety_term_white
+src/eval/king_safety.rs:206:21: replace == with != in king_safety_term_white
+src/eval/king_safety.rs:207:19: replace += with -= in king_safety_term_white
+src/eval/king_safety.rs:207:19: replace += with *= in king_safety_term_white
+src/eval/king_safety.rs:210:12: replace += with -= in king_safety_term_white
+src/eval/king_safety.rs:210:12: replace += with *= in king_safety_term_white
+src/eval/king_safety.rs:210:20: replace * with + in king_safety_term_white
+src/eval/king_safety.rs:211:12: replace += with -= in king_safety_term_white
+src/eval/king_safety.rs:211:12: replace += with *= in king_safety_term_white
+src/eval/king_safety.rs:211:20: replace * with + in king_safety_term_white
+src/eval/mobility.rs:27:5: replace mobility_features -> Vec<(u16, i32)> with vec![]
+src/eval/mobility.rs:27:5: replace mobility_features -> Vec<(u16, i32)> with vec![(0, 0)]
+src/eval/mobility.rs:27:5: replace mobility_features -> Vec<(u16, i32)> with vec![(0, 1)]
+src/eval/mobility.rs:27:5: replace mobility_features -> Vec<(u16, i32)> with vec![(0, -1)]
+src/eval/mobility.rs:27:5: replace mobility_features -> Vec<(u16, i32)> with vec![(1, 0)]
+src/eval/mobility.rs:27:5: replace mobility_features -> Vec<(u16, i32)> with vec![(1, 1)]
+src/eval/mobility.rs:27:5: replace mobility_features -> Vec<(u16, i32)> with vec![(1, -1)]
+src/eval/mobility.rs:32:48: replace | with & in mobility_features
+src/eval/mobility.rs:32:48: replace | with ^ in mobility_features
+src/eval/mobility.rs:33:48: replace | with & in mobility_features
+src/eval/mobility.rs:33:48: replace | with ^ in mobility_features
+src/eval/mobility.rs:41:63: delete - in mobility_features
+src/eval/mobility.rs:46:20: delete ! in mobility_features
+src/eval/mobility.rs:46:41: replace | with & in mobility_features
+src/eval/mobility.rs:46:41: replace | with ^ in mobility_features
+src/eval/mobility.rs:49:57: replace & with | in mobility_features
+src/eval/mobility.rs:49:57: replace & with ^ in mobility_features
+src/eval/mobility.rs:51:23: replace += with -= in mobility_features
+src/eval/mobility.rs:51:23: replace += with *= in mobility_features
+src/eval/mobility.rs:54:57: replace & with | in mobility_features
+src/eval/mobility.rs:54:57: replace & with ^ in mobility_features
+src/eval/mobility.rs:56:23: replace += with -= in mobility_features
+src/eval/mobility.rs:56:23: replace += with *= in mobility_features
+src/eval/mobility.rs:59:55: replace & with | in mobility_features
+src/eval/mobility.rs:59:55: replace & with ^ in mobility_features
+src/eval/mobility.rs:61:21: replace += with -= in mobility_features
+src/eval/mobility.rs:61:21: replace += with *= in mobility_features
+src/eval/mobility.rs:64:56: replace & with | in mobility_features
+src/eval/mobility.rs:64:56: replace & with ^ in mobility_features
+src/eval/mobility.rs:66:22: replace += with -= in mobility_features
+src/eval/mobility.rs:66:22: replace += with *= in mobility_features
+src/eval/mobility.rs:82:22: replace != with == in mobility_features
+src/eval/mobility.rs:83:34: replace + with - in mobility_features
+src/eval/mobility.rs:83:34: replace + with * in mobility_features
+src/eval/mobility.rs:84:38: replace + with - in mobility_features
+src/eval/mobility.rs:84:38: replace + with * in mobility_features
+src/eval/mobility.rs:84:34: replace + with - in mobility_features
+src/eval/mobility.rs:84:34: replace + with * in mobility_features
+src/eval/mobility.rs:94:5: replace mobility_term_white -> (i32, i32) with (0, 0)
+src/eval/mobility.rs:94:5: replace mobility_term_white -> (i32, i32) with (0, 1)
+src/eval/mobility.rs:94:5: replace mobility_term_white -> (i32, i32) with (0, -1)
+src/eval/mobility.rs:94:5: replace mobility_term_white -> (i32, i32) with (1, 0)
+src/eval/mobility.rs:94:5: replace mobility_term_white -> (i32, i32) with (1, 1)
+src/eval/mobility.rs:94:5: replace mobility_term_white -> (i32, i32) with (1, -1)
+src/eval/mobility.rs:94:5: replace mobility_term_white -> (i32, i32) with (-1, 0)
+src/eval/mobility.rs:94:5: replace mobility_term_white -> (i32, i32) with (-1, 1)
+src/eval/mobility.rs:94:5: replace mobility_term_white -> (i32, i32) with (-1, -1)
+src/eval/mobility.rs:99:48: replace | with & in mobility_term_white
+src/eval/mobility.rs:99:48: replace | with ^ in mobility_term_white
+src/eval/mobility.rs:100:48: replace | with & in mobility_term_white
+src/eval/mobility.rs:100:48: replace | with ^ in mobility_term_white
+src/eval/mobility.rs:102:63: delete - in mobility_term_white
+src/eval/mobility.rs:108:20: delete ! in mobility_term_white
+src/eval/mobility.rs:108:41: replace | with & in mobility_term_white
+src/eval/mobility.rs:108:41: replace | with ^ in mobility_term_white
+src/eval/mobility.rs:113:16: replace += with -= in mobility_term_white
+src/eval/mobility.rs:113:24: replace * with + in mobility_term_white
+src/eval/mobility.rs:113:24: replace * with / in mobility_term_white
+src/eval/mobility.rs:114:16: replace += with -= in mobility_term_white
+src/eval/mobility.rs:114:24: replace * with + in mobility_term_white
+src/eval/mobility.rs:114:24: replace * with / in mobility_term_white
+src/eval/mobility.rs:119:16: replace += with -= in mobility_term_white
+src/eval/mobility.rs:119:24: replace * with + in mobility_term_white
+src/eval/mobility.rs:119:24: replace * with / in mobility_term_white
+src/eval/mobility.rs:120:16: replace += with -= in mobility_term_white
+src/eval/mobility.rs:120:24: replace * with + in mobility_term_white
+src/eval/mobility.rs:120:24: replace * with / in mobility_term_white
+src/eval/mobility.rs:125:16: replace += with -= in mobility_term_white
+src/eval/mobility.rs:125:24: replace * with + in mobility_term_white
+src/eval/mobility.rs:125:24: replace * with / in mobility_term_white
+src/eval/mobility.rs:126:16: replace += with -= in mobility_term_white
+src/eval/mobility.rs:126:24: replace * with + in mobility_term_white
+src/eval/mobility.rs:126:24: replace * with / in mobility_term_white
+src/eval/mobility.rs:131:16: replace += with -= in mobility_term_white
+src/eval/mobility.rs:131:24: replace * with + in mobility_term_white
+src/eval/mobility.rs:131:24: replace * with / in mobility_term_white
+src/eval/mobility.rs:132:16: replace += with -= in mobility_term_white
+src/eval/mobility.rs:132:24: replace * with + in mobility_term_white
+src/eval/mobility.rs:132:24: replace * with / in mobility_term_white
+src/eval/pawns.rs:50:91: delete - in pawn_eval
+src/eval/pawns.rs:70:35: replace - with / in pawn_eval
+src/eval/pawns.rs:72:21: replace += with -= in pawn_eval
+src/eval/pawns.rs:72:21: replace += with *= in pawn_eval
+src/eval/pawns.rs:73:21: replace += with -= in pawn_eval
+src/eval/pawns.rs:73:21: replace += with *= in pawn_eval
+src/eval/pawns.rs:76:12: replace += with -= in pawn_eval
+src/eval/pawns.rs:76:12: replace += with *= in pawn_eval
+src/eval/pawns.rs:77:13: replace * with + in pawn_eval
+src/eval/pawns.rs:77:86: replace + with - in pawn_eval
+src/eval/pawns.rs:77:86: replace + with * in pawn_eval
+src/eval/pawns.rs:77:65: replace + with - in pawn_eval
+src/eval/pawns.rs:77:65: replace + with * in pawn_eval
+src/eval/pawns.rs:77:35: replace + with - in pawn_eval
+src/eval/pawns.rs:77:35: replace + with * in pawn_eval
+src/eval/pawns.rs:77:23: replace * with + in pawn_eval
+src/eval/pawns.rs:77:44: replace * with + in pawn_eval
+src/eval/pawns.rs:77:74: replace * with + in pawn_eval
+src/eval/pawns.rs:78:12: replace += with -= in pawn_eval
+src/eval/pawns.rs:78:12: replace += with *= in pawn_eval
+src/eval/pawns.rs:79:13: replace * with + in pawn_eval
+src/eval/pawns.rs:79:86: replace + with - in pawn_eval
+src/eval/pawns.rs:79:86: replace + with * in pawn_eval
+src/eval/pawns.rs:79:65: replace + with - in pawn_eval
+src/eval/pawns.rs:79:65: replace + with * in pawn_eval
+src/eval/pawns.rs:79:35: replace + with - in pawn_eval
+src/eval/pawns.rs:79:35: replace + with * in pawn_eval
+src/eval/pawns.rs:79:23: replace * with + in pawn_eval
+src/eval/pawns.rs:79:44: replace * with + in pawn_eval
+src/eval/pawns.rs:79:74: replace * with + in pawn_eval
+src/eval/pawns.rs:134:9: replace PawnHashTable::clear with ()
+src/eval/pawns.rs:217:5: replace isolated_pawns -> Bitboard with Default::default()
+src/eval/pawns.rs:218:50: replace | with & in isolated_pawns
+src/eval/pawns.rs:218:50: replace | with ^ in isolated_pawns
+src/eval/pawns.rs:219:9: replace & with | in isolated_pawns
+src/eval/pawns.rs:219:9: replace & with ^ in isolated_pawns
+src/eval/pawns.rs:219:11: delete ! in isolated_pawns
+src/eval/pawns.rs:233:5: replace doubled_pawns -> Bitboard with Default::default()
+src/eval/pawns.rs:233:9: replace & with | in doubled_pawns
+src/eval/pawns.rs:233:9: replace & with ^ in doubled_pawns
+src/eval/pawns.rs:241:5: replace backward_pawns -> Bitboard with Default::default()
+src/eval/pawns.rs:246:58: replace | with & in backward_pawns
+src/eval/pawns.rs:246:58: replace | with ^ in backward_pawns
+src/eval/pawns.rs:249:17: replace | with & in backward_pawns
+src/eval/pawns.rs:252:36: replace & with | in backward_pawns
+src/eval/pawns.rs:252:36: replace & with ^ in backward_pawns
+src/eval/pawns.rs:252:20: replace & with | in backward_pawns
+src/eval/pawns.rs:252:20: replace & with ^ in backward_pawns
+src/eval/pawns.rs:252:38: delete ! in backward_pawns
+src/eval/pawns.rs:257:58: replace | with & in backward_pawns
+src/eval/pawns.rs:259:17: replace | with & in backward_pawns
+src/eval/pawns.rs:260:36: replace & with | in backward_pawns
+src/eval/pawns.rs:260:36: replace & with ^ in backward_pawns
+src/eval/pawns.rs:260:20: replace & with | in backward_pawns
+src/eval/pawns.rs:260:20: replace & with ^ in backward_pawns
+src/eval/pawns.rs:260:38: delete ! in backward_pawns
+src/eval/pawns.rs:273:5: replace connected_pawns -> Bitboard with Default::default()
+src/eval/pawns.rs:273:23: replace & with | in connected_pawns
+src/eval/pawns.rs:273:23: replace & with ^ in connected_pawns
+src/eval/pawns.rs:273:43: replace | with & in connected_pawns
+src/eval/pawns.rs:279:29: replace & with | in connected_pawns
+src/eval/pawns.rs:279:29: replace & with ^ in connected_pawns
+src/eval/pawns.rs:279:55: replace | with & in connected_pawns
+src/eval/pawns.rs:280:29: replace & with | in connected_pawns
+src/eval/pawns.rs:280:29: replace & with ^ in connected_pawns
+src/eval/pawns.rs:283:13: replace | with & in connected_pawns
+src/eval/pawns.rs:291:5: replace passed_pawns -> Bitboard with Default::default()
+src/eval/pawns.rs:294:34: replace | with & in passed_pawns
+src/eval/pawns.rs:294:34: replace | with ^ in passed_pawns
+src/eval/pawns.rs:294:16: replace | with & in passed_pawns
+src/eval/pawns.rs:294:16: replace | with ^ in passed_pawns
+src/eval/pawns.rs:298:34: replace | with & in passed_pawns
+src/eval/pawns.rs:298:34: replace | with ^ in passed_pawns
+src/eval/pawns.rs:298:16: replace | with & in passed_pawns
+src/eval/pawns.rs:298:16: replace | with ^ in passed_pawns
+src/eval/pawns.rs:301:9: replace & with | in passed_pawns
+src/eval/pawns.rs:301:9: replace & with ^ in passed_pawns
+src/eval/pawns.rs:301:11: delete ! in passed_pawns
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, 0, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, 0, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, 0, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, 1, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, 1, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, 1, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, -1, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, -1, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, -1, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, 0, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, 0, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, 0, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, 1, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, 1, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, 1, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, -1, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, -1, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, -1, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, 0, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, 0, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, 0, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, 1, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, 1, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, 1, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, -1, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, -1, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, -1, -1)
+src/eval/pawns.rs:311:91: delete - in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:312:13: replace += with -= in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:312:13: replace += with *= in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:312:21: replace * with + in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:312:21: replace * with / in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:313:13: replace += with -= in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:313:13: replace += with *= in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:313:21: replace * with + in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:313:21: replace * with / in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:314:13: replace += with -= in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:314:13: replace += with *= in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:314:21: replace * with + in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:314:21: replace * with / in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:326:5: replace iso_dbl_bwd_features -> Vec<(u16, i32)> with vec![]

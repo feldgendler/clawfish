@@ -1,0 +1,16 @@
+src/eval/king_safety.rs:43:49: replace | with ^ in shield_open_file_signed_counts
+src/eval/king_safety.rs:69:31: replace += with -= in shield_open_file_signed_counts
+src/eval/king_safety.rs:69:31: replace += with *= in shield_open_file_signed_counts
+src/eval/king_safety.rs:92:26: replace += with *= in shield_open_file_signed_counts
+src/eval/king_safety.rs:95:21: replace == with != in shield_open_file_signed_counts
+src/eval/king_safety.rs:96:23: replace += with -= in shield_open_file_signed_counts
+src/eval/king_safety.rs:96:23: replace += with *= in shield_open_file_signed_counts
+src/eval/king_safety.rs:146:49: replace | with ^ in king_safety_term_white
+src/eval/pawns.rs:249:17: replace | with ^ in backward_pawns
+src/eval/pawns.rs:257:58: replace | with ^ in backward_pawns
+src/eval/pawns.rs:259:17: replace | with ^ in backward_pawns
+src/eval/pawns.rs:273:43: replace | with ^ in connected_pawns
+src/eval/pawns.rs:279:55: replace | with ^ in connected_pawns
+src/eval/pawns.rs:280:55: replace | with & in connected_pawns
+src/eval/pawns.rs:280:55: replace | with ^ in connected_pawns
+src/eval/pawns.rs:283:13: replace | with ^ in connected_pawns

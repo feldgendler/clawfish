@@ -1,0 +1,8 @@
+src/eval/pawns.rs:43:5: replace pawn_eval -> PawnEval with Default::default()
+src/eval/pawns.rs:88:62: replace / with %
+src/eval/pawns.rs:88:62: replace / with *
+src/eval/pawns.rs:88:55: replace * with +
+src/eval/pawns.rs:88:55: replace * with /
+src/eval/pawns.rs:88:48: replace * with +
+src/eval/pawns.rs:88:48: replace * with /
+src/eval/pawns.rs:148:9: replace PawnHashTable::get -> PawnEval with Default::default()

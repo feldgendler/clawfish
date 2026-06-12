@@ -1,0 +1,55 @@
+Found 715 mutants to test
+ok       Unmutated baseline in 14s build + 32s test
+ INFO Auto-set test timeout to 162s
+MISSED   src/eval/king_safety.rs:43:49: replace | with ^ in shield_open_file_signed_counts in 2s build + 42s test
+MISSED   src/eval/king_safety.rs:69:31: replace += with -= in shield_open_file_signed_counts in 2s build + 55s test
+MISSED   src/eval/king_safety.rs:69:31: replace += with *= in shield_open_file_signed_counts in 3s build + 53s test
+MISSED   src/eval/king_safety.rs:92:26: replace += with *= in shield_open_file_signed_counts in 4s build + 62s test
+MISSED   src/eval/king_safety.rs:95:21: replace == with != in shield_open_file_signed_counts in 4s build + 60s test
+MISSED   src/eval/king_safety.rs:96:23: replace += with -= in shield_open_file_signed_counts in 4s build + 58s test
+MISSED   src/eval/king_safety.rs:96:23: replace += with *= in shield_open_file_signed_counts in 4s build + 57s test
+MISSED   src/eval/king_safety.rs:146:49: replace | with ^ in king_safety_term_white in 5s build + 49s test
+TIMEOUT  src/eval/king_safety.rs:171:26: replace + with - in king_safety_term_white in 5s build + 162s test
+TIMEOUT  src/eval/king_safety.rs:198:76: replace + with - in king_safety_term_white in 6s build + 162s test
+TIMEOUT  src/eval/king_safety.rs:203:26: replace += with -= in king_safety_term_white in 7s build + 162s test
+TIMEOUT  src/eval/king_safety.rs:210:20: replace * with / in king_safety_term_white in 7s build + 162s test
+TIMEOUT  src/eval/king_safety.rs:211:20: replace * with / in king_safety_term_white in 6s build + 162s test
+TIMEOUT  src/eval/mobility.rs:111:57: replace & with | in mobility_term_white in 10s build + 162s test
+TIMEOUT  src/eval/mobility.rs:111:57: replace & with ^ in mobility_term_white in 8s build + 162s test
+TIMEOUT  src/eval/mobility.rs:113:16: replace += with *= in mobility_term_white in 8s build + 162s test
+TIMEOUT  src/eval/mobility.rs:114:16: replace += with *= in mobility_term_white in 9s build + 162s test
+TIMEOUT  src/eval/mobility.rs:117:57: replace & with | in mobility_term_white in 9s build + 162s test
+TIMEOUT  src/eval/mobility.rs:117:57: replace & with ^ in mobility_term_white in 8s build + 162s test
+TIMEOUT  src/eval/mobility.rs:119:16: replace += with *= in mobility_term_white in 8s build + 162s test
+TIMEOUT  src/eval/mobility.rs:120:16: replace += with *= in mobility_term_white in 9s build + 162s test
+TIMEOUT  src/eval/mobility.rs:123:55: replace & with | in mobility_term_white in 9s build + 162s test
+TIMEOUT  src/eval/mobility.rs:123:55: replace & with ^ in mobility_term_white in 9s build + 162s test
+TIMEOUT  src/eval/mobility.rs:125:16: replace += with *= in mobility_term_white in 9s build + 162s test
+TIMEOUT  src/eval/mobility.rs:126:16: replace += with *= in mobility_term_white in 10s build + 162s test
+TIMEOUT  src/eval/mobility.rs:129:56: replace & with | in mobility_term_white in 10s build + 162s test
+TIMEOUT  src/eval/mobility.rs:129:56: replace & with ^ in mobility_term_white in 9s build + 162s test
+TIMEOUT  src/eval/mobility.rs:131:16: replace += with *= in mobility_term_white in 9s build + 162s test
+TIMEOUT  src/eval/mobility.rs:132:16: replace += with *= in mobility_term_white in 10s build + 162s test
+TIMEOUT  src/eval/pawns.rs:70:35: replace - with + in pawn_eval in 11s build + 162s test
+TIMEOUT  src/eval/pawns.rs:77:13: replace * with / in pawn_eval in 12s build + 162s test
+TIMEOUT  src/eval/pawns.rs:77:23: replace * with / in pawn_eval in 13s build + 162s test
+TIMEOUT  src/eval/pawns.rs:77:44: replace * with / in pawn_eval in 11s build + 162s test
+TIMEOUT  src/eval/pawns.rs:77:74: replace * with / in pawn_eval in 11s build + 162s test
+TIMEOUT  src/eval/pawns.rs:79:13: replace * with / in pawn_eval in 12s build + 162s test
+TIMEOUT  src/eval/pawns.rs:79:23: replace * with / in pawn_eval in 14s build + 162s test
+TIMEOUT  src/eval/pawns.rs:79:44: replace * with / in pawn_eval in 12s build + 162s test
+TIMEOUT  src/eval/pawns.rs:79:74: replace * with / in pawn_eval in 12s build + 162s test
+TIMEOUT  src/eval/pawns.rs:156:34: replace & with | in PawnHashTable::get in 12s build + 162s test
+TIMEOUT  src/eval/pawns.rs:156:34: replace & with ^ in PawnHashTable::get in 12s build + 162s test
+TIMEOUT  src/eval/pawns.rs:156:55: replace - with + in PawnHashTable::get in 15s build + 162s test
+TIMEOUT  src/eval/pawns.rs:156:55: replace - with / in PawnHashTable::get in 15s build + 162s test
+MISSED   src/eval/pawns.rs:249:17: replace | with ^ in backward_pawns in 15s build + 49s test
+MISSED   src/eval/pawns.rs:257:58: replace | with ^ in backward_pawns in 16s build + 49s test
+MISSED   src/eval/pawns.rs:259:17: replace | with ^ in backward_pawns in 16s build + 47s test
+MISSED   src/eval/pawns.rs:273:43: replace | with ^ in connected_pawns in 18s build + 50s test
+MISSED   src/eval/pawns.rs:279:55: replace | with ^ in connected_pawns in 19s build + 52s test
+MISSED   src/eval/pawns.rs:280:55: replace | with & in connected_pawns in 17s build + 44s test
+MISSED   src/eval/pawns.rs:280:55: replace | with ^ in connected_pawns in 18s build + 50s test
+MISSED   src/eval/pawns.rs:283:13: replace | with ^ in connected_pawns in 18s build + 49s test
+ERROR interrupted
+ERROR scenario execution internal error err=interrupted phase=Test
