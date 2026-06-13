@@ -215,7 +215,7 @@ pub(crate) fn king_safety_term_white(pos: &Position) -> (i32, i32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{king_safety_term_white, king_zone};
+    use super::{king_safety_term_white, king_zone, shield_open_file_signed_counts};
     use crate::bitboard;
     use crate::eval::data::{
         KS_ADJ_SEMI_OPEN_MG, KS_BOTH_ADJ_SEMI_OPEN_MG, KS_KFILE_OPEN_MG, KS_KFILE_SEMI_OPEN_MG,
@@ -861,6 +861,120 @@ mod tests {
             adj_count, 1,
             "a-file king has only 1 adjacent file (b); \
              KS_BOTH_ADJ_SEMI_OPEN_MG can never be triggered (semi_adj ≤ 1)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mutation-backstop fixtures for shield_open_file_signed_counts.
+    //
+    // The public API tests above drive `king_safety_term_white`, which has its
+    // own duplicate accumulator loop.  `shield_open_file_signed_counts` is a
+    // private helper only reachable through `shield_open_file_term_white` /
+    // `shield_open_file_features`, so its accumulator mutations survive the
+    // existing suite.  The fixtures below pin exact slot arrays and are
+    // designed to distinguish every surviving mutant.
+    //
+    // Slot layout (matches the code comments):
+    //   [0]=SHIELD_1 MG  [1]=SHIELD_1 EG  [2]=SHIELD_2 MG  [3]=SHIELD_2 EG
+    //   [4]=KFILE_SEMI_OPEN  [5]=KFILE_OPEN  [6]=ADJ_SEMI_OPEN  [7]=BOTH_ADJ
+    // -----------------------------------------------------------------------
+
+    /// White Kg1 + Pf2, Black Ka8, no other pawns.
+    ///
+    /// Detailed count derivation (white sign=+1, black sign=−1):
+    ///
+    /// White (kf=6, files 5–7, r2=1, r3=2):
+    ///   f(5): Pf2 on rank 2 → on2=true → counts[0]+=1, counts[1]+=1.
+    ///   g(6): no pawn. h(7): no pawn.
+    ///   Kfile g: all_pawn_files = f-file only. has_any(6)=false → counts[5]+=1.
+    ///   adj h(7): has_own(7)=false → counts[6]+=1. f(5): has_own(5)=true → no adj.
+    ///   semi_adj=1 → counts[7] unchanged.
+    ///
+    /// Black (kf=0, files 0–1, r2=6, r3=5):
+    ///   a(0): a7 absent. b(1): b7 absent. → no shield.
+    ///   Kfile a: has_any(0)=false → counts[5]+= −1.
+    ///   adj b(1): has_own(1)=false → counts[6]+= −1. semi_adj=1 → counts[7] unchanged.
+    ///
+    /// Result: counts[5] = 1−1 = 0; counts[6] = 1−1 = 0.
+    /// Final: [1, 1, 0, 0, 0, 0, 0, 0].
+    ///
+    /// Catches (line 69):
+    ///   `+= → -=`: White f-pawn: 0 -= 1 = −1 ≠ 1.
+    ///   `+= → *=`: White f-pawn: 0 *= 1 = 0 ≠ 1.
+    #[test]
+    fn signed_counts_shield1_pawn_isolated() {
+        // White Kg1, Pf2. Black Ka8.
+        let pos = pos_of("k7/8/8/8/8/8/5P2/6K1 w - - 0 1");
+        assert_eq!(
+            pos.king_square(Color::White).file(),
+            6,
+            "White king on g-file"
+        );
+        assert_eq!(
+            pos.king_square(Color::Black).file(),
+            0,
+            "Black king on a-file"
+        );
+
+        let counts = shield_open_file_signed_counts(&pos);
+        assert_eq!(
+            counts,
+            [1, 1, 0, 0, 0, 0, 0, 0],
+            "Pf2 contributes exactly 1 SHIELD_1 slot; all other slots cancel or are 0"
+        );
+    }
+
+    /// White Kg1 + Pg2, Black Ka8, no other pawns.
+    ///
+    /// Detailed count derivation:
+    ///
+    /// White (kf=6, files 5–7, r2=1, r3=2):
+    ///   f(5): absent. g(6): Pg2 on rank 2 → on2=true → counts[0]+=1, counts[1]+=1.
+    ///   h(7): absent.
+    ///   Kfile g: all_pawn_files = g-file. has_any(6)=true, has_own(6)=true → no kfile penalty.
+    ///   adj f(5): has_own(5)=false → counts[6]+=1. adj h(7): has_own(7)=false → counts[6]+=1.
+    ///   semi_adj=2 → counts[7]+=1.
+    ///
+    /// Black (kf=0, files 0–1, r2=6, r3=5):
+    ///   a(0): a7 absent. b(1): b7 absent. → no shield.
+    ///   Kfile a: all_pawn_files = g-file. has_any(0)=false → counts[5]+= −1.
+    ///   adj b(1): has_own(1)=false → counts[6]+= −1. semi_adj=1 → counts[7] unchanged.
+    ///
+    /// Final: [1, 1, 0, 0, 0, −1, 1, 1].
+    ///
+    /// Catches (line 92): `semi_adj += 1 → *= 1`:
+    ///   semi_adj stays 0 permanently → `semi_adj == 2` never fires → counts[7] = 0 ≠ 1.
+    ///
+    /// Catches (line 95): `== → !=` on semi_adj==2:
+    ///   White semi_adj=2 → `2!=2`=false → counts[7] NOT incremented (0).
+    ///   Black semi_adj=1 → `1!=2`=true → counts[7]+= −1 (−1). Final = −1 ≠ 1.
+    ///
+    /// Catches (line 96): `+= → -=` on counts[7]:
+    ///   White: 0 -= 1 = −1 ≠ 1. (Black semi_adj=1, no change.)
+    ///
+    /// Catches (line 96): `+= → *=` on counts[7]:
+    ///   White: 0 *= 1 = 0 ≠ 1. (Black semi_adj=1, no change.)
+    #[test]
+    fn signed_counts_both_adj_semi_open_and_shield1() {
+        // White Kg1, Pg2. Black Ka8.
+        let pos = pos_of("k7/8/8/8/8/8/6P1/6K1 w - - 0 1");
+        assert_eq!(
+            pos.king_square(Color::White).file(),
+            6,
+            "White king on g-file"
+        );
+        assert_eq!(
+            pos.king_square(Color::Black).file(),
+            0,
+            "Black king on a-file"
+        );
+
+        let counts = shield_open_file_signed_counts(&pos);
+        assert_eq!(
+            counts,
+            [1, 1, 0, 0, 0, -1, 1, 1],
+            "Pg2 gives SHIELD_1; both adj files (f,h) semi-open for White → KS_BOTH fires; \
+             Black a-open; net counts pinned exactly"
         );
     }
 }

@@ -1,0 +1,21 @@
+src/eval/pawns.rs:249:17: replace | with ^ in backward_pawns
+src/eval/pawns.rs:257:58: replace | with ^ in backward_pawns
+src/eval/pawns.rs:259:17: replace | with ^ in backward_pawns
+src/eval/pawns.rs:273:43: replace | with ^ in connected_pawns
+src/eval/pawns.rs:279:55: replace | with ^ in connected_pawns
+src/eval/pawns.rs:280:55: replace | with & in connected_pawns
+src/eval/pawns.rs:280:55: replace | with ^ in connected_pawns
+src/eval/pawns.rs:283:13: replace | with ^ in connected_pawns
+src/eval/tier1.rs:67:63: delete - in outpost_features
+src/eval/tier1.rs:78:28: replace += with -= in outpost_features
+src/eval/tier1.rs:78:28: replace += with *= in outpost_features
+src/eval/tier1.rs:88:24: replace - with / in outpost_features
+src/eval/tier1.rs:93:23: replace != with == in outpost_features
+src/eval/tier1.rs:94:34: replace + with - in outpost_features
+src/eval/tier1.rs:94:34: replace + with * in outpost_features
+src/eval/tier1.rs:94:30: replace + with - in outpost_features
+src/eval/tier1.rs:94:30: replace + with * in outpost_features
+src/eval/tier1.rs:95:34: replace + with - in outpost_features
+src/eval/tier1.rs:95:34: replace + with * in outpost_features
+src/eval/tier1.rs:95:30: replace + with - in outpost_features
+src/eval/tier1.rs:95:30: replace + with * in outpost_features

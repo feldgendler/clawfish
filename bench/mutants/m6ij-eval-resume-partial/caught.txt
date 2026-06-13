@@ -1,0 +1,299 @@
+src/eval/pawns.rs:50:91: delete - in pawn_eval
+src/eval/pawns.rs:70:35: replace - with / in pawn_eval
+src/eval/pawns.rs:72:21: replace += with -= in pawn_eval
+src/eval/pawns.rs:72:21: replace += with *= in pawn_eval
+src/eval/pawns.rs:73:21: replace += with -= in pawn_eval
+src/eval/pawns.rs:73:21: replace += with *= in pawn_eval
+src/eval/pawns.rs:76:12: replace += with -= in pawn_eval
+src/eval/pawns.rs:76:12: replace += with *= in pawn_eval
+src/eval/pawns.rs:77:13: replace * with + in pawn_eval
+src/eval/pawns.rs:77:86: replace + with - in pawn_eval
+src/eval/pawns.rs:77:86: replace + with * in pawn_eval
+src/eval/pawns.rs:77:65: replace + with - in pawn_eval
+src/eval/pawns.rs:77:65: replace + with * in pawn_eval
+src/eval/pawns.rs:77:35: replace + with - in pawn_eval
+src/eval/pawns.rs:77:35: replace + with * in pawn_eval
+src/eval/pawns.rs:77:23: replace * with + in pawn_eval
+src/eval/pawns.rs:77:44: replace * with + in pawn_eval
+src/eval/pawns.rs:77:74: replace * with + in pawn_eval
+src/eval/pawns.rs:78:12: replace += with -= in pawn_eval
+src/eval/pawns.rs:78:12: replace += with *= in pawn_eval
+src/eval/pawns.rs:79:13: replace * with + in pawn_eval
+src/eval/pawns.rs:79:86: replace + with - in pawn_eval
+src/eval/pawns.rs:79:86: replace + with * in pawn_eval
+src/eval/pawns.rs:79:65: replace + with - in pawn_eval
+src/eval/pawns.rs:79:65: replace + with * in pawn_eval
+src/eval/pawns.rs:79:35: replace + with - in pawn_eval
+src/eval/pawns.rs:79:35: replace + with * in pawn_eval
+src/eval/pawns.rs:79:23: replace * with + in pawn_eval
+src/eval/pawns.rs:79:44: replace * with + in pawn_eval
+src/eval/pawns.rs:79:74: replace * with + in pawn_eval
+src/eval/pawns.rs:134:9: replace PawnHashTable::clear with ()
+src/eval/pawns.rs:217:5: replace isolated_pawns -> Bitboard with Default::default()
+src/eval/pawns.rs:218:50: replace | with & in isolated_pawns
+src/eval/pawns.rs:218:50: replace | with ^ in isolated_pawns
+src/eval/pawns.rs:219:9: replace & with | in isolated_pawns
+src/eval/pawns.rs:219:9: replace & with ^ in isolated_pawns
+src/eval/pawns.rs:219:11: delete ! in isolated_pawns
+src/eval/pawns.rs:233:5: replace doubled_pawns -> Bitboard with Default::default()
+src/eval/pawns.rs:233:9: replace & with | in doubled_pawns
+src/eval/pawns.rs:233:9: replace & with ^ in doubled_pawns
+src/eval/pawns.rs:241:5: replace backward_pawns -> Bitboard with Default::default()
+src/eval/pawns.rs:246:58: replace | with & in backward_pawns
+src/eval/pawns.rs:246:58: replace | with ^ in backward_pawns
+src/eval/pawns.rs:249:17: replace | with & in backward_pawns
+src/eval/pawns.rs:252:36: replace & with | in backward_pawns
+src/eval/pawns.rs:252:36: replace & with ^ in backward_pawns
+src/eval/pawns.rs:252:20: replace & with | in backward_pawns
+src/eval/pawns.rs:252:20: replace & with ^ in backward_pawns
+src/eval/pawns.rs:252:38: delete ! in backward_pawns
+src/eval/pawns.rs:257:58: replace | with & in backward_pawns
+src/eval/pawns.rs:259:17: replace | with & in backward_pawns
+src/eval/pawns.rs:260:36: replace & with | in backward_pawns
+src/eval/pawns.rs:260:36: replace & with ^ in backward_pawns
+src/eval/pawns.rs:260:20: replace & with | in backward_pawns
+src/eval/pawns.rs:260:20: replace & with ^ in backward_pawns
+src/eval/pawns.rs:260:38: delete ! in backward_pawns
+src/eval/pawns.rs:273:5: replace connected_pawns -> Bitboard with Default::default()
+src/eval/pawns.rs:273:23: replace & with | in connected_pawns
+src/eval/pawns.rs:273:23: replace & with ^ in connected_pawns
+src/eval/pawns.rs:273:43: replace | with & in connected_pawns
+src/eval/pawns.rs:279:29: replace & with | in connected_pawns
+src/eval/pawns.rs:279:29: replace & with ^ in connected_pawns
+src/eval/pawns.rs:279:55: replace | with & in connected_pawns
+src/eval/pawns.rs:280:29: replace & with | in connected_pawns
+src/eval/pawns.rs:280:29: replace & with ^ in connected_pawns
+src/eval/pawns.rs:283:13: replace | with & in connected_pawns
+src/eval/pawns.rs:291:5: replace passed_pawns -> Bitboard with Default::default()
+src/eval/pawns.rs:294:34: replace | with & in passed_pawns
+src/eval/pawns.rs:294:34: replace | with ^ in passed_pawns
+src/eval/pawns.rs:294:16: replace | with & in passed_pawns
+src/eval/pawns.rs:294:16: replace | with ^ in passed_pawns
+src/eval/pawns.rs:298:34: replace | with & in passed_pawns
+src/eval/pawns.rs:298:34: replace | with ^ in passed_pawns
+src/eval/pawns.rs:298:16: replace | with & in passed_pawns
+src/eval/pawns.rs:298:16: replace | with ^ in passed_pawns
+src/eval/pawns.rs:301:9: replace & with | in passed_pawns
+src/eval/pawns.rs:301:9: replace & with ^ in passed_pawns
+src/eval/pawns.rs:301:11: delete ! in passed_pawns
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, 0, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, 0, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, 0, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, 1, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, 1, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, 1, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, -1, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, -1, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (0, -1, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, 0, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, 0, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, 0, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, 1, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, 1, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, 1, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, -1, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, -1, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (1, -1, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, 0, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, 0, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, 0, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, 1, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, 1, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, 1, -1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, -1, 0)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, -1, 1)
+src/eval/pawns.rs:308:5: replace iso_dbl_bwd_signed_counts -> (i32, i32, i32) with (-1, -1, -1)
+src/eval/pawns.rs:311:91: delete - in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:312:13: replace += with -= in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:312:13: replace += with *= in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:312:21: replace * with + in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:312:21: replace * with / in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:313:13: replace += with -= in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:313:13: replace += with *= in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:313:21: replace * with + in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:313:21: replace * with / in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:314:13: replace += with -= in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:314:13: replace += with *= in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:314:21: replace * with + in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:314:21: replace * with / in iso_dbl_bwd_signed_counts
+src/eval/pawns.rs:326:5: replace iso_dbl_bwd_features -> Vec<(u16, i32)> with vec![]
+src/eval/pawns.rs:326:5: replace iso_dbl_bwd_features -> Vec<(u16, i32)> with vec![(0, 0)]
+src/eval/pawns.rs:326:5: replace iso_dbl_bwd_features -> Vec<(u16, i32)> with vec![(0, 1)]
+src/eval/pawns.rs:326:5: replace iso_dbl_bwd_features -> Vec<(u16, i32)> with vec![(0, -1)]
+src/eval/pawns.rs:326:5: replace iso_dbl_bwd_features -> Vec<(u16, i32)> with vec![(1, 0)]
+src/eval/pawns.rs:326:5: replace iso_dbl_bwd_features -> Vec<(u16, i32)> with vec![(1, 1)]
+src/eval/pawns.rs:326:5: replace iso_dbl_bwd_features -> Vec<(u16, i32)> with vec![(1, -1)]
+src/eval/pawns.rs:332:18: replace != with == in iso_dbl_bwd_features
+src/eval/pawns.rs:333:30: replace + with - in iso_dbl_bwd_features
+src/eval/pawns.rs:333:30: replace + with * in iso_dbl_bwd_features
+src/eval/pawns.rs:334:37: replace + with - in iso_dbl_bwd_features
+src/eval/pawns.rs:334:37: replace + with * in iso_dbl_bwd_features
+src/eval/pawns.rs:334:30: replace + with - in iso_dbl_bwd_features
+src/eval/pawns.rs:334:30: replace + with * in iso_dbl_bwd_features
+src/eval/pawns.rs:346:5: replace iso_dbl_bwd_term_white -> (i32, i32) with (0, 0)
+src/eval/pawns.rs:346:5: replace iso_dbl_bwd_term_white -> (i32, i32) with (0, 1)
+src/eval/pawns.rs:346:5: replace iso_dbl_bwd_term_white -> (i32, i32) with (0, -1)
+src/eval/pawns.rs:346:5: replace iso_dbl_bwd_term_white -> (i32, i32) with (1, 0)
+src/eval/pawns.rs:346:5: replace iso_dbl_bwd_term_white -> (i32, i32) with (1, 1)
+src/eval/pawns.rs:346:5: replace iso_dbl_bwd_term_white -> (i32, i32) with (1, -1)
+src/eval/pawns.rs:346:5: replace iso_dbl_bwd_term_white -> (i32, i32) with (-1, 0)
+src/eval/pawns.rs:346:5: replace iso_dbl_bwd_term_white -> (i32, i32) with (-1, 1)
+src/eval/pawns.rs:346:5: replace iso_dbl_bwd_term_white -> (i32, i32) with (-1, -1)
+src/eval/pawns.rs:347:42: replace + with - in iso_dbl_bwd_term_white
+src/eval/pawns.rs:347:42: replace + with * in iso_dbl_bwd_term_white
+src/eval/pawns.rs:347:27: replace + with - in iso_dbl_bwd_term_white
+src/eval/pawns.rs:347:27: replace + with * in iso_dbl_bwd_term_white
+src/eval/pawns.rs:347:21: replace * with + in iso_dbl_bwd_term_white
+src/eval/pawns.rs:347:21: replace * with / in iso_dbl_bwd_term_white
+src/eval/pawns.rs:347:36: replace * with + in iso_dbl_bwd_term_white
+src/eval/pawns.rs:347:36: replace * with / in iso_dbl_bwd_term_white
+src/eval/pawns.rs:347:51: replace * with + in iso_dbl_bwd_term_white
+src/eval/pawns.rs:347:51: replace * with / in iso_dbl_bwd_term_white
+src/eval/pawns.rs:348:42: replace + with - in iso_dbl_bwd_term_white
+src/eval/pawns.rs:348:42: replace + with * in iso_dbl_bwd_term_white
+src/eval/pawns.rs:348:27: replace + with - in iso_dbl_bwd_term_white
+src/eval/pawns.rs:348:27: replace + with * in iso_dbl_bwd_term_white
+src/eval/pawns.rs:348:21: replace * with + in iso_dbl_bwd_term_white
+src/eval/pawns.rs:348:21: replace * with / in iso_dbl_bwd_term_white
+src/eval/pawns.rs:348:36: replace * with + in iso_dbl_bwd_term_white
+src/eval/pawns.rs:348:36: replace * with / in iso_dbl_bwd_term_white
+src/eval/pawns.rs:348:51: replace * with + in iso_dbl_bwd_term_white
+src/eval/pawns.rs:348:51: replace * with / in iso_dbl_bwd_term_white
+src/eval/pawns.rs:356:5: replace conn_signed_rank_counts -> [i32; 8] with [0; 8]
+src/eval/pawns.rs:356:5: replace conn_signed_rank_counts -> [i32; 8] with [1; 8]
+src/eval/pawns.rs:356:5: replace conn_signed_rank_counts -> [i32; 8] with [-1; 8]
+src/eval/pawns.rs:359:76: delete - in conn_signed_rank_counts
+src/eval/pawns.rs:364:35: replace - with + in conn_signed_rank_counts
+src/eval/pawns.rs:364:35: replace - with / in conn_signed_rank_counts
+src/eval/pawns.rs:366:30: replace += with -= in conn_signed_rank_counts
+src/eval/pawns.rs:366:30: replace += with *= in conn_signed_rank_counts
+src/eval/pawns.rs:379:5: replace conn_features -> Vec<(u16, i32)> with vec![]
+src/eval/pawns.rs:379:5: replace conn_features -> Vec<(u16, i32)> with vec![(0, 0)]
+src/eval/pawns.rs:379:5: replace conn_features -> Vec<(u16, i32)> with vec![(0, 1)]
+src/eval/pawns.rs:379:5: replace conn_features -> Vec<(u16, i32)> with vec![(0, -1)]
+src/eval/pawns.rs:379:5: replace conn_features -> Vec<(u16, i32)> with vec![(1, 0)]
+src/eval/pawns.rs:379:5: replace conn_features -> Vec<(u16, i32)> with vec![(1, 1)]
+src/eval/pawns.rs:379:5: replace conn_features -> Vec<(u16, i32)> with vec![(1, -1)]
+src/eval/pawns.rs:386:18: replace != with == in conn_features
+src/eval/pawns.rs:387:30: replace - with + in conn_features
+src/eval/pawns.rs:387:30: replace - with / in conn_features
+src/eval/pawns.rs:388:30: replace + with - in conn_features
+src/eval/pawns.rs:388:30: replace + with * in conn_features
+src/eval/pawns.rs:389:34: replace + with - in conn_features
+src/eval/pawns.rs:389:34: replace + with * in conn_features
+src/eval/pawns.rs:389:30: replace + with - in conn_features
+src/eval/pawns.rs:389:30: replace + with * in conn_features
+src/eval/pawns.rs:400:5: replace conn_term_white -> (i32, i32) with (0, 0)
+src/eval/pawns.rs:400:5: replace conn_term_white -> (i32, i32) with (0, 1)
+src/eval/pawns.rs:400:5: replace conn_term_white -> (i32, i32) with (0, -1)
+src/eval/pawns.rs:400:5: replace conn_term_white -> (i32, i32) with (1, 0)
+src/eval/pawns.rs:400:5: replace conn_term_white -> (i32, i32) with (1, 1)
+src/eval/pawns.rs:400:5: replace conn_term_white -> (i32, i32) with (1, -1)
+src/eval/pawns.rs:400:5: replace conn_term_white -> (i32, i32) with (-1, 0)
+src/eval/pawns.rs:400:5: replace conn_term_white -> (i32, i32) with (-1, 1)
+src/eval/pawns.rs:400:5: replace conn_term_white -> (i32, i32) with (-1, -1)
+src/eval/pawns.rs:404:12: replace += with -= in conn_term_white
+src/eval/pawns.rs:404:12: replace += with *= in conn_term_white
+src/eval/pawns.rs:404:29: replace * with + in conn_term_white
+src/eval/pawns.rs:404:29: replace * with / in conn_term_white
+src/eval/pawns.rs:405:12: replace += with -= in conn_term_white
+src/eval/pawns.rs:405:12: replace += with *= in conn_term_white
+src/eval/pawns.rs:405:29: replace * with + in conn_term_white
+src/eval/pawns.rs:405:29: replace * with / in conn_term_white
+src/eval/pawns.rs:422:5: replace passed_pawn_term_white -> (i32, i32) with (0, 0)
+src/eval/pawns.rs:422:5: replace passed_pawn_term_white -> (i32, i32) with (0, 1)
+src/eval/pawns.rs:422:5: replace passed_pawn_term_white -> (i32, i32) with (0, -1)
+src/eval/pawns.rs:422:5: replace passed_pawn_term_white -> (i32, i32) with (1, 0)
+src/eval/pawns.rs:422:5: replace passed_pawn_term_white -> (i32, i32) with (1, 1)
+src/eval/pawns.rs:422:5: replace passed_pawn_term_white -> (i32, i32) with (1, -1)
+src/eval/pawns.rs:422:5: replace passed_pawn_term_white -> (i32, i32) with (-1, 0)
+src/eval/pawns.rs:422:5: replace passed_pawn_term_white -> (i32, i32) with (-1, 1)
+src/eval/pawns.rs:422:5: replace passed_pawn_term_white -> (i32, i32) with (-1, -1)
+src/eval/pawns.rs:426:63: delete - in passed_pawn_term_white
+src/eval/pawns.rs:434:35: replace - with / in passed_pawn_term_white
+src/eval/pawns.rs:437:16: replace += with -= in passed_pawn_term_white
+src/eval/pawns.rs:437:16: replace += with *= in passed_pawn_term_white
+src/eval/pawns.rs:437:24: replace * with + in passed_pawn_term_white
+src/eval/pawns.rs:438:16: replace += with -= in passed_pawn_term_white
+src/eval/pawns.rs:438:24: replace * with + in passed_pawn_term_white
+src/eval/pawns.rs:448:22: replace & with | in passed_pawn_term_white
+src/eval/pawns.rs:448:22: replace & with ^ in passed_pawn_term_white
+src/eval/pawns.rs:449:20: replace += with -= in passed_pawn_term_white
+src/eval/pawns.rs:449:20: replace += with *= in passed_pawn_term_white
+src/eval/pawns.rs:449:28: replace * with + in passed_pawn_term_white
+src/eval/pawns.rs:450:29: replace & with | in passed_pawn_term_white
+src/eval/pawns.rs:450:29: replace & with ^ in passed_pawn_term_white
+src/eval/pawns.rs:451:20: replace -= with += in passed_pawn_term_white
+src/eval/pawns.rs:451:28: replace * with + in passed_pawn_term_white
+src/eval/pawns.rs:468:16: replace += with -= in passed_pawn_term_white
+src/eval/pawns.rs:468:16: replace += with *= in passed_pawn_term_white
+src/eval/pawns.rs:468:64: replace * with + in passed_pawn_term_white
+src/eval/pawns.rs:468:36: replace * with + in passed_pawn_term_white
+src/eval/pawns.rs:468:36: replace * with / in passed_pawn_term_white
+src/eval/pawns.rs:468:24: replace * with + in passed_pawn_term_white
+src/eval/pawns.rs:468:24: replace * with / in passed_pawn_term_white
+src/eval/pawns.rs:468:84: replace - with + in passed_pawn_term_white
+src/eval/pawns.rs:468:84: replace - with / in passed_pawn_term_white
+src/eval/pawns.rs:469:16: replace += with -= in passed_pawn_term_white
+src/eval/pawns.rs:469:66: replace * with + in passed_pawn_term_white
+src/eval/pawns.rs:469:36: replace * with + in passed_pawn_term_white
+src/eval/pawns.rs:469:36: replace * with / in passed_pawn_term_white
+src/eval/pawns.rs:469:24: replace * with + in passed_pawn_term_white
+src/eval/pawns.rs:469:24: replace * with / in passed_pawn_term_white
+src/eval/pawns.rs:469:77: replace - with + in passed_pawn_term_white
+src/eval/pawns.rs:469:77: replace - with / in passed_pawn_term_white
+src/eval/tier1.rs:21:5: replace relative_rank -> u8 with 0
+src/eval/tier1.rs:21:5: replace relative_rank -> u8 with 1
+src/eval/tier1.rs:23:27: replace - with + in relative_rank
+src/eval/tier1.rs:23:27: replace - with / in relative_rank
+src/eval/tier1.rs:38:5: replace outpost_squares -> Bitboard with Default::default()
+src/eval/tier1.rs:42:35: delete ! in outpost_squares
+src/eval/tier1.rs:43:50: replace | with & in outpost_squares
+src/eval/tier1.rs:43:50: replace | with ^ in outpost_squares
+src/eval/tier1.rs:44:29: replace & with | in outpost_squares
+src/eval/tier1.rs:44:29: replace & with ^ in outpost_squares
+src/eval/tier1.rs:47:35: delete ! in outpost_squares
+src/eval/tier1.rs:48:50: replace | with & in outpost_squares
+src/eval/tier1.rs:48:50: replace | with ^ in outpost_squares
+src/eval/tier1.rs:49:29: replace & with | in outpost_squares
+src/eval/tier1.rs:49:29: replace & with ^ in outpost_squares
+src/eval/tier1.rs:62:5: replace outpost_features -> Vec<(u16, i32)> with vec![]
+src/eval/tier1.rs:62:5: replace outpost_features -> Vec<(u16, i32)> with vec![(0, 0)]
+src/eval/tier1.rs:62:5: replace outpost_features -> Vec<(u16, i32)> with vec![(0, 1)]
+src/eval/tier1.rs:62:5: replace outpost_features -> Vec<(u16, i32)> with vec![(0, -1)]
+src/eval/tier1.rs:62:5: replace outpost_features -> Vec<(u16, i32)> with vec![(1, 0)]
+src/eval/tier1.rs:62:5: replace outpost_features -> Vec<(u16, i32)> with vec![(1, 1)]
+src/eval/tier1.rs:62:5: replace outpost_features -> Vec<(u16, i32)> with vec![(1, -1)]
+src/eval/tier1.rs:69:64: replace & with | in outpost_features
+src/eval/tier1.rs:69:64: replace & with ^ in outpost_features
+src/eval/tier1.rs:72:28: replace += with -= in outpost_features
+src/eval/tier1.rs:72:28: replace += with *= in outpost_features
+src/eval/tier1.rs:75:64: replace & with | in outpost_features
+src/eval/tier1.rs:75:64: replace & with ^ in outpost_features
+src/eval/tier1.rs:88:24: replace - with + in outpost_features
+src/eval/tier1.rs:89:23: replace != with == in outpost_features
+src/eval/tier1.rs:90:30: replace + with - in outpost_features
+src/eval/tier1.rs:90:30: replace + with * in outpost_features
+src/eval/tier1.rs:91:34: replace + with - in outpost_features
+src/eval/tier1.rs:91:34: replace + with * in outpost_features
+src/eval/tier1.rs:91:30: replace + with - in outpost_features
+src/eval/tier1.rs:91:30: replace + with * in outpost_features
+src/eval/tier1.rs:109:5: replace rook_file_features -> Vec<(u16, i32)> with vec![]
+src/eval/tier1.rs:109:5: replace rook_file_features -> Vec<(u16, i32)> with vec![(0, 0)]
+src/eval/tier1.rs:109:5: replace rook_file_features -> Vec<(u16, i32)> with vec![(0, 1)]
+src/eval/tier1.rs:109:5: replace rook_file_features -> Vec<(u16, i32)> with vec![(0, -1)]
+src/eval/tier1.rs:109:5: replace rook_file_features -> Vec<(u16, i32)> with vec![(1, 0)]
+src/eval/tier1.rs:109:5: replace rook_file_features -> Vec<(u16, i32)> with vec![(1, 1)]
+src/eval/tier1.rs:109:5: replace rook_file_features -> Vec<(u16, i32)> with vec![(1, -1)]
+src/eval/tier1.rs:119:63: delete - in rook_file_features
+src/eval/tier1.rs:126:37: replace & with | in rook_file_features
+src/eval/tier1.rs:126:37: replace & with ^ in rook_file_features
+src/eval/tier1.rs:127:41: replace & with | in rook_file_features
+src/eval/tier1.rs:127:41: replace & with ^ in rook_file_features
+src/eval/tier1.rs:128:24: replace && with || in rook_file_features
+src/eval/tier1.rs:128:16: delete ! in rook_file_features
+src/eval/tier1.rs:128:27: delete ! in rook_file_features
+src/eval/tier1.rs:129:22: replace += with -= in rook_file_features
+src/eval/tier1.rs:129:22: replace += with *= in rook_file_features
+src/eval/tier1.rs:130:23: delete ! in rook_file_features
+src/eval/tier1.rs:131:22: replace += with -= in rook_file_features

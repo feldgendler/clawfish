@@ -664,6 +664,101 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Overlapping-operand union tests for backward_pawns (mutant closure).
+    //
+    // The three tests below construct positions where the two operands of a
+    // `|` inside `backward_pawns` share at least one common square, so that
+    // substituting `|` with `^` drops the shared square and changes the
+    // result. Each test asserts an exact bitboard that differs from the result
+    // under the targeted mutation.
+    // -----------------------------------------------------------------------
+
+    /// White own_attack_spans union — line-249 `|→^` mutant.
+    ///
+    /// White pawns b2, c2, d2. Black pawns b4, d4 (both attack c3 from SE/SW).
+    ///
+    /// own_attack_spans derivation (white branch):
+    ///   white_front_spans({b2,c2,d2}) = {b3..b8} ∪ {c3..c8} ∪ {d3..d8}
+    ///   .shift_east() = {c3..c8} ∪ {d3..d8} ∪ {e3..e8}
+    ///   .shift_west() = {a3..a8} ∪ {b3..b8} ∪ {c3..c8}
+    ///   overlap: {c3..c8} appears in both shifts.
+    ///
+    ///   Correct `|`: c3 ∈ own_attack_spans. c2's stop is c3; c3 is covered
+    ///   → c2 NOT backward. backward = EMPTY.
+    ///
+    ///   Under `|→^` (line 249): {c3..c8} cancels from both → c3 ∉ mutated
+    ///   own_attack_spans. stops({b2,c2,d2}) ∩ enemy_attacks = {c3} (b4→c3,
+    ///   d4→c3); c3 not masked → c2 IS backward → result = {c2} ≠ EMPTY. ✓
+    #[test]
+    fn backward_white_own_attack_spans_overlap_kills_line249_xor() {
+        // White: b2, c2, d2. Black: b4, d4 (both attack the c3 stop of c2).
+        let (wp, bp) = pawns_of("4k3/8/8/8/1p1p4/8/1PPP4/4K3 w - - 0 1");
+        assert_eq!(
+            backward_pawns(wp, bp, Color::White),
+            Bitboard::EMPTY,
+            "c2 is not backward: its stop c3 appears in BOTH shifted white attack-spans, \
+             so c3 is covered by own_attack_spans; |→^ at line 249 drops c3..c8, \
+             wrongly making c2 backward"
+        );
+    }
+
+    /// Black enemy_attacks union — line-257 `|→^` mutant.
+    ///
+    /// Black pawn c5. White (enemy) pawns b3, d3 (both attack c4 via NE/NW).
+    ///
+    /// enemy_attacks derivation (black branch):
+    ///   {b3,d3}.shift_north_east() = {c4, e4}
+    ///   {b3,d3}.shift_north_west() = {a4, c4}
+    ///   overlap: c4 appears in both shifts.
+    ///
+    ///   Correct `|`: c4 ∈ enemy_attacks. Black own_attack_spans of {c5}
+    ///   = {d4..d1} ∪ {b4..b1} (c4 absent); stops∩attacks = {c4} →
+    ///   c5 IS backward. Result = {c5}.
+    ///
+    ///   Under `|→^` (line 257): c4 cancels from both shifts → c4 ∉ mutated
+    ///   enemy_attacks → stops∩attacks = empty → c5 NOT backward → EMPTY ≠ {c5}. ✓
+    #[test]
+    fn backward_black_enemy_attacks_overlap_kills_line257_xor() {
+        // Black: c5. White (enemy): b3, d3 (b3→NE=c4, d3→NW=c4, both attack c5's stop).
+        let (wp, bp) = pawns_of("4k3/8/8/2p5/8/1P1P4/8/4K3 w - - 0 1");
+        assert_eq!(
+            backward_pawns(bp, wp, Color::Black),
+            Bitboard::from_square(Square::C5),
+            "c5 is backward: its stop c4 is attacked by both b3 (NE) and d3 (NW), \
+             and c4 is absent from black own_attack_spans; |→^ at line 257 drops \
+             c4 from enemy_attacks, wrongly making c5 NOT backward"
+        );
+    }
+
+    /// Black own_attack_spans union — line-259 `|→^` mutant.
+    ///
+    /// Black pawns b5, c5, d5. White (enemy) pawns b3, d3 (attack c4).
+    ///
+    /// own_attack_spans derivation (black branch):
+    ///   black_front_spans({b5,c5,d5}) = {b4..b1} ∪ {c4..c1} ∪ {d4..d1}
+    ///   .shift_east() = {c4..c1} ∪ {d4..d1} ∪ {e4..e1}
+    ///   .shift_west() = {a4..a1} ∪ {b4..b1} ∪ {c4..c1}
+    ///   overlap: {c4..c1} appears in both shifts.
+    ///
+    ///   Correct `|`: c4 ∈ own_attack_spans. c5's stop c4 is covered →
+    ///   c5 NOT backward. backward = EMPTY.
+    ///
+    ///   Under `|→^` (line 259): {c4..c1} cancels → c4 ∉ mutated
+    ///   own_attack_spans. stops∩enemy_attacks = {c4}; c4 not masked →
+    ///   c5 IS backward → result = {c5} ≠ EMPTY. ✓
+    #[test]
+    fn backward_black_own_attack_spans_overlap_kills_line259_xor() {
+        // Black: b5, c5, d5. White (enemy): b3, d3 (attack c4 = c5's stop).
+        let (wp, bp) = pawns_of("4k3/8/8/1ppp4/8/1P1P4/8/4K3 w - - 0 1");
+        assert_eq!(
+            backward_pawns(bp, wp, Color::Black),
+            Bitboard::EMPTY,
+            "c5 is not backward: its stop c4 appears in BOTH shifted black own_attack_spans, \
+             so c4 is covered; |→^ at line 259 drops c4..c1, wrongly making c5 backward"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Connected pawns (connected = phalanx | defended).
     // -----------------------------------------------------------------------
 
@@ -718,6 +813,149 @@ mod tests {
             connected_pawns(wp, Color::White),
             Bitboard::EMPTY,
             "lone e4 pawn → not connected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Overlapping-operand union tests for connected_pawns (mutant closure).
+    //
+    // The four tests below construct positions where the two operands of a `|`
+    // inside `connected_pawns` share at least one common square, so that
+    // substituting `|` with `^` (or `&` for the 280 mutant) changes the
+    // result. Each test asserts an exact bitboard.
+    // -----------------------------------------------------------------------
+
+    /// Phalanx inner union — line-273 `|→^` mutant.
+    ///
+    /// White pawns c4, d4, e4 (three-pawn rank-4 phalanx).
+    ///
+    /// phalanx derivation:
+    ///   own.shift_east() of {c4,d4,e4} = {d4, e4, f4}
+    ///   own.shift_west() of {c4,d4,e4} = {b4, c4, d4}
+    ///   overlap: d4 appears in both shifts.
+    ///
+    ///   Correct `|`: d4 present → own & {b4,c4,d4,e4,f4} = {c4,d4,e4}.
+    ///
+    ///   Under `|→^` (line 273): d4 cancels → {b4,c4,e4,f4};
+    ///   own & xor = {c4,e4} — d4 drops. defended = empty (no below-defender).
+    ///   Result = {c4,e4} ≠ {c4,d4,e4}. ✓
+    #[test]
+    fn connected_phalanx_inner_union_overlap_kills_line273_xor() {
+        // White: c4, d4, e4 — d4 reachable from both sides via shift_east/shift_west.
+        let (wp, _bp) = pawns_of("4k3/8/8/8/2PPP3/8/8/4K3 w - - 0 1");
+        assert_eq!(
+            connected_pawns(wp, Color::White),
+            Bitboard::from_square(Square::C4)
+                | Bitboard::from_square(Square::D4)
+                | Bitboard::from_square(Square::E4),
+            "d4 is in both own.shift_east and own.shift_west; |→^ at line 273 \
+             cancels d4 from the phalanx inner union, wrongly dropping d4"
+        );
+    }
+
+    /// White defended inner union — line-279 `|→^` mutant.
+    ///
+    /// White pawns c3, d4, e3 — d4 is doubly defended from both diagonals.
+    ///
+    /// defended derivation:
+    ///   own.shift_north_east() of {c3,d4,e3} = {d4, e5, f4}
+    ///   own.shift_north_west() of {c3,d4,e3} = {b4, c5, d4}
+    ///   overlap: d4 appears in both shifts.
+    ///
+    ///   Correct `|`: d4 ∈ union; own & union = {d4}. phalanx = empty.
+    ///   connected = {d4}.
+    ///
+    ///   Under `|→^` (line 279): d4 cancels → union = {b4,c5,e5,f4};
+    ///   own & xor = empty. connected = empty ≠ {d4}. ✓
+    #[test]
+    fn connected_white_defended_inner_union_overlap_kills_line279_xor() {
+        // White: c3, d4, e3 — d4 doubly defended by c3 (NE) and e3 (NW).
+        let (wp, _bp) = pawns_of("4k3/8/8/8/3P4/2P1P3/8/4K3 w - - 0 1");
+        assert_eq!(
+            connected_pawns(wp, Color::White),
+            Bitboard::from_square(Square::D4),
+            "d4 is in both own.shift_north_east and own.shift_north_west; \
+             |→^ at line 279 cancels d4, wrongly dropping it from connected"
+        );
+    }
+
+    /// Black defended inner union — line-280 `|→^` mutant.
+    ///
+    /// Black pawns c6, d5, e6 — d5 is doubly defended from both diagonals.
+    ///
+    /// defended derivation (black uses SE/SW):
+    ///   own.shift_south_east() of {c6,d5,e6} = {d5, e4, f5}
+    ///   own.shift_south_west() of {c6,d5,e6} = {b5, c4, d5}
+    ///   overlap: d5 appears in both shifts.
+    ///
+    ///   Correct `|`: d5 ∈ union; own & union = {d5}. phalanx = empty
+    ///   (c6/e6 are not adjacent files). connected = {d5}.
+    ///
+    ///   Under `|→^` (line 280): d5 cancels → union = {b5,c4,e4,f5};
+    ///   own & xor = empty. connected = empty ≠ {d5}. ✓
+    #[test]
+    fn connected_black_defended_inner_union_overlap_kills_line280_xor() {
+        // Black: c6, d5, e6 — d5 doubly defended by c6 (SE) and e6 (SW).
+        let (_wp, bp) = pawns_of("4k3/8/2p1p3/3p4/8/8/8/4K3 w - - 0 1");
+        assert_eq!(
+            connected_pawns(bp, Color::Black),
+            Bitboard::from_square(Square::D5),
+            "d5 is in both own.shift_south_east and own.shift_south_west; \
+             |→^ at line 280 cancels d5, wrongly dropping it from connected"
+        );
+    }
+
+    /// Black defended single-diagonal — line-280 `|→&` mutant.
+    ///
+    /// Black pawns c6, d5 — c6 defends d5 from SE only (no SW defender).
+    ///
+    /// defended derivation:
+    ///   own.shift_south_east() of {c6,d5} = {d5, e4}
+    ///   own.shift_south_west() of {c6,d5} = {b5, c4}
+    ///   intersection: empty (d5 is in SE shift but not SW shift).
+    ///
+    ///   Correct `|`: d5 ∈ union → own & union = {d5}. phalanx = empty.
+    ///   connected = {d5}.
+    ///
+    ///   Under `|→&` (line 280): intersection = empty → own & empty = empty.
+    ///   connected = empty ≠ {d5}. ✓
+    ///   (The `|→^` mutant for this position also fires: SE^SW = {b5,c4,d5,e4},
+    ///   own & xor = {d5}, so connected = {d5} = correct — `|→^` is invisible
+    ///   here; the overlap test above catches `|→^` instead.)
+    #[test]
+    fn connected_black_defended_single_diagonal_kills_line280_and() {
+        // Black: c6, d5 — c6 defends d5 from SE only; no SW defender of d5.
+        let (_wp, bp) = pawns_of("4k3/8/2p5/3p4/8/8/8/4K3 w - - 0 1");
+        assert_eq!(
+            connected_pawns(bp, Color::Black),
+            Bitboard::from_square(Square::D5),
+            "d5 is defended by c6 from SE only; |→& at line 280 drops d5 \
+             because d5 is not in the intersection of both shifts"
+        );
+    }
+
+    /// Final phalanx|defended union — line-283 `|→^` mutant.
+    ///
+    /// White pawns c4, d4, e3 — c4/d4 form a phalanx AND d4 is defended by e3.
+    ///
+    /// phalanx = {c4, d4} (same-rank adjacent). defended:
+    ///   own.shift_north_east() = {d5, e5, f4}; own.shift_north_west() = {b5,c5,d4}
+    ///   union = {b5,c5,d4,d5,e5,f4}; own & union = {d4}. defended = {d4}.
+    ///
+    ///   Correct `|`: phalanx|defended = {c4,d4}|{d4} = {c4,d4}.
+    ///
+    ///   Under `|→^` (line 283): {c4,d4}^{d4} = {c4} — d4 cancels.
+    ///   Result = {c4} ≠ {c4,d4}. ✓
+    #[test]
+    fn connected_phalanx_defended_final_union_overlap_kills_line283_xor() {
+        // White: c4, d4, e3 — c4/d4 phalanx; d4 also defended by e3.
+        let (wp, _bp) = pawns_of("4k3/8/8/8/2PP4/4P3/8/4K3 w - - 0 1");
+        assert_eq!(
+            connected_pawns(wp, Color::White),
+            Bitboard::from_square(Square::C4) | Bitboard::from_square(Square::D4),
+            "d4 is simultaneously in phalanx (with c4) and in defended (via e3); \
+             |→^ at line 283 cancels d4 where phalanx and defended overlap, \
+             wrongly returning only {{c4}}"
         );
     }
 

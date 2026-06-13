@@ -833,4 +833,78 @@ exclude_re = [
     # `with >=` replacement text matches ONLY the equivalent variant, so it does
     # not suppress them. (M6.I/J texel backstop, 2026-06-08.)
     "src/texel/features\\.rs:\\d+:\\d+: replace > with >= in endgame_scale",
+
+    # ---- king_safety.rs: `all_pawn_files = file_fill(wp | bp)` — disjoint ----
+    #
+    # `wp` (white pawn bitboard) and `bp` (black pawn bitboard) are disjoint by
+    # the Position invariant (no square can hold two pieces). For disjoint a, b:
+    # a | b == a ^ b for every input. Both the `shield_open_file_signed_counts`
+    # and `king_safety_term_white` functions compute `all_pawn_files` from this
+    # union; no chess-legal position can place a white and black pawn on the same
+    # square, so the `^`-mutated version produces the same bitboard. Equivalent.
+    #
+    # Function-anchored (each function has exactly one `wp | bp` expression;
+    # using the function name avoids a fragile line-number anchor). Verified by
+    # hand-applying both mutations and confirming all 14 king-safety tests pass.
+    # (M6.I/J eval backstop, 2026-06-13.)
+    "replace \\| with \\^ in shield_open_file_signed_counts",
+    "replace \\| with \\^ in king_safety_term_white",
+
+    # ---- tier1.rs: endgame_scale 50-move taper — equivalent at shipped weights ----
+    #
+    # `endgame_scale` (tier1.rs ~208-226) computes a 50-move taper:
+    #   span    = (100 - FIFTY_MOVE_TAPER_FROM).max(1)
+    #   prog    = (hmc - FIFTY_MOVE_TAPER_FROM).clamp(0, span)
+    #   tapered = EG_SCALE_DEN - (EG_SCALE_DEN - FIFTY_MOVE_FLOOR) * prog / span
+    # At SHIPPED weights FIFTY_MOVE_FLOOR == EG_SCALE_DEN (== 64), so the factor
+    # `(EG_SCALE_DEN - FIFTY_MOVE_FLOOR) == 0` and `tapered == EG_SCALE_DEN` for
+    # EVERY input — the taper is a no-op and `endgame_scale` returns DEN always.
+    # Therefore any mutation that PRESERVES the `... * 0 ...` structure cannot
+    # change the return value: no reachable input distinguishes it. EQUIVALENT.
+    #
+    # EXCEPTION (the ONE non-equivalent taper mutant — NOT excluded, caught by
+    # the `endgame_scale_fifty_move_hmc100_returns_den` fixture, hmc==100 ⇒
+    # prog==span ⇒ prog/span==1):
+    #   222:52 `- with /`  → `(DEN/FLOOR)=1` ⇒ tapered = DEN - 1*1 = 63 < DEN,
+    #                        NOT capped by min/clamp ⇒ observable. Real gap.
+    # NOTE 222:72 `* with +` is EQUIVALENT despite breaking the `×0`: by operator
+    # precedence it becomes `DEN - (DEN-FLOOR) + prog/span` = `64 - 0 + 1` = 65,
+    # and `scale.min(65).clamp(0,64)` caps it back to 64. Only mutations that push
+    # `tapered` BELOW the cap (i.e. 222:52) are observable; raising it is absorbed.
+    #
+    # File-anchored to `src/eval/tier1.rs` because the texel mirror
+    # (`src/texel/features.rs`) has its own `endgame_scale` where the `>` guard
+    # mutants are NON-equivalent (two-function cross-check — see the features.rs
+    # `> with >=` rule above). Bare-name rules would wrongly suppress those.
+    #
+    # IMPORTANT: this whole block is conditional on FLOOR == DEN. If the
+    # draw-scale tunables are ever retuned away from identity (the backlogged
+    # draw-scale SPSA), DELETE these rules and re-triage — the taper becomes
+    # live and most of these become real gaps. (M6.I/J eval backstop, 2026-06-13.)
+    #
+    # Guard (line 219): branch body is a no-op ⇒ when it runs can't matter.
+    "src/eval/tier1\\.rs:\\d+:\\d+: replace > with == in endgame_scale",
+    "src/eval/tier1\\.rs:\\d+:\\d+: replace > with < in endgame_scale",
+    "src/eval/tier1\\.rs:\\d+:\\d+: replace > with >= in endgame_scale",
+    # `- with +` (outer minus 222:36, and span/prog minuses 220:25/221:25): the
+    #  (DEN-FLOOR)=0 factor is untouched, product stays 0. All three EQUIVALENT.
+    "src/eval/tier1\\.rs:\\d+:\\d+: replace - with \\+ in endgame_scale",
+    # `/ with %` and `/ with *` (222:79): numerator is `(0)*prog == 0`;
+    #  0%span == 0 and 0*span == 0. EQUIVALENT.
+    "src/eval/tier1\\.rs:\\d+:\\d+: replace / with % in endgame_scale",
+    "src/eval/tier1\\.rs:\\d+:\\d+: replace / with \\* in endgame_scale",
+    # `* with /` (222:72): `(0)/prog == 0` (prog>=1 inside the hmc>80 branch, no
+    #  div-by-zero). EQUIVALENT.
+    "src/eval/tier1\\.rs:\\d+:\\d+: replace \\* with / in endgame_scale",
+    # `* with +` (222:72): `DEN - 0 + prog/span` = 65 ⇒ capped to 64 by
+    #  min/clamp. EQUIVALENT (see EXCEPTION note in the header above).
+    "src/eval/tier1\\.rs:\\d+:\\d+: replace \\* with \\+ in endgame_scale",
+    # `- with /` at 220:25 (span) and 221:25 (prog): EQUIVALENT (factor still 0).
+    #  Line-anchored — the SANCTIONED exception to the no-line-anchor rule: these
+    #  share the display name "replace - with / in endgame_scale" with the
+    #  NON-equivalent 222:52 (caught by the hmc100 fixture), so a bare-name rule
+    #  would suppress a real-gap test. Production lines are stable vs test edits;
+    #  re-triage on any endgame_scale refactor (already required — see above).
+    "src/eval/tier1\\.rs:220:25: replace - with / in endgame_scale",
+    "src/eval/tier1\\.rs:221:25: replace - with / in endgame_scale",
 ]

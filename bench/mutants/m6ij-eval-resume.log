@@ -1,0 +1,49 @@
+Found 477 mutants to test
+ok       Unmutated baseline in 18s build + 34s test
+ INFO Auto-set test timeout to 172s
+TIMEOUT  src/eval/pawns.rs:70:35: replace - with + in pawn_eval in 2s build + 172s test
+TIMEOUT  src/eval/pawns.rs:77:13: replace * with / in pawn_eval in 2s build + 172s test
+TIMEOUT  src/eval/pawns.rs:77:23: replace * with / in pawn_eval in 2s build + 172s test
+TIMEOUT  src/eval/pawns.rs:77:44: replace * with / in pawn_eval in 2s build + 172s test
+TIMEOUT  src/eval/pawns.rs:77:74: replace * with / in pawn_eval in 2s build + 172s test
+TIMEOUT  src/eval/pawns.rs:79:13: replace * with / in pawn_eval in 2s build + 172s test
+TIMEOUT  src/eval/pawns.rs:79:23: replace * with / in pawn_eval in 2s build + 172s test
+TIMEOUT  src/eval/pawns.rs:79:44: replace * with / in pawn_eval in 2s build + 172s test
+TIMEOUT  src/eval/pawns.rs:79:74: replace * with / in pawn_eval in 2s build + 172s test
+TIMEOUT  src/eval/pawns.rs:156:34: replace & with | in PawnHashTable::get in 2s build + 172s test
+TIMEOUT  src/eval/pawns.rs:156:34: replace & with ^ in PawnHashTable::get in 2s build + 172s test
+TIMEOUT  src/eval/pawns.rs:156:55: replace - with + in PawnHashTable::get in 2s build + 172s test
+TIMEOUT  src/eval/pawns.rs:156:55: replace - with / in PawnHashTable::get in 2s build + 172s test
+MISSED   src/eval/pawns.rs:249:17: replace | with ^ in backward_pawns in 4s build + 43s test
+MISSED   src/eval/pawns.rs:257:58: replace | with ^ in backward_pawns in 3s build + 42s test
+MISSED   src/eval/pawns.rs:259:17: replace | with ^ in backward_pawns in 3s build + 40s test
+MISSED   src/eval/pawns.rs:273:43: replace | with ^ in connected_pawns in 3s build + 44s test
+MISSED   src/eval/pawns.rs:279:55: replace | with ^ in connected_pawns in 3s build + 43s test
+MISSED   src/eval/pawns.rs:280:55: replace | with & in connected_pawns in 4s build + 39s test
+MISSED   src/eval/pawns.rs:280:55: replace | with ^ in connected_pawns in 4s build + 44s test
+MISSED   src/eval/pawns.rs:283:13: replace | with ^ in connected_pawns in 4s build + 44s test
+TIMEOUT  src/eval/pawns.rs:434:35: replace - with + in passed_pawn_term_white in 10s build + 172s test
+TIMEOUT  src/eval/pawns.rs:437:24: replace * with / in passed_pawn_term_white in 10s build + 172s test
+TIMEOUT  src/eval/pawns.rs:438:16: replace += with *= in passed_pawn_term_white in 10s build + 172s test
+TIMEOUT  src/eval/pawns.rs:438:24: replace * with / in passed_pawn_term_white in 10s build + 172s test
+TIMEOUT  src/eval/pawns.rs:449:28: replace * with / in passed_pawn_term_white in 11s build + 172s test
+TIMEOUT  src/eval/pawns.rs:451:20: replace -= with /= in passed_pawn_term_white in 11s build + 172s test
+TIMEOUT  src/eval/pawns.rs:451:28: replace * with / in passed_pawn_term_white in 11s build + 172s test
+TIMEOUT  src/eval/pawns.rs:468:64: replace * with / in passed_pawn_term_white in 11s build + 172s test
+TIMEOUT  src/eval/pawns.rs:469:16: replace += with *= in passed_pawn_term_white in 12s build + 172s test
+TIMEOUT  src/eval/pawns.rs:469:66: replace * with / in passed_pawn_term_white in 12s build + 172s test
+MISSED   src/eval/tier1.rs:67:63: delete - in outpost_features in 16s build + 50s test
+MISSED   src/eval/tier1.rs:78:28: replace += with -= in outpost_features in 16s build + 50s test
+MISSED   src/eval/tier1.rs:78:28: replace += with *= in outpost_features in 16s build + 52s test
+MISSED   src/eval/tier1.rs:88:24: replace - with / in outpost_features in 16s build + 51s test
+MISSED   src/eval/tier1.rs:93:23: replace != with == in outpost_features in 17s build + 51s test
+MISSED   src/eval/tier1.rs:94:34: replace + with - in outpost_features in 20s build + 52s test
+MISSED   src/eval/tier1.rs:94:34: replace + with * in outpost_features in 18s build + 51s test
+MISSED   src/eval/tier1.rs:94:30: replace + with - in outpost_features in 18s build + 51s test
+MISSED   src/eval/tier1.rs:94:30: replace + with * in outpost_features in 17s build + 51s test
+MISSED   src/eval/tier1.rs:95:34: replace + with - in outpost_features in 18s build + 51s test
+MISSED   src/eval/tier1.rs:95:34: replace + with * in outpost_features in 18s build + 53s test
+MISSED   src/eval/tier1.rs:95:30: replace + with - in outpost_features in 20s build + 52s test
+MISSED   src/eval/tier1.rs:95:30: replace + with * in outpost_features in 18s build + 52s test
+ERROR interrupted
+ERROR scenario execution internal error err=interrupted phase=Test

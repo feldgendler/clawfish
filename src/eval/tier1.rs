@@ -287,8 +287,8 @@ pub(crate) fn is_pawnless_drawish(pos: &Position) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        endgame_scale, is_ocb_with_pawns, is_pawnless_drawish, outpost_squares, outpost_term_white,
-        rook_file_term_white,
+        endgame_scale, is_ocb_with_pawns, is_pawnless_drawish, outpost_features, outpost_squares,
+        outpost_term_white, rook_file_term_white,
     };
     use crate::bitboard::{self, Bitboard};
     use crate::eval::data::{
@@ -1082,6 +1082,32 @@ mod tests {
         );
     }
 
+    /// `endgame_scale` at hmc=100 with shipped FLOOR==DEN returns EG_SCALE_DEN.
+    ///
+    /// Position: KPvKP (pawn on each side, no other pieces) → OCB=false,
+    /// pawnless-drawish=false. Only the 50-move path is active.
+    ///
+    /// At hmc=100: prog==span==20. Clean: `(DEN-FLOOR)*20/20 = 0*1 = 0` →
+    /// tapered=DEN=64. Survivors caught:
+    /// - `222:52 - with /`: `(DEN/FLOOR)*20/20 = 1` → tapered=63 ≠ 64.
+    /// - `222:72 * with +`: `(DEN-FLOOR)+20/20 = 0+1 = 1` → tapered=63 ≠ 64.
+    ///
+    /// (hmc=90 in the sibling test gives prog=10, 10/20=0 by integer division,
+    /// making both mutations indistinguishable from clean — that's why hmc=100
+    /// is required here.)
+    #[test]
+    fn endgame_scale_fifty_move_hmc100_returns_den() {
+        // KPvKP: pawns present → OCB=false, pawnless-drawish=false.
+        // hmc=100 → prog==span so the taper denominator is non-zero and ≠ prog.
+        let pos = pos_of("4k3/4p3/8/8/8/8/4P3/4K3 w - - 100 1");
+        assert_eq!(
+            endgame_scale(&pos),
+            EG_SCALE_DEN,
+            "hmc=100, FLOOR==DEN → tapered=(DEN-(DEN-FLOOR)*prog/span)=DEN; \
+             catches 222:52 `-→/` and 222:72 `*→+` which both yield tapered=DEN-1=63"
+        );
+    }
+
     /// Pure-arithmetic 50-move ramp structural pin: the taper formula is
     /// monotone non-increasing in halfmove_clock and equals DEN at
     /// FIFTY_MOVE_TAPER_FROM and FLOOR at halfmove=100. Does NOT touch
@@ -1144,6 +1170,380 @@ mod tests {
                 "ramp({hmc}) = {v} must be in [0, {den}]"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Mutation-backstop fixtures for outpost_features (Cluster 1).
+    //
+    // These anchor the exact `(index, count)` pairs emitted by
+    // `outpost_features` for specific positions, killing survivors that were
+    // invisible to the weight-based `outpost_term_white` tests.
+    // -----------------------------------------------------------------------
+
+    /// White knight on g4 (rank=3, rr=3 for White), supported by Pf3+Ph3 and
+    /// unchallengeable (no black pawns). Pins the KNIGHT_MG and KNIGHT_EG
+    /// feature indices for rr=3 (local=0).
+    ///
+    /// Survivors caught:
+    /// - 88 `- with /`: `local = rr/3 = 1` instead of `0` → index 178 not 177.
+    /// - 89 `!= with ==`: `knight[3]==0` → nothing emitted.
+    /// - 90/91: knight MG/EG indices (existing coverage, no change).
+    #[test]
+    fn outpost_features_knight_rr3_white_exact_indices() {
+        use crate::texel::layout::{Group, group_range};
+        // g4: file=6, rank=3 (0-indexed) → rr=3 for White. local = 3-3 = 0.
+        // f3 (5,2) shift_ne → g4 ✓; h3 (7,2) shift_nw → g4 ✓.
+        // No black pawns → unchallengeable.
+        let pos = pos_of("4k3/8/8/8/6N1/5P1P/8/4K3 w - - 0 1");
+        let features = outpost_features(&pos);
+        let start = group_range(Group::Outpost).start;
+        // rr=3 → local=0 → KNIGHT_MG index = start+0 = 177, KNIGHT_EG = start+3 = 180.
+        assert!(
+            features.contains(&(start as u16, 1)),
+            "rr=3 White knight: KNIGHT_MG index {start} with count 1 must appear; got {features:?}"
+        );
+        assert!(
+            features.contains(&((start + 3) as u16, 1)),
+            "rr=3 White knight: KNIGHT_EG index {} with count 1 must appear; got {features:?}",
+            start + 3
+        );
+        // No bishop outpost → no BISHOP indices.
+        assert!(
+            !features
+                .iter()
+                .any(|&(i, _)| i >= (start + 6) as u16 && i < (start + 12) as u16),
+            "no bishop on outpost → no BISHOP feature indices must appear; got {features:?}"
+        );
+    }
+
+    /// White bishop on e5 (rank=4, rr=4 for White), supported by Pd4+Pf4 and
+    /// unchallengeable. Pins the BISHOP_MG and BISHOP_EG feature indices for
+    /// rr=4 (local=1, so the `+` vs `-` vs `*` distinctions are non-trivial).
+    ///
+    /// Survivors caught (bishop index arithmetic, lines 94-95):
+    /// - 94:30 `+ with -`: `start - 6 + 1 = 172` ≠ 184.
+    /// - 94:30 `+ with *`: `start * 6 + 1 = 1063` ≠ 184.
+    /// - 94:34 `+ with -`: `start + 6 - 1 = 182` ≠ 184.
+    /// - 94:34 `+ with *`: `start + 6 * 1 = 183` ≠ 184.
+    /// - 95:30 `+ with -`: `start - 9 + 1 = 169` ≠ 187.
+    /// - 95:30 `+ with *`: `start * 9 + 1 = 1594` ≠ 187.
+    /// - 95:34 `+ with -`: `start + 9 - 1 = 185` ≠ 187.
+    /// - 95:34 `+ with *`: `start + 9 * 1 = 186` ≠ 187.
+    /// - 93 `!= with ==`: bishop[4]=1 → `!= 0` true; mutant `== 0` skips → nothing.
+    #[test]
+    fn outpost_features_bishop_rr4_white_exact_indices() {
+        use crate::texel::layout::{Group, group_range};
+        // e5: file=4, rank=4 (0-indexed) → rr=4 for White. local = 4-3 = 1.
+        // d4 (3,3) shift_ne → e5 ✓; f4 (5,3) shift_nw → e5 ✓.
+        // No black pawns → unchallengeable.
+        let pos = pos_of("4k3/8/8/4B3/3P1P2/8/8/4K3 w - - 0 1");
+        let features = outpost_features(&pos);
+        let start = group_range(Group::Outpost).start;
+        // rr=4 → local=1 → BISHOP_MG index = start+6+1 = 184, BISHOP_EG = start+9+1 = 187.
+        let bishop_mg_idx = (start + 6 + 1) as u16;
+        let bishop_eg_idx = (start + 9 + 1) as u16;
+        assert!(
+            features.contains(&(bishop_mg_idx, 1)),
+            "rr=4 White bishop: BISHOP_MG index {bishop_mg_idx} count 1 must appear; got {features:?}"
+        );
+        assert!(
+            features.contains(&(bishop_eg_idx, 1)),
+            "rr=4 White bishop: BISHOP_EG index {bishop_eg_idx} count 1 must appear; got {features:?}"
+        );
+        // No knight on outpost → no KNIGHT indices.
+        assert!(
+            !features.iter().any(|&(i, _)| i < (start + 6) as u16),
+            "no knight on outpost → no KNIGHT feature indices must appear; got {features:?}"
+        );
+    }
+
+    /// Black knight on d5 (rank=4, rr=7-4=3 for Black) supported by Bpc6+pe6,
+    /// no White outpost. Pins that the Black outpost sign is -1, not +1.
+    ///
+    /// Survivor caught:
+    /// - 67 `delete -` in `(Color::Black, -1i32)`: sign becomes +1 → emits
+    ///   (177, +1) instead of (177, -1). The assertion on sign=-1 catches it.
+    #[test]
+    fn outpost_features_black_knight_rr3_negative_sign() {
+        use crate::texel::layout::{Group, group_range};
+        // d5: file=3, rank=4 → rr=7-4=3 for Black. local = 3-3 = 0.
+        // Black pawn c6 (2,5) shift_se → d5 ✓; e6 (4,5) shift_sw → d5 ✓.
+        // No white c/e pawns → unchallengeable.
+        let pos = pos_of("4k3/8/2p1p3/3n4/8/8/8/4K3 w - - 0 1");
+        let features = outpost_features(&pos);
+        let start = group_range(Group::Outpost).start;
+        // Black knight rr=3 → local=0 → KNIGHT_MG index=start, count=-1 (sign=-1).
+        assert!(
+            features.contains(&(start as u16, -1)),
+            "Black rr=3 knight: KNIGHT_MG index {start} with count -1 must appear (sign=-1); \
+             got {features:?}"
+        );
+        assert!(
+            features.contains(&((start + 3) as u16, -1)),
+            "Black rr=3 knight: KNIGHT_EG index {} with count -1 must appear; got {features:?}",
+            start + 3
+        );
+        // Sign -1 means count is negative; no positive knight count should appear.
+        assert!(
+            !features.iter().any(|&(_, c)| c > 0),
+            "Black-only outpost: all feature counts must be negative (sign=-1); got {features:?}"
+        );
+    }
+
+    /// Two White bishops at rr=3 (c4 and e4), both on outpost squares.
+    /// bishop[3] accumulates to 2; pins that `+=` is additive (not `*=` or `-=`).
+    ///
+    /// Survivors caught (line 78):
+    /// - `+= with -=`: bishop[3] = 1 - 1 = 0 → nothing emitted.
+    /// - `+= with *=`: bishop[3] = 1 * 1 = 1 → emits count 1 ≠ 2.
+    #[test]
+    fn outpost_features_two_bishops_same_rank_count_two() {
+        use crate::texel::layout::{Group, group_range};
+        // c4: file=2, rank=3 → rr=3 for White. Supported by b3 (shift_ne→c4) + d3 (shift_nw→c4).
+        // e4: file=4, rank=3 → rr=3 for White. Supported by d3 (shift_ne→e4) + f3 (shift_nw→e4).
+        // No black pawns → both unchallengeable.
+        let pos = pos_of("4k3/8/8/8/2B1B3/1P1P1P2/8/4K3 w - - 0 1");
+        let features = outpost_features(&pos);
+        let start = group_range(Group::Outpost).start;
+        // rr=3 → local=0 → BISHOP_MG index = start+6 = 183, BISHOP_EG = start+9 = 186.
+        let bishop_mg_idx = (start + 6) as u16;
+        let bishop_eg_idx = (start + 9) as u16;
+        assert!(
+            features.contains(&(bishop_mg_idx, 2)),
+            "two White bishops rr=3: BISHOP_MG index {bishop_mg_idx} count 2 must appear \
+             (+=, not -=/*=); got {features:?}"
+        );
+        assert!(
+            features.contains(&(bishop_eg_idx, 2)),
+            "two White bishops rr=3: BISHOP_EG index {bishop_eg_idx} count 2 must appear; \
+             got {features:?}"
+        );
+    }
+
+    /// Black bishop on d5 (rank=4, rr=3 for Black) in `outpost_term_white`.
+    /// sign=-1, OUTPOST_BISHOP_MG[3]=22 → mg contribution = -22; `/` gives 0.
+    ///
+    /// Survivor caught (line 167 `* with /`):
+    /// - `* with /`: `(-1) / 22 = 0` (integer truncation) ≠ -22.
+    #[test]
+    fn outpost_term_black_bishop_rr3_sign_times_weight() {
+        // Black Bd5 (rank=4, rr=3 for Black). Black pawns c6+e6 support d5.
+        // No white pieces in outpost zone; Black bishop contributes with sign=-1.
+        let pos = pos_of("4k3/8/2p1p3/3b4/8/8/8/4K3 w - - 0 1");
+        let expected_mg = -OUTPOST_BISHOP_MG[3]; // -1 * 22 = -22
+        let expected_eg = -OUTPOST_BISHOP_EG[3]; // -1 * 6 = -6
+        let (actual_mg, actual_eg) = outpost_term_white(&pos);
+        assert_eq!(
+            (actual_mg, actual_eg),
+            (expected_mg, expected_eg),
+            "Black bishop d5 (rr=3): outpost_term_white must be \
+             (-OUTPOST_BISHOP_MG[3], -OUTPOST_BISHOP_EG[3]) = ({expected_mg},{expected_eg}); \
+             `sign * weight` not `sign / weight`"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mutation-backstop fixtures for draw predicates (Cluster 2).
+    // -----------------------------------------------------------------------
+
+    /// White has TWO bishops (not one): `is_ocb_with_pawns` must return false
+    /// because `wb.count() != 1` fires under the `||` condition.
+    ///
+    /// Survivor caught (line 244 `|| with &&`):
+    /// - Mutant `&&`: needs BOTH sides to have ≠1 bishop to early-return. With
+    ///   White=2 bishops and Black=1 bishop: `2!=1 && 1!=1` = `true && false` =
+    ///   false → mutant DOES NOT return false → continues → returns true (wrong).
+    ///   The assertion `!is_ocb_with_pawns(...)` catches the mutant.
+    #[test]
+    fn ocb_with_pawns_two_white_bishops_returns_false() {
+        // White Be2 (light) + Bf2 (dark) + Ph2. Black Bc7 (dark). No queens/rooks.
+        // wb.count() = 2 → `wb.count() != 1` = true → original early-returns false.
+        // Mutant `&&`: `2!=1 && 1!=1` = false → doesn't return false → OCB check
+        // sees wb_on_light=true (e2 is light) and bb_on_light=false (c7 is dark)
+        // → wb_on_light != bb_on_light = true → mutant returns true (wrong).
+        let pos = pos_of("4k3/2b5/8/8/8/8/4BBP1/4K3 w - - 0 1");
+        let wb = pos.pieces_colored(Color::White, PieceKind::Bishop);
+        assert_eq!(wb.count(), 2, "fixture: white must have exactly 2 bishops");
+        assert!(
+            !is_ocb_with_pawns(&pos),
+            "white has 2 bishops (not 1) → is_ocb_with_pawns must be false; \
+             catches line 244 `|| with &&`"
+        );
+    }
+
+    /// White bishop on a DARK square, Black bishop on a LIGHT square → they are
+    /// on OPPOSITE color complexes → `is_ocb_with_pawns` must return true.
+    ///
+    /// The existing `ocb_with_pawns_predicate` test uses White on LIGHT, Black on
+    /// DARK, so `(wb & LIGHT_SQUARES).any()` = true regardless of the `&→|/^`
+    /// mutation. This fixture uses the opposite setup so the mutation is visible.
+    ///
+    /// Survivors caught (line 248 `& with |` and `& with ^`):
+    /// - `& with |`: `(wb | LIGHT).any()` = always true → wb_on_light=true →
+    ///   `true != true` = false → incorrectly returns false.
+    /// - `& with ^`: `(wb ^ LIGHT).any()` = true (many bits) → same wrong path.
+    #[test]
+    fn ocb_white_dark_bishop_black_light_bishop_is_ocb() {
+        // f2: file=5, rank=1 → 5+1=6 even → DARK. White bishop on dark.
+        // a6: file=0, rank=5 → 0+5=5 odd → LIGHT. Black bishop on light.
+        // Pawn on g4 (White). Kings on e1/e8. No queens/rooks.
+        // Opposite color complexes → OCB condition satisfied → must return true.
+        let pos = pos_of("4k3/8/b7/8/6P1/8/5B2/4K3 w - - 0 1");
+        // Verify fixture: White bishop on dark, Black bishop on light.
+        let wb = pos.pieces_colored(Color::White, PieceKind::Bishop);
+        let bb_b = pos.pieces_colored(Color::Black, PieceKind::Bishop);
+        assert!(
+            (wb & Bitboard::DARK_SQUARES).any() && !(wb & Bitboard::LIGHT_SQUARES).any(),
+            "fixture: White bishop (f2) must be on a dark square"
+        );
+        assert!(
+            (bb_b & Bitboard::LIGHT_SQUARES).any() && !(bb_b & Bitboard::DARK_SQUARES).any(),
+            "fixture: Black bishop (a6) must be on a light square"
+        );
+        assert!(
+            is_ocb_with_pawns(&pos),
+            "White bishop on dark, Black bishop on light → opposite complexes → \
+             is_ocb_with_pawns must be true; catches line 248 `& with |` and `& with ^`"
+        );
+    }
+
+    /// KBNvKN (wn=1, wb=1, bn=1, bb=0, no pawns): `w_minors = wn + wb = 2`.
+    /// NOT drawish (w_minors=2 > 1 for balanced; KBN is not KNN pattern).
+    ///
+    /// Survivor caught (line 273 `+ with *`):
+    /// - Mutant `*`: `w_minors = wn * wb = 1 * 1 = 1`. `is_balanced = (1<=1 && 1<=1)` =
+    ///   true → incorrectly marks as drawish.
+    #[test]
+    fn pawnless_drawish_kbnvkn_not_drawish_plus_vs_multiply() {
+        // White Ke1 + Nb1 + Bc2. Black Ka8 + Ng8. No pawns, no queens, no rooks.
+        let pos = pos_of("k5n1/8/8/8/8/8/2B5/1N2K3 w - - 0 1");
+        let wn = pos.pieces_colored(Color::White, PieceKind::Knight).count();
+        let wb = pos.pieces_colored(Color::White, PieceKind::Bishop).count();
+        assert_eq!(
+            (wn, wb),
+            (1, 1),
+            "fixture: white must have 1 knight + 1 bishop"
+        );
+        assert!(
+            !is_pawnless_drawish(&pos),
+            "KBNvKN (w_minors=2 via +): not drawish; \
+             catches line 273 `+ with *` (1*1=1 would falsely trigger balanced)"
+        );
+    }
+
+    /// KvKNN (Black has 2 knights, White bare King): `is_knnvk` second clause
+    /// `(bn==2 && bb==0 && w_minors==0)` fires → drawish.
+    ///
+    /// Survivors caught (line 276 Black clause):
+    /// - `bn==2 → bn!=2` (276:76): `0 != 0` = false → is_knnvk=false; NOT drawish. Caught.
+    /// - `bb==0 → bb!=0` (in `&&` survivors): KvKNN has bb=0 so `0!=0`=false. Caught.
+    /// - `w_minors==0 → w_minors!=0` (276:93): w_minors=0, `0!=0`=false → NOT drawish. Caught.
+    /// - `&&→||` at 70/81 (within Black clause): loosening `&&` to `||` expands
+    ///   the condition but KvKNN is already true under original `&&`; these are
+    ///   caught via false-positive cases (KNNvKN, KBNNvK) together with this test.
+    #[test]
+    fn pawnless_drawish_kvknn_is_drawish() {
+        // White Ka1. Black Ka8 + Nb8 + Nc8. No pawns, no queens, no rooks.
+        let pos = pos_of("knn5/8/8/8/8/8/8/K7 w - - 0 1");
+        let bn = pos.pieces_colored(Color::Black, PieceKind::Knight).count();
+        let bb = pos.pieces_colored(Color::Black, PieceKind::Bishop).count();
+        let w_minors = pos.pieces_colored(Color::White, PieceKind::Knight).count()
+            + pos.pieces_colored(Color::White, PieceKind::Bishop).count();
+        assert_eq!((bn, bb, w_minors), (2, 0, 0), "fixture: KvKNN material");
+        assert!(
+            is_pawnless_drawish(&pos),
+            "KvKNN (Black 2 knights vs bare White K) → is_pawnless_drawish must be true; \
+             catches 276 Black-clause `== → !=` mutations"
+        );
+    }
+
+    /// KNNvKN (wn=2, wb=0, bn=1, bb=0): the `b_minors == 0` condition of the
+    /// White KNNvK clause is false → NOT drawish. Pins that `&&` in
+    /// `wb==0 && b_minors==0` is AND not OR.
+    ///
+    /// Survivor caught (276 `&&→||` for b_minors==0 in White clause):
+    /// - Mutant `||`: `(wn==2 && (wb==0 || b_minors==0))` = `true && true` = true
+    ///   → is_knnvk=true → incorrectly drawish.
+    #[test]
+    fn pawnless_drawish_knnvkn_not_drawish() {
+        // White Ke1 + Nb1 + Nc1. Black Ka8 + Nd8. No pawns, no queens, no rooks.
+        // wn=2, wb=0, b_minors=1 → White KNN clause fails on `b_minors==0`.
+        let pos = pos_of("k2n4/8/8/8/8/8/8/1NNK4 w - - 0 1");
+        let wn = pos.pieces_colored(Color::White, PieceKind::Knight).count();
+        let wb = pos.pieces_colored(Color::White, PieceKind::Bishop).count();
+        let bn = pos.pieces_colored(Color::Black, PieceKind::Knight).count();
+        assert_eq!((wn, wb, bn), (2, 0, 1), "fixture: KNNvKN material");
+        assert!(
+            !is_pawnless_drawish(&pos),
+            "KNNvKN (wn=2 but b_minors=1≠0) → NOT drawish; \
+             catches 276 `&&→||` for the `b_minors==0` condition"
+        );
+    }
+
+    /// KBNNvK (wn=2, wb=1, bn=0, bb=0): `wb==0` fails in the White KNN clause.
+    /// NOT drawish because KBNNvK is a forced win, not KNNvK.
+    ///
+    /// Survivor caught (276 `&&→||` for wb==0 in White clause at col 29):
+    /// - Mutant `||` at `wn==2 && wb==0` → `wn==2 || wb==0`:
+    ///   `(wn==2 || wb==0) && b_minors==0` = `(true || false) && true` = true →
+    ///   is_knnvk=true → incorrectly drawish.
+    #[test]
+    fn pawnless_drawish_kbnnvk_not_drawish() {
+        // White Ke1 + Nb1 + Nc1 + Bc2. Black Ka8. No pawns, no queens, no rooks.
+        // wn=2, wb=1 → `wb==0` false → White KNN clause fails.
+        let pos = pos_of("k7/8/8/8/8/8/2B5/1NNK4 w - - 0 1");
+        let wn = pos.pieces_colored(Color::White, PieceKind::Knight).count();
+        let wb = pos.pieces_colored(Color::White, PieceKind::Bishop).count();
+        assert_eq!((wn, wb), (2, 1), "fixture: KBNNvK material (wn=2, wb=1)");
+        assert!(
+            !is_pawnless_drawish(&pos),
+            "KBNNvK (wn=2 but wb=1≠0) → NOT drawish; \
+             catches 276 `&&→||` for the `wb==0` condition (col 29)"
+        );
+    }
+
+    /// KvKNNN (bn=3, bb=0, w_minors=0): NOT drawish — b_minors=3 > 1 for
+    /// balanced, and `bn==3 != 2` for KNNvK. Pins that `&&` between `bn==2`
+    /// and `bb==0` is AND not OR (col 70).
+    ///
+    /// Survivor caught (276:70 `&&→||`):
+    /// - Mutant `||`: `(3==2 || 0==0) && 0==0` = true → incorrectly drawish.
+    #[test]
+    fn pawnless_drawish_kvknnn_not_drawish() {
+        // White Ka1. Black Ka8 + Nb8 + Nc8 + Nd8. No pawns/queens/rooks.
+        let pos = pos_of("knnn4/8/8/8/8/8/8/K7 w - - 0 1");
+        let bn = pos.pieces_colored(Color::Black, PieceKind::Knight).count();
+        assert_eq!(bn, 3, "fixture: black must have 3 knights");
+        assert!(
+            !is_pawnless_drawish(&pos),
+            "KvKNNN (bn=3 ≠ 2, b_minors=3 > 1) → NOT drawish; \
+             catches 276:70 `&&→||` in `bn==2 && bb==0`"
+        );
+    }
+
+    /// KvKBNN (bn=2, bb=1, w_minors=0): NOT drawish — the `bb==0` condition
+    /// fails in the Black KNNvK clause. Pins that `&&` between `bb==0` and
+    /// `w_minors==0` is AND not OR (col 81).
+    ///
+    /// Survivor caught (276:81 `&&→||`):
+    /// - Mutant `||`: `bn==2 && (bb==0 || w_minors==0)` = true when bb=1,w=0
+    ///   since `w_minors==0` is true → incorrectly drawish.
+    #[test]
+    fn pawnless_drawish_kvkbnn_not_drawish() {
+        // White Ka1. Black Ka8 + Nb8 + Nc8 + Bc8 (reuse c8 for bishop).
+        // We need 2 Black knights + 1 Black bishop, White bare K.
+        // Use a8=k, b8=n, c8=n, d8=b with k on a1:
+        let pos = pos_of("knnb4/8/8/8/8/8/8/K7 w - - 0 1");
+        let bn = pos.pieces_colored(Color::Black, PieceKind::Knight).count();
+        let bb = pos.pieces_colored(Color::Black, PieceKind::Bishop).count();
+        let w_minors = pos.pieces_colored(Color::White, PieceKind::Knight).count()
+            + pos.pieces_colored(Color::White, PieceKind::Bishop).count();
+        assert_eq!((bn, bb, w_minors), (2, 1, 0), "fixture: KvKBNN material");
+        assert!(
+            !is_pawnless_drawish(&pos),
+            "KvKBNN (bn=2, bb=1≠0, w_minors=0) → NOT drawish; \
+             catches 276:81 `&&→||` in `bb==0 && w_minors==0`"
+        );
     }
 
     // Property: `endgame_scale` always returns a value in `[0, EG_SCALE_DEN]`

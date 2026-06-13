@@ -1,0 +1,43 @@
+Found 194 mutants to test
+ok       Unmutated baseline in 13s build + 33s test
+ INFO Auto-set test timeout to 168s
+MISSED   src/eval/tier1.rs:67:63: delete - in outpost_features in 3s build + 50s test
+MISSED   src/eval/tier1.rs:78:28: replace += with -= in outpost_features in 2s build + 47s test
+MISSED   src/eval/tier1.rs:78:28: replace += with *= in outpost_features in 2s build + 46s test
+MISSED   src/eval/tier1.rs:88:24: replace - with / in outpost_features in 3s build + 46s test
+MISSED   src/eval/tier1.rs:93:23: replace != with == in outpost_features in 3s build + 46s test
+MISSED   src/eval/tier1.rs:94:34: replace + with - in outpost_features in 3s build + 46s test
+MISSED   src/eval/tier1.rs:94:34: replace + with * in outpost_features in 3s build + 46s test
+MISSED   src/eval/tier1.rs:94:30: replace + with - in outpost_features in 3s build + 46s test
+MISSED   src/eval/tier1.rs:94:30: replace + with * in outpost_features in 3s build + 47s test
+MISSED   src/eval/tier1.rs:95:34: replace + with - in outpost_features in 3s build + 46s test
+MISSED   src/eval/tier1.rs:95:34: replace + with * in outpost_features in 3s build + 46s test
+MISSED   src/eval/tier1.rs:95:30: replace + with - in outpost_features in 3s build + 46s test
+MISSED   src/eval/tier1.rs:95:30: replace + with * in outpost_features in 3s build + 46s test
+MISSED   src/eval/tier1.rs:167:28: replace * with / in outpost_term_white in 5s build + 46s test
+TIMEOUT  src/eval/tier1.rs:193:20: replace += with *= in rook_file_term_white in 6s build + 168s test
+TIMEOUT  src/eval/tier1.rs:209:5: replace endgame_scale -> i32 with -1 in 7s build + 168s test
+MISSED   src/eval/tier1.rs:219:12: replace > with == in endgame_scale in 6s build + 45s test
+MISSED   src/eval/tier1.rs:219:12: replace > with < in endgame_scale in 7s build + 46s test
+MISSED   src/eval/tier1.rs:219:12: replace > with >= in endgame_scale in 7s build + 47s test
+MISSED   src/eval/tier1.rs:220:25: replace - with + in endgame_scale in 7s build + 47s test
+MISSED   src/eval/tier1.rs:220:25: replace - with / in endgame_scale in 7s build + 46s test
+MISSED   src/eval/tier1.rs:221:25: replace - with + in endgame_scale in 7s build + 46s test
+MISSED   src/eval/tier1.rs:221:25: replace - with / in endgame_scale in 7s build + 46s test
+MISSED   src/eval/tier1.rs:222:36: replace - with + in endgame_scale in 7s build + 47s test
+MISSED   src/eval/tier1.rs:222:79: replace / with % in endgame_scale in 7s build + 46s test
+MISSED   src/eval/tier1.rs:222:79: replace / with * in endgame_scale in 7s build + 47s test
+MISSED   src/eval/tier1.rs:222:72: replace * with + in endgame_scale in 7s build + 47s test
+MISSED   src/eval/tier1.rs:222:72: replace * with / in endgame_scale in 7s build + 46s test
+MISSED   src/eval/tier1.rs:222:52: replace - with / in endgame_scale in 7s build + 46s test
+MISSED   src/eval/tier1.rs:244:24: replace || with && in is_ocb_with_pawns in 8s build + 46s test
+MISSED   src/eval/tier1.rs:248:27: replace & with | in is_ocb_with_pawns in 8s build + 46s test
+MISSED   src/eval/tier1.rs:248:27: replace & with ^ in is_ocb_with_pawns in 8s build + 46s test
+MISSED   src/eval/tier1.rs:273:23: replace + with * in is_pawnless_drawish in 8s build + 46s test
+MISSED   src/eval/tier1.rs:276:29: replace && with || in is_pawnless_drawish in 8s build + 46s test
+MISSED   src/eval/tier1.rs:276:81: replace && with || in is_pawnless_drawish in 8s build + 47s test
+MISSED   src/eval/tier1.rs:276:70: replace && with || in is_pawnless_drawish in 8s build + 47s test
+MISSED   src/eval/tier1.rs:276:65: replace == with != in is_pawnless_drawish in 9s build + 47s test
+MISSED   src/eval/tier1.rs:276:76: replace == with != in is_pawnless_drawish in 9s build + 47s test
+MISSED   src/eval/tier1.rs:276:93: replace == with != in is_pawnless_drawish in 9s build + 47s test
+194 mutants tested in 3h: 37 missed, 154 caught, 1 unviable, 2 timeouts

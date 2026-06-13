@@ -1,0 +1,2 @@
+src/eval/tier1.rs:193:20: replace += with *= in rook_file_term_white
+src/eval/tier1.rs:209:5: replace endgame_scale -> i32 with -1
