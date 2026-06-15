@@ -102,12 +102,22 @@ real but the *correctness* is the hard gate):
   random positions × all their captures (the M1.C magic / slow-ray-walker
   precedent). The oracle derives EP/promo square-arithmetic inline, not via a
   shared helper.
-- **King-recapture-stop equivalent mutant.** The stop `break` is an equivalent
-  mutant: the sentinel (30000) + the minimax back-up produce the identical return
-  value with or without it (a king-into-attack recapture back-propagates a
-  hugely-negative value that the prior `max(0,·)` floors to 0). It is kept as a
-  performance optimization, covered by an execution-path test, and triaged in
-  `.cargo/mutants.toml` (the M5.H1 equivalent-mutant precedent).
+- **Mutation sweep (scoped to `see::` tests): 73 caught / 3 missed / 1 unviable
+  — 100% of viable non-equivalent mutants caught.** The 3 survivors are all the
+  `| → ^` **disjoint-OR equivalent class** (`bishop_like`/`rook_like` and the
+  x-ray rescan in `see`; the colour/piece-type/diag-XOR-orth unions in
+  `attackers_to` are disjoint by construction, so `|` ≡ `^`) — excluded in
+  `.cargo/mutants.toml` with the masks/slow_attacks precedent. The unviable one
+  is a benign non-compiling `find_lva` body replacement (`PieceKind`/`Square`
+  have no `Default`). llvm-cov: 99.39% region / 100% fn / 98.62% line.
+- **King-recapture-stop:** the stop `break` is a *performance* optimization with
+  **no return-value effect** — the sentinel (30000) + the minimax back-up produce
+  the identical result with or without it (a king-into-attack recapture
+  back-propagates a hugely-negative value the prior `max(0,·)` floors to 0). It is
+  covered by an execution-path test (`see_king_stop_branch_fires`); the mutations
+  cargo-mutants generates on its *condition* (`==`→`!=`, the `&`-chain) DO change
+  behaviour on non-king LVAs and were **caught** — so no exclusion is needed for
+  it (it is not a surviving mutant).
 
 ### 5. Move-ordering tier (the ADR-0030 §9 deferral) — EXPLORED, SHELVED
 

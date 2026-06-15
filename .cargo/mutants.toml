@@ -185,6 +185,29 @@ exclude_re = [
     "replace \\| with \\^ in MaskInfo::compute",
     "replace \\| with \\^ in emit_pawn_moves",
 
+    # ---- see::{attackers_to, see} — disjoint-by-construction unions (M7.A) -
+    #
+    # Every binary `|` in `attackers_to` and `see` ORs bitboards that share
+    # zero bits:
+    #   - `(pawn_attacks_from(sq,Black) & white_pawns) | (… & black_pawns)`:
+    #     a square holds at most one color of pawn → the two operands are
+    #     disjoint.
+    #   - `Bishop | Queen` (bishop_like) and `Rook | Queen` (rook_like): a
+    #     square holds one piece kind, never both.
+    #   - the final `pawn | knight | diag | orth | king` union (attackers_to)
+    #     and the x-ray rescan `bishop_attacks(to)&bishop_like |
+    #     rook_attacks(to)&rook_like` (see): distinct piece types occupy
+    #     distinct squares, and a queen attacks `to` via at most ONE of the
+    #     diagonal (diag) / orthogonal (orth) rays (a square is on a diagonal
+    #     XOR a rank/file relative to the queen) → diag and orth are disjoint.
+    # For disjoint a,b: `a | b == a ^ b` for every input ⇒ no test can
+    # distinguish `|` from `^`. Same equivalent-mutant class as the masks /
+    # slow_attacks unions above. NOTE: these patterns match the binary `|`
+    # only — `see`'s x-ray-accumulating `attackers |= …` is NOT disjoint
+    # (revealed sliders overlap the running set) and is correctly caught.
+    "replace \\| with \\^ in attackers_to",
+    "replace \\| with \\^ in see",
+
     # ---- masks::is_slider_at — equivalent on knight/pawn checker -----
     #
     # `is_slider_at` is consumed only inside MaskInfo::compute's
