@@ -126,10 +126,12 @@ hypothesis) but landed **flat** — neither variant clears any ADR-0037 ship run
 **Conclusion: ordering-by-SEE is neutral for this engine** — the existing
 MVV-LVA + TT + killer + history ordering is already strong enough that reordering
 captures by SEE adds nothing measurable. SEE's Elo is in *pruning* (M7.B/M7.C),
-not ordering. The experiment is preserved on branch `m7a-see` (commits `7313358`
-v1, `96e82db` v2) and in `bench/m7.md`; the hook (`BAD_CAPTURE_BASE`,
-`SEE_ORDER_MARGIN`, `see_nonneg_fastout`, the `negamax_move_order_score` split)
-is **reverted** on `main`. The tier ladder it implemented, for the record:
+not ordering. The experiment (both variants + CIs + per-TC) is documented in
+`bench/m7.md`; the hook (`BAD_CAPTURE_BASE`, `SEE_ORDER_MARGIN`,
+`see_nonneg_fastout`, the `negamax_move_order_score` split) is **reverted** on
+`main` and the split *code* is not retained (the result is conclusive enough that
+re-deriving it from this record is cheaper than carrying the code). The tier
+ladder it implemented, for the record:
 
 ```
 TT > good captures (SEE≥0) > killer0 > killer1 > history quiets > bad captures
