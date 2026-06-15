@@ -23,6 +23,7 @@ pub mod perft;
 pub mod piece;
 pub mod position;
 pub mod search;
+pub(crate) mod see;
 pub mod slow_attacks;
 pub mod square;
 /// M6.I — Texel tuning harness (deferred eval-weight calibration). See
