@@ -1,6 +1,6 @@
 # ADR-0040 — Quiescence SEE-pruning: gate set, threshold, fast-out, TT policy
 
-**Status:** Proposed (lands with M7.B, pending the confirmation SPRT vs production HEAD `M6.J`/`M5.K`).
+**Status:** Accepted — **SHIPPED 2026-06-16** (rung-1 by aggregate CI, user-approved "ship now, tune later"). SPRT vs `M5.K` (≡ production HEAD): **Δ Elo +40.13 [+12.97, +67.80]** pentanomial, mixed-TC + virtual-clock, 400 games (`bench/sprt/2026-06-16-m7b-qsearch-see-prune-vs-m5k.md`). **Caveat:** inverse depth profile — strongly positive at fast/mid TC (10+0.1 ≈+109, 40+0.4 ≈+109) but **≈−104 Elo at 60+0.6** (the strength-relevant TC). Hypothesised over-aggressive threshold at depth; the negative-threshold fix is **M7.B.1** (HIGH-priority tuning-backlog).
 
 ## Context
 

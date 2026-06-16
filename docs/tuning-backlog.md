@@ -8,6 +8,16 @@ This file also tracks **deferred features awaiting a precondition** — items re
 
 ---
 
+### M7.B.1 — qsearch SEE-prune threshold (fix the slow-TC regression) — NEW, HIGH PRIORITY (2026-06-16)
+
+**Why (top of queue).** M7.B (qsearch SEE-pruning, ADR-0040) shipped 2026-06-16 on a **+40.13 [+12.97, +67.80]** aggregate (rung-1), but with an **inverse depth profile**: ≈+109 / +73 / +109 Elo at 10+0.1 / 20+0.2 / 40+0.4, and **≈−104 Elo at 60+0.6** (10W-42L-58D, ≈4.4σ — not noise). The slowest TC is the strength-relevant one for the GM goal, so recovering it is the highest-value tuning slot. Shipped "now, tune later" per user decision; full record `bench/sprt/2026-06-16-m7b-qsearch-see-prune-vs-m5k.md`.
+
+**The lever.** `QS_SEE_PRUNE_THRESHOLD` (`src/search.rs`, currently `0` = prune every `see < 0` capture). Hypothesis: `0` is too aggressive at depth — at slow TC the engine has the budget to refute "statically losing" captures that are real tactical shots, so pruning them costs accuracy. A **negative margin** (prune only *clearly*-losing, e.g. `see < −100` or `< −50`) should keep most of the fast-TC node-saving gain while restoring slow-TC tactical accuracy.
+
+**Plan.** Sweep `QS_SEE_PRUNE_THRESHOLD ∈ {−50, −100, −150}` via mixed-TC + virtual-clock SPRT vs `M5.K` (same shape as the M7.B run), reading the **per-TC** breakdown (the 60+0.6 bucket is the target). Ship the variant that maximises the aggregate **without** the 60+0.6 regression (ideally net-positive at every TC). A negative threshold keeps the ADR-0040 §3 fast-out validity assert (`QS_SEE_PRUNE_THRESHOLD <= 0`) satisfied — no fast-out rework needed (a *positive* threshold would). A 2–3-point manual SPRT sweep is the right tool (per the M5.K lesson, SPSA is low-signal for node-efficiency knobs); the threshold is a single named const — trivial to vary.
+
+---
+
 ### 2026-06-03 overnight backlog sweep — 0 ships (full plan: [`docs/plans/tuning-overnight-2026-06-03.md`](plans/tuning-overnight-2026-06-03.md))
 
 Walked the whole active queue in order. Dispositions:
