@@ -1138,7 +1138,14 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
     // SPRT-validated +37.49 alone but did NOT compose with M5.F.1 — combined
     // −58 Elo at 40+0.4 — so it was deferred, not shipped; see tuning-backlog.)
     // History prepend: M5.F.1 `112_020`.
-    const DEPTH4_BENCH_NODES: u64 = 112_020;
+    // M7.B (qsearch SEE-pruning, ADR-0040): skipping statically-losing
+    // (`see < 0`) non-promotion captures in quiescence cuts the qsearch tree
+    // sharply — depth-4 anchor moved 112_020 -> 45_788 (−59%); the default
+    // (depth-7) bench moved 1_326_598 -> 662_085 (−50%). Per the roadmap
+    // bench-node-count policy this is a determinism anchor, not a no-regression
+    // signal; the strength claim is the SPRT (mixed-TC + virtual-clock vs the
+    // M6.J/M5.K production HEAD). History prepend: M7.B `45_788`.
+    const DEPTH4_BENCH_NODES: u64 = 45_788;
     assert_eq!(
         nodes1, DEPTH4_BENCH_NODES,
         "E51: bench node count changed from the M5.F.1 pin ({DEPTH4_BENCH_NODES} at depth=4); \

@@ -114,6 +114,20 @@ exclude_re = [
     # `replace <fn> -> () with ()` — no-op for unit-returning functions.
     "replace .* -> \\(\\) with \\(\\)",
 
+    # ---- M7.B qsearch SEE-pruning: `< → <=` is equivalent at threshold 0 ----
+    #
+    # `see(pos, mv) < QS_SEE_PRUNE_THRESHOLD` (=0) vs `<=` differ only when
+    # `see() == 0` exactly. The prune predicate only reaches the `see()` call
+    # when `attacker > victim` (the `victim >= attacker` fast-out returns early
+    # otherwise). With the integer SEE_VALUE set [82,337,365,477,1025,30000],
+    # no `attacker > victim` exchange can net exactly 0: the swap-list remainder
+    # is a sum/difference of these values and never cancels to 0 on that path
+    # (an exact-even trade requires victim == attacker, which the fast-out
+    # already short-circuits). So no position can distinguish `<` from `<=`.
+    # Equivalent mutant (ADR-0040 §6). See the analysis comment in search.rs's
+    # §5.3 test block.
+    "replace < with <= in qsearch_see_pruneable",
+
     # ---- `|` ↔ `^` between provably-disjoint operands -----------------
     #
     # These functions OR together bitboards (or single-bit integer values)

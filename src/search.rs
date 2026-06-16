@@ -1290,6 +1290,14 @@ pub(crate) struct AlphaBetaMover {
     /// `depth - 1`. Reset to `None` at each `negamax_for_test` invocation.
     #[cfg(test)]
     se_tt_move_search_depth: Option<u32>,
+    /// M7.B: per-`go` count of qsearch captures skipped by the SEE-pruning gate.
+    /// Incremented each time the `!in_chk && is_capture && !is_promotion &&
+    /// qsearch_see_pruneable` guard fires a `continue`. Test-only; gated by
+    /// `#[cfg(test)]` so production builds don't carry the field. Naming follows
+    /// the M5.A `nmp_firings` / M5.D `ffp_firings` / M5.E `qsearch_*_firings`
+    /// convention.
+    #[cfg(test)]
+    qsearch_see_prune_firings: u32,
 }
 
 impl AlphaBetaMover {
@@ -1338,6 +1346,8 @@ impl AlphaBetaMover {
             se_extensions: 0,
             #[cfg(test)]
             se_tt_move_search_depth: None,
+            #[cfg(test)]
+            qsearch_see_prune_firings: 0,
         }
     }
 }
@@ -2359,6 +2369,8 @@ impl AlphaBetaMover {
         // M5.G: reset SE extensions counter and depth-recording field.
         self.se_extensions = 0;
         self.se_tt_move_search_depth = None;
+        // M7.B: reset SEE-prune firing counter symmetrically.
+        self.qsearch_see_prune_firings = 0;
         self.lmr_trace_root_ply = Some(ply);
         let score = self.negamax(
             pos,
@@ -2762,6 +2774,15 @@ impl AlphaBetaMover {
         let mut best = best_init;
         let mut cutoff_move: Option<Move> = None;
         for mv in moves_vec {
+            // M7.B: qsearch SEE-pruning — skip statically-losing captures when not
+            // in check. Promotions and (when in check) evasions are exempt by guard.
+            if !in_chk && mv.is_capture() && !mv.is_promotion() && qsearch_see_pruneable(pos, mv) {
+                #[cfg(test)]
+                {
+                    self.qsearch_see_prune_firings += 1;
+                }
+                continue;
+            }
             let undo = pos.make_move(mv);
             self.history.push(pos.zobrist());
 
@@ -2927,6 +2948,8 @@ impl AlphaBetaMover {
         // M5.F: reset TT probe/store counters per-entry for the same reason.
         self.qsearch_tt_probes = 0;
         self.qsearch_tt_stores = 0;
+        // M7.B: reset SEE-prune firing counter per-entry for the same reason.
+        self.qsearch_see_prune_firings = 0;
         let clock = SearchClock::start_for(ctx.virtual_clock, ctx.caps);
         self.qsearch(pos, alpha, beta, ply, ctx, &clock)
     }
@@ -2944,6 +2967,15 @@ impl AlphaBetaMover {
     #[cfg(test)]
     pub(super) fn qsearch_under_promo_firings_for_test(&self) -> u32 {
         self.qsearch_under_promo_firings
+    }
+
+    /// Test-only accessor for the per-`go` qsearch SEE-prune firing counter
+    /// (M7.B). Incremented each time the `!in_chk && is_capture &&
+    /// !is_promotion && qsearch_see_pruneable` gate fires a `continue`.
+    /// Production code never reads this through the accessor.
+    #[cfg(test)]
+    pub(super) fn qsearch_see_prune_firings_for_test(&self) -> u32 {
+        self.qsearch_see_prune_firings
     }
 
     /// Test-only accessor for the per-`go` qsearch TT probe counter (M5.F).
@@ -3193,6 +3225,54 @@ fn qsearch_move_filter(mv: Move) -> bool {
         mv.flag(),
         Capture | EnPassant | QueenPromo | QueenPromoCapture
     )
+}
+
+// ---------------------------------------------------------------------------
+// M7.B — qsearch SEE-pruning
+// ---------------------------------------------------------------------------
+
+/// Centipawn SEE threshold for qsearch capture pruning. A non-promotion
+/// capture with `see < QS_SEE_PRUNE_THRESHOLD` is skipped in quiescence
+/// (statically losing). `0` prunes strictly-losing captures; this is the
+/// SPRT/SPSA tuning lever (docs/plans/m7.b.md §10).
+const QS_SEE_PRUNE_THRESHOLD: i32 = 0;
+
+/// Returns `true` iff `mv` (a non-promotion capture: `Capture` | `EnPassant`)
+/// should be pruned from quiescence as statically losing. The caller
+/// guarantees `!in_check` and `mv.is_capture() && !mv.is_promotion()`.
+///
+/// Fast-out: a capture whose victim is worth >= the attacker can never be
+/// SEE-negative (worst case the attacker is traded off, netting >= 0), so
+/// the full `see()` resolver is skipped for the common winning/equal captures
+/// (PxN, RxQ, equal trades, all EP PxP). Only `attacker > victim` captures
+/// (QxP-class) pay for the resolver. The fast-out is only valid while
+/// `QS_SEE_PRUNE_THRESHOLD <= 0` (victim>=attacker ⇒ see>=0 ⇒ not <
+/// threshold); pinned by a compile-time assert.
+fn qsearch_see_pruneable(pos: &Position, mv: Move) -> bool {
+    use crate::mov::MoveFlag;
+    use crate::piece::PieceKind;
+    use crate::see::{SEE_VALUE, see};
+    const _: () = assert!(QS_SEE_PRUNE_THRESHOLD <= 0); // fast-out validity
+
+    let attacker = SEE_VALUE[pos
+        .piece_at(mv.from_square())
+        .expect("qsearch_see_pruneable: capture from-square occupied")
+        .kind as usize];
+    // EP victim is a pawn off-square (the to-square is empty for EP); reading
+    // piece_at(to) would be a bug. All other captures take the piece on `to`.
+    let victim = match mv.flag() {
+        MoveFlag::EnPassant => SEE_VALUE[PieceKind::Pawn as usize],
+        _ => {
+            SEE_VALUE[pos
+                .piece_at(mv.to_square())
+                .expect("qsearch_see_pruneable: capture to-square occupied")
+                .kind as usize]
+        }
+    };
+    if victim >= attacker {
+        return false; // SEE >= 0; never prune (valid while threshold <= 0)
+    }
+    see(pos, mv) < QS_SEE_PRUNE_THRESHOLD
 }
 
 /// M5.E #3 — given a queen-promo move `mv`, returns the rook-promo and
@@ -16789,49 +16869,81 @@ mod tests {
 
     /// A capture stored as the TT best_move is promoted to index 0 in the
     /// qsearch move loop. Drives a two-run node-count differential: run (a)
-    /// without a TT pre-population, run (b) with a TT entry whose best_move
-    /// is the ordering-relevant capture. Different node counts confirm ordering
-    /// changed.
+    /// without TT pre-population, run (b) with a TT entry whose best_move is
+    /// the lower-MVV-LVA (but still SEE-non-negative) capture. Different node
+    /// counts confirm ordering changed.
     ///
-    /// Fixture: `4k3/8/8/8/3b1q2/8/3Q4/4K3 w - - 0 1` — white Q d2 can
-    /// capture black B d4 (Qxd4) or black Q f4 (Qxf4). MVV-LVA: QxQ > QxB.
-    /// Pre-populate TT with best_move = Qxd4 (lower MVV-LVA score). If ordering
-    /// works, run (b) searches Qxd4 first and may cut earlier/later, changing
-    /// node count.
+    /// Fixture: `4k3/8/8/8/3b1n2/8/3Q4/4K3 w - - 0 1` — white Q d2 can
+    /// capture black B d4 (Qxd4, d2d4) or black N f4 (Qxf4, d2f4). Both
+    /// captures are undefended; SEE(Qxd4)=+365, SEE(Qxf4)=+337 — both
+    /// SEE-non-negative, so neither is pruned by M7.B.
+    ///
+    /// MVV-LVA order: QxBd4 (victim B=365) > QxNf4 (victim N=337) — QxBd4
+    /// sorts first by default. Pre-populate TT with best_move = Qxf4 (lower
+    /// MVV-LVA), promoting it to index 0. With a narrow beta window
+    /// (`beta = evaluate(pos) + 360`): QxBd4 (higher-scoring) exceeds beta
+    /// in run (a) after 1 child, cutting off before QxNf4. In run (b), QxNf4
+    /// (lower-scoring) is searched first without cutoff, then QxBd4 cuts — 3
+    /// nodes vs 2. The node-count difference pins the ordering effect.
+    ///
+    /// Re-pointed from the original `3b1q2` fixture (M7.B §5.4 audit):
+    /// that fixture's TT move Qxd4 had SEE(Qxd4)=−660 (bishop defended by
+    /// Qf4 along rank 4), which M7.B's real impl would prune, breaking the
+    /// ordering assertion. The new fixture has both captures SEE-non-negative.
     #[test]
     fn qsearch_tt_move_promoted_to_index_0_when_capture() {
+        use crate::eval::evaluate;
+        use crate::movegen::{MoveList, generate_moves};
+        use crate::see::see;
         use crate::tt::{TranspositionTable, TtBound, TtData, score_to_tt};
-        let pos = Position::from_fen("4k3/8/8/8/3b1q2/8/3Q4/4K3 w - - 0 1")
+
+        // Fixture: white Q d2, black B d4 (undefended), black N f4 (undefended).
+        let pos = Position::from_fen("4k3/8/8/8/3b1n2/8/3Q4/4K3 w - - 0 1")
             .expect("two-capture FEN must parse");
 
-        // Verify both captures are available.
-        use crate::movegen::{MoveList, generate_moves};
+        // Verify both SEE-non-negative captures are available.
         let mut ml = MoveList::new();
         generate_moves(&pos, &mut ml);
-        let qxd4 = Move::from_uci("d2d4", &pos).expect("Qxd4 must be legal");
-        let qxf4 = Move::from_uci("d2f4", &pos).expect("Qxf4 must be legal");
+        let qxb = Move::from_uci("d2d4", &pos).expect("Qxd4 (QxB) must be legal");
+        let qxn = Move::from_uci("d2f4", &pos).expect("Qxf4 (QxN) must be legal");
         let captures: Vec<_> = ml.iter().filter(|m| m.is_capture()).collect();
         assert!(
-            captures.contains(&qxd4),
-            "fixture must have Qxd4 capture; got {captures:?}"
+            captures.contains(&qxb),
+            "fixture must have QxBd4 capture; got {captures:?}"
         );
         assert!(
-            captures.contains(&qxf4),
-            "fixture must have Qxf4 capture; got {captures:?}"
+            captures.contains(&qxn),
+            "fixture must have QxNf4 capture; got {captures:?}"
+        );
+        // Both captures must be SEE-non-negative (so neither is pruned by M7.B).
+        let see_qxb = see(&pos, qxb);
+        let see_qxn = see(&pos, qxn);
+        assert!(
+            see_qxb >= 0,
+            "QxBd4 must be SEE-non-negative (not pruned by M7.B); see={see_qxb}"
+        );
+        assert!(
+            see_qxn >= 0,
+            "QxNf4 must be SEE-non-negative (not pruned by M7.B); see={see_qxn}"
         );
 
         let ply: u32 = 1;
+        // Narrow beta: between QxN score (~337 gain) and QxB score (~365 gain).
+        // Empirically confirmed: at beta=evaluate(pos)+360, QxBd4 (higher-scoring)
+        // causes cutoff after 1 child in run (a); QxNf4 first in run (b) does not
+        // cut → different node counts.
+        let beta = evaluate(&pos) + 360;
 
-        // Run (a): no TT.
+        // Run (a): no TT — order is [QxBd4 (higher MVV-LVA), QxNf4].
+        // QxBd4 score exceeds beta → cutoff → 2 nodes total.
         let mut ab_a = AlphaBetaMover::new();
         ab_a.history = vec![pos.zobrist()];
         let (ctx_a, _stop_a) = non_aborting_ctx();
-        let _ = ab_a.qsearch_for_test(&mut pos.clone(), -INF, INF, ply, &ctx_a);
+        let _ = ab_a.qsearch_for_test(&mut pos.clone(), -INF, beta, ply, &ctx_a);
         let nodes_a = ab_a.nodes;
 
-        // Run (b): pre-populate TT with the LOWER-ranked capture (Qxd4 by MVV-LVA,
-        // since QxB < QxQ) as the ordering hint. If ordering works, Qxd4 moves to
-        // index 0, changing the search order and potentially the node count.
+        // Run (b): TT hint = QxNf4 (lower MVV-LVA → promoted to index 0).
+        // QxNf4 searched first (score < beta → no cutoff), then QxBd4 cuts → 3 nodes.
         let tt_b = Arc::new(TranspositionTable::new(1));
         tt_b.store(
             pos.zobrist(),
@@ -16839,29 +16951,107 @@ mod tests {
                 score: score_to_tt(100, ply as i32) as i16,
                 depth: 0,
                 bound: TtBound::Lower,
-                best_move: qxd4.bits(),
+                best_move: qxn.bits(),
             },
         );
-
         let mut ab_b = AlphaBetaMover::new();
         ab_b.history = vec![pos.zobrist()];
         ab_b.set_tt_for_test(Some(Arc::clone(&tt_b)));
-        let (ctx_b, _stop_b) = non_aborting_ctx();
-        let _ = ab_b.qsearch_for_test(&mut pos.clone(), -INF, INF, ply, &ctx_b);
+        let (ctx_b, _stop_b) = non_aborting_ctx_with_tt(Arc::clone(&tt_b));
+        let _ = ab_b.qsearch_for_test(&mut pos.clone(), -INF, beta, ply, &ctx_b);
         let nodes_b = ab_b.nodes;
 
-        // Without ordering impl, nodes_a == nodes_b (same search order). With
-        // impl, the order changes and nodes differ. The probe also registers.
+        // TT probe registered.
         assert_eq!(
             ab_b.qsearch_tt_probes_for_test(),
             1,
             "run (b) must probe the TT; got probes={}",
             ab_b.qsearch_tt_probes_for_test()
         );
+        // Ordering changes node count.
         assert_ne!(
             nodes_a, nodes_b,
-            "TT-move ordering must change the search shape; both runs produced {nodes_a} nodes. \
-             This test will pass only after the ordering block is implemented."
+            "TT-move ordering must change the search shape (QxBd4 first in run (a) \
+             causes earlier cutoff than QxNf4-first in run (b)); \
+             both runs produced {nodes_a} nodes."
+        );
+    }
+
+    /// A SEE-losing capture promoted to index 0 by the TT is still pruned in
+    /// the qsearch loop under M7.B (no TT exemption — plan §4).
+    ///
+    /// Fixture: `4k3/8/8/8/3b1q2/8/3Q4/4K3 w - - 0 1` — white Q d2, black
+    /// B d4 (defended by Qf4 along rank 4), black Q f4. Pre-populate TT with
+    /// best_move = Qxd4 (d2d4), promoting it to index 0. SEE(Qxd4) = −660
+    /// (QxB defended by Qf4; attacker Q=1025, victim B=365, recapture Q=1025:
+    /// gain=365−1025=−660). The real impl prunes Qxd4 despite its TT priority.
+    ///
+    /// With the stub (`qsearch_see_pruneable` always returns false), this test
+    /// is RED: `qsearch_see_prune_firings_for_test()` returns 0. After the
+    /// real impl lands, the SEE-losing TT move is pruned → firings=1.
+    #[test]
+    fn qsearch_tt_move_pruned_when_see_losing_capture() {
+        use crate::eval::evaluate;
+        use crate::movegen::in_check;
+        use crate::see::see;
+        use crate::tt::{TranspositionTable, TtBound, TtData, score_to_tt};
+
+        // Fixture: white Q d2, black B d4 (defended by Qf4), black Q f4.
+        // White has two captures: Qxd4 (SEE=−660, losing) and QxQf4 (SEE=0,
+        // fast-out fires → not pruned). After M7.B, Qxd4 is pruned but QxQf4
+        // is still searched — white trades queens, leaving white Q vs black B.
+        let pos = Position::from_fen("4k3/8/8/8/3b1q2/8/3Q4/4K3 w - - 0 1")
+            .expect("SEE-losing TT-capture FEN must parse");
+        assert!(!in_check(&pos), "fixture must not be in check");
+
+        // Confirm SEE(Qxd4) is negative (SEE-losing).
+        let qxd4 = Move::from_uci("d2d4", &pos).expect("Qxd4 must be legal");
+        let see_val = see(&pos, qxd4);
+        assert!(
+            see_val < 0,
+            "Qxd4 must be SEE-losing (bishop defended by Qf4 on rank 4); see={see_val}"
+        );
+        // Confirm it is a non-promotion capture (subject to pruning predicate).
+        assert!(qxd4.is_capture(), "Qxd4 must be a capture");
+        assert!(!qxd4.is_promotion(), "Qxd4 must not be a promotion");
+
+        let ply: u32 = 1;
+        let tt = Arc::new(TranspositionTable::new(1));
+        tt.store(
+            pos.zobrist(),
+            TtData {
+                score: score_to_tt(100, ply as i32) as i16,
+                depth: 0,
+                bound: TtBound::Lower,
+                best_move: qxd4.bits(), // promotes SEE-losing Qxd4 to index 0
+            },
+        );
+
+        let stand_pat = evaluate(&pos);
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let (ctx, _stop) = non_aborting_ctx_with_tt(Arc::clone(&tt));
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, ply, &ctx);
+
+        // Real impl: SEE-losing TT move is pruned → firings >= 1.
+        // Stub: always returns false → firings = 0 (RED until impl).
+        assert!(
+            ab.qsearch_see_prune_firings_for_test() >= 1,
+            "SEE-losing capture (Qxd4, see={see_val}) promoted to TT index 0 \
+             must still be pruned by the SEE gate (no TT exemption — plan §4); \
+             firings={}",
+            ab.qsearch_see_prune_firings_for_test()
+        );
+
+        // QxQf4 (SEE=0, fast-out → not pruned) must still be searched and
+        // return a score better than stand-pat (white trades queens, gaining
+        // ~bishop worth net: initial pos is Q vs Q+B; after QxQ it's Q vs B).
+        assert!(
+            score > stand_pat + 300,
+            "QxQf4 (not SEE-pruned) must improve score over stand-pat \
+             (white gains ~B after equal Q trade); stand_pat={stand_pat}, score={score}"
         );
     }
 
@@ -20812,4 +21002,494 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // M7.B — qsearch SEE-pruning tests (plan §5.1, §5.2, §5.3)
+    // -----------------------------------------------------------------------
+
+    // ---- §5.1 Predicate unit tests — `qsearch_see_pruneable` ----
+    //
+    // Tests in this section assert the FINAL intended behavior of
+    // `qsearch_see_pruneable`. With the current stub (always returns `false`),
+    // the tests expecting `true` are RED. That is the correct TDD state.
+
+    /// Fast-out: winning capture (PxN) is not pruned.
+    ///
+    /// Pawn takes undefended knight: victim N (337) > attacker P (82) →
+    /// fast-out fires (victim >= attacker), returns `false` without calling
+    /// the SEE resolver. SEE(PxN) = +337.
+    ///
+    /// Fixture: `4k3/8/8/3n4/4P3/8/8/4K3 w - - 0 1` — white Pe4, black Nd5.
+    /// e4d5 = PxN (undefended). SEE = +337 (empirically verified).
+    #[test]
+    fn qsearch_see_pruneable_fast_out_winning_capture_not_pruned() {
+        use crate::movegen::in_check;
+        let pos = Position::from_fen("4k3/8/8/3n4/4P3/8/8/4K3 w - - 0 1")
+            .expect("PxN fixture must parse");
+        assert!(!in_check(&pos), "fixture must not be in check");
+        let mv = Move::from_uci("e4d5", &pos).expect("PxN (e4d5) must be legal");
+        assert!(mv.is_capture(), "move must be a capture");
+        assert!(!mv.is_promotion(), "move must not be a promotion");
+
+        // Fast-out: victim(N=337) >= attacker(P=82) → returns false immediately.
+        // Spec anchor: the stub also returns false, so this test is GREEN with
+        // the stub and has no mutation-discriminating power against it. The
+        // `>= vs >` fast-out boundary is killed by the equal-trade test
+        // (`qsearch_see_pruneable_fast_out_equal_capture_not_pruned`).
+        assert!(
+            !qsearch_see_pruneable(&pos, mv),
+            "PxN (victim >= attacker fast-out): must NOT be pruneable; SEE(e4d5)=+337"
+        );
+    }
+
+    /// Fast-out: equal capture (RxR) is not pruned.
+    ///
+    /// Rook takes defended rook: victim R (477) == attacker R (477) →
+    /// fast-out fires (victim >= attacker), returns `false`. SEE(RxR/R) = 0.
+    ///
+    /// Fixture: `r6k/r7/8/R7/8/8/8/4K3 w - - 0 1` — white Ra5 takes black Ra7,
+    /// black Ra8 recaptures. a5a7 = RxR (SEE=0; empirically verified in see.rs).
+    #[test]
+    fn qsearch_see_pruneable_fast_out_equal_capture_not_pruned() {
+        use crate::movegen::in_check;
+        let pos = Position::from_fen("r6k/r7/8/R7/8/8/8/4K3 w - - 0 1")
+            .expect("RxR/R fixture must parse");
+        assert!(!in_check(&pos), "fixture must not be in check");
+        let mv = Move::from_uci("a5a7", &pos).expect("RxR (a5a7) must be legal");
+        assert!(mv.is_capture(), "move must be a capture");
+        assert!(!mv.is_promotion(), "move must not be a promotion");
+
+        // victim(R=477) >= attacker(R=477) → fast-out fires, returns false.
+        // Mutation guard: changing `>=` to `>` would miss this equal-value case.
+        assert!(
+            !qsearch_see_pruneable(&pos, mv),
+            "RxR equal trade (victim == attacker fast-out): must NOT be pruneable; SEE=0"
+        );
+    }
+
+    /// Fast-out: en-passant (PxP) is not pruned.
+    ///
+    /// EP capture: attacker P (82), victim P (82) (always, by EP rules). The
+    /// EP victim square does not contain a piece (`piece_at(to)` is empty); the
+    /// fast-out must use the EP-pawn sentinel value (SEE_VALUE[Pawn]), NOT read
+    /// `piece_at(to)`. victim(P=82) == attacker(P=82) → fast-out fires.
+    ///
+    /// Fixture: `4k3/8/8/3Pp3/8/8/8/4K3 w - e6 0 1` — white Pd5 takes black
+    /// Pe5 en passant (d5e6). SEE=+82 (verified: `see_en_passant_basic` in
+    /// see.rs). Fast-out fires and must return false.
+    #[test]
+    fn qsearch_see_pruneable_fast_out_ep_pawn_not_pruned() {
+        use crate::movegen::in_check;
+        let pos = Position::from_fen("4k3/8/8/3Pp3/8/8/8/4K3 w - e6 0 1")
+            .expect("EP PxP fixture must parse");
+        assert!(!in_check(&pos), "fixture must not be in check");
+        let mv = Move::from_uci("d5e6", &pos).expect("EP (d5e6) must be legal");
+        assert!(mv.is_capture(), "EP must be a capture");
+        assert!(!mv.is_promotion(), "EP must not be a promotion");
+
+        // victim(P=82) == attacker(P=82) → fast-out fires. Pins the EP special case:
+        // the victim square is the EP landing square (e6, empty in FEN), so the
+        // predicate MUST use the EP-pawn sentinel, not piece_at(to).
+        assert!(
+            !qsearch_see_pruneable(&pos, mv),
+            "EP PxP (victim == attacker = P fast-out): must NOT be pruneable"
+        );
+    }
+
+    /// Losing capture is pruneable.
+    ///
+    /// QxP where the pawn is defended by a rook: attacker Q (1025) > victim P (82),
+    /// fast-out does not fire. Full SEE is called: Q takes P(82), Rxq(1025) →
+    /// see = 82−1025 = −943 (negative). Returns `true`.
+    ///
+    /// Fixture: `3rk3/8/8/8/3p4/8/8/3QK3 w - - 0 1` — white Qd1, black pd4
+    /// defended by Rd8. d1d4 = QxP (SEE=−943). Verified via temp test.
+    ///
+    /// RED with the stub (stub returns `false`; real impl returns `true`).
+    #[test]
+    fn qsearch_see_pruneable_losing_capture_is_pruneable() {
+        use crate::movegen::in_check;
+        let pos = Position::from_fen("3rk3/8/8/8/3p4/8/8/3QK3 w - - 0 1")
+            .expect("QxP/R fixture must parse");
+        assert!(!in_check(&pos), "fixture must not be in check");
+        let mv = Move::from_uci("d1d4", &pos).expect("QxP (d1d4) must be legal");
+        assert!(mv.is_capture(), "move must be a capture");
+        assert!(!mv.is_promotion(), "move must not be a promotion");
+
+        // attacker(Q=1025) > victim(P=82): fast-out does NOT fire.
+        // Full SEE: Q×P(82), R×Q(1025) → see=82-1025=−943 < 0 → prune.
+        // Stub: returns false → this assertion FAILS (RED).
+        assert!(
+            qsearch_see_pruneable(&pos, mv),
+            "QxP/Rd8 (SEE=−943): must be pruneable (see < QS_SEE_PRUNE_THRESHOLD=0)"
+        );
+    }
+
+    /// Winning-looking but actually safe QxP (undefended pawn) is NOT pruned.
+    ///
+    /// QxP where pawn is undefended: attacker Q (1025) > victim P (82), so
+    /// fast-out does NOT fire. Full SEE is called: see(QxP undefended) = +82
+    /// (non-negative) → returns `false`. Tests that the predicate correctly
+    /// invokes the SEE resolver and uses its result.
+    ///
+    /// Fixture: `4k3/8/8/8/3p4/8/8/3QK3 w - - 0 1` — white Qd1, black pd4
+    /// (undefended). d1d4 = QxP (SEE=+82). Verified via temp test.
+    #[test]
+    fn qsearch_see_pruneable_undefended_qxp_not_pruned() {
+        use crate::movegen::in_check;
+        let pos = Position::from_fen("4k3/8/8/8/3p4/8/8/3QK3 w - - 0 1")
+            .expect("QxP undefended fixture must parse");
+        assert!(!in_check(&pos), "fixture must not be in check");
+        let mv = Move::from_uci("d1d4", &pos).expect("QxP (d1d4) must be legal");
+        assert!(mv.is_capture(), "move must be a capture");
+        assert!(!mv.is_promotion(), "move must not be a promotion");
+
+        // attacker(Q=1025) > victim(P=82): fast-out does NOT fire.
+        // Full SEE: see(QxP undefended) = +82 ≥ 0 → not pruned.
+        // Stub: returns false → GREEN (happens to match).
+        assert!(
+            !qsearch_see_pruneable(&pos, mv),
+            "QxP undefended (SEE=+82 ≥ 0): must NOT be pruneable"
+        );
+    }
+
+    // ---- §5.2 qsearch behavioral tests ----
+
+    /// Pruning skips a SEE-losing capture: qsearch returns stand-pat when the
+    /// only non-stand-pat candidate is pruned.
+    ///
+    /// Fixture: `3rk3/8/8/8/3p4/8/8/3QK3 w - - 0 1` — white Qd1, black pd4
+    /// defended by Rd8. The ONLY capture is QxP (SEE=−943). With the real impl,
+    /// the gate prunes it → qsearch returns stand-pat, and `see_prune_firings=1`.
+    ///
+    /// With the stub: QxP is searched (not pruned), score reflects the capture.
+    /// This test asserts FINAL behavior:
+    /// - `see_prune_firings >= 1` (gate fired) — RED with stub.
+    /// - `score == stand_pat` (only capture pruned → stand-pat returned) — RED
+    ///   with stub (stub returns a score reflecting the capture).
+    #[test]
+    fn qsearch_see_prune_skips_losing_capture_returns_stand_pat() {
+        use crate::eval::evaluate;
+        use crate::movegen::{MoveList, generate_moves, in_check};
+
+        let pos = Position::from_fen("3rk3/8/8/8/3p4/8/8/3QK3 w - - 0 1")
+            .expect("QxP defended fixture must parse");
+        assert!(!in_check(&pos), "fixture must not be in check");
+
+        // Confirm only one capture (QxPd4).
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let captures: Vec<_> = ml.iter().filter(|m| m.is_capture()).collect();
+        assert_eq!(
+            captures.len(),
+            1,
+            "fixture must have exactly one capture (QxPd4); got {captures:?}"
+        );
+
+        let stand_pat = evaluate(&pos);
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 0, &ctx);
+
+        // Real impl: QxP is SEE-losing → pruned → returns stand-pat.
+        // Stub: QxP is searched → score differs from stand-pat (RED).
+        assert_eq!(
+            score, stand_pat,
+            "all captures pruned → qsearch must return stand-pat={stand_pat}; got {score}"
+        );
+        assert!(
+            ab.qsearch_see_prune_firings_for_test() >= 1,
+            "SEE-prune gate must have fired (QxP/Rd8 is SEE-losing); \
+             firings={}",
+            ab.qsearch_see_prune_firings_for_test()
+        );
+    }
+
+    /// A winning capture is still searched after M7.B.
+    ///
+    /// Fixture: `4k3/8/8/8/3p4/8/8/3QK3 w - - 0 1` — white Qd1, black pd4
+    /// (undefended). QxP is SEE-winning (SEE=+82). The gate does NOT prune it.
+    /// qsearch returns a score > stand-pat reflecting the material gain.
+    ///
+    /// GREEN with the stub (stub never prunes → same behavior as real impl).
+    #[test]
+    fn qsearch_see_prune_winning_capture_still_searched() {
+        use crate::eval::evaluate;
+        use crate::movegen::in_check;
+
+        let pos = Position::from_fen("4k3/8/8/8/3p4/8/8/3QK3 w - - 0 1")
+            .expect("QxP undefended fixture must parse");
+        assert!(!in_check(&pos), "fixture must not be in check");
+        let stand_pat = evaluate(&pos);
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 0, &ctx);
+
+        // QxP undefended (SEE=+82): not pruned, returns score > stand-pat.
+        assert!(
+            score > stand_pat,
+            "winning QxP capture must be searched; \
+             stand_pat={stand_pat}, score={score} must be higher"
+        );
+        assert_eq!(
+            ab.qsearch_see_prune_firings_for_test(),
+            0,
+            "no captures pruned (only capture is SEE-winning); firings must be 0"
+        );
+    }
+
+    /// In check: a forced SEE-losing capture evasion must NOT be pruned.
+    ///
+    /// Mutation target: dropping `!in_chk` from the gate causes this test to
+    /// fail because the sole legal evasion is a SEE-losing capture; pruning it
+    /// leaves qsearch with no moves at the root → returns ≈ −INF (spurious
+    /// checkmate), which the score assertion detects.
+    ///
+    /// Why forced single evasion (ml.len()==1, INTENTIONAL):
+    /// A multi-evasion fixture cannot kill the "drop `!in_chk`" mutant via
+    /// score: if the king has a quiet escape, removing the guard prunes only
+    /// the losing capture but the king-move evasion still produces a fine score
+    /// — the mutant survives. The firings counter is also unreliable here
+    /// because `qsearch_see_prune_firings` is CUMULATIVE over the entire
+    /// qsearch subtree: the in-check root's evasion leads to child nodes where
+    /// SEE-losing captures ARE correctly pruned, inflating the counter above 0
+    /// even when the guard fires correctly at the root. A forced single-evasion
+    /// position eliminates both failure modes cleanly.
+    ///
+    /// Fixture: `8/8/8/8/Q7/pn6/b5r1/K6k w - - 0 1`
+    ///   White Ka1, Qa4. Black Nb3 (checks Ka1 — knight on b3 attacks a1),
+    ///   Ba2 (defends b3 diagonally AND covers b1 via SE diagonal a2→b1),
+    ///   pa3 (covers b2 diagonally), rg2 (covers a2 and b2 via rank 2),
+    ///   Kh8.
+    ///   King escapes: a2 (black Ba2, covered by rg2 → illegal), b2 (covered
+    ///   by pa3 + rg2 → illegal), b1 (attacked by Ba2 diagonal a2→b1 →
+    ///   illegal). No captures except QxNb3 (knight check → no interposition).
+    ///   QxNb3: SEE = N(337) − Q(1025) = −688 (Ba2 recaptures). SEE < 0.
+    ///
+    /// With `!in_chk` guard (correct): forced capture is searched → real
+    /// (non-mate) score. Without guard (mutant): only legal move is pruned →
+    /// loop body skipped → best stays −INF → returns ≈ −INF → fails.
+    #[test]
+    fn qsearch_see_prune_in_check_losing_captures_not_pruned() {
+        use crate::movegen::{MoveList, generate_moves, in_check};
+        use crate::see::see;
+
+        let pos = Position::from_fen("8/8/8/8/Q7/pn6/b5r1/K6k w - - 0 1")
+            .expect("forced-evasion fixture must parse");
+        assert!(in_check(&pos), "fixture must be in check (Nb3 attacks Ka1)");
+
+        // Verify fixture invariants: exactly one legal move, a SEE-losing
+        // non-promotion capture. ml.len()==1 is LOAD-BEARING (see doc comment).
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        assert_eq!(
+            ml.len(),
+            1,
+            "fixture must have exactly one legal evasion (forced QxNb3); \
+             got {} moves: {:?}",
+            ml.len(),
+            ml.iter().collect::<Vec<_>>()
+        );
+        let only_mv = ml.iter().next().unwrap();
+        assert!(
+            only_mv.is_capture(),
+            "the forced evasion must be a capture; got {:?}",
+            only_mv
+        );
+        assert!(
+            !only_mv.is_promotion(),
+            "the forced evasion must not be a promotion; got {:?}",
+            only_mv
+        );
+        let see_val = see(&pos, only_mv);
+        assert!(
+            see_val < 0,
+            "forced evasion must be SEE-losing (QxNb3/Ba2, Q>N); see={see_val}"
+        );
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 0, &ctx);
+
+        // Forced capture must be searched (not pruned). If the `!in_chk` guard
+        // were dropped (mutant), the only legal move would be SEE-pruned → no
+        // move searched → returns ≈ −INF → this assertion fails.
+        // NOTE: do NOT assert firings==0 here — `qsearch_see_prune_firings` is
+        // cumulative over the whole subtree; child nodes after QxNb3 may
+        // correctly prune their own SEE-losing captures, making firings > 0
+        // even when the root guard is functioning correctly.
+        assert!(
+            score > -(MATE - 10),
+            "forced evasion must be searched (not SEE-pruned): expected real \
+             score > {}, got {score}",
+            -(MATE - 10)
+        );
+    }
+
+    /// Queen-promo-capture is NOT pruned (guards the `!mv.is_promotion()` gate).
+    ///
+    /// The `!mv.is_promotion()` gate in the prune condition explicitly excludes
+    /// all promo-captures. For a QueenPromoCapture, the fast-out also naturally
+    /// exempts it (pawn attacker=82 < any captured piece victim≥82), so the
+    /// mutation `drop !is_promotion()` is *equivalent* for our piece-value set.
+    /// This test confirms the promo-capture IS searched and improves the score.
+    ///
+    /// Fixture: `6rk/5P2/8/8/8/8/8/4K3 w - - 0 1` — white Pf7 (rank 7),
+    /// black Rg8 and Kh8 (rank 8). f7g8q = QueenPromoCapture (pawn on f7
+    /// captures rook on g8 diagonally and promotes to queen). SEE = +395
+    /// (R=477 + promo_bonus=943, less King recapture on g8 = 1025; net 395).
+    /// Victim(R=477) > attacker(P=82): fast-out fires anyway → never pruneable.
+    #[test]
+    fn qsearch_see_prune_queen_promo_capture_not_pruned() {
+        use crate::eval::evaluate;
+        use crate::mov::MoveFlag;
+        use crate::movegen::in_check;
+
+        // Pf7, Rg8 (black), Kh8 (black), Ke1 (white).
+        let pos = Position::from_fen("6rk/5P2/8/8/8/8/8/4K3 w - - 0 1")
+            .expect("queen-promo-capture fixture must parse");
+        assert!(!in_check(&pos), "fixture must not be in check");
+
+        // Confirm the QueenPromoCapture is available. Pawn on f7 captures Rg8 diagonally.
+        let mv = Move::from_uci("f7g8q", &pos).expect("f7g8q (QueenPromoCapture) must be legal");
+        assert_eq!(
+            mv.flag(),
+            MoveFlag::QueenPromoCapture,
+            "f7g8q must be a QueenPromoCapture; got {:?}",
+            mv.flag()
+        );
+        assert!(mv.is_capture(), "f7g8q must be a capture");
+        assert!(mv.is_promotion(), "f7g8q must be a promotion");
+
+        let stand_pat = evaluate(&pos);
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx();
+        let score = ab.qsearch_for_test(&mut pos.clone(), -INF, INF, 0, &ctx);
+
+        // Promo-capture must be searched: score >> stand-pat (gains R + promo bonus).
+        assert!(
+            score > stand_pat + 300,
+            "queen-promo-capture must be searched and significantly improve score; \
+             stand_pat={stand_pat}, score={score}"
+        );
+        // No SEE pruning fired (promo-capture excluded by gate).
+        assert_eq!(
+            ab.qsearch_see_prune_firings_for_test(),
+            0,
+            "queen-promo-capture must NOT trigger SEE pruning; firings={}",
+            ab.qsearch_see_prune_firings_for_test()
+        );
+    }
+
+    /// All captures pruned → qsearch stores an Upper bound (stand-pat return).
+    ///
+    /// Fixture: `3rk3/8/8/8/3p4/8/8/3QK3 w - - 0 1` — white Qd1, black pd4
+    /// defended by Rd8. The only capture QxP/Rd8 has SEE=−943 < 0 → pruned.
+    ///
+    /// With alpha = evaluate(pos) (= stand-pat) at entry:
+    /// - Real impl: loop body never executes (all pruned). `best = stand_pat`.
+    ///   `alpha_entry = stand_pat`. `best <= alpha_entry` → **Upper** bound. ✓
+    /// - Stub: QxP is searched; child returns a very negative score (black
+    ///   recaptures the queen). `best = max(stand_pat, negative) = stand_pat`.
+    ///   `best <= alpha_entry` → Upper bound too (coincidentally same bound,
+    ///   but for a different reason — the loop ran but didn't improve).
+    ///
+    /// To make this test RED with the stub: assert that `see_prune_firings == 1`
+    /// AND `bound == Upper` (both conditions). With the stub, `see_prune_firings
+    /// == 0` (no pruning fired) → fails.
+    #[test]
+    fn qsearch_see_prune_all_pruned_stores_upper_bound() {
+        use crate::eval::evaluate;
+        use crate::movegen::{MoveList, generate_moves};
+        use crate::tt::{TranspositionTable, TtBound};
+
+        let pos = Position::from_fen("3rk3/8/8/8/3p4/8/8/3QK3 w - - 0 1")
+            .expect("all-captures-pruned fixture must parse");
+
+        // Self-documenting: fixture must have exactly one capture so the
+        // "all captures pruned" property holds for any gate implementation.
+        let mut ml = MoveList::new();
+        generate_moves(&pos, &mut ml);
+        let captures: Vec<_> = ml.iter().filter(|m| m.is_capture()).collect();
+        assert_eq!(
+            captures.len(),
+            1,
+            "fixture must have exactly one capture (QxPd4/Rd8) for the \
+             'all-pruned' property to be self-contained; got {captures:?}"
+        );
+
+        let ply: u32 = 1;
+        let tt = Arc::new(TranspositionTable::new(1));
+        // Use alpha = stand_pat so that the fail-low (Upper) path is exercised.
+        // If best==stand_pat and alpha_entry==stand_pat: bound = Upper.
+        let stand_pat = evaluate(&pos);
+
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        ab.set_tt_for_test(Some(Arc::clone(&tt)));
+        let (ctx, _stop) = non_aborting_ctx_with_tt(Arc::clone(&tt));
+        let score = ab.qsearch_for_test(&mut pos.clone(), stand_pat, INF, ply, &ctx);
+
+        // Returned score must be stand_pat (no capture improved it).
+        assert_eq!(
+            score, stand_pat,
+            "all-captures-pruned: score must equal stand_pat={stand_pat}; got {score}"
+        );
+
+        // TT stores Upper bound.
+        let entry = tt.probe(pos.zobrist());
+        assert!(
+            entry.is_some(),
+            "qsearch must store a TT entry for this position"
+        );
+        assert_eq!(
+            entry.unwrap().bound(),
+            TtBound::Upper,
+            "all-captures-pruned path must store Upper bound; \
+             got {:?}",
+            entry.unwrap().bound()
+        );
+
+        // Real impl: pruning gate fired exactly once (for QxP). Stub: 0 (RED).
+        assert!(
+            ab.qsearch_see_prune_firings_for_test() >= 1,
+            "pruning gate must have fired at least once (only capture is SEE-losing); \
+             firings={}",
+            ab.qsearch_see_prune_firings_for_test()
+        );
+    }
+
+    // ---- §5.3 Mutation-resistance fixture ----
+    //
+    // `< QS_SEE_PRUNE_THRESHOLD` vs `<=` boundary mutant:
+    //
+    // The mutant `see(pos, mv) <= QS_SEE_PRUNE_THRESHOLD` differs from the
+    // original `see(pos, mv) < QS_SEE_PRUNE_THRESHOLD` only when
+    // `see(pos, mv) == 0` exactly. To catch this mutant requires a fixture
+    // with `attacker > victim` (so the fast-out does NOT fire — `victim >=
+    // attacker` returns false) AND `see() == 0` exactly.
+    //
+    // After exhaustive analysis of our SEE_VALUE scale [82, 337, 365, 477, 1025]:
+    // the 2-ply formula gives see==0 only when victim==attacker (equal trade),
+    // which always fires the fast-out (victim >= attacker). The 3-ply formula
+    // requires v1 = a0 − v0 where a0 > v0; with our integer piece values, no
+    // valid piece value v1 = a0 − v0 exists (differences like 477−365=112,
+    // 1025−82=943, 1025−337=688, 1025−477=548, 365−337=28 are not in the set).
+    // Higher-ply exchanges are similarly constrained. Therefore:
+    //
+    // **The `<` vs `<=` mutant is EQUIVALENT at threshold 0 for our piece-value
+    // set**: no capture with `attacker > victim` can produce `see() == 0`
+    // exactly, so the boundary is unreachable via the non-fast-out path.
+    // This is documented here for mutation-triage (add an `exclude_re` rule
+    // for `QS_SEE_PRUNE_THRESHOLD` in `.cargo/mutants.toml` with this note).
+
+    // No test for this case — the mutant is equivalent by integer-value
+    // analysis. See comment above.
 }

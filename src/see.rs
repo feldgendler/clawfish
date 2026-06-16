@@ -23,9 +23,8 @@
 //! `SEE_VALUE` are the reusable search primitive that **M7.B (qsearch
 //! SEE-pruning)** and M7.C consume; landing it inert ahead of its consumer
 //! follows the M6 inert-landing precedent (eval byte-identical to M5.K, bench
-//! unchanged). The module-wide `dead_code` allow is removed when M7.B wires the
-//! first production caller.
-#![allow(dead_code)]
+//! unchanged). The module-wide `dead_code` allow was removed when M7.B wired the
+//! first production caller (`qsearch_see_pruneable` in `search.rs`).
 
 use crate::bitboard::Bitboard;
 use crate::magic::{bishop_attacks, rook_attacks};
