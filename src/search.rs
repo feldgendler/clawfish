@@ -601,6 +601,22 @@ pub(crate) const FFP_MARGIN_D2: i32 = 150;
 /// ADR-0026 §4.
 pub(crate) const FFP_MARGIN_D3: i32 = 250;
 
+/// M7.C — SEE capture-futility (CFP) positional margin at depth 1 (frontier).
+/// The bound is `static_eval + see/victim + CFP_MARGIN`, so this margin is the
+/// **positional** slack ON TOP of the material term (a larger margin is the
+/// *safer* direction — it makes the prune harder to satisfy). 150 cp is the
+/// research-anchored v1 value (MadChess d1 = 150; Heinz ≈ 125; TalkChess
+/// "200–300 safe"); captures carry more positional volatility than quiets, so
+/// it sits above FFP's quiet `FFP_MARGIN_D1 = 100`. ADR-0042. The margin sweep
+/// is the top deferred tuning lever.
+pub(crate) const CFP_MARGIN_D1: i32 = 150;
+/// CFP margin at depth 2. **Inactive at v1** (`FFP_MAX_DEPTH = 1` keeps depth 2
+/// from firing; CFP shares FFP's frontier-node gate). Defined for a forward
+/// `FFP_MAX_DEPTH = 2` raise. Mirrors the FFP `{150,250,400,600}`-style slope.
+pub(crate) const CFP_MARGIN_D2: i32 = 300;
+/// CFP margin at depth 3. **Inactive at v1**. Forward-compat (see `CFP_MARGIN_D2`).
+pub(crate) const CFP_MARGIN_D3: i32 = 500;
+
 /// Compile-time invariant: at v1, FFP fires at `depth ≤ 2` and LMR fires at
 /// `depth ≥ 3`, so the two pruning paths cannot co-fire at any node. This
 /// assertion is load-bearing as a tripwire — a future tuning that raises
@@ -888,6 +904,87 @@ pub(crate) fn ffp_pruned_bound(static_eval: i32, depth: u32, alpha: i32) -> Opti
     }
     let bound = static_eval.saturating_add(frontier_futility_margin(depth));
     if bound <= alpha { Some(bound) } else { None }
+}
+
+/// Per-depth CFP positional margin (M7.C — ADR-0042). Returns 0 outside
+/// `[1, FFP_MAX_DEPTH-domain]`; the depth-2/3 entries are defined for a forward
+/// `FFP_MAX_DEPTH` raise (the `frontier_futility_margin` precedent) and the
+/// helper-level domain guard in `cfp_pruned_bound` keeps them inert at v1.
+fn capture_futility_margin(depth: u32) -> i32 {
+    match depth {
+        1 => CFP_MARGIN_D1,
+        2 => CFP_MARGIN_D2,
+        3 => CFP_MARGIN_D3, // inactive until FFP_MAX_DEPTH raised
+        _ => 0,
+    }
+}
+
+/// M7.C — SEE capture-futility pruned bound (ADR-0042). STM-relative
+/// `static_eval`/`alpha` at the **parent** node. Returns `Some(bound)` — a
+/// fail-soft **upper** bound on the move's true score, guaranteed `<= alpha` —
+/// iff the non-promotion capture `mv` should be pruned; `None` otherwise.
+///
+/// Two layers, mirroring the Stockfish MVV-first / SEE-second pattern:
+/// - **(a) delta-prune** `static_eval + victim + margin <= alpha`: even taking
+///   the victim for free (no recapture) can't reach alpha. `victim` is the
+///   maximum material a non-promo capture can net (`see(mv) <= victim`
+///   unconditionally — the swap-list only ever *subtracts* recaptures), so this
+///   is a SOUND optimistic ceiling. Returns BEFORE any `see()` call.
+/// - **(b) SEE refinement** for materially-losing captures (`victim < attacker`)
+///   only: `static_eval + see(mv) + margin <= alpha`. Winning/equal captures
+///   (`victim >= attacker`) are never SEE-pruned in v1 (perf: bounds `see()` to
+///   the `qsearch_see_pruneable` fast-out class; conservatism: the likeliest
+///   saving tactics). `see <= victim ⇒ see_bound <= mvv_bound`, so (b)'s bound
+///   is also a valid `<= alpha` upper bound.
+///
+/// Domain-guarded to `[1, FFP_MAX_DEPTH]` (defense-in-depth, M5.C precedent).
+/// Caller guarantees `mv.is_capture() && !mv.is_promotion()` (flag ∈
+/// {`Capture`, `EnPassant`}). The victim/attacker reads and `expect` messages
+/// mirror `qsearch_see_pruneable` (ADR-0040 §3) — EP captures the pawn off the
+/// to-square (the to-square is empty for EP, so reading `piece_at(to)` would be
+/// a bug). `saturating_add` mirrors `ffp_pruned_bound`'s overflow defense.
+pub(crate) fn cfp_pruned_bound(
+    pos: &Position,
+    mv: Move,
+    static_eval: i32,
+    depth: u32,
+    alpha: i32,
+) -> Option<i32> {
+    use crate::mov::MoveFlag;
+    use crate::piece::PieceKind;
+    use crate::see::{SEE_VALUE, see};
+    if depth == 0 || depth > FFP_MAX_DEPTH {
+        return None;
+    }
+    let margin = capture_futility_margin(depth);
+    let victim = match mv.flag() {
+        MoveFlag::EnPassant => SEE_VALUE[PieceKind::Pawn as usize],
+        _ => {
+            SEE_VALUE[pos
+                .piece_at(mv.to_square())
+                .expect("cfp_pruned_bound: capture to-square occupied")
+                .kind as usize]
+        }
+    };
+    let mvv_bound = static_eval.saturating_add(victim).saturating_add(margin);
+    if mvv_bound <= alpha {
+        return Some(mvv_bound); // (a) sound delta-prune; returns BEFORE see()
+    }
+    let attacker = SEE_VALUE[pos
+        .piece_at(mv.from_square())
+        .expect("cfp_pruned_bound: capture from-square occupied")
+        .kind as usize];
+    if victim >= attacker {
+        return None; // winning/equal capture: never SEE-pruned in v1 (ADR-0042)
+    }
+    let see_bound = static_eval
+        .saturating_add(see(pos, mv))
+        .saturating_add(margin);
+    if see_bound <= alpha {
+        Some(see_bound)
+    } else {
+        None
+    } // (b) SEE refinement
 }
 
 /// Per-quiet LMR eligibility, applied after the caller has already cleared
@@ -1255,6 +1352,15 @@ pub(crate) struct AlphaBetaMover {
     /// `lmr_trace_root_ply` frame.
     #[cfg(test)]
     ffp_skipped_moves: Vec<Move>,
+    /// M7.C (ADR-0042): per-`go` count of CFP (SEE capture-futility) per-move
+    /// skips at the `lmr_trace_root_ply` frame. Test-only; mirrors the M5.D
+    /// `ffp_firings` convention.
+    #[cfg(test)]
+    cfp_firings: u32,
+    /// M7.C: exact capture moves that took the CFP-skip path at the
+    /// `lmr_trace_root_ply` frame.
+    #[cfg(test)]
+    cfp_pruned_moves: Vec<Move>,
     /// M5.E: per-`go` count of qsearch single-reply extensions (M5.E #1) —
     /// number of times qsearch recursed on the unique legal quiet move
     /// instead of returning stand-pat. Test-only instrumentation; gated by
@@ -1344,6 +1450,10 @@ impl AlphaBetaMover {
             #[cfg(test)]
             ffp_skipped_moves: Vec::new(),
             #[cfg(test)]
+            cfp_firings: 0,
+            #[cfg(test)]
+            cfp_pruned_moves: Vec::new(),
+            #[cfg(test)]
             qsearch_single_reply_firings: 0,
             #[cfg(test)]
             qsearch_under_promo_firings: 0,
@@ -1395,6 +1505,8 @@ impl Search for AlphaBetaMover {
             self.lmr_trace_root_ply = None;
             self.ffp_firings = 0;
             self.ffp_skipped_moves.clear();
+            self.cfp_firings = 0;
+            self.cfp_pruned_moves.clear();
             self.qsearch_tt_probes = 0;
             self.qsearch_tt_stores = 0;
             self.se_extensions = 0;
@@ -2125,6 +2237,46 @@ impl AlphaBetaMover {
                 continue;
             }
 
+            // M7.C — CFP (SEE capture-futility) per-move skip (ADR-0042). The
+            // capture analogue of the FFP quiet skip above, at the SAME
+            // frontier-node gate (`ffp_static_eval`): a non-promotion capture
+            // whose optimistic material-plus-margin ceiling cannot reach alpha
+            // is skipped.
+            //   - per-capture, non-promotion (flag ∈ {Capture, EnPassant});
+            //     promotions are tactically sharp and excluded (ADR-0040 §2).
+            //   - `cfp_pruned_bound` returns a fail-soft proved upper bound
+            //     `<= alpha` (two layers: a sound MVV delta-prune + a SEE
+            //     refinement on materially-losing captures).
+            //   - the contribution is routed through
+            //     `best_is_full_depth_after_score` with `move_is_full_depth =
+            //     false` (the FFP §7 provenance downgrade, verbatim) so the
+            //     TT-store flag is downgraded if the CFP bound overwrites a
+            //     full-depth-witnessed `best`.
+            //   - captures are not quiets: this fires before `quiet_index`/
+            //     `quiets_searched`/LMR, none of which apply to captures.
+            if mv.is_capture()
+                && !mv.is_promotion()
+                && let Some(static_eval) = ffp_static_eval
+                && let Some(pruned_bound) = cfp_pruned_bound(pos, mv, static_eval, depth, alpha)
+            {
+                #[cfg(test)]
+                if self.lmr_trace_root_ply == Some(ply) {
+                    self.cfp_firings += 1;
+                    self.cfp_pruned_moves.push(mv);
+                }
+
+                best_is_full_depth = best_is_full_depth_after_score(
+                    best,
+                    best_is_full_depth,
+                    pruned_bound,
+                    /* move_is_full_depth = */ false,
+                );
+                // `pruned_bound` is `<= alpha` by the CFP gate; floors `best`
+                // without improving alpha or causing a cutoff (FFP precedent).
+                best = best.max(pruned_bound);
+                continue;
+            }
+
             // Decide whether this move takes the LMR path (reduced first
             // pass + conditional full re-search) or the plain full-depth
             // path. Only quiets at LMR-eligible nodes that pass the per-quiet
@@ -2369,6 +2521,8 @@ impl AlphaBetaMover {
         self.lmr_history_candidates.clear();
         self.ffp_firings = 0;
         self.ffp_skipped_moves.clear();
+        self.cfp_firings = 0;
+        self.cfp_pruned_moves.clear();
         // M5.E: clear qsearch counters here too — negamax delegates to
         // qsearch at depth 0, so a negamax-driven test that touches qsearch
         // transitively must start with cleared counters. Symmetric reset
@@ -2465,6 +2619,20 @@ impl AlphaBetaMover {
     #[cfg(test)]
     pub(super) fn ffp_skipped_moves_for_test(&self) -> &[Move] {
         &self.ffp_skipped_moves
+    }
+
+    /// Test-only accessor for the per-`go` CFP (SEE capture-futility) firings
+    /// counter (M7.C — ADR-0042). Mirrors `ffp_firings_for_test`.
+    #[cfg(test)]
+    pub(super) fn cfp_firings_for_test(&self) -> u32 {
+        self.cfp_firings
+    }
+
+    /// Test-only accessor for the exact captures that took the CFP-skip path
+    /// at the traced negamax frame (M7.C).
+    #[cfg(test)]
+    pub(super) fn cfp_pruned_moves_for_test(&self) -> &[Move] {
+        &self.cfp_pruned_moves
     }
 
     /// Test-only accessor for the per-`go` SE extensions counter (M5.G).
@@ -14740,20 +14908,36 @@ mod tests {
         let static_eval = stm_static_eval(&pos);
         let pruned_bound_d1 = static_eval + frontier_futility_margin(1);
 
-        // alpha is set just below the mate-window gate's ceiling. No realistic
-        // depth-1 capture can score this high, so the capture cannot improve
-        // alpha — it only improves `best` from -INF and sets the flag, leaving
-        // the FFP contribution to overwrite `best` and discriminate the
-        // downgrade behavior.
-        let alpha = MATE_IN_MAX_PLY - 100; // 29836; |alpha| < MATE_IN_MAX_PLY = 29936.
+        // alpha placement (M7.C-aware). Two windows must both hold:
+        //   (i)  FFP fires:        pruned_bound_d1 (= static+100) <= alpha
+        //   (ii) CFP prunes Qxd7 via branch (b), NOT branch (a): the capture's
+        //        branch-(a) MVV ceiling is static + victim(82) + CFP margin(150)
+        //        = static+232, so we need alpha < static+232 to keep branch (a)
+        //        from firing — then branch (b) prunes Qxd7 to the LOW bound
+        //        static + see(-943) + 150 = static-793, well below the FFP
+        //        quiet bound (static+100). So the FFP contribution remains the
+        //        node's max and the FFP downgrade is the thing exercised.
+        // (Before M7.C this used alpha ≈ MATE-ceiling and the capture was
+        // SEARCHED to ~-900; now the capture is CFP-pruned to ~static-793, which
+        // is observationally the same for this test: a sub-FFP-bound capture
+        // contribution that the FFP quiet overwrites.) alpha = static+150 sits in
+        // [static+100, static+232).
+        let alpha = static_eval + frontier_futility_margin(1) + 50;
         assert!(
             alpha.abs() < MATE_IN_MAX_PLY,
             "fixture invariant: alpha must satisfy mate-window FFP gate; \
              got alpha={alpha}, MATE_IN_MAX_PLY={MATE_IN_MAX_PLY}"
         );
         assert!(
-            pruned_bound_d1 < alpha,
-            "fixture invariant: pruned_bound (={pruned_bound_d1}) must be below alpha (={alpha}) so FFP fires"
+            pruned_bound_d1 <= alpha,
+            "fixture invariant: pruned_bound (={pruned_bound_d1}) must be <= alpha (={alpha}) so FFP fires"
+        );
+        // CFP-interaction invariant: alpha below the capture's branch-(a) MVV
+        // ceiling, so Qxd7 is CFP-pruned via branch (b) to a sub-FFP-bound value.
+        assert!(
+            alpha < static_eval + 82 + CFP_MARGIN_D1,
+            "fixture invariant: alpha must be below Qxd7's CFP branch-(a) ceiling \
+             (static+82+{CFP_MARGIN_D1}) so it is pruned via branch (b)"
         );
         let beta = MATE_IN_MAX_PLY;
 
@@ -14846,6 +15030,593 @@ mod tests {
             tt_sister.probe(pos.zobrist()).is_some(),
             "sister: with FFP not firing, the TT path must be reachable and an entry stored \
              (proves the FFP-test assertion is non-vacuous)"
+        );
+    }
+
+    // =======================================================================
+    // M7.C — SEE capture futility / delta pruning (ADR-0042).
+    //
+    // Two-layer prune at the SAME frontier-node gate as FFP, for non-promotion
+    // captures: (a) MVV delta-prune `static_eval + victim + margin <= alpha`
+    // (sound optimistic ceiling, no see()); (b) SEE refinement for losing
+    // captures (`victim < attacker`) `static_eval + see + margin <= alpha`.
+    // Helper: `cfp_pruned_bound`. Margins: `capture_futility_margin`.
+    // Counter: `cfp_firings` / `cfp_pruned_moves` (gated to lmr_trace_root_ply).
+    //
+    // Verified fixture see() values (independently checked against src/see.rs):
+    //   QxP-defended "4k3/8/2p5/3p4/8/8/8/3QK3 w - - 0 1"  d1d5 → see = -943
+    //   RxR-defended "r6k/r7/8/8/8/8/8/R3K3 w - - 0 1"      a1a7 → see =    0
+    //   RxQ-free     "q3k3/8/8/8/8/8/8/R3K3 w - - 0 1"      a1a8 → see = 1025
+    //   in-check Qxg3 "4k3/8/8/8/5p2/6n1/8/6QK w - - 0 1"   g1g3 → see = -688
+    // -----------------------------------------------------------------------
+
+    // ---- Margin-table tests (required for clippy: D2/D3 are forward-compat
+    //      dead constants at FFP_MAX_DEPTH = 1; pinned by a test as FFP does). ----
+
+    #[test]
+    fn capture_futility_margin_table_values() {
+        assert_eq!(capture_futility_margin(1), CFP_MARGIN_D1);
+        assert_eq!(capture_futility_margin(1), 150);
+        assert_eq!(capture_futility_margin(2), CFP_MARGIN_D2);
+        assert_eq!(capture_futility_margin(2), 300);
+        assert_eq!(capture_futility_margin(3), CFP_MARGIN_D3);
+        assert_eq!(capture_futility_margin(3), 500);
+        assert_eq!(capture_futility_margin(0), 0, "depth 0 → 0");
+        assert_eq!(capture_futility_margin(4), 0, "depth > 3 → 0");
+    }
+
+    /// Anti-vacuous: the margin table is not the constant-zero function.
+    #[test]
+    fn capture_futility_margin_not_always_zero() {
+        assert!(capture_futility_margin(1) > 0);
+    }
+
+    // ---- Helper unit tests for `cfp_pruned_bound`. ----
+
+    /// Parse `(pos, capture-move)` for the helper tests.
+    fn cfp_fixture(fen: &str, uci: &str) -> (Position, Move) {
+        let pos = Position::from_fen(fen).expect("FEN must parse");
+        let mv = Move::from_uci(uci, &pos).expect("move must be legal");
+        assert!(
+            mv.is_capture() && !mv.is_promotion(),
+            "fixture must be a non-promo capture"
+        );
+        (pos, mv)
+    }
+
+    /// Domain guard: depth 0 and depth > FFP_MAX_DEPTH return None even with
+    /// an arithmetically-passing condition (M5.C / FFP defense-in-depth).
+    #[test]
+    fn cfp_pruned_bound_domain_guard() {
+        let (pos, mv) = cfp_fixture("4k3/8/2p5/3p4/8/8/8/3QK3 w - - 0 1", "d1d5");
+        assert!(
+            cfp_pruned_bound(&pos, mv, -1_000_000, 0, 1_000_000).is_none(),
+            "depth 0 must return None"
+        );
+        assert!(
+            cfp_pruned_bound(&pos, mv, -1_000_000, FFP_MAX_DEPTH + 1, 1_000_000).is_none(),
+            "depth > FFP_MAX_DEPTH must return None"
+        );
+    }
+
+    /// Branch (a) `<=` boundary. The EQUAL-trade fixture (victim == attacker,
+    /// RxR-defended, see = 0) is chosen specifically so branch (b) is exempt and
+    /// CANNOT interfere with the boundary: mvv_bound = 0 + 477 + 150 = 627.
+    /// alpha 627 fires (inclusive); alpha 626 does not (and victim>=attacker →
+    /// no branch b → None, not a branch-b fire). Pins `<=` → `<` at branch (a).
+    #[test]
+    fn cfp_pruned_bound_branch_a_boundary_inclusive() {
+        let (pos, mv) = cfp_fixture("r6k/r7/8/8/8/8/8/R3K3 w - - 0 1", "a1a7");
+        assert_eq!(
+            cfp_pruned_bound(&pos, mv, 0, 1, 627),
+            Some(627),
+            "mvv_bound == alpha must fire (branch a inclusive)"
+        );
+        assert!(
+            cfp_pruned_bound(&pos, mv, 0, 1, 626).is_none(),
+            "mvv_bound > alpha (and victim>=attacker → no branch b) must NOT fire"
+        );
+    }
+
+    /// Branch (b) SEE refinement fires on a losing capture (QxP-defended, victim
+    /// 82 < attacker 1025, see = -943): mvv_bound = 232, see_bound = -793.
+    /// alpha 100 → branch a no (232 > 100), branch b fires (-793 <= 100).
+    /// Sister alpha -800 → branch b no (-793 > -800) → None.
+    #[test]
+    fn cfp_pruned_bound_branch_b_fires_on_losing_capture() {
+        let (pos, mv) = cfp_fixture("4k3/8/2p5/3p4/8/8/8/3QK3 w - - 0 1", "d1d5");
+        assert_eq!(
+            cfp_pruned_bound(&pos, mv, 0, 1, 100),
+            Some(-793),
+            "losing capture whose see_bound <= alpha must be SEE-pruned (branch b)"
+        );
+        assert!(
+            cfp_pruned_bound(&pos, mv, 0, 1, -800).is_none(),
+            "losing capture whose see_bound > alpha must NOT be pruned"
+        );
+        // Branch (b) `<=` boundary (pins `<=` → `<` on the SEE comparator,
+        // independently of branch (a)): see_bound = 0 + (-943) + 150 = -793.
+        // mvv_bound = 232 > alpha at both boundary alphas, so branch (a) cannot
+        // fire — the boundary is purely branch (b).
+        assert_eq!(
+            cfp_pruned_bound(&pos, mv, 0, 1, -793),
+            Some(-793),
+            "see_bound == alpha must fire (branch b inclusive)"
+        );
+        assert!(
+            cfp_pruned_bound(&pos, mv, 0, 1, -794).is_none(),
+            "see_bound > alpha (by 1) must NOT fire branch b"
+        );
+    }
+
+    /// Winning/equal capture exemption (the v1 `victim >= attacker` gate on
+    /// branch b). On an EQUAL trade (RxR-defended, see = 0) where mvv_bound (627)
+    /// exceeds alpha (300), the helper must return None — a mutant dropping the
+    /// `victim >= attacker` guard would compute see_bound = 0 + 0 + 150 = 150,
+    /// which is `<= 300`, and wrongly prune. This is the discriminating guard test.
+    #[test]
+    fn cfp_pruned_bound_equal_trade_exempt_from_branch_b() {
+        let (pos, mv) = cfp_fixture("r6k/r7/8/8/8/8/8/R3K3 w - - 0 1", "a1a7");
+        assert!(
+            cfp_pruned_bound(&pos, mv, 0, 1, 300).is_none(),
+            "equal trade (victim>=attacker) must be exempt from the SEE refinement at v1"
+        );
+        // And a genuinely winning capture (RxQ, victim 1025 > attacker 477) is
+        // likewise exempt at the same window.
+        let (pos2, mv2) = cfp_fixture("q3k3/8/8/8/8/8/8/R3K3 w - - 0 1", "a1a8");
+        assert!(
+            cfp_pruned_bound(&pos2, mv2, 0, 1, 300).is_none(),
+            "winning capture (victim>attacker) must not be branch-b-pruned"
+        );
+    }
+
+    /// EP victim is read as a Pawn (the to-square is empty for EP — reading
+    /// piece_at(to) would panic). e5xd6 EP: victim = Pawn (82), attacker = Pawn
+    /// (82). Branch (a): mvv_bound = 0 + 82 + 150 = 232; alpha 232 → Some(232).
+    /// A passing result proves the EP victim branch used 82 (a wrong piece_at(to)
+    /// read would have panicked on the empty d6 square).
+    #[test]
+    fn cfp_pruned_bound_en_passant_victim_is_pawn() {
+        let (pos, mv) = cfp_fixture("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", "e5d6");
+        assert_eq!(
+            cfp_pruned_bound(&pos, mv, 0, 1, 232),
+            Some(232),
+            "EP victim must be valued as a pawn (82)"
+        );
+    }
+
+    /// Overflow defense: i32::MAX static eval saturates, no panic.
+    #[test]
+    fn cfp_pruned_bound_does_not_overflow_on_max_static_eval() {
+        let (pos, mv) = cfp_fixture("r6k/r7/8/8/8/8/8/R3K3 w - - 0 1", "a1a7");
+        assert_eq!(
+            cfp_pruned_bound(&pos, mv, i32::MAX, 1, i32::MAX),
+            Some(i32::MAX),
+            "saturating_add keeps the bound at i32::MAX without overflowing"
+        );
+    }
+
+    /// Branch-ordering / no-needless-see perf contract: when branch (a) already
+    /// prunes (mvv_bound <= alpha) AND the capture is losing (victim < attacker)
+    /// AND see_bound != mvv_bound, the helper must return Some(mvv_bound) — i.e.
+    /// it returns from branch (a) BEFORE reaching see(). QxP-defended, static
+    /// -2000: mvv_bound = -2000 + 82 + 150 = -1768; see_bound = -2000 - 943 +
+    /// 150 = -2793. alpha 0 → must be Some(-1768), not Some(-2793). A mutant
+    /// that ran see() first (or dropped the early return) returns -2793 and
+    /// fails — catching a reorder that silently changes the see()-call (NPS)
+    /// population even when the prune decision is unchanged.
+    #[test]
+    fn cfp_pruned_bound_branch_a_returns_before_see() {
+        let (pos, mv) = cfp_fixture("4k3/8/2p5/3p4/8/8/8/3QK3 w - - 0 1", "d1d5");
+        assert_eq!(
+            cfp_pruned_bound(&pos, mv, -2000, 1, 0),
+            Some(-1768),
+            "branch (a) must return the MVV bound before any see() refinement"
+        );
+    }
+
+    // ---- Move-loop integration tests (mirror the FFP suite). ----
+
+    /// The FFP middlegame fixture has captures of the d5 pawn (e.g. d4xc5,
+    /// Nc3xd5). At a high alpha they are CFP-pruned (branch a). Non-PV fires;
+    /// the PV sister does not.
+    #[test]
+    fn negamax_fires_cfp_for_capture_at_frontier_nonpv_only() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        // alpha well above static + (pawn victim 82 + margin 150) so the pawn
+        // captures cannot reach alpha → branch (a) prunes them.
+        let alpha = static_eval + 82 + capture_futility_margin(1) + 100;
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab_nonpv = AlphaBetaMover::new();
+        let _ =
+            ab_nonpv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
+        assert!(
+            ab_nonpv.cfp_firings_for_test() > 0,
+            "non-PV frontier node must CFP-prune at least one capture; got 0"
+        );
+
+        let mut ab_pv = AlphaBetaMover::new();
+        let _ = ab_pv.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, true, true, None, &ctx);
+        assert_eq!(
+            ab_pv.cfp_firings_for_test(),
+            0,
+            "PV node must skip CFP; got {}",
+            ab_pv.cfp_firings_for_test()
+        );
+    }
+
+    /// CFP node gate: ply 0 (structural-root guard) blocks even at is_pv=false.
+    #[test]
+    fn negamax_skips_cfp_at_ply_zero() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let alpha = static_eval + 82 + capture_futility_margin(1) + 100;
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab0 = AlphaBetaMover::new();
+        let _ = ab0.negamax_for_test(&mut pos.clone(), 1, 0, alpha, beta, false, true, None, &ctx);
+        assert_eq!(ab0.cfp_firings_for_test(), 0, "ply 0 must skip CFP");
+
+        let mut ab1 = AlphaBetaMover::new();
+        let _ = ab1.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
+        assert!(ab1.cfp_firings_for_test() > 0, "ply 1 sister must fire");
+    }
+
+    /// CFP node gate: in check blocks (the move loop holds evasions; pruning any
+    /// is unsound). In-check fixture has a losing capture-evasion (Qxg3, see
+    /// -688) that would be SEE-pruned at the configured alpha absent the gate —
+    /// so a mutant dropping `!in_check` would fire here. Correct code: 0.
+    #[test]
+    fn negamax_skips_cfp_when_in_check() {
+        use crate::movegen::in_check;
+        // White Kh1 in check from black Ng3; pawn f4 defends g3. Qg1xg3 is a
+        // legal but losing capture-evasion (see -688).
+        let pos_check =
+            Position::from_fen("4k3/8/8/8/5p2/6n1/8/6QK w - - 0 1").expect("in-check FEN parses");
+        assert!(in_check(&pos_check), "fixture must be in check");
+        let pos_no =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN parses");
+        assert!(!in_check(&pos_no), "sister must not be in check");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let beta = MATE_IN_MAX_PLY;
+
+        // alpha = static so that, absent the gate, Qxg3's see_bound (static-538)
+        // <= alpha < mvv_bound (static+487) → branch b would fire.
+        let alpha_check = stm_static_eval(&pos_check);
+        let mut ab_check = AlphaBetaMover::new();
+        let _ = ab_check.negamax_for_test(
+            &mut pos_check.clone(),
+            1,
+            1,
+            alpha_check,
+            beta,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+        assert_eq!(
+            ab_check.cfp_firings_for_test(),
+            0,
+            "in-check node must skip CFP; got {}",
+            ab_check.cfp_firings_for_test()
+        );
+
+        let alpha_no = stm_static_eval(&pos_no) + 82 + capture_futility_margin(1) + 100;
+        let mut ab_no = AlphaBetaMover::new();
+        let _ = ab_no.negamax_for_test(
+            &mut pos_no.clone(),
+            1,
+            1,
+            alpha_no,
+            beta,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+        assert!(
+            ab_no.cfp_firings_for_test() > 0,
+            "not-in-check sister must fire CFP at least once"
+        );
+    }
+
+    /// CFP node gate: depth > FFP_MAX_DEPTH blocks. The counter is gated to the
+    /// root frame (ply == 1); at depth FFP_MAX_DEPTH+1 the root gate fails → 0.
+    /// Sister at depth FFP_MAX_DEPTH fires. Pins the `<=` depth boundary.
+    #[test]
+    fn negamax_skips_cfp_at_depth_above_max() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(8);
+        let static_eval = stm_static_eval(&pos);
+        let alpha = static_eval + 82 + capture_futility_margin(1) + 100;
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab_above = AlphaBetaMover::new();
+        let _ = ab_above.negamax_for_test(
+            &mut pos.clone(),
+            FFP_MAX_DEPTH + 1,
+            1,
+            alpha,
+            beta,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+        assert_eq!(
+            ab_above.cfp_firings_for_test(),
+            0,
+            "depth > FFP_MAX_DEPTH at the root frame must skip CFP"
+        );
+
+        let mut ab_at = AlphaBetaMover::new();
+        let _ = ab_at.negamax_for_test(
+            &mut pos.clone(),
+            FFP_MAX_DEPTH,
+            1,
+            alpha,
+            beta,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+        assert!(
+            ab_at.cfp_firings_for_test() > 0,
+            "depth == FFP_MAX_DEPTH sister must fire CFP"
+        );
+    }
+
+    /// CFP node gate: mate-magnitude alpha blocks (centipawn margins meaningless
+    /// near mate). Sister with normal alpha fires.
+    #[test]
+    fn negamax_skips_cfp_at_mate_alpha() {
+        let pos =
+            Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+                .expect("FEN must parse");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let beta = MATE;
+
+        let mut ab_mate = AlphaBetaMover::new();
+        let _ = ab_mate.negamax_for_test(
+            &mut pos.clone(),
+            1,
+            1,
+            MATE_IN_MAX_PLY,
+            beta,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+        assert_eq!(
+            ab_mate.cfp_firings_for_test(),
+            0,
+            "mate-magnitude alpha must skip CFP"
+        );
+
+        let static_eval = stm_static_eval(&pos);
+        let alpha = static_eval + 82 + capture_futility_margin(1) + 100;
+        let mut ab_normal = AlphaBetaMover::new();
+        let _ = ab_normal.negamax_for_test(
+            &mut pos.clone(),
+            1,
+            1,
+            alpha,
+            MATE_IN_MAX_PLY,
+            false,
+            true,
+            None,
+            &ctx,
+        );
+        assert!(
+            ab_normal.cfp_firings_for_test() > 0,
+            "normal-alpha sister must fire CFP"
+        );
+    }
+
+    /// A winning capture is searched, not pruned, while a small capture at the
+    /// SAME node and alpha IS CFP-pruned. Position: white Rxa8 (victim Q 1025 >
+    /// attacker R 477 → never branch-b-pruned, and mvv_bound static+1175 >
+    /// alpha so not branch-a-pruned) and white bxc5 (pawn victim 82 → branch a
+    /// prunes it). Guards the winning-capture exemption end-to-end.
+    #[test]
+    fn negamax_cfp_prunes_small_capture_but_searches_winning_capture() {
+        let pos = Position::from_fen("q3k3/8/8/2p5/1P6/8/8/R3K3 w - - 0 1").expect("FEN parses");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let alpha = static_eval + 82 + capture_futility_margin(1) + 100;
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
+
+        let pruned: Vec<Move> = ab.cfp_pruned_moves_for_test().to_vec();
+        let winning = Move::from_uci("a1a8", &pos).expect("Rxa8 legal");
+        let small = Move::from_uci("b4c5", &pos).expect("bxc5 legal");
+        assert!(
+            !pruned.contains(&winning),
+            "winning capture Rxa8 must be searched, not CFP-pruned; pruned = {pruned:?}"
+        );
+        assert!(
+            pruned.contains(&small),
+            "small capture bxc5 must be CFP-pruned (branch a); pruned = {pruned:?}"
+        );
+    }
+
+    /// Counter / list invariant: cfp_firings == cfp_pruned_moves.len() (catches
+    /// updating one field but not the other). Uses the winning/small fixture.
+    #[test]
+    fn cfp_firings_counter_matches_pruned_moves_len() {
+        let pos = Position::from_fen("q3k3/8/8/2p5/1P6/8/8/R3K3 w - - 0 1").expect("FEN parses");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        let alpha = static_eval + 82 + capture_futility_margin(1) + 100;
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
+        assert_eq!(
+            ab.cfp_firings_for_test() as usize,
+            ab.cfp_pruned_moves_for_test().len(),
+            "cfp_firings must equal cfp_pruned_moves.len()"
+        );
+        assert!(
+            ab.cfp_firings_for_test() > 0,
+            "anti-vacuous: at least one prune"
+        );
+    }
+
+    /// CFP must NOT fire on promotion-captures (plan §1: non-promotion captures
+    /// only — promos are ~+900 cp material events, tactically sharp; the call
+    /// site gates on `mv.is_capture() && !mv.is_promotion()`). Fixture: white
+    /// Pb7 can play b7xa8=Q (a QueenPromoCapture). alpha is set high enough that
+    /// a non-promo capture of the same a8 knight (victim 337) WOULD be
+    /// branch-(a)-pruned (mvv_bound = static+337+150 <= alpha), so a mutant that
+    /// dropped `!mv.is_promotion()` would prune b7xa8=Q. Correct code: the
+    /// promo-capture is never in the pruned list.
+    #[test]
+    fn negamax_cfp_does_not_fire_on_promotion_capture() {
+        let pos = Position::from_fen("n3k3/1P6/8/8/8/8/8/4K3 w - - 0 1").expect("FEN parses");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let static_eval = stm_static_eval(&pos);
+        // High enough that a hypothetical non-promo capture of the knight would
+        // be branch-(a)-pruned (static + 337 + 150 + slack <= alpha).
+        let alpha = static_eval + 337 + capture_futility_margin(1) + 100;
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
+
+        let promo_capture = Move::from_uci("b7a8q", &pos).expect("b7xa8=Q legal");
+        assert!(
+            promo_capture.is_capture() && promo_capture.is_promotion(),
+            "fixture invariant: b7a8q must be a promotion-capture"
+        );
+        assert!(
+            !ab.cfp_pruned_moves_for_test().contains(&promo_capture),
+            "promotion-capture must NOT be CFP-pruned; pruned = {:?}",
+            ab.cfp_pruned_moves_for_test()
+        );
+    }
+
+    /// A CFP-pruned capture must not prevent a sibling quiet from being searched
+    /// (plan §8 #10 / §4: the `continue` lives in the capture arm and must not
+    /// skip the quiet/LMR machinery). QxP-defended at alpha = static: the QxP is
+    /// branch-(b)-pruned (see_bound = static-793 <= static), while quiets are
+    /// NOT FFP-pruned (FFP needs static+100 <= alpha = static, false) → searched
+    /// and recorded in lmr_history_candidates. Mirrors the FFP analogue
+    /// `ffp_skipped_quiet_does_not_enter_quiets_searched`.
+    #[test]
+    fn negamax_cfp_pruned_capture_does_not_prevent_quiet_search() {
+        let pos = Position::from_fen("4k3/8/2p5/3p4/8/8/8/3QK3 w - - 0 1").expect("FEN parses");
+        let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+        let alpha = stm_static_eval(&pos); // FFP cannot fire (needs static+100 <= alpha)
+        let beta = MATE_IN_MAX_PLY;
+
+        let mut ab = AlphaBetaMover::new();
+        let _ = ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
+
+        let qxp = Move::from_uci("d1d5", &pos).expect("Qxd5 legal");
+        assert!(
+            ab.cfp_pruned_moves_for_test().contains(&qxp),
+            "fixture invariant: QxP must be CFP-pruned (branch b)"
+        );
+        // The capture is ordered early (MVV-LVA) and CFP-pruned via branch (b)
+        // while alpha is still ~static; a sibling quiet is then searched and
+        // recorded. (We do NOT assert ffp_firings == 0: a searched quiet can
+        // raise alpha mid-loop, after which FFP may fire for later quiets — the
+        // point is only that at least one quiet IS searched.)
+        assert!(
+            !ab.lmr_history_candidates_for_test().is_empty(),
+            "a sibling quiet must still be searched after the capture is CFP-pruned; \
+             lmr_history_candidates is empty"
+        );
+    }
+
+    /// All-captures-pruned fail-soft soundness + provenance-downgrade TT
+    /// suppression (ADR-0026 §7 / ADR-0042; the load-bearing accounting CFP
+    /// reuses verbatim). Fixture: white Kc1, Pd5; black Ke8, Pe6. Only capture
+    /// is d5xe6 (pawn, victim 82 = attacker → branch (a)); the rest are quiet
+    /// king moves. alpha set so all prune: the CFP capture's bound
+    /// (static + 82 + 150 = static+232) is the UNIQUE max (FFP quiet bounds are
+    /// static+100), so the CFP contribution determines the node's final
+    /// `best_is_full_depth` flag. Correct code routes it through
+    /// `best_is_full_depth_after_score(.., move_is_full_depth = false)` →
+    /// flag = false → no TT store. A mutant passing `true` would store an
+    /// inflated Upper(static+232) at depth 1. Anti-vacuous sister: alpha = -INF
+    /// → the capture is searched (Exact bound), TT entry present.
+    #[test]
+    fn negamax_all_moves_pruned_failsoft_and_suppresses_tt_store() {
+        let pos = Position::from_fen("4k3/8/4p3/3P4/8/8/8/2K5 w - - 0 1").expect("FEN parses");
+        let static_eval = stm_static_eval(&pos);
+        let alpha = static_eval + 82 + capture_futility_margin(1) + 200;
+        let beta = MATE_IN_MAX_PLY;
+        let expected_bound = static_eval + 82 + capture_futility_margin(1); // CFP bound = unique max
+
+        let tt = Arc::new(TranspositionTable::new(1));
+        let (ctx, _stop) = non_aborting_ctx_at_depth_with_tt(4, tt.clone());
+        let mut ab = AlphaBetaMover::new();
+        ab.set_tt_for_test(Some(tt.clone()));
+        tt.new_search();
+        let score =
+            ab.negamax_for_test(&mut pos.clone(), 1, 1, alpha, beta, false, true, None, &ctx);
+
+        // Fail-soft soundness: a real floored bound <= alpha, NOT -INF negated.
+        assert!(
+            score <= alpha && score > -MATE,
+            "all-pruned node must return a floored fail-soft bound <= alpha; got {score}"
+        );
+        // Regime-exercised: the CFP capture's bound is the highest contribution,
+        // so it is the move that sets the final `best`/flag.
+        assert_eq!(
+            score, expected_bound,
+            "regime invariant: the CFP capture bound ({expected_bound}) must be the node's best"
+        );
+        // Non-vacuous: the capture was CFP-pruned.
+        let capture = Move::from_uci("d5e6", &pos).expect("d5e6 legal");
+        assert!(
+            ab.cfp_pruned_moves_for_test().contains(&capture),
+            "fixture invariant: d5xe6 must be CFP-pruned"
+        );
+        // Load-bearing: no Upper entry stored at depth 1 (provenance downgraded).
+        if let Some(e) = tt.probe(pos.zobrist()) {
+            assert!(
+                !(e.depth as u32 == 1 && matches!(e.bound(), TtBound::Upper)),
+                "provenance-downgrade failed: stored Upper at depth=1 score={} (inflated)",
+                e.score
+            );
+        }
+
+        // Anti-vacuous sister: alpha = -INF → CFP/FFP cannot fire; the capture
+        // is searched (Exact), TT entry IS present (proves the suppression
+        // assertion above is non-vacuous — the store path is reachable).
+        let tt2 = Arc::new(TranspositionTable::new(1));
+        let (ctx2, _stop2) = non_aborting_ctx_at_depth_with_tt(4, tt2.clone());
+        let mut ab2 = AlphaBetaMover::new();
+        ab2.set_tt_for_test(Some(tt2.clone()));
+        tt2.new_search();
+        let _ = ab2.negamax_for_test(&mut pos.clone(), 1, 1, -INF, INF, false, true, None, &ctx2);
+        assert_eq!(
+            ab2.cfp_firings_for_test(),
+            0,
+            "anti-vacuous: CFP must not fire at alpha = -INF"
+        );
+        assert!(
+            tt2.probe(pos.zobrist()).is_some(),
+            "anti-vacuous: the TT store path must be reachable when nothing is pruned"
         );
     }
 

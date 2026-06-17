@@ -8,6 +8,21 @@ This file also tracks **deferred features awaiting a precondition** — items re
 
 ---
 
+### M7.C deferred levers — capture-futility tuning (gated on the M7.C SPRT outcome)
+
+**Status (2026-06-17).** M7.C (SEE capture futility, ADR-0042) landed final-review-approved; SPRT vs `M7.B.2` is operator-launched. These levers apply **after** the SPRT, ordered by what the result indicates:
+
+1. **(if SPRT shows a 60+0.6 regression — BLOCKS the ship) M7.C.1 — root-depth margin ramp.** The M7.B.2 mechanism applied to `CFP_MARGIN_D1`: keep the flat 150 at shallow ID iterations, widen (more conservative) at the deep iterations only slow TC reaches. Ships *before* M7.C if needed (the M7.B→M7.B.2 sequence). Research §4 argues this is unlikely (alpha-relative futility self-regulates), so v1 ships flat.
+2. **(if SPRT marginal-positive — TOP lever) broaden branch (b) to ALL captures.** Drop the v1 `victim >= attacker` exemption so the SEE refinement applies to winning/equal captures too (the literature form; research §1b). More `see()` calls, more aggressive — the restriction is exactly what makes the v1 SEE half thin, so this is the first lever to recover Elo. *Before* the margin sweep.
+3. **`CFP_MARGIN_D1` sweep** (and activate D2/D3 by raising `FFP_MAX_DEPTH`, jointly with the FFP table). Larger = safer (fewer false prunes); smaller = more aggressive.
+4. **Gives-check capture exemption** (needs `gives_check` infra; the FFP §1 / ADR-0026 deferral; research flags discovered-check risk).
+5. **TT-move / killer-capture exemption** if a regression traces to over-pruning trusted captures (ADR-0040 §5 remediation precedent).
+6. **Mechanism 1c — absolute SEE-by-depth (`see(mv) < -k·depth²`, alpha-independent).** A *separate future mechanism*, not a tune of v1 — carries the M7.B alpha-independent slow-TC risk (would need depth/root-depth conditioning from the start). Research-recommended only after the alpha-relative form lands.
+
+Cross-ref: ADR-0042 §Consequences; `docs/plans/m7.c.md` §11; `docs/milestones/m7.c.md`.
+
+---
+
 ### M7.B.1 — qsearch SEE-prune threshold (fix the slow-TC regression) — ✅ CLOSED / SHIPPED 2026-06-17 (delivered as M7.B.2, the depth ramp)
 
 **RESOLVED.** The flat-threshold sweep (this item's original plan) proved a flat value can only *trade* 20+0.2 for 60+0.6 (flat −50 2-seed-confirmed lateral). The fix shipped as **M7.B.2** — a depth-conditioned ramp (ADR-0041) — which **2-seed H1-ACCEPT dominated** both M7.B (flat-0) and flat −50 at every TC: vs `M5.K` `…D00B` +92.53 [+67.62,+118.41], `…D01B` +123.93 [+94.75,+154.90]; 60+0.6 recovered (−104→+56), 20+0.2 held (+140), 40+0.4 no band-edge dip (+125). New production search HEAD. Record: `bench/sprt/2026-06-17-m7b2-ramp-vs-m5k.md`, ADR-0041, `docs/plans/m7.b.2.md`. The historical sweep notes below are retained for the record.

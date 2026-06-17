@@ -1145,10 +1145,19 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
     // bench-node-count policy this is a determinism anchor, not a no-regression
     // signal; the strength claim is the SPRT (mixed-TC + virtual-clock vs the
     // M6.J/M5.K production HEAD). History prepend: M7.B `45_788`.
-    const DEPTH4_BENCH_NODES: u64 = 45_788;
+    // M7.C (SEE capture futility / delta pruning, ADR-0042): the negamax-side
+    // complement of FFP — non-promotion captures at frontier nodes whose
+    // optimistic material-plus-margin ceiling can't reach alpha are skipped
+    // (two layers: MVV delta-prune + SEE refinement on losing captures). Far
+    // smaller than M7.B's qsearch prune (frontier nodes are rare): depth-4 anchor
+    // moved 45_788 -> 43_128 (−5.8%); the default (depth-7) bench moved
+    // 662_085 -> 588_673 (−11.1%). Determinism anchor, not a no-regression
+    // signal; the strength claim is the SPRT vs the M7.B.2 production HEAD.
+    // History prepend: M7.C `43_128`.
+    const DEPTH4_BENCH_NODES: u64 = 43_128;
     assert_eq!(
         nodes1, DEPTH4_BENCH_NODES,
-        "E51: bench node count changed from the M5.F.1 pin ({DEPTH4_BENCH_NODES} at depth=4); \
+        "E51: bench node count changed from the M7.C pin ({DEPTH4_BENCH_NODES} at depth=4); \
          re-pin if intentional; got {nodes1}"
     );
 }
