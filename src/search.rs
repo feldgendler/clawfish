@@ -1164,6 +1164,14 @@ pub(crate) struct AlphaBetaMover {
     history: Vec<u64>,
     /// Running node counter for this search invocation.
     nodes: u64,
+    /// M7.B.2: current iterative-deepening *root* iteration depth. Set at the
+    /// top of each ID iteration (`for depth in 1..=max_depth`). Read by qsearch
+    /// to compute the depth-conditioned SEE-prune threshold
+    /// (`qs_see_prune_threshold`): aggressive (0) at shallow iterations, relaxed
+    /// toward a negative margin at deep iterations. Defaults to `0` for any path
+    /// that does not run the ID loop (`qsearch_for_test`, the eval `stm_score`
+    /// helper) ⇒ threshold `0` ⇒ byte-identical to the flat-0 M7.B behavior.
+    root_depth: u32,
     /// Set when the cancellation check fires; once set, every recursive return
     /// propagates 0 without committing the score.
     aborted: bool,
@@ -1307,6 +1315,7 @@ impl AlphaBetaMover {
             pv: PvTable::new(),
             history: Vec::new(),
             nodes: 0,
+            root_depth: 0,
             aborted: false,
             root_score: None,
             tt: None,
@@ -1414,6 +1423,10 @@ impl Search for AlphaBetaMover {
         let mut prev_prev_score: Option<i32> = None;
 
         for depth in 1..=max_depth {
+            // M7.B.2: publish the current ID iteration depth so qsearch can
+            // depth-condition its SEE-prune threshold (`qs_see_prune_threshold`).
+            // Set before any negamax/qsearch call in this iteration.
+            self.root_depth = depth;
             // Per-iteration reset (M4.B inter-iteration policy): clear the
             // killer table once at the top of each ID iteration. NOT cleared
             // between aspiration tries — research §12.7 + plan AS23: a failed
@@ -2371,6 +2384,9 @@ impl AlphaBetaMover {
         self.se_tt_move_search_depth = None;
         // M7.B: reset SEE-prune firing counter symmetrically.
         self.qsearch_see_prune_firings = 0;
+        // M7.B.2: reset root_depth so the depth-0 qsearch delegation uses the
+        // flat-0 threshold (≡ M7.B) on a reused mover instance.
+        self.root_depth = 0;
         self.lmr_trace_root_ply = Some(ply);
         let score = self.negamax(
             pos,
@@ -2773,10 +2789,18 @@ impl AlphaBetaMover {
         // 8. Recurse fail-soft. Track cutoff_move for path F Lower best_move.
         let mut best = best_init;
         let mut cutoff_move: Option<Move> = None;
+        // M7.B.2: depth-conditioned prune threshold for this frame (constant
+        // across the move loop — `root_depth` is fixed for the ID iteration).
+        let see_threshold = qs_see_prune_threshold(self.root_depth);
         for mv in moves_vec {
             // M7.B: qsearch SEE-pruning — skip statically-losing captures when not
             // in check. Promotions and (when in check) evasions are exempt by guard.
-            if !in_chk && mv.is_capture() && !mv.is_promotion() && qsearch_see_pruneable(pos, mv) {
+            // M7.B.2: `see_threshold` relaxes the prune at deep ID iterations.
+            if !in_chk
+                && mv.is_capture()
+                && !mv.is_promotion()
+                && qsearch_see_pruneable(pos, mv, see_threshold)
+            {
                 #[cfg(test)]
                 {
                     self.qsearch_see_prune_firings += 1;
@@ -2950,6 +2974,36 @@ impl AlphaBetaMover {
         self.qsearch_tt_stores = 0;
         // M7.B: reset SEE-prune firing counter per-entry for the same reason.
         self.qsearch_see_prune_firings = 0;
+        // M7.B.2: reset root_depth so qsearch_for_test uses the flat-0
+        // threshold (≡ M7.B) regardless of any prior `go`/depth-driving on a
+        // reused mover instance. Makes the "default 0 ⇒ flat threshold"
+        // guarantee code-backed, not invariant-backed.
+        self.root_depth = 0;
+        let clock = SearchClock::start_for(ctx.virtual_clock, ctx.caps);
+        self.qsearch(pos, alpha, beta, ply, ctx, &clock)
+    }
+
+    /// Test-only variant of `qsearch_for_test` that drives the M7.B.2
+    /// depth-conditioned SEE-prune ramp by publishing `root_depth` *after* the
+    /// per-entry resets (so it is not clobbered). Exercises the live qsearch
+    /// path's read of `self.root_depth` (which the pure-function value-table
+    /// test cannot).
+    #[cfg(test)]
+    pub(super) fn qsearch_at_root_depth_for_test(
+        &mut self,
+        pos: &mut Position,
+        alpha: i32,
+        beta: i32,
+        ply: u32,
+        ctx: &SearchContext,
+        root_depth: u32,
+    ) -> i32 {
+        self.qsearch_single_reply_firings = 0;
+        self.qsearch_under_promo_firings = 0;
+        self.qsearch_tt_probes = 0;
+        self.qsearch_tt_stores = 0;
+        self.qsearch_see_prune_firings = 0;
+        self.root_depth = root_depth;
         let clock = SearchClock::start_for(ctx.virtual_clock, ctx.caps);
         self.qsearch(pos, alpha, beta, ply, ctx, &clock)
     }
@@ -3231,28 +3285,49 @@ fn qsearch_move_filter(mv: Move) -> bool {
 // M7.B — qsearch SEE-pruning
 // ---------------------------------------------------------------------------
 
-/// Centipawn SEE threshold for qsearch capture pruning. A non-promotion
-/// capture with `see < QS_SEE_PRUNE_THRESHOLD` is skipped in quiescence
-/// (statically losing). `0` prunes strictly-losing captures; this is the
-/// SPRT/SPSA tuning lever (docs/plans/m7.b.md §10).
-const QS_SEE_PRUNE_THRESHOLD: i32 = 0;
+/// M7.B.2 — depth-conditioned qsearch SEE-prune ramp parameters
+/// (`docs/plans/m7.b.2.md`). The threshold is flat `0` (prune every `see < 0`
+/// capture, ≡ flat-0 M7.B) at/below `D0`, then ramps linearly more-negative by
+/// `SLOPE` cp per ply, clamped at `FLOOR`. Rationale: a `see < 0` capture can be
+/// a real tactical sacrifice the engine *would* refute given depth; at shallow
+/// (fast-TC) iterations the node saving wins, but at deep (slow-TC) iterations
+/// pruning it costs accuracy — so relax the prune only at depth.
+const QS_SEE_RAMP_D0: u32 = 12;
+const QS_SEE_RAMP_SLOPE: i32 = 16;
+const QS_SEE_RAMP_FLOOR: i32 = -64;
+/// Fast-out validity (see `qsearch_see_pruneable`): the ramp must be
+/// non-positive at every depth so that `victim >= attacker ⇒ see >= 0 ⇒ not
+/// pruneable` holds. `-SLOPE * max(0, ·)` clamped to `[FLOOR, 0]` is `<= 0` iff
+/// `FLOOR <= 0 && SLOPE >= 0`. Compile-time-pinned (strongest form).
+const _: () = assert!(QS_SEE_RAMP_FLOOR <= 0 && QS_SEE_RAMP_SLOPE >= 0);
+
+/// Depth-conditioned SEE-prune threshold for the current ID root iteration.
+/// `threshold(d) = clamp(-SLOPE * max(0, d - D0), FLOOR, 0)`: `0` for `d <= D0`
+/// (flat-0 ≡ M7.B), ramping to `FLOOR` at `d >= D0 + FLOOR.abs()/SLOPE`.
+/// Monotonically non-increasing in `d`; always in `[FLOOR, 0]`.
+fn qs_see_prune_threshold(root_depth: u32) -> i32 {
+    (-QS_SEE_RAMP_SLOPE * (root_depth.saturating_sub(QS_SEE_RAMP_D0) as i32))
+        .clamp(QS_SEE_RAMP_FLOOR, 0)
+}
 
 /// Returns `true` iff `mv` (a non-promotion capture: `Capture` | `EnPassant`)
-/// should be pruned from quiescence as statically losing. The caller
-/// guarantees `!in_check` and `mv.is_capture() && !mv.is_promotion()`.
+/// should be pruned from quiescence as statically losing relative to
+/// `threshold` (the depth-conditioned `qs_see_prune_threshold` value). The
+/// caller guarantees `!in_check` and `mv.is_capture() && !mv.is_promotion()`.
 ///
 /// Fast-out: a capture whose victim is worth >= the attacker can never be
 /// SEE-negative (worst case the attacker is traded off, netting >= 0), so
 /// the full `see()` resolver is skipped for the common winning/equal captures
 /// (PxN, RxQ, equal trades, all EP PxP). Only `attacker > victim` captures
 /// (QxP-class) pay for the resolver. The fast-out is only valid while
-/// `QS_SEE_PRUNE_THRESHOLD <= 0` (victim>=attacker ⇒ see>=0 ⇒ not <
-/// threshold); pinned by a compile-time assert.
-fn qsearch_see_pruneable(pos: &Position, mv: Move) -> bool {
+/// `threshold <= 0` (victim>=attacker ⇒ see>=0 ⇒ not < threshold); the ramp is
+/// `<= 0` by construction (clamped to `[FLOOR, 0]`, FLOOR<=0), pinned at the
+/// const site above and re-asserted here as a debug belt-and-suspenders.
+fn qsearch_see_pruneable(pos: &Position, mv: Move, threshold: i32) -> bool {
     use crate::mov::MoveFlag;
     use crate::piece::PieceKind;
     use crate::see::{SEE_VALUE, see};
-    const _: () = assert!(QS_SEE_PRUNE_THRESHOLD <= 0); // fast-out validity
+    debug_assert!(threshold <= 0, "fast-out validity requires threshold <= 0");
 
     let attacker = SEE_VALUE[pos
         .piece_at(mv.from_square())
@@ -3272,7 +3347,7 @@ fn qsearch_see_pruneable(pos: &Position, mv: Move) -> bool {
     if victim >= attacker {
         return false; // SEE >= 0; never prune (valid while threshold <= 0)
     }
-    see(pos, mv) < QS_SEE_PRUNE_THRESHOLD
+    see(pos, mv) < threshold
 }
 
 /// M5.E #3 — given a queen-promo move `mv`, returns the rook-promo and
@@ -21037,7 +21112,7 @@ mod tests {
         // `>= vs >` fast-out boundary is killed by the equal-trade test
         // (`qsearch_see_pruneable_fast_out_equal_capture_not_pruned`).
         assert!(
-            !qsearch_see_pruneable(&pos, mv),
+            !qsearch_see_pruneable(&pos, mv, 0),
             "PxN (victim >= attacker fast-out): must NOT be pruneable; SEE(e4d5)=+337"
         );
     }
@@ -21062,7 +21137,7 @@ mod tests {
         // victim(R=477) >= attacker(R=477) → fast-out fires, returns false.
         // Mutation guard: changing `>=` to `>` would miss this equal-value case.
         assert!(
-            !qsearch_see_pruneable(&pos, mv),
+            !qsearch_see_pruneable(&pos, mv, 0),
             "RxR equal trade (victim == attacker fast-out): must NOT be pruneable; SEE=0"
         );
     }
@@ -21091,7 +21166,7 @@ mod tests {
         // the victim square is the EP landing square (e6, empty in FEN), so the
         // predicate MUST use the EP-pawn sentinel, not piece_at(to).
         assert!(
-            !qsearch_see_pruneable(&pos, mv),
+            !qsearch_see_pruneable(&pos, mv, 0),
             "EP PxP (victim == attacker = P fast-out): must NOT be pruneable"
         );
     }
@@ -21120,8 +21195,8 @@ mod tests {
         // Full SEE: Q×P(82), R×Q(1025) → see=82-1025=−943 < 0 → prune.
         // Stub: returns false → this assertion FAILS (RED).
         assert!(
-            qsearch_see_pruneable(&pos, mv),
-            "QxP/Rd8 (SEE=−943): must be pruneable (see < QS_SEE_PRUNE_THRESHOLD=0)"
+            qsearch_see_pruneable(&pos, mv, 0),
+            "QxP/Rd8 (SEE=−943): must be pruneable at threshold 0 (see < 0)"
         );
     }
 
@@ -21148,7 +21223,7 @@ mod tests {
         // Full SEE: see(QxP undefended) = +82 ≥ 0 → not pruned.
         // Stub: returns false → GREEN (happens to match).
         assert!(
-            !qsearch_see_pruneable(&pos, mv),
+            !qsearch_see_pruneable(&pos, mv, 0),
             "QxP undefended (SEE=+82 ≥ 0): must NOT be pruneable"
         );
     }
@@ -21468,13 +21543,14 @@ mod tests {
 
     // ---- §5.3 Mutation-resistance fixture ----
     //
-    // `< QS_SEE_PRUNE_THRESHOLD` vs `<=` boundary mutant:
+    // `see(pos, mv) < threshold` vs `<=` boundary mutant (M7.B.2: `threshold`
+    // is now the depth-conditioned `qs_see_prune_threshold(root_depth)` value,
+    // reachable values {0, −16, −32, −48, −64}):
     //
-    // The mutant `see(pos, mv) <= QS_SEE_PRUNE_THRESHOLD` differs from the
-    // original `see(pos, mv) < QS_SEE_PRUNE_THRESHOLD` only when
-    // `see(pos, mv) == 0` exactly. To catch this mutant requires a fixture
-    // with `attacker > victim` (so the fast-out does NOT fire — `victim >=
-    // attacker` returns false) AND `see() == 0` exactly.
+    // The mutant `see(pos, mv) <= threshold` differs from the original
+    // `see(pos, mv) < threshold` only when `see(pos, mv) == threshold` exactly.
+    // To catch it requires a fixture with `attacker > victim` (so the fast-out
+    // does NOT fire) AND `see()` equal to one of the reachable thresholds.
     //
     // After exhaustive analysis of our SEE_VALUE scale [82, 337, 365, 477, 1025]:
     // the 2-ply formula gives see==0 only when victim==attacker (equal trade),
@@ -21482,14 +21558,147 @@ mod tests {
     // requires v1 = a0 − v0 where a0 > v0; with our integer piece values, no
     // valid piece value v1 = a0 − v0 exists (differences like 477−365=112,
     // 1025−82=943, 1025−337=688, 1025−477=548, 365−337=28 are not in the set).
-    // Higher-ply exchanges are similarly constrained. Therefore:
+    // The non-zero reachable thresholds {−16,−32,−48,−64} are multiples of the
+    // ramp SLOPE (16); no `attacker > victim` capture see() value lands on any
+    // of them either (the achievable losing-exchange values −28, −112, −140,
+    // −255, −283, −395, −548, −660, −688, −943, … are none of these). Deeper
+    // (3-ply+) swap remainders are sums/differences of the same piece values, so
+    // they remain multiples-of-1 that cannot equal a multiple-of-16 threshold
+    // unless a 16-multiple difference exists in the set — spot-checked: none does
+    // (the only sub-100 difference is 365−337=28). Therefore:
     //
-    // **The `<` vs `<=` mutant is EQUIVALENT at threshold 0 for our piece-value
-    // set**: no capture with `attacker > victim` can produce `see() == 0`
-    // exactly, so the boundary is unreachable via the non-fast-out path.
-    // This is documented here for mutation-triage (add an `exclude_re` rule
-    // for `QS_SEE_PRUNE_THRESHOLD` in `.cargo/mutants.toml` with this note).
+    // **The `<` vs `<=` mutant is EQUIVALENT at every reachable threshold for our
+    // piece-value set**: no capture with `attacker > victim` can produce a
+    // `see()` equal to any reachable threshold, so the boundary is unreachable
+    // via the non-fast-out path. Documented for mutation-triage (`exclude_re`
+    // rule in `.cargo/mutants.toml` with this note).
 
     // No test for this case — the mutant is equivalent by integer-value
     // analysis. See comment above.
+
+    // ---- M7.B.2 depth-conditioned ramp tests (docs/plans/m7.b.2.md §7) ----
+
+    /// §7.1 — `qs_see_prune_threshold` value table. Pins D0 onset (flat 0 at/
+    /// below 12), the −SLOPE-per-ply ramp, and the FLOOR clamp. Kills off-by-one
+    /// / sign / clamp mutants on the ramp function.
+    #[test]
+    fn qs_see_prune_threshold_value_table() {
+        let cases = [
+            (1u32, 0i32),
+            (11, 0),
+            (12, 0), // D0: still flat
+            (13, -16),
+            (14, -32),
+            (15, -48),
+            (16, -64), // FLOOR reached
+            (32, -64), // clamped at FLOOR
+        ];
+        for (d, expect) in cases {
+            assert_eq!(
+                qs_see_prune_threshold(d),
+                expect,
+                "qs_see_prune_threshold({d}) should be {expect}"
+            );
+        }
+    }
+
+    /// §7.2 — monotonic non-increasing in depth, and always in [FLOOR, 0]
+    /// (the fast-out validity invariant `threshold <= 0` holds at every depth).
+    #[test]
+    fn qs_see_prune_threshold_monotone_and_bounded() {
+        let mut prev = qs_see_prune_threshold(0);
+        for d in 0..=64u32 {
+            let t = qs_see_prune_threshold(d);
+            assert!(
+                (QS_SEE_RAMP_FLOOR..=0).contains(&t),
+                "threshold({d})={t} must be in [{QS_SEE_RAMP_FLOOR}, 0]"
+            );
+            assert!(
+                t <= prev,
+                "threshold must be non-increasing in depth at d={d}"
+            );
+            prev = t;
+        }
+    }
+
+    /// §7.3 — the ramp **backs off at deep root_depth** through the LIVE qsearch
+    /// path (pins that `qsearch` reads `self.root_depth`; the value-table test
+    /// cannot). Fixture: B×N onto a defended knight, `see = 337−365 = −28` (in
+    /// the marginal band (FLOOR,0); attacker bishop 365 > victim knight 337 so
+    /// the fast-out does not short-circuit and the full see() runs). The −28
+    /// capture is pruned at root_depth=12 (threshold 0) but NOT at root_depth=16
+    /// (threshold −64 < −28). Robust to SLOPE retuning while FLOOR < −28.
+    #[test]
+    fn qsearch_see_ramp_backs_off_at_deep_root_depth() {
+        // White Bg2, black Nd5 defended by Pc6 (and Pe6). Bg2xd5 = B×N, the
+        // knight is pawn-defended, so see = 337 − 365 = −28.
+        let fen = "4k3/8/2p1p3/3n4/8/8/6B1/4K3 w - - 0 1";
+        let see_minus_28 = {
+            let pos = Position::from_fen(fen).expect("B×N fixture must parse");
+            let mv = Move::from_uci("g2d5", &pos).expect("Bg2xNd5 must be legal");
+            crate::see::see(&pos, mv)
+        };
+        assert_eq!(
+            see_minus_28, -28,
+            "fixture SEE must be exactly −28 (B×N defended)"
+        );
+
+        let (ctx, _stop) = non_aborting_ctx();
+        // Shallow (root_depth=12 ⇒ threshold 0): −28 < 0 ⇒ pruned (firing ≥ 1).
+        let mut ab_shallow = AlphaBetaMover::new();
+        let mut p1 = Position::from_fen(fen).unwrap();
+        ab_shallow.history = vec![p1.zobrist()];
+        ab_shallow.qsearch_at_root_depth_for_test(&mut p1, -INF, INF, 0, &ctx, 12);
+        assert!(
+            ab_shallow.qsearch_see_prune_firings_for_test() >= 1,
+            "−28 capture must be pruned at root_depth=12 (threshold 0)"
+        );
+        // Deep (root_depth=16 ⇒ threshold −64): −28 ≮ −64 ⇒ NOT pruned (firing 0).
+        let mut ab_deep = AlphaBetaMover::new();
+        let mut p2 = Position::from_fen(fen).unwrap();
+        ab_deep.history = vec![p2.zobrist()];
+        ab_deep.qsearch_at_root_depth_for_test(&mut p2, -INF, INF, 0, &ctx, 16);
+        assert_eq!(
+            ab_deep.qsearch_see_prune_firings_for_test(),
+            0,
+            "−28 capture must NOT be pruned at root_depth=16 (threshold −64)"
+        );
+    }
+
+    /// §7.4 — a gross losing capture (QxP defended, see≈−943) is pruned at ALL
+    /// depths: −943 < FLOOR(−64), so it is below every reachable threshold. The
+    /// ramp relaxes marginal prunes, not gross ones.
+    #[test]
+    fn qsearch_see_ramp_gross_capture_pruned_at_all_depths() {
+        let fen = "3rk3/8/8/8/3p4/8/8/3QK3 w - - 0 1"; // QxP/Rd8, see=−943
+        let (ctx, _stop) = non_aborting_ctx();
+        for d in [0u32, 12, 13, 16, 32, 63] {
+            let mut ab = AlphaBetaMover::new();
+            let mut pos = Position::from_fen(fen).unwrap();
+            ab.history = vec![pos.zobrist()];
+            ab.qsearch_at_root_depth_for_test(&mut pos, -INF, INF, 0, &ctx, d);
+            assert!(
+                ab.qsearch_see_prune_firings_for_test() >= 1,
+                "QxP (see=−943) must be pruned at root_depth={d} (below FLOOR)"
+            );
+        }
+    }
+
+    /// §7.5 — the ID loop publishes the iteration depth to `self.root_depth`
+    /// (the signal the ramp reads). Covers the `self.root_depth = depth`
+    /// assignment, which bench (inert at ≤ d7) does NOT exercise: a mutant that
+    /// drops the assignment would leave `root_depth` at its initial 0. A shallow
+    /// `go` suffices — the deep-iteration ramp behavior is covered by §7.3.
+    #[test]
+    fn go_publishes_root_depth_for_ramp() {
+        let pos = Position::starting_position();
+        let mut ab = AlphaBetaMover::new();
+        ab.history = vec![pos.zobrist()];
+        let (ctx, _stop) = non_aborting_ctx_at_depth(5);
+        let _ = ab.go(&pos, &ctx, &|_| {});
+        assert_eq!(
+            ab.root_depth, 5,
+            "ID loop must publish the final iteration depth (5) to root_depth"
+        );
+    }
 }

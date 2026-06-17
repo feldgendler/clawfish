@@ -1,0 +1,592 @@
+1	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	20+0.2
+11	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	20+0.2
+9	clawfish	clawfish	1-0	78	adjudication: resign	40+0.4
+2	clawfish	clawfish	1/2-1/2	116	adjudication: threefold repetition	20+0.2
+progress: t=4 games=4 elo=86.82 sigma=30.50 K=30.769 wld=1-0-3
+12	clawfish	clawfish	1-0	192	adjudication: resign	20+0.2
+progress: t=5 games=5 elo=86.79 sigma=30.19 K=28.571 wld=1-1-3
+13	clawfish	clawfish	1-0	78	adjudication: resign	10+0.1
+3	clawfish	clawfish	1/2-1/2	83	adjudication: threefold repetition	60+0.6
+5	clawfish	clawfish	1-0	102	adjudication: resign	60+0.6
+7	clawfish	clawfish	1-0	120	adjudication: resign	60+0.6
+14	clawfish	clawfish	0-1	171	adjudication: resign	10+0.1
+progress: t=10 games=10 elo=192.64 sigma=55.86 K=21.053 wld=5-1-4
+17	clawfish	clawfish	1-0	114	adjudication: resign	10+0.1
+18	clawfish	clawfish	1/2-1/2	127	adjudication: threefold repetition	10+0.1
+progress: t=12 games=12 elo=222.10 sigma=66.70 K=19.048 wld=6-1-5
+10	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	40+0.4
+progress: t=13 games=13 elo=231.16 sigma=70.41 K=18.182 wld=6-1-6
+15	clawfish	clawfish	1/2-1/2	145	adjudication: threefold repetition	40+0.4
+21	clawfish	clawfish	1/2-1/2	115	adjudication: draw-by-score	20+0.2
+8	clawfish	clawfish	1/2-1/2	54	adjudication: threefold repetition	60+0.6
+progress: t=16 games=16 elo=256.09 sigma=78.38 K=16.000 wld=6-1-9
+4	clawfish	clawfish	0-1	111	adjudication: resign	60+0.6
+progress: t=17 games=17 elo=271.44 sigma=81.05 K=15.385 wld=7-1-9
+6	clawfish	clawfish	0-1	127	adjudication: resign	60+0.6
+progress: t=18 games=18 elo=286.22 sigma=83.99 K=14.815 wld=8-1-9
+19	clawfish	clawfish	1-0	116	adjudication: resign	40+0.4
+22	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	20+0.2
+progress: t=20 games=20 elo=307.32 sigma=89.79 K=13.793 wld=9-1-10
+16	clawfish	clawfish	1-0	134	adjudication: resign	40+0.4
+progress: t=21 games=21 elo=307.28 sigma=91.71 K=13.333 wld=9-2-10
+23	clawfish	clawfish	1-0	122	adjudication: resign	60+0.6
+20	clawfish	clawfish	1/2-1/2	179	adjudication: insufficient material	40+0.4
+progress: t=23 games=23 elo=326.36 sigma=95.79 K=12.500 wld=10-2-11
+25	clawfish	clawfish	1-0	140	adjudication: resign	60+0.6
+27	clawfish	clawfish	1-0	120	adjudication: resign	60+0.6
+31	clawfish	clawfish	1-0	138	adjudication: resign	60+0.6
+29	clawfish	clawfish	1/2-1/2	188	adjudication: threefold repetition	60+0.6
+24	clawfish	clawfish	0-1	50	time forfeit	60+0.6
+progress: t=28 games=28 elo=377.83 sigma=106.72 K=10.811 wld=14-2-12
+26	clawfish	clawfish	1-0	33	time forfeit	60+0.6
+progress: t=29 games=29 elo=377.78 sigma=108.43 K=10.526 wld=14-3-12
+33	clawfish	clawfish	0-1	50	time forfeit	60+0.6
+28	clawfish	clawfish	1-0	31	time forfeit	60+0.6
+progress: t=31 games=31 elo=377.69 sigma=104.59 K=10.000 wld=14-5-12
+39	clawfish	clawfish	0-1	0	time forfeit	10+0.1
+40	clawfish	clawfish	0-1	71	adjudication: resign	10+0.1
+progress: t=33 games=33 elo=387.13 sigma=94.97 K=9.524 wld=15-6-12
+37	clawfish	clawfish	1-0	76	adjudication: resign	20+0.2
+35	clawfish	clawfish	1/2-1/2	73	adjudication: draw-by-score	40+0.4
+38	clawfish	clawfish	1/2-1/2	66	adjudication: draw-by-score	20+0.2
+progress: t=36 games=36 elo=405.29 sigma=81.03 K=8.889 wld=16-6-14
+32	clawfish	clawfish	0-1	86	time forfeit	60+0.6
+progress: t=37 games=37 elo=413.94 sigma=76.36 K=8.696 wld=17-6-14
+30	clawfish	clawfish	1/2-1/2	82	adjudication: draw-by-score	60+0.6
+progress: t=38 games=38 elo=418.15 sigma=72.31 K=8.511 wld=17-6-15
+34	clawfish	clawfish	1/2-1/2	100	adjudication: draw-by-score	60+0.6
+progress: t=39 games=39 elo=422.27 sigma=68.89 K=8.333 wld=17-6-16
+36	clawfish	clawfish	1/2-1/2	92	adjudication: threefold repetition	40+0.4
+progress: t=40 games=40 elo=426.31 sigma=66.09 K=8.163 wld=17-6-17
+45	clawfish	clawfish	1-0	103	time forfeit	40+0.4
+47	clawfish	clawfish	1-0	83	time forfeit	40+0.4
+41	clawfish	clawfish	1/2-1/2	109	adjudication: draw-by-score	60+0.6
+51	clawfish	clawfish	1-0	120	adjudication: resign	10+0.1
+52	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	10+0.1
+progress: t=45 games=45 elo=457.01 sigma=56.10 K=7.407 wld=20-6-19
+43	clawfish	clawfish	1-0	140	adjudication: resign	60+0.6
+49	clawfish	clawfish	1/2-1/2	48	adjudication: threefold repetition	60+0.6
+53	clawfish	clawfish	1/2-1/2	95	adjudication: draw-by-score	20+0.2
+46	clawfish	clawfish	1-0	91	time forfeit	40+0.4
+progress: t=49 games=49 elo=471.16 sigma=49.86 K=6.897 wld=21-7-21
+48	clawfish	clawfish	1-0	97	time forfeit	40+0.4
+progress: t=50 games=50 elo=471.10 sigma=48.53 K=6.780 wld=21-8-21
+54	clawfish	clawfish	0-1	116	time forfeit	20+0.2
+progress: t=51 games=51 elo=477.72 sigma=46.81 K=6.667 wld=22-8-21
+42	clawfish	clawfish	0-1	78	time forfeit	60+0.6
+progress: t=52 games=52 elo=484.23 sigma=45.60 K=6.557 wld=23-8-21
+57	clawfish	clawfish	0-1	49	adjudication: resign	40+0.4
+59	clawfish	clawfish	1/2-1/2	66	adjudication: draw-by-score	20+0.2
+44	clawfish	clawfish	0-1	67	adjudication: resign	60+0.6
+progress: t=55 games=55 elo=493.50 sigma=42.36 K=6.250 wld=24-9-22
+55	clawfish	clawfish	1/2-1/2	147	adjudication: threefold repetition	40+0.4
+50	clawfish	clawfish	1/2-1/2	92	adjudication: draw-by-score	60+0.6
+progress: t=57 games=57 elo=499.50 sigma=41.68 K=6.061 wld=24-9-24
+60	clawfish	clawfish	1/2-1/2	73	adjudication: threefold repetition	20+0.2
+progress: t=58 games=58 elo=502.43 sigma=41.62 K=5.970 wld=24-9-25
+67	clawfish	clawfish	0-1	6	time forfeit	10+0.1
+65	clawfish	clawfish	0-1	16	time forfeit	20+0.2
+58	clawfish	clawfish	0-1	26	time forfeit	40+0.4
+progress: t=61 games=61 elo=507.99 sigma=38.98 K=5.714 wld=25-11-25
+68	clawfish	clawfish	1-0	5	time forfeit	10+0.1
+progress: t=62 games=62 elo=507.94 sigma=37.23 K=5.634 wld=25-12-25
+61	clawfish	clawfish	0-1	30	time forfeit	60+0.6
+66	clawfish	clawfish	0-1	2	time forfeit	20+0.2
+progress: t=64 games=64 elo=513.32 sigma=34.33 K=5.479 wld=26-13-25
+56	clawfish	clawfish	1-0	27	time forfeit	40+0.4
+progress: t=65 games=65 elo=513.26 sigma=32.89 K=5.405 wld=26-14-25
+73	clawfish	clawfish	1-0	27	time forfeit	20+0.2
+63	clawfish	clawfish	1-0	29	time forfeit	60+0.6
+71	clawfish	clawfish	0-1	24	time forfeit	40+0.4
+74	clawfish	clawfish	1-0	17	time forfeit	20+0.2
+progress: t=69 games=69 elo=523.65 sigma=27.94 K=5.128 wld=28-16-25
+75	clawfish	clawfish	0-1	16	time forfeit	40+0.4
+69	clawfish	clawfish	0-1	16	time forfeit	60+0.6
+62	clawfish	clawfish	1-0	19	time forfeit	60+0.6
+progress: t=72 games=72 elo=523.50 sigma=23.79 K=4.938 wld=28-19-25
+77	clawfish	clawfish	1-0	13	time forfeit	20+0.2
+78	clawfish	clawfish	1-0	118	adjudication: resign	20+0.2
+progress: t=74 games=74 elo=528.28 sigma=21.76 K=4.819 wld=29-20-25
+72	clawfish	clawfish	0-1	138	time forfeit	40+0.4
+progress: t=75 games=75 elo=532.99 sigma=20.99 K=4.762 wld=30-20-25
+64	clawfish	clawfish	0-1	95	adjudication: resign	60+0.6
+progress: t=76 games=76 elo=537.65 sigma=20.65 K=4.706 wld=31-20-25
+76	clawfish	clawfish	0-1	139	adjudication: resign	40+0.4
+progress: t=77 games=77 elo=542.25 sigma=20.50 K=4.651 wld=32-20-25
+70	clawfish	clawfish	1-0	58	adjudication: resign	60+0.6
+progress: t=78 games=78 elo=542.20 sigma=20.27 K=4.598 wld=32-21-25
+81	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	20+0.2
+79	clawfish	clawfish	1/2-1/2	64	adjudication: threefold repetition	60+0.6
+89	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	20+0.2
+82	clawfish	clawfish	1-0	94	adjudication: resign	20+0.2
+progress: t=82 games=82 elo=548.74 sigma=18.68 K=4.396 wld=32-22-28
+85	clawfish	clawfish	1-0	84	adjudication: resign	40+0.4
+83	clawfish	clawfish	1/2-1/2	132	adjudication: draw-by-score	40+0.4
+90	clawfish	clawfish	1-0	90	adjudication: resign	20+0.2
+progress: t=85 games=85 elo=555.08 sigma=18.18 K=4.255 wld=33-23-29
+86	clawfish	clawfish	1-0	80	adjudication: resign	40+0.4
+progress: t=86 games=86 elo=555.03 sigma=18.05 K=4.211 wld=33-24-29
+87	clawfish	clawfish	1/2-1/2	172	adjudication: draw-by-score	60+0.6
+84	clawfish	clawfish	1/2-1/2	138	adjudication: insufficient material	40+0.4
+progress: t=88 games=88 elo=559.07 sigma=18.00 K=4.124 wld=33-24-31
+93	clawfish	clawfish	1/2-1/2	82	adjudication: draw-by-score	40+0.4
+80	clawfish	clawfish	1/2-1/2	150	adjudication: draw-by-score	60+0.6
+progress: t=90 games=90 elo=563.03 sigma=17.66 K=4.040 wld=33-24-33
+91	clawfish	clawfish	1-0	180	adjudication: resign	60+0.6
+95	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	40+0.4
+88	clawfish	clawfish	1-0	68	adjudication: resign	60+0.6
+progress: t=93 games=93 elo=568.86 sigma=17.46 K=3.922 wld=34-25-34
+94	clawfish	clawfish	1/2-1/2	147	adjudication: draw-by-score	40+0.4
+progress: t=94 games=94 elo=570.75 sigma=17.39 K=3.883 wld=34-25-35
+97	clawfish	clawfish	1-0	68	adjudication: resign	60+0.6
+99	clawfish	clawfish	1-0	112	adjudication: resign	60+0.6
+101	clawfish	clawfish	1-0	86	adjudication: resign	40+0.4
+96	clawfish	clawfish	0-1	107	adjudication: resign	40+0.4
+progress: t=98 games=98 elo=585.71 sigma=18.49 K=3.738 wld=38-25-35
+92	clawfish	clawfish	1-0	112	adjudication: resign	60+0.6
+progress: t=99 games=99 elo=585.66 sigma=18.71 K=3.704 wld=38-26-35
+103	clawfish	clawfish	1-0	104	adjudication: resign	40+0.4
+102	clawfish	clawfish	1/2-1/2	90	adjudication: draw-by-score	40+0.4
+progress: t=101 games=101 elo=591.04 sigma=18.95 K=3.636 wld=39-26-36
+104	clawfish	clawfish	1/2-1/2	66	adjudication: draw-by-score	40+0.4
+progress: t=102 games=102 elo=592.79 sigma=18.80 K=3.604 wld=39-26-37
+100	clawfish	clawfish	1-0	106	adjudication: resign	60+0.6
+progress: t=103 games=103 elo=592.74 sigma=18.68 K=3.571 wld=39-27-37
+98	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	60+0.6
+progress: t=104 games=104 elo=594.45 sigma=18.39 K=3.540 wld=39-27-38
+113	clawfish	clawfish	1-0	98	adjudication: resign	10+0.1
+107	clawfish	clawfish	1-0	76	adjudication: resign	60+0.6
+114	clawfish	clawfish	0-1	143	adjudication: resign	10+0.1
+progress: t=107 games=107 elo=604.73 sigma=18.90 K=3.448 wld=42-27-38
+117	clawfish	clawfish	1-0	96	adjudication: resign	10+0.1
+105	clawfish	clawfish	1/2-1/2	194	adjudication: draw-by-score	60+0.6
+118	clawfish	clawfish	0-1	107	adjudication: resign	10+0.1
+progress: t=110 games=110 elo=613.04 sigma=19.91 K=3.361 wld=44-27-39
+115	clawfish	clawfish	1-0	120	adjudication: resign	40+0.4
+109	clawfish	clawfish	1/2-1/2	102	adjudication: threefold repetition	60+0.6
+111	clawfish	clawfish	1-0	104	adjudication: resign	60+0.6
+119	clawfish	clawfish	1-0	102	adjudication: resign	20+0.2
+108	clawfish	clawfish	1/2-1/2	114	adjudication: draw-by-score	60+0.6
+progress: t=115 games=115 elo=625.88 sigma=21.72 K=3.226 wld=47-27-41
+120	clawfish	clawfish	0-1	89	adjudication: resign	20+0.2
+progress: t=116 games=116 elo=629.02 sigma=21.90 K=3.200 wld=48-27-41
+121	clawfish	clawfish	1/2-1/2	153	adjudication: threefold repetition	10+0.1
+116	clawfish	clawfish	1/2-1/2	124	adjudication: threefold repetition	40+0.4
+progress: t=118 games=118 elo=632.07 sigma=22.02 K=3.150 wld=48-27-43
+106	clawfish	clawfish	1/2-1/2	113	adjudication: draw-by-score	60+0.6
+progress: t=119 games=119 elo=633.57 sigma=21.96 K=3.125 wld=48-27-44
+122	clawfish	clawfish	0-1	109	adjudication: resign	10+0.1
+progress: t=120 games=120 elo=636.62 sigma=21.91 K=3.101 wld=49-27-44
+125	clawfish	clawfish	1-0	90	adjudication: resign	10+0.1
+110	clawfish	clawfish	1/2-1/2	66	adjudication: draw-by-score	60+0.6
+progress: t=122 games=122 elo=641.10 sigma=21.97 K=3.053 wld=50-27-45
+126	clawfish	clawfish	1/2-1/2	44	adjudication: threefold repetition	10+0.1
+progress: t=123 games=123 elo=642.56 sigma=21.76 K=3.030 wld=50-27-46
+112	clawfish	clawfish	1/2-1/2	66	adjudication: draw-by-score	60+0.6
+progress: t=124 games=124 elo=644.00 sigma=21.46 K=3.008 wld=50-27-47
+131	clawfish	clawfish	1/2-1/2	103	adjudication: draw-by-score	10+0.1
+123	clawfish	clawfish	1-0	94	adjudication: resign	40+0.4
+132	clawfish	clawfish	0-1	63	adjudication: resign	10+0.1
+progress: t=127 games=127 elo=651.22 sigma=20.97 K=2.941 wld=52-27-48
+133	clawfish	clawfish	1-0	62	adjudication: resign	20+0.2
+127	clawfish	clawfish	1-0	86	adjudication: resign	40+0.4
+129	clawfish	clawfish	1-0	107	time forfeit	40+0.4
+134	clawfish	clawfish	0-1	127	adjudication: resign	20+0.2
+progress: t=131 games=131 elo=662.52 sigma=21.09 K=2.857 wld=56-27-48
+137	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	20+0.2
+135	clawfish	clawfish	0-1	117	adjudication: resign	40+0.4
+124	clawfish	clawfish	1-0	114	adjudication: resign	40+0.4
+progress: t=134 games=134 elo=663.75 sigma=20.19 K=2.797 wld=56-29-49
+138	clawfish	clawfish	0-1	89	adjudication: resign	20+0.2
+progress: t=135 games=135 elo=666.47 sigma=19.76 K=2.778 wld=57-29-49
+128	clawfish	clawfish	1/2-1/2	63	adjudication: threefold repetition	40+0.4
+progress: t=136 games=136 elo=667.79 sigma=19.35 K=2.759 wld=57-29-50
+143	clawfish	clawfish	0-1	149	adjudication: resign	10+0.1
+136	clawfish	clawfish	1/2-1/2	66	adjudication: draw-by-score	40+0.4
+progress: t=138 games=138 elo=669.02 sigma=18.49 K=2.721 wld=57-30-51
+144	clawfish	clawfish	0-1	103	adjudication: resign	10+0.1
+progress: t=139 games=139 elo=671.66 sigma=18.07 K=2.703 wld=58-30-51
+141	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	20+0.2
+145	clawfish	clawfish	1/2-1/2	157	adjudication: threefold repetition	20+0.2
+130	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	40+0.4
+progress: t=142 games=142 elo=675.47 sigma=16.92 K=2.649 wld=58-30-54
+139	clawfish	clawfish	1/2-1/2	66	adjudication: draw-by-score	60+0.6
+147	clawfish	clawfish	1/2-1/2	93	adjudication: draw-by-score	20+0.2
+146	clawfish	clawfish	1/2-1/2	99	adjudication: draw-by-score	20+0.2
+progress: t=145 games=145 elo=679.21 sigma=15.88 K=2.597 wld=58-30-57
+142	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	20+0.2
+progress: t=146 games=146 elo=680.43 sigma=15.58 K=2.581 wld=58-30-58
+148	clawfish	clawfish	1/2-1/2	69	adjudication: threefold repetition	20+0.2
+progress: t=147 games=147 elo=681.65 sigma=15.23 K=2.564 wld=58-30-59
+153	clawfish	clawfish	1/2-1/2	87	adjudication: draw-by-score	20+0.2
+151	clawfish	clawfish	1/2-1/2	89	adjudication: threefold repetition	40+0.4
+149	clawfish	clawfish	1/2-1/2	56	adjudication: threefold repetition	60+0.6
+154	clawfish	clawfish	0-1	169	adjudication: resign	20+0.2
+progress: t=151 games=151 elo=687.70 sigma=13.74 K=2.500 wld=59-30-62
+159	clawfish	clawfish	1-0	114	adjudication: resign	10+0.1
+140	clawfish	clawfish	1/2-1/2	148	adjudication: draw-by-score	60+0.6
+progress: t=153 games=153 elo=691.29 sigma=13.25 K=2.469 wld=60-30-63
+152	clawfish	clawfish	1/2-1/2	104	adjudication: threefold repetition	40+0.4
+progress: t=154 games=154 elo=692.45 sigma=12.94 K=2.454 wld=60-30-64
+160	clawfish	clawfish	1-0	116	adjudication: resign	10+0.1
+progress: t=155 games=155 elo=692.39 sigma=12.51 K=2.439 wld=60-31-64
+157	clawfish	clawfish	1/2-1/2	79	adjudication: draw-by-score	60+0.6
+155	clawfish	clawfish	1-0	140	adjudication: resign	60+0.6
+165	clawfish	clawfish	1-0	116	adjudication: resign	10+0.1
+161	clawfish	clawfish	1-0	62	adjudication: resign	20+0.2
+166	clawfish	clawfish	1-0	116	adjudication: resign	10+0.1
+progress: t=160 games=160 elo=700.47 sigma=11.95 K=2.367 wld=63-32-65
+150	clawfish	clawfish	0-1	99	adjudication: resign	60+0.6
+progress: t=161 games=161 elo=702.75 sigma=12.14 K=2.353 wld=64-32-65
+163	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	20+0.2
+169	clawfish	clawfish	1/2-1/2	76	adjudication: draw-by-score	10+0.1
+162	clawfish	clawfish	0-1	117	adjudication: resign	20+0.2
+progress: t=164 games=164 elo=707.20 sigma=12.43 K=2.312 wld=65-32-67
+170	clawfish	clawfish	1/2-1/2	136	adjudication: threefold repetition	10+0.1
+progress: t=165 games=165 elo=708.29 sigma=12.53 K=2.299 wld=65-32-68
+164	clawfish	clawfish	0-1	59	adjudication: resign	20+0.2
+progress: t=166 games=166 elo=710.51 sigma=12.67 K=2.286 wld=66-32-68
+167	clawfish	clawfish	1/2-1/2	66	adjudication: threefold repetition	40+0.4
+173	clawfish	clawfish	1-0	62	adjudication: resign	20+0.2
+175	clawfish	clawfish	1-0	62	adjudication: resign	20+0.2
+171	clawfish	clawfish	1-0	94	adjudication: resign	40+0.4
+158	clawfish	clawfish	1-0	138	adjudication: resign	60+0.6
+progress: t=171 games=171 elo=718.05 sigma=13.25 K=2.222 wld=69-33-69
+156	clawfish	clawfish	0-1	143	adjudication: resign	60+0.6
+progress: t=172 games=172 elo=720.19 sigma=13.37 K=2.210 wld=70-33-69
+176	clawfish	clawfish	0-1	99	adjudication: resign	20+0.2
+progress: t=173 games=173 elo=722.33 sigma=13.51 K=2.198 wld=71-33-69
+174	clawfish	clawfish	1/2-1/2	173	adjudication: draw-by-score	20+0.2
+progress: t=174 games=174 elo=723.35 sigma=13.61 K=2.186 wld=71-33-70
+179	clawfish	clawfish	0-1	133	adjudication: resign	10+0.1
+181	clawfish	clawfish	1-0	62	adjudication: resign	20+0.2
+180	clawfish	clawfish	1/2-1/2	108	adjudication: threefold repetition	10+0.1
+progress: t=177 games=177 elo=726.38 sigma=13.59 K=2.151 wld=72-34-71
+168	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	40+0.4
+progress: t=178 games=178 elo=727.39 sigma=13.51 K=2.139 wld=72-34-72
+172	clawfish	clawfish	1/2-1/2	144	adjudication: draw-by-score	40+0.4
+progress: t=179 games=179 elo=728.38 sigma=13.40 K=2.128 wld=72-34-73
+182	clawfish	clawfish	0-1	141	adjudication: resign	20+0.2
+progress: t=180 games=180 elo=730.43 sigma=13.29 K=2.116 wld=73-34-73
+177	clawfish	clawfish	1-0	130	adjudication: resign	60+0.6
+183	clawfish	clawfish	1-0	82	adjudication: resign	60+0.6
+185	clawfish	clawfish	1-0	120	adjudication: resign	40+0.4
+187	clawfish	clawfish	1-0	88	adjudication: resign	40+0.4
+191	clawfish	clawfish	1/2-1/2	50	adjudication: threefold repetition	60+0.6
+186	clawfish	clawfish	1/2-1/2	115	adjudication: draw-by-score	40+0.4
+progress: t=186 games=186 elo=740.43 sigma=13.36 K=2.051 wld=77-34-75
+189	clawfish	clawfish	1-0	126	adjudication: resign	60+0.6
+188	clawfish	clawfish	0-1	93	adjudication: resign	40+0.4
+progress: t=188 games=188 elo=744.36 sigma=13.37 K=2.030 wld=79-34-75
+178	clawfish	clawfish	1/2-1/2	66	adjudication: draw-by-score	60+0.6
+progress: t=189 games=189 elo=745.30 sigma=13.42 K=2.020 wld=79-34-76
+184	clawfish	clawfish	1/2-1/2	74	adjudication: draw-by-score	60+0.6
+progress: t=190 games=190 elo=746.23 sigma=13.34 K=2.010 wld=79-34-77
+193	clawfish	clawfish	1/2-1/2	178	adjudication: threefold repetition	10+0.1
+195	clawfish	clawfish	1-0	72	adjudication: resign	20+0.2
+194	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	10+0.1
+progress: t=193 games=193 elo=750.00 sigma=13.11 K=1.980 wld=80-34-79
+199	clawfish	clawfish	1-0	110	adjudication: resign	20+0.2
+192	clawfish	clawfish	1/2-1/2	74	adjudication: threefold repetition	60+0.6
+progress: t=195 games=195 elo=752.80 sigma=12.95 K=1.961 wld=81-34-80
+201	clawfish	clawfish	1-0	74	adjudication: resign	20+0.2
+196	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	20+0.2
+progress: t=197 games=197 elo=755.58 sigma=12.81 K=1.942 wld=82-34-81
+203	clawfish	clawfish	1/2-1/2	157	adjudication: draw-by-score	10+0.1
+200	clawfish	clawfish	1/2-1/2	79	adjudication: draw-by-score	20+0.2
+progress: t=199 games=199 elo=757.37 sigma=12.66 K=1.923 wld=82-34-83
+197	clawfish	clawfish	0-1	119	adjudication: resign	40+0.4
+204	clawfish	clawfish	0-1	93	adjudication: resign	10+0.1
+progress: t=201 games=201 elo=759.13 sigma=12.41 K=1.905 wld=83-35-83
+207	clawfish	clawfish	0-1	97	adjudication: resign	10+0.1
+202	clawfish	clawfish	0-1	85	adjudication: resign	20+0.2
+progress: t=203 games=203 elo=760.87 sigma=12.12 K=1.887 wld=84-36-83
+190	clawfish	clawfish	1-0	116	adjudication: resign	60+0.6
+progress: t=204 games=204 elo=760.80 sigma=11.93 K=1.878 wld=84-37-83
+205	clawfish	clawfish	1-0	64	adjudication: resign	20+0.2
+208	clawfish	clawfish	0-1	79	adjudication: resign	10+0.1
+progress: t=206 games=206 elo=764.38 sigma=11.51 K=1.860 wld=86-37-83
+211	clawfish	clawfish	1-0	64	adjudication: resign	20+0.2
+206	clawfish	clawfish	0-1	107	adjudication: resign	20+0.2
+progress: t=208 games=208 elo=767.93 sigma=11.16 K=1.843 wld=88-37-83
+198	clawfish	clawfish	1-0	82	adjudication: resign	40+0.4
+progress: t=209 games=209 elo=767.86 sigma=10.88 K=1.835 wld=88-38-83
+213	clawfish	clawfish	1-0	76	adjudication: resign	40+0.4
+212	clawfish	clawfish	0-1	147	adjudication: resign	20+0.2
+progress: t=211 games=211 elo=771.36 sigma=10.52 K=1.818 wld=90-38-83
+219	clawfish	clawfish	1-0	64	adjudication: resign	20+0.2
+215	clawfish	clawfish	1-0	92	adjudication: resign	40+0.4
+221	clawfish	clawfish	1/2-1/2	120	adjudication: threefold repetition	10+0.1
+209	clawfish	clawfish	1-0	78	adjudication: resign	60+0.6
+222	clawfish	clawfish	0-1	111	adjudication: resign	10+0.1
+progress: t=216 games=216 elo=779.06 sigma=10.59 K=1.778 wld=94-38-84
+220	clawfish	clawfish	1/2-1/2	132	adjudication: draw-by-score	20+0.2
+progress: t=217 games=217 elo=779.87 sigma=10.65 K=1.770 wld=94-38-85
+217	clawfish	clawfish	1-0	116	adjudication: resign	40+0.4
+214	clawfish	clawfish	0-1	125	adjudication: resign	40+0.4
+progress: t=219 games=219 elo=783.23 sigma=10.91 K=1.754 wld=96-38-85
+223	clawfish	clawfish	1/2-1/2	148	adjudication: draw-by-score	20+0.2
+216	clawfish	clawfish	1/2-1/2	159	adjudication: threefold repetition	40+0.4
+progress: t=221 games=221 elo=784.82 sigma=11.04 K=1.739 wld=96-38-87
+227	clawfish	clawfish	1/2-1/2	66	adjudication: draw-by-score	20+0.2
+210	clawfish	clawfish	1/2-1/2	59	adjudication: threefold repetition	60+0.6
+progress: t=223 games=223 elo=786.40 sigma=11.10 K=1.724 wld=96-38-89
+218	clawfish	clawfish	0-1	113	adjudication: resign	40+0.4
+progress: t=224 games=224 elo=788.04 sigma=11.17 K=1.717 wld=97-38-89
+224	clawfish	clawfish	1/2-1/2	178	adjudication: insufficient material	20+0.2
+progress: t=225 games=225 elo=788.82 sigma=11.21 K=1.709 wld=97-38-90
+229	clawfish	clawfish	1-0	68	adjudication: resign	20+0.2
+231	clawfish	clawfish	1-0	62	adjudication: resign	20+0.2
+228	clawfish	clawfish	1/2-1/2	105	adjudication: draw-by-score	20+0.2
+progress: t=228 games=228 elo=792.83 sigma=11.46 K=1.688 wld=99-38-91
+225	clawfish	clawfish	0-1	108	time forfeit	60+0.6
+230	clawfish	clawfish	0-1	79	adjudication: resign	20+0.2
+progress: t=230 games=230 elo=794.35 sigma=11.35 K=1.674 wld=100-39-91
+232	clawfish	clawfish	0-1	93	adjudication: resign	20+0.2
+progress: t=231 games=231 elo=795.94 sigma=11.32 K=1.667 wld=101-39-91
+237	clawfish	clawfish	1/2-1/2	167	adjudication: draw-by-score	20+0.2
+233	clawfish	clawfish	1-0	98	adjudication: resign	40+0.4
+235	clawfish	clawfish	1/2-1/2	56	adjudication: threefold repetition	60+0.6
+238	clawfish	clawfish	0-1	125	adjudication: resign	20+0.2
+progress: t=235 games=235 elo=800.57 sigma=10.78 K=1.639 wld=103-39-93
+239	clawfish	clawfish	1/2-1/2	56	adjudication: threefold repetition	60+0.6
+234	clawfish	clawfish	1/2-1/2	63	adjudication: threefold repetition	40+0.4
+progress: t=237 games=237 elo=802.05 sigma=10.50 K=1.626 wld=103-39-95
+241	clawfish	clawfish	1/2-1/2	56	adjudication: threefold repetition	60+0.6
+245	clawfish	clawfish	1-0	64	adjudication: resign	20+0.2
+226	clawfish	clawfish	1/2-1/2	165	adjudication: threefold repetition	60+0.6
+progress: t=240 games=240 elo=805.04 sigma=10.01 K=1.606 wld=104-39-97
+243	clawfish	clawfish	1-0	108	adjudication: resign	40+0.4
+236	clawfish	clawfish	1/2-1/2	81	adjudication: threefold repetition	60+0.6
+progress: t=242 games=242 elo=807.28 sigma=9.77 K=1.594 wld=105-39-98
+247	clawfish	clawfish	1/2-1/2	157	adjudication: draw-by-score	10+0.1
+246	clawfish	clawfish	1-0	110	adjudication: resign	20+0.2
+progress: t=244 games=244 elo=807.91 sigma=9.48 K=1.581 wld=105-40-99
+248	clawfish	clawfish	0-1	55	adjudication: resign	10+0.1
+progress: t=245 games=245 elo=809.41 sigma=9.36 K=1.575 wld=106-40-99
+249	clawfish	clawfish	1-0	100	adjudication: resign	10+0.1
+251	clawfish	clawfish	1/2-1/2	80	adjudication: threefold repetition	10+0.1
+253	clawfish	clawfish	1-0	98	adjudication: resign	10+0.1
+250	clawfish	clawfish	0-1	69	adjudication: resign	10+0.1
+progress: t=249 games=249 elo=814.55 sigma=9.19 K=1.550 wld=109-40-100
+252	clawfish	clawfish	1/2-1/2	74	adjudication: draw-by-score	10+0.1
+progress: t=250 games=250 elo=815.24 sigma=9.19 K=1.544 wld=109-40-101
+240	clawfish	clawfish	1/2-1/2	115	adjudication: draw-by-score	60+0.6
+progress: t=251 games=251 elo=815.93 sigma=9.14 K=1.538 wld=109-40-102
+254	clawfish	clawfish	0-1	107	adjudication: resign	10+0.1
+progress: t=252 games=252 elo=817.38 sigma=9.11 K=1.533 wld=110-40-102
+244	clawfish	clawfish	1/2-1/2	80	adjudication: draw-by-score	40+0.4
+progress: t=253 games=253 elo=818.07 sigma=9.04 K=1.527 wld=110-40-103
+259	clawfish	clawfish	1-0	88	adjudication: resign	10+0.1
+257	clawfish	clawfish	1-0	64	adjudication: resign	20+0.2
+242	clawfish	clawfish	1/2-1/2	165	adjudication: insufficient material	60+0.6
+progress: t=256 games=256 elo=821.62 sigma=9.01 K=1.509 wld=112-40-104
+260	clawfish	clawfish	1/2-1/2	192	adjudication: draw-by-score	10+0.1
+progress: t=257 games=257 elo=822.29 sigma=9.03 K=1.504 wld=112-40-105
+263	clawfish	clawfish	1/2-1/2	108	adjudication: threefold repetition	20+0.2
+265	clawfish	clawfish	1/2-1/2	99	adjudication: threefold repetition	10+0.1
+255	clawfish	clawfish	1-0	94	adjudication: resign	40+0.4
+267	clawfish	clawfish	1/2-1/2	107	adjudication: draw-by-score	10+0.1
+258	clawfish	clawfish	1-0	138	adjudication: resign	20+0.2
+progress: t=262 games=262 elo=825.61 sigma=8.73 K=1.476 wld=113-41-108
+266	clawfish	clawfish	0-1	109	adjudication: resign	10+0.1
+progress: t=263 games=263 elo=827.00 sigma=8.68 K=1.471 wld=114-41-108
+268	clawfish	clawfish	0-1	53	adjudication: resign	10+0.1
+progress: t=264 games=264 elo=828.38 sigma=8.65 K=1.465 wld=115-41-108
+264	clawfish	clawfish	1-0	142	adjudication: resign	20+0.2
+progress: t=265 games=265 elo=828.30 sigma=8.59 K=1.460 wld=115-42-108
+273	clawfish	clawfish	1-0	64	adjudication: resign	20+0.2
+261	clawfish	clawfish	1/2-1/2	89	adjudication: threefold repetition	60+0.6
+275	clawfish	clawfish	1-0	62	adjudication: resign	20+0.2
+269	clawfish	clawfish	1-0	96	adjudication: resign	40+0.4
+256	clawfish	clawfish	0-1	149	adjudication: resign	40+0.4
+progress: t=270 games=270 elo=834.39 sigma=8.40 K=1.434 wld=119-42-109
+274	clawfish	clawfish	1-0	132	adjudication: resign	20+0.2
+progress: t=271 games=271 elo=834.30 sigma=8.37 K=1.429 wld=119-43-109
+277	clawfish	clawfish	0-1	133	adjudication: resign	10+0.1
+276	clawfish	clawfish	1/2-1/2	181	adjudication: threefold repetition	20+0.2
+progress: t=273 games=273 elo=834.85 sigma=8.16 K=1.418 wld=119-44-110
+278	clawfish	clawfish	0-1	79	adjudication: resign	10+0.1
+progress: t=274 games=274 elo=836.18 sigma=8.00 K=1.413 wld=120-44-110
+271	clawfish	clawfish	1-0	106	adjudication: resign	60+0.6
+270	clawfish	clawfish	1/2-1/2	59	adjudication: threefold repetition	40+0.4
+progress: t=276 games=276 elo=838.13 sigma=7.81 K=1.404 wld=121-44-111
+279	clawfish	clawfish	1-0	122	adjudication: resign	40+0.4
+262	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	60+0.6
+progress: t=278 games=278 elo=840.06 sigma=7.67 K=1.394 wld=122-44-112
+281	clawfish	clawfish	1/2-1/2	67	adjudication: threefold repetition	60+0.6
+283	clawfish	clawfish	1/2-1/2	50	adjudication: threefold repetition	60+0.6
+285	clawfish	clawfish	1/2-1/2	50	adjudication: threefold repetition	60+0.6
+287	clawfish	clawfish	1-0	64	adjudication: resign	20+0.2
+280	clawfish	clawfish	1-0	98	adjudication: resign	40+0.4
+progress: t=283 games=283 elo=843.10 sigma=7.33 K=1.370 wld=123-45-115
+272	clawfish	clawfish	1/2-1/2	139	adjudication: draw-by-score	60+0.6
+progress: t=284 games=284 elo=843.70 sigma=7.26 K=1.365 wld=123-45-116
+288	clawfish	clawfish	1/2-1/2	108	adjudication: draw-by-score	20+0.2
+progress: t=285 games=285 elo=844.30 sigma=7.22 K=1.361 wld=123-45-117
+289	clawfish	clawfish	1-0	62	adjudication: resign	20+0.2
+282	clawfish	clawfish	1/2-1/2	67	adjudication: draw-by-score	60+0.6
+progress: t=287 games=287 elo=846.16 sigma=7.15 K=1.351 wld=124-45-118
+290	clawfish	clawfish	0-1	87	adjudication: resign	20+0.2
+progress: t=288 games=288 elo=847.43 sigma=7.12 K=1.347 wld=125-45-118
+295	clawfish	clawfish	0-1	97	adjudication: resign	10+0.1
+297	clawfish	clawfish	1/2-1/2	51	adjudication: threefold repetition	10+0.1
+286	clawfish	clawfish	1/2-1/2	65	adjudication: threefold repetition	60+0.6
+progress: t=291 games=291 elo=848.51 sigma=6.90 K=1.333 wld=125-46-120
+284	clawfish	clawfish	1/2-1/2	126	adjudication: draw-by-score	60+0.6
+progress: t=292 games=292 elo=849.10 sigma=6.76 K=1.329 wld=125-46-121
+296	clawfish	clawfish	1-0	56	adjudication: resign	10+0.1
+progress: t=293 games=293 elo=849.01 sigma=6.62 K=1.325 wld=125-47-121
+298	clawfish	clawfish	1/2-1/2	96	adjudication: draw-by-score	10+0.1
+progress: t=294 games=294 elo=849.59 sigma=6.50 K=1.320 wld=125-47-122
+303	clawfish	clawfish	1/2-1/2	110	adjudication: draw-by-score	10+0.1
+301	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	10+0.1
+291	clawfish	clawfish	1-0	98	adjudication: resign	60+0.6
+304	clawfish	clawfish	0-1	111	adjudication: resign	10+0.1
+progress: t=298 games=298 elo=853.18 sigma=6.01 K=1.303 wld=127-47-124
+302	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	10+0.1
+progress: t=299 games=299 elo=853.75 sigma=5.98 K=1.299 wld=127-47-125
+307	clawfish	clawfish	0-1	137	adjudication: resign	10+0.1
+293	clawfish	clawfish	1/2-1/2	129	adjudication: draw-by-score	60+0.6
+299	clawfish	clawfish	1/2-1/2	115	adjudication: insufficient material	40+0.4
+308	clawfish	clawfish	1/2-1/2	117	adjudication: threefold repetition	10+0.1
+progress: t=303 games=303 elo=855.35 sigma=5.61 K=1.282 wld=127-48-128
+305	clawfish	clawfish	1-0	118	adjudication: resign	40+0.4
+309	clawfish	clawfish	1-0	132	adjudication: resign	40+0.4
+292	clawfish	clawfish	1/2-1/2	101	adjudication: threefold repetition	60+0.6
+progress: t=306 games=306 elo=858.29 sigma=5.53 K=1.270 wld=129-48-129
+311	clawfish	clawfish	1/2-1/2	99	adjudication: draw-by-score	40+0.4
+306	clawfish	clawfish	0-1	83	adjudication: resign	40+0.4
+progress: t=308 games=308 elo=860.02 sigma=5.61 K=1.262 wld=130-48-130
+300	clawfish	clawfish	1/2-1/2	157	adjudication: draw-by-score	40+0.4
+progress: t=309 games=309 elo=860.56 sigma=5.65 K=1.258 wld=130-48-131
+317	clawfish	clawfish	0-1	117	adjudication: resign	10+0.1
+294	clawfish	clawfish	1-0	152	adjudication: resign	60+0.6
+progress: t=311 games=311 elo=860.40 sigma=5.60 K=1.250 wld=130-50-131
+318	clawfish	clawfish	1-0	56	adjudication: resign	10+0.1
+progress: t=312 games=312 elo=860.32 sigma=5.56 K=1.246 wld=130-51-131
+310	clawfish	clawfish	1/2-1/2	129	adjudication: insufficient material	40+0.4
+progress: t=313 games=313 elo=860.85 sigma=5.48 K=1.242 wld=130-51-132
+319	clawfish	clawfish	1-0	104	adjudication: resign	10+0.1
+312	clawfish	clawfish	1/2-1/2	81	adjudication: draw-by-score	40+0.4
+progress: t=315 games=315 elo=862.55 sigma=5.37 K=1.235 wld=131-51-133
+315	clawfish	clawfish	1/2-1/2	66	adjudication: draw-by-score	40+0.4
+313	clawfish	clawfish	1-0	94	adjudication: resign	40+0.4
+321	clawfish	clawfish	1-0	66	adjudication: resign	20+0.2
+320	clawfish	clawfish	0-1	83	adjudication: resign	10+0.1
+progress: t=319 games=319 elo=866.50 sigma=5.50 K=1.220 wld=134-51-134
+325	clawfish	clawfish	1-0	64	adjudication: resign	20+0.2
+322	clawfish	clawfish	1/2-1/2	127	adjudication: draw-by-score	20+0.2
+progress: t=321 games=321 elo=868.15 sigma=5.68 K=1.212 wld=135-51-135
+316	clawfish	clawfish	1/2-1/2	44	adjudication: threefold repetition	40+0.4
+progress: t=322 games=322 elo=868.68 sigma=5.75 K=1.208 wld=135-51-136
+323	clawfish	clawfish	1-0	106	adjudication: resign	40+0.4
+326	clawfish	clawfish	1-0	102	adjudication: resign	20+0.2
+progress: t=324 games=324 elo=869.71 sigma=5.80 K=1.201 wld=136-52-136
+329	clawfish	clawfish	1-0	62	adjudication: resign	20+0.2
+314	clawfish	clawfish	1-0	108	adjudication: resign	40+0.4
+progress: t=326 games=326 elo=870.74 sigma=5.79 K=1.194 wld=137-53-136
+327	clawfish	clawfish	1-0	102	adjudication: resign	40+0.4
+330	clawfish	clawfish	0-1	105	adjudication: resign	20+0.2
+progress: t=328 games=328 elo=872.95 sigma=5.91 K=1.187 wld=139-53-136
+324	clawfish	clawfish	1/2-1/2	44	adjudication: threefold repetition	40+0.4
+progress: t=329 games=329 elo=873.46 sigma=5.98 K=1.183 wld=139-53-137
+331	clawfish	clawfish	1-0	118	adjudication: resign	40+0.4
+333	clawfish	clawfish	1-0	82	adjudication: resign	40+0.4
+328	clawfish	clawfish	1/2-1/2	66	adjudication: draw-by-score	40+0.4
+progress: t=332 games=332 elo=876.15 sigma=6.14 K=1.173 wld=141-53-138
+335	clawfish	clawfish	1-0	82	adjudication: resign	40+0.4
+337	clawfish	clawfish	1-0	94	adjudication: resign	20+0.2
+338	clawfish	clawfish	1/2-1/2	84	adjudication: draw-by-score	20+0.2
+progress: t=335 games=335 elo=878.82 sigma=6.43 K=1.163 wld=143-53-139
+332	clawfish	clawfish	1/2-1/2	69	adjudication: draw-by-score	40+0.4
+progress: t=336 games=336 elo=879.31 sigma=6.52 K=1.159 wld=143-53-140
+339	clawfish	clawfish	1/2-1/2	50	adjudication: threefold repetition	60+0.6
+336	clawfish	clawfish	1/2-1/2	67	adjudication: draw-by-score	40+0.4
+progress: t=338 games=338 elo=880.30 sigma=6.68 K=1.153 wld=143-53-142
+334	clawfish	clawfish	1/2-1/2	108	adjudication: draw-by-score	40+0.4
+progress: t=339 games=339 elo=880.79 sigma=6.75 K=1.149 wld=143-53-143
+347	clawfish	clawfish	1-0	98	adjudication: resign	10+0.1
+341	clawfish	clawfish	1/2-1/2	50	adjudication: threefold repetition	60+0.6
+348	clawfish	clawfish	1-0	156	adjudication: resign	10+0.1
+progress: t=342 games=342 elo=882.25 sigma=6.70 K=1.140 wld=144-54-144
+345	clawfish	clawfish	1-0	104	adjudication: resign	40+0.4
+343	clawfish	clawfish	1/2-1/2	78	adjudication: draw-by-score	60+0.6
+340	clawfish	clawfish	0-1	113	adjudication: resign	60+0.6
+progress: t=345 games=345 elo=884.83 sigma=6.44 K=1.130 wld=146-54-145
+346	clawfish	clawfish	1/2-1/2	118	adjudication: draw-by-score	40+0.4
+progress: t=346 games=346 elo=885.31 sigma=6.33 K=1.127 wld=146-54-146
+353	clawfish	clawfish	1-0	62	adjudication: resign	20+0.2
+349	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	60+0.6
+351	clawfish	clawfish	1/2-1/2	123	adjudication: draw-by-score	60+0.6
+342	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	60+0.6
+progress: t=350 games=350 elo=887.76 sigma=6.12 K=1.114 wld=147-54-149
+355	clawfish	clawfish	1-0	76	adjudication: resign	20+0.2
+354	clawfish	clawfish	1/2-1/2	86	adjudication: threefold repetition	20+0.2
+progress: t=352 games=352 elo=889.26 sigma=6.06 K=1.108 wld=148-54-150
+344	clawfish	clawfish	1/2-1/2	119	adjudication: threefold repetition	60+0.6
+progress: t=353 games=353 elo=889.73 sigma=6.03 K=1.105 wld=148-54-151
+359	clawfish	clawfish	1/2-1/2	151	adjudication: draw-by-score	10+0.1
+357	clawfish	clawfish	1-0	62	adjudication: resign	20+0.2
+356	clawfish	clawfish	1-0	58	adjudication: resign	20+0.2
+progress: t=356 games=356 elo=891.12 sigma=5.77 K=1.096 wld=149-55-152
+360	clawfish	clawfish	1/2-1/2	96	adjudication: draw-by-score	10+0.1
+progress: t=357 games=357 elo=891.58 sigma=5.66 K=1.093 wld=149-55-153
+363	clawfish	clawfish	1-0	64	adjudication: resign	20+0.2
+358	clawfish	clawfish	1/2-1/2	119	adjudication: threefold repetition	20+0.2
+progress: t=359 games=359 elo=893.04 sigma=5.49 K=1.087 wld=150-55-154
+367	clawfish	clawfish	1/2-1/2	83	adjudication: draw-by-score	10+0.1
+350	clawfish	clawfish	1-0	96	adjudication: resign	60+0.6
+progress: t=361 games=361 elo=893.41 sigma=5.33 K=1.081 wld=150-56-155
+368	clawfish	clawfish	1/2-1/2	93	adjudication: draw-by-score	10+0.1
+progress: t=362 games=362 elo=893.87 sigma=5.23 K=1.078 wld=150-56-156
+364	clawfish	clawfish	0-1	127	adjudication: resign	20+0.2
+progress: t=363 games=363 elo=894.86 sigma=5.19 K=1.075 wld=151-56-156
+352	clawfish	clawfish	1-0	134	adjudication: resign	60+0.6
+progress: t=364 games=364 elo=894.77 sigma=5.13 K=1.072 wld=151-57-156
+373	clawfish	clawfish	1/2-1/2	111	adjudication: draw-by-score	10+0.1
+371	clawfish	clawfish	1/2-1/2	131	adjudication: threefold repetition	10+0.1
+365	clawfish	clawfish	0-1	139	adjudication: resign	40+0.4
+374	clawfish	clawfish	0-1	67	adjudication: resign	10+0.1
+progress: t=368 games=368 elo=896.56 sigma=4.81 K=1.061 wld=152-58-158
+372	clawfish	clawfish	1/2-1/2	85	adjudication: threefold repetition	10+0.1
+progress: t=369 games=369 elo=897.01 sigma=4.72 K=1.058 wld=152-58-159
+375	clawfish	clawfish	1-0	62	adjudication: resign	20+0.2
+361	clawfish	clawfish	1/2-1/2	129	adjudication: threefold repetition	60+0.6
+369	clawfish	clawfish	1/2-1/2	71	adjudication: draw-by-score	40+0.4
+379	clawfish	clawfish	1/2-1/2	126	adjudication: insufficient material	10+0.1
+380	clawfish	clawfish	0-1	77	adjudication: resign	10+0.1
+progress: t=374 games=374 elo=900.25 sigma=4.40 K=1.044 wld=154-58-162
+376	clawfish	clawfish	1/2-1/2	131	adjudication: threefold repetition	20+0.2
+progress: t=375 games=375 elo=900.69 sigma=4.37 K=1.042 wld=154-58-163
+366	clawfish	clawfish	1/2-1/2	66	adjudication: draw-by-score	40+0.4
+progress: t=376 games=376 elo=901.12 sigma=4.34 K=1.039 wld=154-58-164
+383	clawfish	clawfish	1-0	62	adjudication: resign	20+0.2
+377	clawfish	clawfish	1-0	138	adjudication: resign	40+0.4
+385	clawfish	clawfish	1-0	64	adjudication: resign	20+0.2
+370	clawfish	clawfish	1/2-1/2	129	adjudication: draw-by-score	40+0.4
+progress: t=380 games=380 elo=904.40 sigma=4.53 K=1.028 wld=157-58-165
+381	clawfish	clawfish	1/2-1/2	76	adjudication: draw-by-score	40+0.4
+384	clawfish	clawfish	1/2-1/2	66	adjudication: draw-by-score	20+0.2
+progress: t=382 games=382 elo=905.25 sigma=4.66 K=1.023 wld=157-58-167
+386	clawfish	clawfish	0-1	89	adjudication: resign	20+0.2
+progress: t=383 games=383 elo=906.18 sigma=4.75 K=1.020 wld=158-58-167
+391	clawfish	clawfish	1-0	132	adjudication: resign	10+0.1
+378	clawfish	clawfish	1/2-1/2	78	adjudication: draw-by-score	40+0.4
+progress: t=385 games=385 elo=907.54 sigma=4.96 K=1.015 wld=159-58-168
+392	clawfish	clawfish	1/2-1/2	66	adjudication: threefold repetition	10+0.1
+progress: t=386 games=386 elo=907.96 sigma=5.03 K=1.013 wld=159-58-169
+362	clawfish	clawfish	1/2-1/2	200	adjudication: max moves	60+0.6
+progress: t=387 games=387 elo=908.38 sigma=5.08 K=1.010 wld=159-58-170
+382	clawfish	clawfish	1-0	122	adjudication: resign	40+0.4
+progress: t=388 games=388 elo=908.29 sigma=5.13 K=1.008 wld=159-59-170
+387	clawfish	clawfish	1-0	92	adjudication: resign	60+0.6
+389	clawfish	clawfish	1-0	110	adjudication: resign	60+0.6
+390	clawfish	clawfish	1-0	72	adjudication: resign	60+0.6
+progress: t=391 games=391 elo=910.04 sigma=5.27 K=1.000 wld=161-60-170
+388	clawfish	clawfish	0-1	133	adjudication: resign	60+0.6
+progress: t=392 games=392 elo=910.95 sigma=5.29 K=0.998 wld=162-60-170
+converged: elo=910.95 sigma=5.29 games=392 reason=sprt-h1
+summary-by-tc: 10+0.1: W=34 L=15 D=33 (82)  20+0.2: W=54 L=12 D=38 (104)  40+0.4: W=41 L=16 D=45 (102)  60+0.6: W=33 L=17 D=54 (104)
+sprt: verdict=H1 llr=3.03 elo0=0.0 elo1=5.0 alpha=0.050 beta=0.050 pairs=196 ptnml=[6,18,72,68,32]
+ci: elo=+92.53 [+67.62, +118.41] pairs=196

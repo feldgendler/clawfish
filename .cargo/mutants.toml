@@ -114,18 +114,21 @@ exclude_re = [
     # `replace <fn> -> () with ()` — no-op for unit-returning functions.
     "replace .* -> \\(\\) with \\(\\)",
 
-    # ---- M7.B qsearch SEE-pruning: `< → <=` is equivalent at threshold 0 ----
+    # ---- M7.B/M7.B.2 qsearch SEE-pruning: `< → <=` is equivalent at every ----
+    # ---- reachable threshold -----------------------------------------------
     #
-    # `see(pos, mv) < QS_SEE_PRUNE_THRESHOLD` (=0) vs `<=` differ only when
-    # `see() == 0` exactly. The prune predicate only reaches the `see()` call
-    # when `attacker > victim` (the `victim >= attacker` fast-out returns early
-    # otherwise). With the integer SEE_VALUE set [82,337,365,477,1025,30000],
-    # no `attacker > victim` exchange can net exactly 0: the swap-list remainder
-    # is a sum/difference of these values and never cancels to 0 on that path
-    # (an exact-even trade requires victim == attacker, which the fast-out
-    # already short-circuits). So no position can distinguish `<` from `<=`.
-    # Equivalent mutant (ADR-0040 §6). See the analysis comment in search.rs's
-    # §5.3 test block.
+    # `see(pos, mv) < threshold` vs `<=` differ only when `see() == threshold`
+    # exactly. M7.B.2 makes `threshold` the depth-conditioned
+    # `qs_see_prune_threshold(root_depth)` ∈ {0, −16, −32, −48, −64}. The prune
+    # predicate only reaches the `see()` call when `attacker > victim` (the
+    # `victim >= attacker` fast-out returns early otherwise). With the integer
+    # SEE_VALUE set [82,337,365,477,1025,30000], no `attacker > victim` exchange
+    # nets exactly 0 (requires victim == attacker → fast-out) NOR any of the
+    # non-zero reachable thresholds (multiples of SLOPE=16: the achievable
+    # losing-exchange values −28,−112,−140,−255,−283,−395,−548,−660,−688,−943,…
+    # are none of {−16,−32,−48,−64}). So no position can distinguish `<` from
+    # `<=`. Equivalent mutant (ADR-0040 §6). See the §5.3 analysis comment in
+    # search.rs.
     "replace < with <= in qsearch_see_pruneable",
 
     # ---- `|` ↔ `^` between provably-disjoint operands -----------------

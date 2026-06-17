@@ -575,6 +575,23 @@ If a log-content Monitor must be used at all, its filter has to cover **every te
 
 **Parallel coding agents are fine** as long as their work stays in distinct worktrees and none of them is in the middle of running a contention-sensitive workload. The orchestrator coordinates step-12 gates centrally rather than letting per-unit subagents fire them concurrently.
 
+### Background-process launch discipline (no detachment)
+
+**Launch every long-running job (SPRT/match drivers, `cargo mutants`, corpus builds, overnight campaigns) as a harness-tracked background task — `run_in_background: true` on the Bash tool — and NEVER via shell detachment (`nohup`, a trailing `&`, `disown`, `setsid`).** Detachment is the antipattern: it severs the process from the harness, so if the session/harness dies the job keeps running orphaned — untracked CPU/RAM with no handle to monitor or stop it (a direct OOM/contention hazard given the table above).
+
+Why the harness-tracked form is strictly better — it already does everything detachment was reached for, without the orphan risk:
+
+- **Persists across turns.** A `run_in_background` task keeps running while the agent does other turns; you do not need `nohup` for longevity.
+- **Stays observable + controllable.** `Read` its output file any time; `TaskStop` to kill it cleanly. An orphaned PID is neither (process enumeration is sandbox-blocked, so you can't even `pkill` it without dropping the sandbox).
+- **Notifies on completion.** The harness re-invokes the agent when the task exits — so completion detection is a notification, not a polling loop. Use `ScheduleWakeup` only for the *hourly heartbeat* / as a long fallback, not as the primary completion signal.
+
+Rules:
+1. **Never double-background.** `nohup script &` *inside* a `run_in_background` call orphans the real work *and* makes the tracked wrapper return "completed" immediately (a false signal). Run the driver/command directly under `run_in_background: true`.
+2. **Sandbox-off composes — it is not a reason to detach.** When a tool needs the sandbox dropped (e.g. `cargo mutants` needs process control / writes outside the allow-list), set BOTH `run_in_background: true` and `dangerouslyDisableSandbox: true` on the one tracked call. Reaching for `nohup` to "escape the sandbox" is wrong — it escapes the *harness*.
+3. **Driver scripts may loop/sleep internally** (e.g. `scripts/m7b1-sweep.sh`), but are invoked directly under `run_in_background`, not wrapped in `nohup`.
+
+This is a documented discipline, not a hard-enforced hook (the 2026-06-16 decision was doc-only — a detachment guard's false-positive surface on `&` wasn't worth the friction). It is load-bearing precisely *because* it's only a convention: a new session inherits it via the session-pickup checklist (read `docs/workflow.md`, CLAUDE.md step 5), so keep it here and keep reading it.
+
 ## Model assignment
 
 Subagents inherit the orchestrator's model unless their definition specifies otherwise. Custom agent definitions in `.claude/agents/` set the model per role. The assignment is **tiered to balance cost against the reasoning each role demands**, not flat.

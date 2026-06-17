@@ -1,0 +1,4 @@
+# Transient campaign logs + run-dir pointers (the curated record is the
+# bench/sprt/*.md docs + the *-summary.txt evidence files).
+*.log
+*-rundir.txt
