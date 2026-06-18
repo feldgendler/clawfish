@@ -1,6 +1,17 @@
 # ADR-0042 — SEE capture futility pruning: gate set, two-layer bound, fail-soft policy
 
-**Status:** Accepted (lands with M7.C).
+**Status:** Accepted as a design, but the feature was **EXPLORED & SHELVED 2026-06-18** —
+both SPRT variants vs `M7.B.2` failed (v1 conservative flat ≈−1.7 Elo; v2 broadened
+— §4's exemption dropped — a clear regression −49 with a 60+0.6 collapse). **Not
+shipped; production HEAD stays `M6.J` + `M7.B.2`.** The code is retained on branch
+`m7c-see-capture-futility` (unmerged) and the design below stands as the record. The
+engineering was sound (2101-pass/0-fail, mutants 0-missed, llvm-cov 97.06%, three
+review loops converged); the failure was *strength* — the mechanism has no productive
+operating point (too thin converts nothing; too broad over-prunes the saving tactics
+slow TC would find). SEE's Elo for this engine is concentrated in the qsearch prune
+(ADR-0040/0041). Record: [`../../bench/sprt/2026-06-18-m7c-cfp-vs-m7b2.md`](../../bench/sprt/2026-06-18-m7c-cfp-vs-m7b2.md),
+[`../milestones/m7.c.md`](../milestones/m7.c.md). The §4 `victim ≥ attacker` exemption
+was v1; §"v2" of the SPRT record removed it (the regression).
 
 ## Context
 

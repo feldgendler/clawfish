@@ -8,18 +8,28 @@ This file also tracks **deferred features awaiting a precondition** — items re
 
 ---
 
-### M7.C deferred levers — capture-futility tuning (gated on the M7.C SPRT outcome)
+### M7.C — capture-futility tuning — ✅ CLOSED 2026-06-18 (mechanism SHELVED; two SPRT variants both failed)
 
-**Status (2026-06-17).** M7.C (SEE capture futility, ADR-0042) landed final-review-approved; SPRT vs `M7.B.2` is operator-launched. These levers apply **after** the SPRT, ordered by what the result indicates:
+**RESOLVED — no productive operating point at current strength.** M7.C (SEE capture
+futility, ADR-0042) was SPRT'd vs `M7.B.2` in two forms, both failed:
+- **v1** (branch (b) restricted to `victim < attacker`): **flat** (2-seed mean ≈ −1.7
+  Elo; `…D00B` −4.34, `…D01B` +0.87; both CIs straddle 0). No 60+0.6 regression — the
+  alpha-relative no-ramp design held — but too thin to convert (frontier nodes rare).
+- **v2** (lever 2 below — broaden (b) to all captures): **clear regression**
+  (`…D00B` −48.96 [−72.27,−26.08]; 60+0.6 collapsed 12-54-44 — the M7.B failure mode
+  reintroduced). Seed 2 stopped at 28g (conclusive).
 
-1. **(if SPRT shows a 60+0.6 regression — BLOCKS the ship) M7.C.1 — root-depth margin ramp.** The M7.B.2 mechanism applied to `CFP_MARGIN_D1`: keep the flat 150 at shallow ID iterations, widen (more conservative) at the deep iterations only slow TC reaches. Ships *before* M7.C if needed (the M7.B→M7.B.2 sequence). Research §4 argues this is unlikely (alpha-relative futility self-regulates), so v1 ships flat.
-2. **(if SPRT marginal-positive — TOP lever) broaden branch (b) to ALL captures.** Drop the v1 `victim >= attacker` exemption so the SEE refinement applies to winning/equal captures too (the literature form; research §1b). More `see()` calls, more aggressive — the restriction is exactly what makes the v1 SEE half thin, so this is the first lever to recover Elo. *Before* the margin sweep.
-3. **`CFP_MARGIN_D1` sweep** (and activate D2/D3 by raising `FFP_MAX_DEPTH`, jointly with the FFP table). Larger = safer (fewer false prunes); smaller = more aggressive.
-4. **Gives-check capture exemption** (needs `gives_check` infra; the FFP §1 / ADR-0026 deferral; research flags discovered-check risk).
-5. **TT-move / killer-capture exemption** if a regression traces to over-pruning trusted captures (ADR-0040 §5 remediation precedent).
-6. **Mechanism 1c — absolute SEE-by-depth (`see(mv) < -k·depth²`, alpha-independent).** A *separate future mechanism*, not a tune of v1 — carries the M7.B alpha-independent slow-TC risk (would need depth/root-depth conditioning from the start). Research-recommended only after the alpha-relative form lands.
-
-Cross-ref: ADR-0042 §Consequences; `docs/plans/m7.c.md` §11; `docs/milestones/m7.c.md`.
+The two endpoints bracket the mechanism: too conservative converts nothing, too
+aggressive over-prunes the saving tactics. **The remaining levers are all weak-prior
+and NOT pursued:** (3) `CFP_MARGIN_D1` sweep slides along the same too-thin/too-broad
+axis the v1/v2 endpoints already bracket; (1) the root-depth ramp (M7.C.1) is moot
+(v1 showed no slow-TC regression to fix); (4) gives-check exemption / (5)
+TT-move exemption only matter if a *shipping* variant existed; (6) the absolute
+SEE-by-depth lever (`see < -k·depth²`) is a separate mechanism that carries the same
+M7.B alpha-independent slow-TC risk v2 just demonstrated. **M7 closes; SEE's Elo for
+this engine is fully captured by the qsearch prune (M7.B/M7.B.2).** Code retained on
+branch `m7c-see-capture-futility` (unmerged). Record:
+`bench/sprt/2026-06-18-m7c-cfp-vs-m7b2.md`, ADR-0042, `docs/milestones/m7.c.md`.
 
 ---
 
