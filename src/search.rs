@@ -930,17 +930,23 @@ fn capture_futility_margin(depth: u32) -> i32 {
 ///   maximum material a non-promo capture can net (`see(mv) <= victim`
 ///   unconditionally — the swap-list only ever *subtracts* recaptures), so this
 ///   is a SOUND optimistic ceiling. Returns BEFORE any `see()` call.
-/// - **(b) SEE refinement** for materially-losing captures (`victim < attacker`)
-///   only: `static_eval + see(mv) + margin <= alpha`. Winning/equal captures
-///   (`victim >= attacker`) are never SEE-pruned in v1 (perf: bounds `see()` to
-///   the `qsearch_see_pruneable` fast-out class; conservatism: the likeliest
-///   saving tactics). `see <= victim ⇒ see_bound <= mvv_bound`, so (b)'s bound
-///   is also a valid `<= alpha` upper bound.
+/// - **(b) SEE refinement** for **all** captures that pass (a):
+///   `static_eval + see(mv) + margin <= alpha`. `see <= victim ⇒ see_bound <=
+///   mvv_bound`, so (b)'s bound is also a valid `<= alpha` upper bound.
+///
+/// **M7.C v2 — broadened (this revision).** v1 restricted (b) to materially-losing
+/// captures (`victim < attacker`) for perf + conservatism; that SPRT'd flat
+/// (≈−1.7 Elo, 2-seed vs `M7.B.2` — `bench/sprt/2026-06-18-m7c-cfp-vs-m7b2.md`),
+/// the restriction making the SEE half too thin to convert. v2 drops the
+/// exemption so (b) SEE-prunes winning/equal captures too (the literature form,
+/// research §1b) — e.g. an even RxR-defended trade in a lost position that v1
+/// forwent. Cost: `see()` is called for every capture that passes (a) (no
+/// `victim >= attacker` fast-out). Soundness unchanged.
 ///
 /// Domain-guarded to `[1, FFP_MAX_DEPTH]` (defense-in-depth, M5.C precedent).
 /// Caller guarantees `mv.is_capture() && !mv.is_promotion()` (flag ∈
-/// {`Capture`, `EnPassant`}). The victim/attacker reads and `expect` messages
-/// mirror `qsearch_see_pruneable` (ADR-0040 §3) — EP captures the pawn off the
+/// {`Capture`, `EnPassant`}). The victim read + `expect` message mirror
+/// `qsearch_see_pruneable` (ADR-0040 §3) — EP captures the pawn off the
 /// to-square (the to-square is empty for EP, so reading `piece_at(to)` would be
 /// a bug). `saturating_add` mirrors `ffp_pruned_bound`'s overflow defense.
 pub(crate) fn cfp_pruned_bound(
@@ -970,13 +976,11 @@ pub(crate) fn cfp_pruned_bound(
     if mvv_bound <= alpha {
         return Some(mvv_bound); // (a) sound delta-prune; returns BEFORE see()
     }
-    let attacker = SEE_VALUE[pos
-        .piece_at(mv.from_square())
-        .expect("cfp_pruned_bound: capture from-square occupied")
-        .kind as usize];
-    if victim >= attacker {
-        return None; // winning/equal capture: never SEE-pruned in v1 (ADR-0042)
-    }
+    // (b) SEE refinement — v2: applied to ALL captures passing (a); the v1
+    // `victim >= attacker` exemption is removed (M7.C broadening lever, after
+    // v1 SPRT'd flat — bench/sprt/2026-06-18-m7c-cfp-vs-m7b2.md). `see()` is now
+    // called for every capture that passes (a); `see <= victim` still holds so
+    // `see_bound <= mvv_bound`, an `<= alpha` upper bound on a fire.
     let see_bound = static_eval
         .saturating_add(see(pos, mv))
         .saturating_add(margin);
@@ -984,7 +988,7 @@ pub(crate) fn cfp_pruned_bound(
         Some(see_bound)
     } else {
         None
-    } // (b) SEE refinement
+    }
 }
 
 /// Per-quiet LMR eligibility, applied after the caller has already cleared
@@ -15099,22 +15103,23 @@ mod tests {
         );
     }
 
-    /// Branch (a) `<=` boundary. The EQUAL-trade fixture (victim == attacker,
-    /// RxR-defended, see = 0) is chosen specifically so branch (b) is exempt and
-    /// CANNOT interfere with the boundary: mvv_bound = 0 + 477 + 150 = 627.
-    /// alpha 627 fires (inclusive); alpha 626 does not (and victim>=attacker →
-    /// no branch b → None, not a branch-b fire). Pins `<=` → `<` at branch (a).
+    /// Branch (a) `<=` boundary. A FREE capture (see == victim, no recapture) is
+    /// chosen so branch (b) cannot interfere at the boundary: RxQ-free has
+    /// see = victim = 1025 ⇒ see_bound == mvv_bound = 0 + 1025 + 150 = 1175.
+    /// alpha 1175 fires (branch a inclusive); alpha 1174 does NOT fire (branch a
+    /// no, and branch b's see_bound 1175 > 1174 → None). Pins `<=` → `<` at
+    /// branch (a) without the v1 exemption (removed in v2).
     #[test]
     fn cfp_pruned_bound_branch_a_boundary_inclusive() {
-        let (pos, mv) = cfp_fixture("r6k/r7/8/8/8/8/8/R3K3 w - - 0 1", "a1a7");
+        let (pos, mv) = cfp_fixture("q3k3/8/8/8/8/8/8/R3K3 w - - 0 1", "a1a8");
         assert_eq!(
-            cfp_pruned_bound(&pos, mv, 0, 1, 627),
-            Some(627),
+            cfp_pruned_bound(&pos, mv, 0, 1, 1175),
+            Some(1175),
             "mvv_bound == alpha must fire (branch a inclusive)"
         );
         assert!(
-            cfp_pruned_bound(&pos, mv, 0, 1, 626).is_none(),
-            "mvv_bound > alpha (and victim>=attacker → no branch b) must NOT fire"
+            cfp_pruned_bound(&pos, mv, 0, 1, 1174).is_none(),
+            "mvv_bound > alpha (and see_bound 1175 > alpha → no branch b) must NOT fire"
         );
     }
 
@@ -15149,24 +15154,29 @@ mod tests {
         );
     }
 
-    /// Winning/equal capture exemption (the v1 `victim >= attacker` gate on
-    /// branch b). On an EQUAL trade (RxR-defended, see = 0) where mvv_bound (627)
-    /// exceeds alpha (300), the helper must return None — a mutant dropping the
-    /// `victim >= attacker` guard would compute see_bound = 0 + 0 + 150 = 150,
-    /// which is `<= 300`, and wrongly prune. This is the discriminating guard test.
+    /// M7.C v2 — branch (b) applies to ALL captures (the v1 `victim >= attacker`
+    /// exemption was removed after v1 SPRT'd flat). On an EQUAL trade
+    /// (RxR-defended, see = 0) where mvv_bound (627) exceeds alpha (300) so branch
+    /// (a) does not fire, the helper now SEE-prunes via branch (b):
+    /// see_bound = 0 + 0 + 150 = 150 ≤ 300 → Some(150). (Under v1 this returned
+    /// None.) Pins the broadening — a re-added `victim >= attacker` guard would
+    /// return None and fail this assertion.
     #[test]
-    fn cfp_pruned_bound_equal_trade_exempt_from_branch_b() {
+    fn cfp_pruned_bound_equal_trade_now_pruned_by_branch_b() {
         let (pos, mv) = cfp_fixture("r6k/r7/8/8/8/8/8/R3K3 w - - 0 1", "a1a7");
-        assert!(
-            cfp_pruned_bound(&pos, mv, 0, 1, 300).is_none(),
-            "equal trade (victim>=attacker) must be exempt from the SEE refinement at v1"
+        assert_eq!(
+            cfp_pruned_bound(&pos, mv, 0, 1, 300),
+            Some(150),
+            "v2: an equal trade (see=0) with mvv_bound>alpha is SEE-pruned via branch (b)"
         );
-        // And a genuinely winning capture (RxQ, victim 1025 > attacker 477) is
-        // likewise exempt at the same window.
+        // A genuinely winning capture (RxQ, see = +1025) is still NOT pruned at
+        // this window — not because of an exemption, but because its see_bound
+        // (0 + 1025 + 150 = 1175) exceeds alpha (300). Pins that branch (b)
+        // prunes by the SEE bound, not by capturing-side material sign.
         let (pos2, mv2) = cfp_fixture("q3k3/8/8/8/8/8/8/R3K3 w - - 0 1", "a1a8");
         assert!(
             cfp_pruned_bound(&pos2, mv2, 0, 1, 300).is_none(),
-            "winning capture (victim>attacker) must not be branch-b-pruned"
+            "winning capture whose see_bound (1175) > alpha (300) must NOT be pruned"
         );
     }
 
@@ -15428,10 +15438,11 @@ mod tests {
     }
 
     /// A winning capture is searched, not pruned, while a small capture at the
-    /// SAME node and alpha IS CFP-pruned. Position: white Rxa8 (victim Q 1025 >
-    /// attacker R 477 → never branch-b-pruned, and mvv_bound static+1175 >
-    /// alpha so not branch-a-pruned) and white bxc5 (pawn victim 82 → branch a
-    /// prunes it). Guards the winning-capture exemption end-to-end.
+    /// SAME node and alpha IS CFP-pruned. Position: white Rxa8 (a FREE queen,
+    /// see = +1025 → see_bound static+1175 > alpha, and mvv_bound static+1175 >
+    /// alpha → neither branch fires) and white bxc5 (pawn victim 82 → branch a
+    /// prunes it). v2-valid: Rxa8 survives because its SEE bound clears alpha
+    /// (not because of any exemption — v2 has none). End-to-end guard.
     #[test]
     fn negamax_cfp_prunes_small_capture_but_searches_winning_capture() {
         let pos = Position::from_fen("q3k3/8/8/2p5/1P6/8/8/R3K3 w - - 0 1").expect("FEN parses");

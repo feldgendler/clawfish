@@ -1154,10 +1154,14 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
     // 662_085 -> 588_673 (−11.1%). Determinism anchor, not a no-regression
     // signal; the strength claim is the SPRT vs the M7.B.2 production HEAD.
     // History prepend: M7.C `43_128`.
-    const DEPTH4_BENCH_NODES: u64 = 43_128;
+    // M7.C v2 (broaden branch (b) to all captures — drop the v1 victim>=attacker
+    // exemption — after v1 SPRT'd flat): winning/equal captures that can't reach
+    // alpha are now SEE-pruned too, a small extra node saving (d4 43_128 ->
+    // 43_069; d7 588_673 -> 585_481). History prepend: M7.C-v2 `43_069`.
+    const DEPTH4_BENCH_NODES: u64 = 43_069;
     assert_eq!(
         nodes1, DEPTH4_BENCH_NODES,
-        "E51: bench node count changed from the M7.C pin ({DEPTH4_BENCH_NODES} at depth=4); \
+        "E51: bench node count changed from the M7.C-v2 pin ({DEPTH4_BENCH_NODES} at depth=4); \
          re-pin if intentional; got {nodes1}"
     );
 }
