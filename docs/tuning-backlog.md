@@ -8,6 +8,31 @@ This file also tracks **deferred features awaiting a precondition** — items re
 
 ---
 
+### M7.C — capture-futility tuning — ✅ CLOSED 2026-06-18 (mechanism SHELVED; two SPRT variants both failed)
+
+**RESOLVED — no productive operating point at current strength.** M7.C (SEE capture
+futility, ADR-0042) was SPRT'd vs `M7.B.2` in two forms, both failed:
+- **v1** (branch (b) restricted to `victim < attacker`): **flat** (2-seed mean ≈ −1.7
+  Elo; `…D00B` −4.34, `…D01B` +0.87; both CIs straddle 0). No 60+0.6 regression — the
+  alpha-relative no-ramp design held — but too thin to convert (frontier nodes rare).
+- **v2** (lever 2 below — broaden (b) to all captures): **clear regression**
+  (`…D00B` −48.96 [−72.27,−26.08]; 60+0.6 collapsed 12-54-44 — the M7.B failure mode
+  reintroduced). Seed 2 stopped at 28g (conclusive).
+
+The two endpoints bracket the mechanism: too conservative converts nothing, too
+aggressive over-prunes the saving tactics. **The remaining levers are all weak-prior
+and NOT pursued:** (3) `CFP_MARGIN_D1` sweep slides along the same too-thin/too-broad
+axis the v1/v2 endpoints already bracket; (1) the root-depth ramp (M7.C.1) is moot
+(v1 showed no slow-TC regression to fix); (4) gives-check exemption / (5)
+TT-move exemption only matter if a *shipping* variant existed; (6) the absolute
+SEE-by-depth lever (`see < -k·depth²`) is a separate mechanism that carries the same
+M7.B alpha-independent slow-TC risk v2 just demonstrated. **M7 closes; SEE's Elo for
+this engine is fully captured by the qsearch prune (M7.B/M7.B.2).** Code retained on
+branch `m7c-see-capture-futility` (unmerged). Record:
+`bench/sprt/2026-06-18-m7c-cfp-vs-m7b2.md`, ADR-0042, `docs/milestones/m7.c.md`.
+
+---
+
 ### M7.B.1 — qsearch SEE-prune threshold (fix the slow-TC regression) — ✅ CLOSED / SHIPPED 2026-06-17 (delivered as M7.B.2, the depth ramp)
 
 **RESOLVED.** The flat-threshold sweep (this item's original plan) proved a flat value can only *trade* 20+0.2 for 60+0.6 (flat −50 2-seed-confirmed lateral). The fix shipped as **M7.B.2** — a depth-conditioned ramp (ADR-0041) — which **2-seed H1-ACCEPT dominated** both M7.B (flat-0) and flat −50 at every TC: vs `M5.K` `…D00B` +92.53 [+67.62,+118.41], `…D01B` +123.93 [+94.75,+154.90]; 60+0.6 recovered (−104→+56), 20+0.2 held (+140), 40+0.4 no band-edge dip (+125). New production search HEAD. Record: `bench/sprt/2026-06-17-m7b2-ramp-vs-m5k.md`, ADR-0041, `docs/plans/m7.b.2.md`. The historical sweep notes below are retained for the record.
