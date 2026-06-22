@@ -4,7 +4,6 @@ use std::path::Path;
 
 /// One line in `summary.txt`.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct SummaryLine {
     pub game_index: u32,
     pub white: String,

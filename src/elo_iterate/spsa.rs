@@ -29,7 +29,6 @@ use super::prng::Prng;
 /// The discriminant is informational (for display and `c_end` specification) and
 /// does not change the arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum Encoding {
     /// Centipawn (cp): θ is an integer cp value, e.g. `Aspiration_Min = 25`.
     IntCp,
@@ -52,6 +51,7 @@ pub(crate) struct SpsaParam {
     pub c_end: f64,
     /// How to interpret and display θ.
     #[allow(dead_code)]
+    // informational discriminant; arithmetic is identical for both variants
     pub encoding: Encoding,
     /// Running accumulator for tail-averaging.
     pub(crate) tail_sum: f64,
@@ -120,6 +120,7 @@ pub(crate) struct SpsaSchedule {
     pub gamma: f64,
     /// Total planned iterations N.
     #[allow(dead_code)]
+    // carried for diagnostics/display; schedule arithmetic uses big_a/alpha/gamma
     pub n: u64,
 }
 

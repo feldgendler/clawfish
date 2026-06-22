@@ -1,5 +1,4 @@
 // #[allow(dead_code)] on each fn: wired by controller in slice E.
-#[allow(dead_code)]
 pub(crate) fn sample_stddev(xs: &[f64]) -> f64 {
     if xs.len() < 2 {
         return 0.0;
@@ -10,7 +9,6 @@ pub(crate) fn sample_stddev(xs: &[f64]) -> f64 {
     variance.sqrt()
 }
 
-#[allow(dead_code)]
 pub(crate) fn should_stop(
     estimates: &[f64],
     window: usize,

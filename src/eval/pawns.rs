@@ -25,7 +25,6 @@ use crate::square::Square;
 /// land in Slices C–E; until then production builds see them unused. The
 /// in-module tests do exercise them. Mirrors the plan-mandated
 /// `#[allow(dead_code)]` on `AlphaBetaMover::pawn_hash`.
-#[allow(dead_code)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PawnEval {
     /// White-perspective pawn-structure MG contribution.
@@ -38,7 +37,6 @@ pub(crate) struct PawnEval {
 
 /// Compute pawn-structure eval from scratch (no cache). Single source of
 /// truth for both `evaluate` and `evaluate_cached` (via the hash table).
-#[allow(dead_code)] // Slice C impl; non-test consumer is evaluate_core (Slice D).
 pub(crate) fn pawn_eval(pos: &Position) -> PawnEval {
     let wp = pos.pieces_colored(Color::White, PieceKind::Pawn);
     let bp = pos.pieces_colored(Color::Black, PieceKind::Pawn);
@@ -143,7 +141,6 @@ impl PawnHashTable {
 
     /// Probe-or-compute: returns `PawnEval`; on miss computes via `pawn_eval`
     /// and stores. `key == 0` recomputes without probe or store (ADR-0032 §2).
-    #[allow(dead_code)] // Slice C impl; non-test consumer is evaluate_cached (Slice E).
     pub(crate) fn get(&mut self, pos: &Position) -> PawnEval {
         let key = pos.pawn_zobrist();
 
@@ -210,7 +207,6 @@ impl PawnHashTable {
 // ---------------------------------------------------------------------------
 
 /// Pawns of `own` with no friendly pawn on either adjacent file.
-#[allow(dead_code)]
 pub(crate) fn isolated_pawns(own: Bitboard) -> Bitboard {
     // A pawn is isolated if no friendly pawn exists on either adjacent file.
     // Neighbor files: east and west of all files containing own pawns.
@@ -226,7 +222,6 @@ pub(crate) fn isolated_pawns(own: Bitboard) -> Bitboard {
 /// northernmost-but-one toward rank 8 (the rear pawn for White, the
 /// least-advanced for Black). Since only the popcount is consumed and it is
 /// color-correct, the per-color square identity is immaterial here.
-#[allow(dead_code)]
 pub(crate) fn doubled_pawns(own: Bitboard) -> Bitboard {
     // South-fill of the full own-pawn set: a pawn is in it iff another own
     // pawn sits north of it on the same file (count = pawns_on_file − 1).
@@ -236,7 +231,6 @@ pub(crate) fn doubled_pawns(own: Bitboard) -> Bitboard {
 /// CPW-simple backward pawns of `own` (white-relative when `side` is White):
 /// stop square attacked by an enemy pawn and not covered by own attack-front
 /// spans.
-#[allow(dead_code)]
 pub(crate) fn backward_pawns(own: Bitboard, enemy: Bitboard, side: Color) -> Bitboard {
     match side {
         Color::White => {
@@ -267,7 +261,6 @@ pub(crate) fn backward_pawns(own: Bitboard, enemy: Bitboard, side: Color) -> Bit
 /// adjacent same-rank friendly pawn OR it is defended by another friendly
 /// pawn's attack. A bare defender (c3 defends d4) is NOT itself connected
 /// unless it is also phalanx or itself defended.
-#[allow(dead_code)]
 pub(crate) fn connected_pawns(own: Bitboard, side: Color) -> Bitboard {
     // Phalanx: same-rank, adjacent-file friendly pawn (direction-independent).
     let phalanx = own & (own.shift_east() | own.shift_west());
@@ -285,7 +278,6 @@ pub(crate) fn connected_pawns(own: Bitboard, side: Color) -> Bitboard {
 
 /// Passed pawns of `own`: no `enemy` pawn on the file or either adjacent file
 /// strictly ahead. White-relative when `side` is White.
-#[allow(dead_code)]
 pub(crate) fn passed_pawns(own: Bitboard, enemy: Bitboard, side: Color) -> Bitboard {
     // Enemy coverage toward own's promotion rank, widened by adjacent files.
     let enemy_front = match side {
@@ -303,7 +295,6 @@ pub(crate) fn passed_pawns(own: Bitboard, enemy: Bitboard, side: Color) -> Bitbo
 
 /// Signed (white − black) isolated / doubled / backward pawn raw counts.
 /// Shares the per-side iso/dbl/bwd detection with [`pawn_eval`].
-#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
 fn iso_dbl_bwd_signed_counts(pos: &Position) -> (i32, i32, i32) {
     let wp = pos.pieces_colored(Color::White, PieceKind::Pawn);
     let bp = pos.pieces_colored(Color::Black, PieceKind::Pawn);
@@ -321,7 +312,6 @@ fn iso_dbl_bwd_signed_counts(pos: &Position) -> (i32, i32, i32) {
 /// −); each term emits BOTH its MG and EG core index (same raw count). Shares
 /// detection with [`pawn_eval`]; `dot(features, shipped core weights)` equals
 /// [`iso_dbl_bwd_term_white`] (pinned by `accessor_dot_weights_equals_term_fn`).
-#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
 pub(crate) fn iso_dbl_bwd_features(pos: &Position) -> Vec<(u16, i32)> {
     use crate::texel::layout::{Group, group_range};
     let (iso, dbl, bwd) = iso_dbl_bwd_signed_counts(pos);
@@ -351,7 +341,6 @@ pub(crate) fn iso_dbl_bwd_term_white(pos: &Position) -> (i32, i32) {
 
 /// Signed (white − black) connected-pawn per-relative-rank raw counts (index
 /// 0..8). Shares the per-side connected-pawn detection with [`pawn_eval`].
-#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
 fn conn_signed_rank_counts(pos: &Position) -> [i32; 8] {
     let wp = pos.pieces_colored(Color::White, PieceKind::Pawn);
     let bp = pos.pieces_colored(Color::Black, PieceKind::Pawn);
@@ -374,7 +363,6 @@ fn conn_signed_rank_counts(pos: &Position) -> [i32; 8] {
 /// counts; each rank emits BOTH its MG and EG core index. Shares detection
 /// with [`pawn_eval`]; `dot(features, shipped core weights)` equals
 /// [`conn_term_white`] (pinned by `accessor_dot_weights_equals_term_fn`).
-#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
 pub(crate) fn conn_features(pos: &Position) -> Vec<(u16, i32)> {
     use crate::texel::layout::{Group, group_range};
     let counts = conn_signed_rank_counts(pos);

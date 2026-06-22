@@ -13,7 +13,6 @@ pub(crate) const STOP_WINDOW_CONFIRM_DEFAULT: usize = 5;
 
 /// Parsed command-line arguments.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct Args {
     /// Path to the engine under test.
     pub engine: String,

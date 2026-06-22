@@ -22,7 +22,6 @@ use crate::{magic, movegen};
 ///
 /// `#[allow(dead_code)]`: the seam is consumed by the test cross-check and by
 /// the `texel::features` cache builder (a later slice), not by `evaluate`.
-#[allow(dead_code)]
 pub(crate) fn mobility_features(pos: &Position) -> Vec<(u16, i32)> {
     use crate::texel::layout::{Group, group_range};
 

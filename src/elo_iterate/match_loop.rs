@@ -11,7 +11,6 @@ use super::adjudicate::GameOver;
 
 /// Outcome of a single game.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) enum GameOutcome {
     /// Normal termination (mate, stalemate, 50-move, threefold, insufficient).
     NativeGameOver(GameOver),
@@ -24,7 +23,7 @@ pub(crate) enum GameOutcome {
 }
 
 /// Per-game state threaded through the match loop.
-#[allow(dead_code)]
+#[allow(dead_code)] // game_index is set for PGN [Round] but not read via the ctx inside play_one_game
 pub(crate) struct GameContext<'a> {
     /// Index of this game within the run (1-based for PGN [Round]).
     pub game_index: u32,
@@ -34,10 +33,6 @@ pub(crate) struct GameContext<'a> {
     pub engine: &'a mut super::driver::EngineHandle,
     /// Handle to the opponent engine (index 1).
     pub opponent: &'a mut super::driver::EngineHandle,
-    /// Initial clock for the primary engine.
-    pub engine_tc: super::cli::TimeControl,
-    /// Initial clock for the opponent engine.
-    pub opponent_tc: super::cli::TimeControl,
     /// Harness overhead grace in milliseconds.
     pub harness_overhead_ms: u32,
     /// Watchdog duration.
@@ -57,7 +52,6 @@ pub(crate) struct GameContext<'a> {
 }
 
 /// Post-move clock state returned by `pure_apply_move_clock_update`.
-#[allow(dead_code)]
 pub(crate) struct ClockUpdate {
     /// New remaining + increment applied.
     pub new_clock: PerSideClock,

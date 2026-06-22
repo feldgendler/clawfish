@@ -8,7 +8,6 @@ use super::driver::LastInfo;
 
 /// Seven Tag Roster plus harness extensions.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct PgnHeader {
     pub event: String,
     pub site: String,
@@ -28,7 +27,6 @@ pub(crate) struct PgnHeader {
 
 /// A single half-move with its associated info snapshot.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct PgnMove {
     /// UCI move string.
     pub uci: String,

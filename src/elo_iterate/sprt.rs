@@ -11,7 +11,6 @@
 
 /// SPRT bounds + indifference zone configuration. Logistic Elo.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) struct SprtConfig {
     /// H0 Elo gap. Standard chess SPRT uses 0.
     pub elo0: f64,
@@ -25,7 +24,6 @@ pub(crate) struct SprtConfig {
 
 /// Running pentanomial state. Indexed pair counts plus the most recent LLR.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub(crate) struct SprtState {
     /// Pair counts indexed by pair-score bin (0..=4 → 0.0/0.5/1.0/1.5/2.0).
     pub pair_counts: [u32; 5],
@@ -39,7 +37,6 @@ pub(crate) struct SprtState {
 
 /// SPRT verdict after a single LLR check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum SprtVerdict {
     /// LLR is in the indifference zone (B, A); keep playing.
     Continue,
@@ -53,7 +50,6 @@ pub(crate) enum SprtVerdict {
 ///
 /// `B = log(β / (1 - α))` (lower bound — accept H0).
 /// `A = log((1 - β) / α)` (upper bound — accept H1).
-#[allow(dead_code)]
 pub(crate) fn wald_bounds(alpha: f64, beta: f64) -> (f64, f64) {
     let b = (beta / (1.0 - alpha)).ln();
     let a = ((1.0 - beta) / alpha).ln();
@@ -70,7 +66,6 @@ fn ll(elo: f64) -> f64 {
 ///
 /// Returns 0.0 when the pair count is 0 or the variance collapses
 /// (e.g. all-draw stream); the caller treats both as "indifference zone".
-#[allow(dead_code)]
 pub(crate) fn compute_llr(state: &SprtState, cfg: &SprtConfig) -> f64 {
     let n: u32 = state.pair_counts.iter().sum();
     if n == 0 {
@@ -103,7 +98,7 @@ pub(crate) fn compute_llr(state: &SprtState, cfg: &SprtConfig) -> f64 {
 /// Inputs outside `{0.0, 0.5, 1.0}` are clamped via the rounded-doubled
 /// sum then bounded to `[0, 4]`; the harness only ever calls this with
 /// the three valid scores, so the clamp is purely defensive.
-#[allow(dead_code)]
+#[allow(dead_code)] // controller uses update_pair(pair_sum) instead of calling classify_pair_score directly
 pub(crate) fn classify_pair_score(game_a: f64, game_b: f64) -> usize {
     let total = game_a + game_b;
     let scaled = (total * 2.0).round() as i64;
@@ -114,7 +109,6 @@ pub(crate) fn classify_pair_score(game_a: f64, game_b: f64) -> usize {
 /// `pair_score` is the candidate's *total* score across the pair (0.0–2.0).
 /// Caller must never call this with a singleton (use `discard_singleton`
 /// for the audit-only count).
-#[allow(dead_code)]
 pub(crate) fn update_pair(state: &mut SprtState, cfg: &SprtConfig, pair_score: f64) -> SprtVerdict {
     let bin = ((pair_score * 2.0).round() as i64).clamp(0, 4) as usize;
     state.pair_counts[bin] = state.pair_counts[bin].saturating_add(1);
@@ -131,7 +125,6 @@ pub(crate) fn update_pair(state: &mut SprtState, cfg: &SprtConfig, pair_score: f
 
 /// Increment the audit-only singleton counter. Used at run end when an
 /// in-flight pair never completes (worker failure or `--max-games` cap).
-#[allow(dead_code)]
 pub(crate) fn discard_singleton(state: &mut SprtState) {
     state.discarded_singletons = state.discarded_singletons.saturating_add(1);
 }
@@ -143,7 +136,6 @@ pub(crate) fn discard_singleton(state: &mut SprtState) {
 ///
 /// NaN-safe at `N < 2` or degenerate variance: returns `(NaN, NaN, NaN)`;
 /// the caller must guard the print path.
-#[allow(dead_code)]
 pub(crate) fn pentanomial_ci(state: &SprtState) -> (f64, f64, f64) {
     let n: u32 = state.pair_counts.iter().sum();
     if n < 2 {

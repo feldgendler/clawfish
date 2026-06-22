@@ -200,7 +200,6 @@ impl Bitboard {
 
 /// Northward (toward rank 8) flood fill: every square at or above an input
 /// square's rank, on that square's file.
-#[allow(dead_code)]
 pub(crate) const fn north_fill(bb: Bitboard) -> Bitboard {
     // Kogge-Stone fill: 7 shifts cover all 8 ranks.
     let bb = Bitboard(bb.0 | (bb.0 << 8));
@@ -209,7 +208,6 @@ pub(crate) const fn north_fill(bb: Bitboard) -> Bitboard {
 }
 
 /// Southward (toward rank 1) flood fill.
-#[allow(dead_code)]
 pub(crate) const fn south_fill(bb: Bitboard) -> Bitboard {
     let bb = Bitboard(bb.0 | (bb.0 >> 8));
     let bb = Bitboard(bb.0 | (bb.0 >> 16));
@@ -218,7 +216,6 @@ pub(crate) const fn south_fill(bb: Bitboard) -> Bitboard {
 
 /// Full-file fill: every square on any file occupied by an input square
 /// (`north_fill | south_fill`). Idempotent.
-#[allow(dead_code)]
 pub(crate) const fn file_fill(bb: Bitboard) -> Bitboard {
     Bitboard(north_fill(bb).0 | south_fill(bb).0)
 }
@@ -226,7 +223,6 @@ pub(crate) const fn file_fill(bb: Bitboard) -> Bitboard {
 /// White front spans: squares strictly ahead (toward rank 8) of each input
 /// pawn on its own file. **Excludes** the pawn's own square (off-by-one
 /// guard — e5 → {e6,e7,e8}).
-#[allow(dead_code)]
 pub(crate) const fn white_front_spans(bb: Bitboard) -> Bitboard {
     // Shift one step north first so the pawn's own square is excluded.
     north_fill(bb.shift_north())
@@ -234,14 +230,12 @@ pub(crate) const fn white_front_spans(bb: Bitboard) -> Bitboard {
 
 /// Black front spans: squares strictly ahead (toward rank 1) of each input
 /// pawn on its own file. Excludes the pawn's own square.
-#[allow(dead_code)]
 pub(crate) const fn black_front_spans(bb: Bitboard) -> Bitboard {
     south_fill(bb.shift_south())
 }
 
 /// White attack-front spans: the white front spans widened east and west
 /// (the diagonal capture files ahead of each pawn).
-#[allow(dead_code)]
 pub(crate) const fn white_attack_front_spans(bb: Bitboard) -> Bitboard {
     let spans = white_front_spans(bb);
     // shift_east/west already mask FILE_H/FILE_A — no wrap.
@@ -249,7 +243,6 @@ pub(crate) const fn white_attack_front_spans(bb: Bitboard) -> Bitboard {
 }
 
 /// Black attack-front spans: black front spans widened east and west.
-#[allow(dead_code)]
 pub(crate) const fn black_attack_front_spans(bb: Bitboard) -> Bitboard {
     let spans = black_front_spans(bb);
     Bitboard(spans.0 | spans.shift_east().0 | spans.shift_west().0)

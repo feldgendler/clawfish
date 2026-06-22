@@ -15245,7 +15245,7 @@ fn negamax_se_below_min_depth_does_not_record_extension_depth() {
 /// excluded from recursive SE. No explicit double-extension unit test is added;
 /// the depth-halving test covers the in-verification case, and the property is
 /// documented here.
-#[allow(dead_code)]
+#[allow(dead_code)] // not a test fn; documents the double-extension invariant inline (see doc comment above)
 fn negamax_se_extension_does_not_double() {
     // See doc comment above. This function is intentionally not annotated
     // with `#[test]`; it documents the "double-extension" reasoning inline.

@@ -6,7 +6,6 @@
 //! (`prng_seed_zero_first_three_words_golden`) so a transcription typo
 //! fails at compile-time-of-test.
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Prng(u64);
 
@@ -38,7 +37,6 @@ impl Prng {
 
 /// Default seed when `--seed` is absent. Intentionally non-zero. Documented
 /// in `--help` so users know no-`--seed` runs are still bit-deterministic.
-#[allow(dead_code)]
 pub(crate) const DEFAULT_SEED: u64 = 0xC1AB_F15A_E10D_D000;
 
 #[cfg(test)]

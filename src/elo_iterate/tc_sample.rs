@@ -7,7 +7,6 @@
 
 /// Parsed `--tc-sample` distribution.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct TcDistribution {
     /// Parsed (TC, weight) entries in input order. Weights are positive.
     pub entries: Vec<(super::cli::TimeControl, u32)>,

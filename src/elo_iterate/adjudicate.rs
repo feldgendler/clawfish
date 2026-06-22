@@ -31,6 +31,7 @@ pub(crate) enum GameOver {
     /// Reserved for future use; time-forfeit detection currently lives in
     /// `match_loop::GameOutcome::TimeForfeit` rather than adjudication.
     #[allow(dead_code)]
+    // reserved variant; time-forfeit is currently in match_loop::GameOutcome
     TimeForfeit(Color),
     /// The just-moved side resigned — its score reached the threshold.
     /// Carries the *resigning* (= losing) color.

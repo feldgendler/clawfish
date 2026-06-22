@@ -1,6 +1,5 @@
 // #[allow(dead_code)] on each fn: wired by controller in slice E; until
 // then, clippy's dead-code lint fires because nothing outside tests calls these.
-#[allow(dead_code)]
 pub(crate) fn compute_k(t: u32, k0: f64, tau: f64) -> f64 {
     if k0 == 0.0 {
         return 0.0;
@@ -8,12 +7,10 @@ pub(crate) fn compute_k(t: u32, k0: f64, tau: f64) -> f64 {
     k0 / (1.0 + (t as f64) / tau)
 }
 
-#[allow(dead_code)]
 pub(crate) fn expected_score(my_elo: f64, opp_elo: f64) -> f64 {
     1.0 / (1.0 + 10_f64.powf((opp_elo - my_elo) / 400.0))
 }
 
-#[allow(dead_code)]
 pub(crate) fn update_estimate(prior_elo: f64, opp_elo: f64, result: f64, k: f64) -> f64 {
     prior_elo + k * (result - expected_score(prior_elo, opp_elo))
 }

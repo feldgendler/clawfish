@@ -338,7 +338,6 @@ impl Position {
     /// In release builds the body compiles out — see the `cfg(not(debug_assertions))`
     /// stub below — so callers can invoke it unconditionally.
     #[cfg(debug_assertions)]
-    #[allow(dead_code)] // Called from tests only at M1.B; M1.E adds a non-test caller.
     pub(crate) fn debug_assert_consistent(&self) {
         // 1. Piece bitboards are pairwise disjoint.
         for i in 0..PieceKind::COUNT {
@@ -674,7 +673,7 @@ impl Position {
     /// invoke it without `cfg`-gating each call site; the body is only
     /// present under `cfg(debug_assertions)`.
     #[cfg(not(debug_assertions))]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // release-mode stub; callers exist only in debug builds
     pub(crate) fn debug_assert_consistent(&self) {}
 }
 
@@ -729,29 +728,20 @@ mod tests {
     // Convenience aliases for piece literals used throughout these tests.
     // Some are referenced in only a subset of tests; `#[allow(dead_code)]`
     // keeps the full set declared for readability without warnings.
-    #[allow(dead_code)]
     const WHITE_PAWN: Piece = Piece::new(Color::White, PieceKind::Pawn);
-    #[allow(dead_code)]
+    #[allow(dead_code)] // not yet used by position-module tests
     const WHITE_KNIGHT: Piece = Piece::new(Color::White, PieceKind::Knight);
-    #[allow(dead_code)]
     const WHITE_BISHOP: Piece = Piece::new(Color::White, PieceKind::Bishop);
-    #[allow(dead_code)]
     const WHITE_ROOK: Piece = Piece::new(Color::White, PieceKind::Rook);
-    #[allow(dead_code)]
+    #[allow(dead_code)] // not yet used by position-module tests
     const WHITE_QUEEN: Piece = Piece::new(Color::White, PieceKind::Queen);
-    #[allow(dead_code)]
     const WHITE_KING: Piece = Piece::new(Color::White, PieceKind::King);
-    #[allow(dead_code)]
     const BLACK_PAWN: Piece = Piece::new(Color::Black, PieceKind::Pawn);
-    #[allow(dead_code)]
     const BLACK_KNIGHT: Piece = Piece::new(Color::Black, PieceKind::Knight);
-    #[allow(dead_code)]
+    #[allow(dead_code)] // not yet used by position-module tests
     const BLACK_BISHOP: Piece = Piece::new(Color::Black, PieceKind::Bishop);
-    #[allow(dead_code)]
     const BLACK_ROOK: Piece = Piece::new(Color::Black, PieceKind::Rook);
-    #[allow(dead_code)]
     const BLACK_QUEEN: Piece = Piece::new(Color::Black, PieceKind::Queen);
-    #[allow(dead_code)]
     const BLACK_KING: Piece = Piece::new(Color::Black, PieceKind::King);
 
     #[test]

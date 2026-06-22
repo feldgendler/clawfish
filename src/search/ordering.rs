@@ -14,7 +14,6 @@ use super::MAX_PLY;
 /// values run. Pinned by `score_tier_invariants_compile` (compile-time
 /// const-assert at the bottom of this section).
 // Used by order_moves (test-only post-M5.H1) and the compile-time invariant.
-#[allow(dead_code)]
 pub(crate) const CAPTURE_OFFSET: i32 = 1_000_000;
 
 /// Bonus score for the most-recent quiet beta-cutoff at this ply (slot 0).
@@ -28,7 +27,6 @@ pub(crate) const CAPTURE_OFFSET: i32 = 1_000_000;
 /// `CAPTURE_OFFSET`. The relative ordering invariants are unchanged from
 /// M4.B; only the absolute-score scale shifted.
 // Used by order_moves (test-only post-M5.H1) and the compile-time invariant.
-#[allow(dead_code)]
 pub(crate) const KILLER0_SCORE: i32 = 100_001;
 
 /// Bonus score for the prior quiet beta-cutoff at this ply (slot 1).
@@ -36,7 +34,6 @@ pub(crate) const KILLER0_SCORE: i32 = 100_001;
 /// `KILLER1_SCORE > MAX_HISTORY` (so killers always rank above the best
 /// history-rated quiet).
 // Used by order_moves (test-only post-M5.H1) and the compile-time invariant.
-#[allow(dead_code)]
 pub(crate) const KILLER1_SCORE: i32 = 100_000;
 
 /// Compile-time check that the score tiers are strictly ordered:
@@ -403,7 +400,7 @@ impl MoveStager {
 
     /// Pre-iteration total move count. Does NOT decrement as `next()` advances.
     // Not called from production paths (is_empty covers the negamax gate); used by tests.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used by tests only; production gate is is_empty()
     pub(crate) fn len(&self) -> usize {
         self.total_len
     }

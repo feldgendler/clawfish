@@ -57,7 +57,6 @@ pub(crate) fn outpost_squares(pos: &Position, side: Color) -> Bitboard {
 /// core index. Shares the `outpost_squares` + relative-rank detection with
 /// [`outpost_term_white`]; `dot(features, shipped core weights)` reproduces it
 /// (pinned by `accessor_dot_weights_equals_term_fn`).
-#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
 pub(crate) fn outpost_features(pos: &Position) -> Vec<(u16, i32)> {
     use crate::texel::layout::{Group, group_range};
 
@@ -104,7 +103,6 @@ pub(crate) fn outpost_features(pos: &Position) -> Vec<(u16, i32)> {
 /// state. Shares the `file_fill` open/semi-open detection with
 /// [`rook_file_term_white`]; `dot(features, shipped core weights)` reproduces
 /// it (pinned by `accessor_dot_weights_equals_term_fn`).
-#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
 pub(crate) fn rook_file_features(pos: &Position) -> Vec<(u16, i32)> {
     use crate::texel::layout::{Group, group_range};
 

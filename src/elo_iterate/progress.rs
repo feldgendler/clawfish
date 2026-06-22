@@ -3,7 +3,6 @@
 use super::StopReason;
 
 /// Snapshot of per-game-batch progress for human-readable output.
-#[allow(dead_code)]
 pub(crate) struct ProgressLine {
     /// Game (pair) serial index `t`.
     pub t: u32,
@@ -22,7 +21,6 @@ pub(crate) struct ProgressLine {
 /// Format a mid-run progress line.
 ///
 /// Output: `progress: t=<t> games=<G> elo=<%.2f> sigma=<%.2f> K=<%.3f> wld=<W>-<L>-<D>`
-#[allow(dead_code)]
 pub(crate) fn format_progress(line: &ProgressLine) -> String {
     let (w, l, d) = line.wld;
     format!(
@@ -38,7 +36,6 @@ pub(crate) fn format_progress(line: &ProgressLine) -> String {
 /// Format the final convergence line.
 ///
 /// Output: `converged: elo=<%.2f> sigma=<%.2f> games=<G> reason=<sigma|max-games>`
-#[allow(dead_code)]
 pub(crate) fn format_converged(
     final_elo: f64,
     final_sigma: f64,

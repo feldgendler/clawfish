@@ -21,7 +21,7 @@ use crate::square::Square;
 /// §1). The king's own square is excluded (`& !from_square(ksq)` is
 /// load-bearing — see plan §3 comment). Called by the zone tests; kept for
 /// future use (e.g., if a non-S-curve attacker term is ever re-introduced).
-#[allow(dead_code)]
+#[allow(dead_code)] // retained for future use; zone tests exercise it, non-test caller removed with M6.K
 pub(crate) fn king_zone(side: Color, ksq: Square) -> Bitboard {
     let ring = movegen::masks::king_attacks(ksq);
     let fwd = match side {
@@ -36,7 +36,6 @@ pub(crate) fn king_zone(side: Color, ksq: Square) -> Bitboard {
 /// MG-only open/semi-open-file penalties. Shares the shield + open-file
 /// detection with [`king_safety_term_white`]; EXCLUDES the frozen attacker
 /// S-curve entirely (ADR-0037 §3, deferred).
-#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
 fn shield_open_file_signed_counts(pos: &Position) -> [i32; 8] {
     let wp = pos.pieces_colored(Color::White, PieceKind::Pawn);
     let bp = pos.pieces_colored(Color::Black, PieceKind::Pawn);
@@ -105,7 +104,6 @@ fn shield_open_file_signed_counts(pos: &Position) -> [i32; 8] {
 /// `KsShieldFile` slots. EXCLUDES the frozen S-curve attacker contribution.
 /// `dot(features, shipped core weights)` equals [`shield_open_file_term_white`]
 /// (pinned by `accessor_dot_weights_equals_term_fn`).
-#[allow(dead_code)] // Texel seam: consumed by tests + `texel::features` (later slice).
 pub(crate) fn shield_open_file_features(pos: &Position) -> Vec<(u16, i32)> {
     use crate::texel::layout::{Group, group_range};
     let counts = shield_open_file_signed_counts(pos);

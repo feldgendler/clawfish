@@ -88,7 +88,6 @@ pub(crate) fn parse_option_advertisement(line: &str) -> Option<&str> {
 
 /// Configuration for spawning an engine subprocess.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct EngineSpec {
     /// Display name for PGN tags and logs.
     pub name: String,
@@ -104,7 +103,7 @@ pub(crate) struct BestMoveOutcome {
     /// UCI move string chosen by the engine.
     pub uci: String,
     /// Engine's ponder hint, if provided. Reserved for ELOH.B ponder support.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // ponder support is planned but not yet consumed
     pub ponder: Option<String>,
 }
 
@@ -116,16 +115,16 @@ pub(crate) enum HarnessError {
     /// The engine's stdout closed (process exited unexpectedly).
     EngineExit,
     /// An I/O error on the engine's stdin. The inner error is surfaced via `Debug`.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // constructed via map_err(HarnessError::Io); payload read via Debug
     Io(std::io::Error),
     /// A protocol line couldn't be parsed (informational; harness skips).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // reserved variant; parse errors are currently silently skipped
     Parse(String),
 }
 
 /// Live handle to a running engine subprocess.
-#[allow(dead_code)]
 pub(crate) struct EngineHandle {
+    #[allow(dead_code)] // used for PGN/log display in the full harness; not yet read in tests
     pub(crate) name: String,
     pub(crate) child: std::process::Child,
     /// Engine's stdin pipe. `None` after `shutdown` has closed it.

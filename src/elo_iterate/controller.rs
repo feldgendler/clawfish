@@ -8,7 +8,6 @@ use std::sync::mpsc;
 
 /// Command sent from the controller to a worker thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum WorkerCmd {
     /// Play one color-pair (2 games, color-swapped, same `opponent_uci_elo`).
     /// `pair_index` is the 0-based pair count for game-index assignment.
@@ -43,7 +42,6 @@ pub(crate) enum WorkerCmd {
 
 /// Report sent from a worker thread back to the controller.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) enum WorkerReport {
     /// A single game in the current pair has completed.
     GameComplete {
@@ -75,36 +73,24 @@ pub(crate) enum WorkerReport {
 /// This struct holds only static configuration that does not vary across pairs.
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerConfig {
-    #[allow(dead_code)]
     pub engine_spec: super::driver::EngineSpec,
-    #[allow(dead_code)]
     pub opponent_spec: super::driver::EngineSpec,
-    #[allow(dead_code)]
     pub engine_options: Vec<(String, String)>,
-    #[allow(dead_code)]
     pub opponent_options: Vec<(String, String)>,
-    #[allow(dead_code)]
     pub mode: crate::MatchTimeMode,
-    #[allow(dead_code)]
     pub harness_overhead_ms: u32,
-    #[allow(dead_code)]
     pub watchdog: std::time::Duration,
-    #[allow(dead_code)]
     pub max_plies: u32,
-    #[allow(dead_code)]
     pub thresholds: super::cli::Thresholds,
     /// When `true`, harness sends `setoption name VirtualClock value true` to
     /// engines advertising the option. See ELOH.C / ADR-0021.
-    #[allow(dead_code)]
     pub virtual_clock: bool,
 }
 
 /// Live worker pool: command senders, report receiver, and thread handles.
 pub(crate) struct WorkerPool {
     pub senders: Vec<mpsc::Sender<WorkerCmd>>,
-    #[allow(dead_code)]
     pub reports: mpsc::Receiver<WorkerReport>,
-    #[allow(dead_code)]
     pub join_handles: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -118,7 +104,7 @@ impl Drop for WorkerPool {
 
 /// Result of a completed iteration run.
 #[derive(Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // fields consumed by callers once run_iteration is wired end-to-end
 pub(crate) struct IterationOutcome {
     pub final_estimate: f64,
     pub final_sigma: f64,
@@ -132,13 +118,10 @@ pub(super) type WorkerFn =
     fn(u32, WorkerConfig, mpsc::Receiver<WorkerCmd>, mpsc::Sender<WorkerReport>);
 
 /// Stockfish-compatible UCI_Elo bounds.
-#[allow(dead_code)]
 const UCI_ELO_MIN: u32 = 1320;
-#[allow(dead_code)]
 const UCI_ELO_MAX: u32 = 3190;
 
 /// Clamp a real-valued estimate to Stockfish's UCI_Elo range and round to u32.
-#[allow(dead_code)]
 pub(super) fn clamp_uci_elo(elo: f64) -> u32 {
     let rounded = elo.round();
     if rounded.is_nan() {
@@ -436,8 +419,6 @@ fn production_worker_fn(
                         white_engine_index,
                         engine: &mut engine,
                         opponent: &mut opponent,
-                        engine_tc,
-                        opponent_tc,
                         harness_overhead_ms: cfg.harness_overhead_ms,
                         watchdog: cfg.watchdog,
                         mode: cfg.mode,
@@ -557,8 +538,6 @@ fn production_worker_fn(
                         white_engine_index,
                         engine: &mut engine,
                         opponent: &mut opponent,
-                        engine_tc: tc,
-                        opponent_tc: tc,
                         harness_overhead_ms: cfg.harness_overhead_ms,
                         watchdog: cfg.watchdog,
                         mode: cfg.mode,
@@ -600,7 +579,6 @@ fn production_worker_fn(
 }
 
 /// Spawn `n` worker threads using the production worker-thread function.
-#[allow(dead_code)]
 pub(crate) fn spawn_workers(
     n: u32,
     cfg: WorkerConfig,
@@ -637,7 +615,6 @@ pub(super) fn spawn_workers_with_fn(
 }
 
 /// Drive the color-pair dispatch + K-update loop to completion.
-#[allow(dead_code)]
 pub(crate) fn run_iteration(
     pool: &mut WorkerPool,
     args: &super::cli::Args,
@@ -1101,7 +1078,6 @@ pub(crate) fn run_iteration(
 /// `match_pgn_path`, separated by a single blank line. Best-effort: missing
 /// `games_dir`, unreadable files, and zero-game runs all produce a
 /// successfully-created empty (or partial) `match_pgn_path`.
-#[allow(dead_code)]
 pub(crate) fn write_match_pgn(
     games_dir: &std::path::Path,
     match_pgn_path: &std::path::Path,
@@ -1148,7 +1124,6 @@ pub(crate) fn write_match_pgn(
 ///
 /// Appends one row per iteration to `<out_dir>/spsa-trajectory.tsv`.
 /// Writes tail-averaged final θ to `<out_dir>/spsa-final.txt`.
-#[allow(dead_code)]
 pub(crate) fn run_spsa(
     args: &super::cli::Args,
     out_dir: &std::path::Path,
@@ -2358,7 +2333,7 @@ mod tests {
     }
 
     /// Build a `TcDistribution` from a spec string; panics on parse error (tests only).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // test helper; not all test cases that use it may be compiled
     fn make_dist(spec: &str) -> super::super::tc_sample::TcDistribution {
         super::super::tc_sample::parse_tc_sample(spec).expect("make_dist: parse_tc_sample failed")
     }

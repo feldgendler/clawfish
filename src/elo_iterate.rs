@@ -39,7 +39,6 @@ use std::process::ExitCode;
 
 /// Why the online iteration terminated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum StopReason {
     /// Trailing-σ fell below `--target-sigma` for `--stop-window-confirm` consecutive games.
     Sigma,
@@ -234,7 +233,6 @@ fn get_hostname(buf: &mut [u8]) {
 }
 
 /// Best-effort current hostname, defaulting to `"localhost"`.
-#[allow(dead_code)]
 pub(crate) fn current_hostname() -> String {
     let mut buf = [0u8; 64];
     get_hostname(&mut buf);
@@ -246,7 +244,6 @@ pub(crate) fn current_hostname() -> String {
 }
 
 /// Current local-day date string in `YYYY.MM.DD` form for PGN headers.
-#[allow(dead_code)]
 pub(crate) fn current_date_str() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
