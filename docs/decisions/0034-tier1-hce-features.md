@@ -133,7 +133,7 @@ M6.F skips none).
   correctness feature; mis-flagging a win is a correctness *regression*, not a
   fix). KRvKN / KQvKR "hard but not dead" tablebase draws are a **documented
   out-of-scope gap** (excluded by the no-rook/no-queen clause; need EGTB —
-  M8). M6.I widens only the *coefficient*; the **pattern set is fixed at
+  M9). M6.I widens only the *coefficient*; the **pattern set is fixed at
   M6.F**. **Overlap precision:** the predicate returns `true` for KBvK/KNvK
   (balanced ≤1-minor) but those early-return `0` via `is_insufficient_material`
   at `eval.rs:228` *before* `endgame_scale` runs — the overlap is unobservable

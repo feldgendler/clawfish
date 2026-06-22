@@ -257,7 +257,7 @@ the current strength/TC — every direction tried regresses or is flat: extendin
 and widening *eligibility* (Lower+Exact C-4: −16) all fail to clear the bar. This
 mirrors the M5.F qsearch-TT campaign's 0-ship outcome and the M5.I flat-aspiration
 result — the search-selectivity layer is tuned out at clawfish's strength; the next
-real gains are in eval/NNUE (M11), not SE/qsearch micro-tuning. Branches
+real gains are in eval/NNUE (M12), not SE/qsearch micro-tuning. Branches
 `tune/m5g-se-item{4,5,6,7}-*` retained for the record; **production HEAD unchanged
 at `M5.F.1`** (no engine bytes changed on `main`).
 

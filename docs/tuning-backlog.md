@@ -59,7 +59,7 @@ Walked the whole active queue in order. Dispositions:
 - **Arm-B PST co-tune — sensitivity gate-checked → NO-GO / deprioritized.** `texel-tune sensitivity` on shipped params (16M-record cache) shows the deferred terms (mobility/passed/rook-file/shield) are the **most** sensitive, NOT pinned-near-zero; only sparse dead cells (data-coverage). Gate condition 2 unmet ⇒ frozen-PST double-count bias is small ⇒ Arm-B sinks down the queue (as the gate specifies). Evidence: `bench/tune/2026-06-03-sensitivity-shipped.json`.
 - **King-safety S-curve — confirmed closed-negative** (M6.K).
 
-**Net:** three consecutive 0-ship campaigns (06-01/02/03) ⇒ the search layer is at a local optimum at current strength/TC. Remaining headroom is in the eval surface (gated on Arm-B's now-deprioritized gate) and NNUE (M11).
+**Net:** three consecutive 0-ship campaigns (06-01/02/03) ⇒ the search layer is at a local optimum at current strength/TC. Remaining headroom is in the eval surface (gated on Arm-B's now-deprioritized gate) and NNUE (M12).
 
 ---
 
@@ -114,7 +114,7 @@ The modest tactical lean (WAC +7, STS +50) is consistent with the SPRT's +1.74 E
 
 **Revisit conditions** (analogous to M5.H2's deferral):
 - Clawfish reaches **depth ≥ 14 at typical TCs** (currently ~depth 8-12 at mixed-TC). At deeper search, score-continuity improves and the intermediate-tier mechanism's literature payoff (Crafty / Meesha / RobboLito reports of +10-20 Elo) is more plausibly realizable.
-- OR: the engine's ordering quality improves substantially (e.g., post-M11 NNUE) so that tier-1 failure rates drop and tier-2 firings become rarer-but-more-targeted.
+- OR: the engine's ordering quality improves substantially (e.g., post-M12 NNUE) so that tier-1 failure rates drop and tier-2 firings become rarer-but-more-targeted.
 
 **Tunables preserved for future revisit** (in case a future iteration reaches the revisit conditions):
 - `ASPIRATION_INTERMEDIATE_HALF_WIDTH` (v1 was 150 — Crafty-proportional): try `100`, `200`, `250` if revisiting.
@@ -314,14 +314,14 @@ Three SPSA-tunable params. Empirically this baseline captures 60-80% of the ML m
 - M4.D's gate is the fixed schedule passing mixed-TC SPRT; building ML training infra is a multi-week scope expansion to a phase that should land in days.
 - Prerequisites missing: tapered eval for proper phase signal (M6), SPSA / CLOP harness for the cheap baseline, position corpus, offline label-generation pipeline.
 - Elo headroom small at this layer: ~+3-5 Elo realistic ceiling for ML over hand-tuned, vs +50-80 Elo for NMP, +80-100 Elo for LMR, +400+ Elo for NNUE. Opportunity cost is poor.
-- NNUE (M11) re-trains the eval from scratch; an ML aspiration model trained on PeSTO eval would need re-training post-NNUE.
+- NNUE (M12) re-trains the eval from scratch; an ML aspiration model trained on PeSTO eval would need re-training post-NNUE.
 
 **When to land.** Four-tier escalation, each tier proceeding only if the previous shows ≥ +5 Elo of remaining headroom worth chasing:
 
 1. **Fixed schedule (M4.D)** — ±50 default, width-tuned via mixed-TC SPRT. Ships at M4.D close.
-2. **TC- or depth-adaptive parametric (post-M5, pre-M11)** — `base · max(min_factor, 1 - α·(depth - threshold))`. SPSA-tuned. Cheapest validation of the depth/TC interaction motif. **ATTEMPTED 2026-06-02 (campaign item B) — NO SHIP (flat).** Linear depth-adaptive first-try width (`BASE=50, SLOPE=4, MIN=16`; depth 6 = 50 unchanged, narrowing to 16 by depth ~14.5), hand-picked defaults (no SPSA harness). SPRT vs `M5.F.1` (mixed-TC + virtual-clock, 400 games, seed `…E0B0`): **Δ Elo −9.56 [−32.51, +13.32]**, CI-lower < 0. Per-TC noisy/bimodal with **no depth-amplifying trend** (10+0.1, where width ≈ base, was the *worst* bucket) ⇒ the narrowing itself is net-neutral-to-harmful at current strength, not a tuning-magnitude issue. Consistent with the ~+2–4 Elo ceiling being below the CI bar. A gentler-slope variant is unmotivated (no per-TC direction to tune toward). `bench/sprt/2026-06-02-b-depth-adaptive-aspiration-vs-m5f1.md`; `bench/sprt/patches/b-depth-adaptive-aspiration.patch`. Tier 3/4 (delta-baseline / MLP) stay gated on tier-2 showing ≥+5 Elo headroom — which it did **not** — so they sink further down the queue (revisit post-M11/NNUE).
-3. **Cheap delta-baseline (post-M11 or earlier if (2) saturates)** — `window = clamp(k · |score(d-1) − score(d-2)|, MIN, MAX)`. Three SPSA-tunable params.
-4. **MLP (post-M11, only if (2)+(3) saturate)** — full feature set + hidden layer.
+2. **TC- or depth-adaptive parametric (post-M5, pre-M12)** — `base · max(min_factor, 1 - α·(depth - threshold))`. SPSA-tuned. Cheapest validation of the depth/TC interaction motif. **ATTEMPTED 2026-06-02 (campaign item B) — NO SHIP (flat).** Linear depth-adaptive first-try width (`BASE=50, SLOPE=4, MIN=16`; depth 6 = 50 unchanged, narrowing to 16 by depth ~14.5), hand-picked defaults (no SPSA harness). SPRT vs `M5.F.1` (mixed-TC + virtual-clock, 400 games, seed `…E0B0`): **Δ Elo −9.56 [−32.51, +13.32]**, CI-lower < 0. Per-TC noisy/bimodal with **no depth-amplifying trend** (10+0.1, where width ≈ base, was the *worst* bucket) ⇒ the narrowing itself is net-neutral-to-harmful at current strength, not a tuning-magnitude issue. Consistent with the ~+2–4 Elo ceiling being below the CI bar. A gentler-slope variant is unmotivated (no per-TC direction to tune toward). `bench/sprt/2026-06-02-b-depth-adaptive-aspiration-vs-m5f1.md`; `bench/sprt/patches/b-depth-adaptive-aspiration.patch`. Tier 3/4 (delta-baseline / MLP) stay gated on tier-2 showing ≥+5 Elo headroom — which it did **not** — so they sink further down the queue (revisit post-M12/NNUE).
+3. **Cheap delta-baseline (post-M12 or earlier if (2) saturates)** — `window = clamp(k · |score(d-1) − score(d-2)|, MIN, MAX)`. Three SPSA-tunable params.
+4. **MLP (post-M12, only if (2)+(3) saturate)** — full feature set + hidden layer.
 
 **Estimated size.** Adaptive parametric: ~30-50 LOC + SPSA harness reuse. Cheap delta-baseline: ~50 LOC + SPSA harness reuse. ML model: ~500-800 LOC (feature extraction + inference + offline-training pipeline as a separate Python or Rust binary), plus the corpus + label-generation infrastructure (potentially shared with Texel tuning or NNUE data prep).
 
@@ -331,7 +331,7 @@ Three SPSA-tunable params. Empirically this baseline captures 60-80% of the ML m
 
 **Pulled from M5.H1 plan §1 / ADR-0030 §8.** Split the captures stage into "good captures" (SEE ≥ 0) yielded immediately after TT and "bad captures" (SEE < 0) yielded last, after quiets. Per CPW Static Exchange Evaluation + Move Ordering pages.
 
-**Prerequisites.** SEE infrastructure (no current ETA in roadmap; M11+ candidate alongside NNUE training). Without SEE, the MVV-LVA-only capture sort is the recommended starting point per research §6.2.
+**Prerequisites.** SEE infrastructure (no current ETA in roadmap; M12+ candidate alongside NNUE training). Without SEE, the MVV-LVA-only capture sort is the recommended starting point per research §6.2.
 
 **Estimated Elo gain.** Hard to disentangle from SEE itself; captures-split is one of several SEE consumers. Tuning-backlog entry rather than roadmap-promised.
 
@@ -345,7 +345,7 @@ Three SPSA-tunable params. Empirically this baseline captures 60-80% of the ML m
 
 **Lessons.** (1) **Val-loss is a poor Elo predictor — reaffirmed with the sign flipped:** a 0.35% val-loss *improvement* bought a 64 Elo *loss* (cf. M6.J's cold/warm 2-µ-loss = +41 Elo). (2) **The counterintuitive M6.I/M6.J sign shapes are not cleanup targets via a constrained refit** — forcing principled signs and recompensating produced a decisively worse-playing eval; the corpus genuinely wants the unconstrained shapes (this is the item's own "abandon if … the corpus genuinely wants the unconstrained shapes" criterion, now realized at SPRT rather than val-loss). (3) **Attribution: RESOLVED — refit-drift, NOT the sign clamps** (control run 2026-06-07, `bench/sprt/2026-06-07-unconstrained-refit-control-vs-m5k.md`). Reran the identical recipe *minus* the constraints (same paired seed `…F0007`): the **unconstrained** refit scored **−68.63 [−94.92, −43.09]** — statistically identical to the constrained −64.13 (marginally worse, despite a tighter val-loss 0.142186). So **a fresh full corpus refit regresses ~−65 Elo vs M6.J regardless of sign/mono constraints**; the clamps are exonerated. The unconstrained refit moreover **reproduced and amplified** the counterintuitive shapes (`ISO_MG=+7`, `PASSED_MG=[0,0,-41,-32,1,39,43,0]`) ⇒ **the corpus genuinely wants the prior-violating signs**, so the sign-shape "cleanup" is moot (the data prefers the violations; they are not what regresses play). The real failure is that **M6.J's specific tuned vector is not reproducible by a naive warm-start refit on the re-materialized corpus** — val-loss improves, play craters; the shared inflated `PASSED_EG` drives the common 60+0.6 collapse in both refits. The **durable deliverable** remains the sign-projection optimizer numerics (`edf6246`), reusable by any future constrained tune. **Practical takeaway for any future eval re-tune: do not expect a corpus Texel refit to hold M6.J's strength — the gap between the val-loss optimum and the Elo optimum is large and not crossable by warm-start refitting; a different mechanism (NNUE / SPSA-on-games) is needed.**
 
-**Cross-ref:** the Arm-B PST co-tune item (above) — the natural merge target for any future eval-weight re-opening — is itself sensitivity-gate-checked NO-GO/deprioritized (2026-06-03), so the whole eval-weight surface is now closed pre-NNUE. King Activity / AKPC residual gaps + this sign-shape question all defer to M11/NNUE.
+**Cross-ref:** the Arm-B PST co-tune item (above) — the natural merge target for any future eval-weight re-opening — is itself sensitivity-gate-checked NO-GO/deprioritized (2026-06-03), so the whole eval-weight surface is now closed pre-NNUE. King Activity / AKPC residual gaps + this sign-shape question all defer to M12/NNUE.
 
 ---
 
@@ -360,7 +360,7 @@ These survive because the M6.I tune used only ridge-toward-shipped + light monot
 
 **Why deferred, not done now.** Re-tuning under sign/monotonicity constraints needs its own SPRT (any weight change vs the shipped `M6.I` is a strength claim). It is not free, and the expected delta is small (these are minor terms). Worth doing only when a tuning slot opens and ideally folded into the larger Arm-B PST co-tune below (which already re-opens the whole eval-weight surface).
 
-**Recommended approach at promotion.** Warm-start from the shipped `M6.I` vector. Add per-term sign constraints (penalty terms ≤ 0; passed/connected bonuses ≥ 0 and rank-monotone) as projected-gradient clamps or strong one-sided ridge. Pick the constraint strength by held-out validation loss; SPRT the winner vs `M6.I`. **Baseline = the `M6.I` tag.** Abandon if (a) constrained validation loss is materially worse (the corpus genuinely wants the unconstrained shapes), or (b) M11/NNUE lands first (obsoletes classical weights).
+**Recommended approach at promotion.** Warm-start from the shipped `M6.I` vector. Add per-term sign constraints (penalty terms ≤ 0; passed/connected bonuses ≥ 0 and rank-monotone) as projected-gradient clamps or strong one-sided ridge. Pick the constraint strength by held-out validation loss; SPRT the winner vs `M6.I`. **Baseline = the `M6.I` tag.** Abandon if (a) constrained validation loss is materially worse (the corpus genuinely wants the unconstrained shapes), or (b) M12/NNUE lands first (obsoletes classical weights).
 
 **Update 2026-06-02 (campaign item C — examined, NOT run; folded into Arm-B per user decision).** Inspected the Texel harness (`src/bin/texel-tune.rs`, `src/texel/{optimizer,loss}.rs`):
 - `tune` warm-starts from `EvalParams::shipped()` ✓.
@@ -396,7 +396,7 @@ Run order is forced (not a preference): **A first** — it is M6.I's committed d
 
 **Expected impact.** Recovery of the under-weighting bias the frozen-PST screens left on the table across M6.B–F. Magnitude unknown until A's sensitivity table quantifies the pinned-near-zero residual; plausibly modest (the per-phase screens suggest the dominant double-counts are a handful of axes: pawn-shield × PeSTO king MG PST, slider mobility EG × PeSTO slider PST, CONN × ISO, and the M6.F outpost/rook-file × PeSTO N/B/R centralization overlap). Bounded upside, real provenance/variance cost — hence gated, not queued.
 
-**Hard rejection criteria.** Abandon permanently if: (a) the λ-sweep's held-out-validation-optimal λ is ≈ ∞ (data does not want the PSTs to move — frozen was right); or (b) the best λ beats A on validation loss but SPRT-regresses or is flat vs `M6.I` (proxy-overfit confirmed, the regime warning realized); or (c) M11/NNUE has landed first — NNUE re-trains the eval from scratch and obsoletes all classical PSTs, zeroing this campaign's value. Priority therefore decays as M11 approaches; this is a *pre-M11* opportunity only.
+**Hard rejection criteria.** Abandon permanently if: (a) the λ-sweep's held-out-validation-optimal λ is ≈ ∞ (data does not want the PSTs to move — frozen was right); or (b) the best λ beats A on validation loss but SPRT-regresses or is flat vs `M6.I` (proxy-overfit confirmed, the regime warning realized); or (c) M12/NNUE has landed first — NNUE re-trains the eval from scratch and obsoletes all classical PSTs, zeroing this campaign's value. Priority therefore decays as M12 approaches; this is a *pre-M12* opportunity only.
 
 **Cross-references.** Roadmap §M6 (M6.I scope detail, frozen-PST commitment; M6.G corpus scope detail; M6.F Tier-1-feature scope detail); ADR-0032 §8 / ADR-0033 §7-8 ("re-derive … against our PeSTO PSTs" — the freeze, whose rationale this entry records explicitly); `src/eval/data.rs` (`MATERIAL`/PST arrays — the frozen reference frame); the M6.D/M6.E per-phase screens (empirical double-count evidence). Conceptual lineage: the gauge-freedom / K-anchoring discussion (centipawn scale is set by the vendored PeSTO magnitude, pinned by freezing K against the M6.F baseline; co-tuning would re-gauge — out of scope for A, in scope for B under the ridge-toward-PeSTO prior).
 
@@ -406,7 +406,7 @@ Run order is forced (not a preference): **A first** — it is M6.I's committed d
 
 ### M6.I king-safety attacker S-curve — SPSA-deflate + SPRT (post-M6.I; the one M6 term Texel left off)
 
-**Status.** **CLOSED NEGATIVE at M6.K (2026-05-29) — the attacker S-curve was REMOVED; not pursued further pre-NNUE.** Both mixed-TC SPRT probes vs `M6.J` regressed: stage 1 (g=1 literature) **Δ Elo −44.54 [−72.13, −17.50]**, stage 2 (g=0.5 deflate) **~−48** (same class — deflation didn't salvage it). The M6.E double-count vs the PeSTO king PST is real and persists at half magnitude (optimum g≈0), so the S-curve was deleted (eval-neutral vs `M6.J`). See ADR-0038 + `docs/milestones/m6.k.md`. King Activity / AKPC remain the largest residual classical-eval gaps but are now deferred to NNUE (M11), which re-learns king safety from scratch. Re-addable from git + ADR-0038 if ever revisited. The structural/semantic rationale below is retained as the record.
+**Status.** **CLOSED NEGATIVE at M6.K (2026-05-29) — the attacker S-curve was REMOVED; not pursued further pre-NNUE.** Both mixed-TC SPRT probes vs `M6.J` regressed: stage 1 (g=1 literature) **Δ Elo −44.54 [−72.13, −17.50]**, stage 2 (g=0.5 deflate) **~−48** (same class — deflation didn't salvage it). The M6.E double-count vs the PeSTO king PST is real and persists at half magnitude (optimum g≈0), so the S-curve was deleted (eval-neutral vs `M6.J`). See ADR-0038 + `docs/milestones/m6.k.md`. King Activity / AKPC remain the largest residual classical-eval gaps but are now deferred to NNUE (M12), which re-learns king safety from scratch. Re-addable from git + ADR-0038 if ever revisited. The structural/semantic rationale below is retained as the record.
 
 _Original deferral note (M6.I harness landing, 2026-05-24):_ M6.I tuned the *linear* king-safety terms (pawn-shield + open/semi-open-file) but **excluded the attacker-count S-curve** (the 100-entry `KING_SAFETY_TABLE` + the 4 per-kind `KING_ATTACK_WEIGHT_*` multipliers) — it shipped at zero (off), identical to M6.F. ADR-0037 §3 / `docs/milestones/m6.i.md`.
 
@@ -428,9 +428,9 @@ _Original deferral note (M6.I harness landing, 2026-05-24):_ M6.I tuned the *lin
 
 **Validation.** Mixed-TC SPRT vs the `M6.I` tag (post-M6.I, so king safety co-exists with the tuned mobility/pawn weights it interacts with). Apply via a small extension of `texel-tune apply` (or hand-edit the marked `eval::data` king-safety regions — the markers exist).
 
-**Trigger / go-no-go.** Promote after the M6.I SPRT resolves and `M6.I` is tagged. Skip if M11/NNUE is imminent.
+**Trigger / go-no-go.** Promote after the M6.I SPRT resolves and `M6.I` is tagged. Skip if M12/NNUE is imminent.
 
-**Opportunity-cost caveat (priority decays as M11 approaches).** King safety is exactly the nonlinear pattern NNUE (M11) learns natively and obsoletes — the same decay logic as the "M6.I PST co-tuning" Arm B. Worth the cheap on/off SPRT + a light SPSA deflation *if it pays*; **not** worth heavy hand-tuning of the curve shape. A pre-M11 opportunity only.
+**Opportunity-cost caveat (priority decays as M12 approaches).** King safety is exactly the nonlinear pattern NNUE (M12) learns natively and obsoletes — the same decay logic as the "M6.I PST co-tuning" Arm B. Worth the cheap on/off SPRT + a light SPSA deflation *if it pays*; **not** worth heavy hand-tuning of the curve shape. A pre-M12 opportunity only.
 
 **Cross-references.** ADR-0037 §3 (the exclusion + its structural/semantic reasons) / §4 (the non-linear-params-outside-the-linear-core pattern); `docs/milestones/m6.i.md` (king-safety scope + lessons); ADR-0033 / `docs/research/m6-king-safety.md` (M6.E's HIGH transfer-risk verdict — the double-count this campaign measures); `docs/research/m6-texel-tuning.md` §3-§4 (freeze-and-sweep for non-linear terms; quiet-corpus blind spot).
 

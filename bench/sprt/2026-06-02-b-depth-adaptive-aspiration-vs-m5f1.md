@@ -55,6 +55,6 @@ current strength rather than a tuning-magnitude issue.
   "right idea, wrong magnitude"). Consistent with the backlog's small-ceiling
   estimate (+2–4 Elo) being below the CI-lower>0 bar; here the point estimate is
   even mildly negative.
-- Revisit conditions unchanged: the tier escalates only post-M11/NNUE or if the
+- Revisit conditions unchanged: the tier escalates only post-M12/NNUE or if the
   fixed schedule saturates with measurable headroom (`docs/tuning-backlog.md`).
 - Patch preserved at `bench/sprt/patches/b-depth-adaptive-aspiration.patch`.

@@ -9,7 +9,7 @@ M6.J STS diagnostics pinned **King Activity 555 / AKPC 628** as the largest resi
 - **Non-linear in the tunable surface.** The term is `score = KING_SAFETY_TABLE[Σ multiplier_kind · attackers]`. With the multipliers shipped at zero, `units ≡ 0` ⇒ only `TABLE[0]` is reachable ⇒ the table is dead by construction. Making the index live needs non-zero multipliers, which breaks the linear inner solve.
 - **Quiet-corpus blind spot.** The corpus's `|static − qsearch| < 30` quiet filter preferentially strips the sharp king-attack positions whose game outcome would train the high-danger end of the curve.
 
-King danger is realized in *games*, so it is tuned on games (SPRT, and SPSA if needed), not on a quiet-position static regression. This was `tuning-backlog.md` item 9; M6.K promotes it to a milestone. Gate opened when M6.J shipped (2026-05-29). Pre-M11 opportunity only — NNUE (M11) re-trains the eval from scratch and obsoletes all classical king-safety weights.
+King danger is realized in *games*, so it is tuned on games (SPRT, and SPSA if needed), not on a quiet-position static regression. This was `tuning-backlog.md` item 9; M6.K promotes it to a milestone. Gate opened when M6.J shipped (2026-05-29). Pre-M12 opportunity only — NNUE (M12) re-trains the eval from scratch and obsoletes all classical king-safety weights.
 
 ## Decision
 

@@ -26,9 +26,9 @@ Rationale: simple; flushes stale entries naturally between root searches; same-d
 
 ### 2. Entry key discipline: full 64-bit Zobrist (single-threaded)
 
-Stored: full 64-bit Zobrist key in each entry. Single-threaded for M4–M9 by ADR-0011 invariant.
+Stored: full 64-bit Zobrist key in each entry. Single-threaded for M4–M10 by ADR-0011 invariant.
 
-Rationale: collision rate ~1 per 4 billion at 64 bits; the lockless XOR-trick (Texel / Stockfish style) solves a concurrency problem we don't have until M10 Lazy SMP. Migration to lockless at M10 replaces `(key: u64, data...)` with `(key_xor_data: u32, data: u64)` — a clean internal refactor; no M4.A code anticipates it.
+Rationale: collision rate ~1 per 4 billion at 64 bits; the lockless XOR-trick (Texel / Stockfish style) solves a concurrency problem we don't have until M11 Lazy SMP. Migration to lockless at M11 replaces `(key: u64, data...)` with `(key_xor_data: u32, data: u64)` — a clean internal refactor; no M4.A code anticipates it.
 
 ### 3. Per-entry packing: 16 bytes
 
@@ -131,7 +131,7 @@ Before promoting the TT move to index 0 of `moves_vec`, scan the legal list for 
 
 `Move::default() == 0u16` (a1-a1-Quiet) is the no-move sentinel; never appears in any legal list, so the membership scan rejects the sentinel without a separate guard.
 
-If migrating to partial-key + XOR-trick at M10: legality check remains mandatory.
+If migrating to partial-key + XOR-trick at M11: legality check remains mandatory.
 
 ### 13. Per-node prologue ordering
 
@@ -180,6 +180,6 @@ Future M4.B–D state additions (killer slots, history table) extend the search-
 ## Consequences
 
 - TT module shipping enables M4.B (killer) / M4.C (history) / M4.D (aspiration) without further structural change to the negamax prologue.
-- Single-threaded `UnsafeCell` is the structural commitment; M10 Lazy SMP swaps to `Vec<AtomicU64>`-pair entries.
+- Single-threaded `UnsafeCell` is the structural commitment; M11 Lazy SMP swaps to `Vec<AtomicU64>`-pair entries.
 - Mate-score discipline lives in `tt.rs` as `score_to_tt` / `score_from_tt`; M5 qsearch-in-TT reuses them as-is.
 - Plan-review (pass 2) verdict: `no further substantive issues`.

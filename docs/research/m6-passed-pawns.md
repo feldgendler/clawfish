@@ -305,11 +305,11 @@ free-running. This is the correct semantics, not a double-count.
 | Candidate (half-)passers | Requires a recursive or approximate bitboard check; adds detection complexity; M6.C benefit/risk ratio is better without it | M6.I or later |
 | Connected-passer extra bonus | Requires identifying connected passer pairs; moderate complexity; additive on top of existing CONN + passed-rank | M6.I (Texel adjusts implicitly when CONN + passed-rank are jointly tuned) |
 | Protected-passer extra bonus | Modest complexity; "long-range" bonus for passed pawn defended by friendly pawn; overlaps with CONN for many cases | M6.I |
-| Unstoppable passer / Rule of the Square (static eval) | Search-interacting: "programs rely on search to solve all kinds of possible tactics" (CPW Unstoppable Passer). Static only gives a large bonus that can mislead shallow search. Explicitly fragile. | M9 or later; requires search extension or tablebase support |
+| Unstoppable passer / Rule of the Square (static eval) | Search-interacting: "programs rely on search to solve all kinds of possible tactics" (CPW Unstoppable Passer). Static only gives a large bonus that can mislead shallow search. Explicitly fragile. | M10 or later; requires search extension or tablebase support |
 | Rook-behind-passer (Tarrasch rule) | Requires rook position info — cannot live in the pawn-hash evaluator; needs piece evaluator integration | M6.D (mobility) or dedicated piece-eval phase |
 | Passed-pawn blockade by own piece | Own piece blocking own passer is a strategic weakness but minor in strength gain; search handles it | M6.I candidate or defer |
 | Outside passed pawn extra bonus | Requires identifying leftmost/rightmost passer relative to all other pawns; king deflection logic | M6.I candidate |
-| Pawn race / tempo-aware evaluation | STM-dependent; cannot be cached in pawn hash; requires careful interaction with search | M9 (post-tablebase) |
+| Pawn race / tempo-aware evaluation | STM-dependent; cannot be cached in pawn hash; requires careful interaction with search | M10 (post-tablebase) |
 
 None of these are required for a useful M6.C. The three M6.C components (rank
 bonus + king-distance + path discriminator) are independently sufficient for a

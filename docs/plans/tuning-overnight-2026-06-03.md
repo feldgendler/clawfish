@@ -51,7 +51,7 @@ empirical confirmation of the stale "~depth 8-12" prior). No code change.
 Three-part gate; the depth≥14 sub-gate (shared with item 1) fails ⇒ the item is
 gated regardless, so the history≥4000/game sub-measurement is moot tonight. No
 code change. (Revisit per the backlog when depth-reach clears 14 — most likely a
-post-M11/NNUE event, or after a parallelism/NPS milestone.)
+post-M12/NNUE event, or after a parallelism/NPS milestone.)
 
 ### Item 3 — M5.F qsearch-TT → **SPRT #1: qsearch-local-depth gate**
 The margin-gate (2026-06-02 A(a)) failed; the one remaining untried M5.F.3-
@@ -85,7 +85,7 @@ SPRT vs `M5.F.1` (elo1=10). Honest prior: low.
 
 ### Item 6 — M5.H2 SEE-split captures → **BLOCKED (prerequisite missing)**
 Requires SEE infrastructure, which does not exist. Building SEE from scratch is a
-milestone-scale feature (M11+ candidate per the backlog), not a tuning run — out
+milestone-scale feature (M12+ candidate per the backlog), not a tuning run — out
 of scope for an overnight tuning campaign and inappropriate to land unattended.
 No build. Documented as blocked-on-prerequisite.
 
@@ -129,7 +129,7 @@ sign-projection from item 7 is shared infra toward this.
 ### Item 9 — king-safety attacker S-curve → **CLOSED NEGATIVE (no re-run)**
 Removed at M6.K (both probes regressed; double-count vs PeSTO king PST confirmed
 at half magnitude, optimum g≈0). No new hypothesis ⇒ no re-run. Deferred to
-NNUE (M11), which re-learns king safety natively.
+NNUE (M12), which re-learns king safety natively.
 
 ## Sequencing & ETA
 

@@ -77,7 +77,7 @@ if sp >= beta {
 ## Item B — depth-adaptive aspiration first-try half-width
 
 **Backlog ref:** "ML-tuned aspiration window sizing" tier 2 (depth-adaptive
-parametric). The cheapest, lowest-risk item; explicitly "post-M5, pre-M11."
+parametric). The cheapest, lowest-risk item; explicitly "post-M5, pre-M12."
 
 **Current.** `aspiration_window(prior, depth)` uses a constant
 `ASPIRATION_HALF_WIDTH = 50` for all `depth >= ASPIRATION_MIN_DEPTH = 6`.

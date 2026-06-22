@@ -14,7 +14,7 @@ Tier-1 features). M6.I is the single joint-Texel pass over that surface
 against a baseline tag of `M6.F`. M6.I consumes a **reusable
 game-result-labeled quiet-position corpus**, which is also a precondition
 of three other downstream consumers: the tuning-backlog "PST co-tuning"
-Arm B, future SPSA campaigns, and M11 NNUE data-prep. M6.G is the corpus
+Arm B, future SPSA campaigns, and M12 NNUE data-prep. M6.G is the corpus
 phase that decouples the corpus from M6.I's tuning loop — its own
 sub-milestone because the corpus has distinct *data* failure modes
 (label-provenance leakage, decisive/draw imbalance, opening
@@ -405,7 +405,7 @@ M6.H2 unifies the four `Source` lanes (`SelfPlayOnBook`, `SelfPlayOffBook`, `Ccr
   contract + a frozen-bytes reproducibility guarantee + a passing
   data-quality gate) is consumable by the M6.I tuner.
 - The tuning-backlog "PST co-tuning" Arm B, future SPSA campaigns, and
-  M11 NNUE data-prep have a stable contract surface
+  M12 NNUE data-prep have a stable contract surface
   (`manifest.json` + `filter_spec.txt` + the binary shard format).
 - The committed artifact is small (self-play-dominant). M6.I's
   effective corpus size in the joint-Texel pass depends on the operator

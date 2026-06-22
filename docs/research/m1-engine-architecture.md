@@ -260,7 +260,7 @@ A competent magic-bitboard movegen on a modern desktop CPU sits in the **100–3
 - **Mailbox writes** per make/unmake. Mandatory; eyeball in profiles.
 - **Branch misprediction in evasion code.** Different path for ~5–15% of positions. `cold` annotations or function separation help. Premature for M1.
 - **Move-list copies.** Returning 256 entries by value is ~1 KB stack churn. Not a real bottleneck.
-- **NEON irrelevance for movegen.** Bitwise + popcount + tzcnt on single `u64`s. NEON helps NNUE (M11), not M1.
+- **NEON irrelevance for movegen.** Bitwise + popcount + tzcnt on single `u64`s. NEON helps NNUE (M12), not M1.
 - **PGO matters.** `cargo-pgo` reportedly buys 10–20%. Defer to post-M3.
 
 Apple-specific: strong unaligned load support — no `#[repr(align)]` needed on `Position`. Use `samply` for sampling (nicer flamegraphs per prose); Instruments → Time Profiler as backup; `criterion` for microbench.

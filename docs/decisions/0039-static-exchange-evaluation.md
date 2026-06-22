@@ -8,7 +8,7 @@ M7.A introduces Static Exchange Evaluation: resolving a capture sequence on one
 square to its net material outcome. SEE is a **search** primitive (it needs only
 piece values, not the hand-crafted eval terms M6 tuned), so — unlike the
 classical eval — **NNUE does not obsolete it**: SEE-based capture ordering and
-qsearch pruning persist under a learned eval. It is slotted before NNUE (M11) so
+qsearch pruning persist under a learned eval. It is slotted before NNUE (M12) so
 its benefit is reaped across every later milestone, and it unblocks the ADR-0030
 §9 deferred good/bad capture split (and the future ADR-0026 SEE capture-futility
 and qsearch SEE-pruning, M7.B/M7.C).

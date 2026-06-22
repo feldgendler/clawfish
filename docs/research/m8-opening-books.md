@@ -1,6 +1,6 @@
-# Opening Book Landscape for M8.A
+# Opening Book Landscape for M9.A
 
-**Report for milestone M8.A (opening-book integration)**
+**Report for milestone M9.A (opening-book integration)**
 **Research date: 2026-06-22**
 
 ---
@@ -362,7 +362,7 @@ This gives unambiguous provenance (no third-party copyright) and a deterministic
 
 ---
 
-## Locked M8.A scope (decided 2026-06-22)
+## Locked M9.A scope (decided 2026-06-22)
 
 Decisions taken on the basis of this report; the format scope falls out of the book
 evaluation (requirements-first), not the other way around.
@@ -375,13 +375,13 @@ evaluation (requirements-first), not the other way around.
   Zobrist key; collect contiguous same-key entries. Decode the king→rook castling
   encoding and promotion bits. Weights treated as opaque within-position priorities;
   selection policies weighted-random (default) + best-weight; sum in `u64`; skip weight-0.
-- **Robustness / fuzzing.** M8.A is the engine's first runtime parser of an untrusted
+- **Robustness / fuzzing.** M9.A is the engine's first runtime parser of an untrusted
   binary blob. Mandatory legality validation: every decoded move is checked against the
   position's legal moves and skipped (never played) on mismatch — this neutralizes Zobrist
   collisions and corruption. Any structural anomaly → "book miss → fall through to search,"
   never a panic. Ship a **fuzz target** over the decoder (likely the project's first):
   never panics, terminates, only returns legal moves, no overflow. Add "fuzz harness for
-  binary parsers" to `docs/tooling-backlog.md`; this sets the precedent for M11 NNUE binary
+  binary parsers" to `docs/tooling-backlog.md`; this sets the precedent for M12 NNUE binary
   loading.
 - **Production book.** Vendor jja CC0 `lichess-201301-202303-2800+.bin` (~3 MB, CC0) as the
   default, **overridable via `BookFile`**.
@@ -395,7 +395,7 @@ evaluation (requirements-first), not the other way around.
   add; blended-union (per-book normalization + mixing coefficients) deferred.
 - **Gate.** Correctness, not Elo (M5.E precedent): hash-compat + weight-decode round-trips +
   the fuzz invariants. SPRT dilutes book Elo to ~0 by design; strength confirmation deferred
-  to M13. One ADR allocated at landing. Est. ~500–800 LOC.
+  to M15. One ADR allocated at landing. Est. ~500–800 LOC.
 
 ---
 
