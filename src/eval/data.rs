@@ -18,38 +18,40 @@
 // M6.B pawn-structure weight constants. Source: docs/research/m6-pawn-
 // structure.md §6 (literature defaults).
 //
-// **Shipped config: connected-pawn term only.** ISO/DBL/BWD weights are
-// **zeroed** — a per-term SPRT screen + confirmation vs `M6.A` proved each
-// term individually positive-to-neutral (ISO +82.7, DBL +31.4, BWD −7.5,
-// CONN +103.1) yet every multi-term subset collapses via a connectivity-axis
-// double-count (ISO×CONN −197.9; all-four −99.9). CONN-only is the largest
-// confirmed gain (+103.1 [+65.5, +143.1] H1) and is interaction-immune.
-// ISO/DBL/BWD are kept as named tunable constants (the term math in
-// `pawns::pawn_eval` still references them at zero weight, M6.F-ready);
-// **M6.F re-introduces them via joint Texel** against the CONN-only baseline.
-// ADR-0032 §7; docs/milestones/m6.b.md.
+// **LIVE since M6.I — all of ISO/DBL/BWD/CONN are active, joint-Texel-tuned
+// weights; the values below are the M6.J meta-tune output (`texel-tune
+// apply`). They are NOT zeroed.** Some Texel-fit shapes are counterintuitive
+// (e.g. ISO_MG positive) — a sign/monotonicity-constrained retune is
+// backlogged (CLAUDE.md M6).
+//
+// History (why they once landed zeroed): at M6.B only the connected-pawn term
+// shipped — a per-term SPRT screen vs `M6.A` proved each term individually
+// positive-to-neutral (ISO +82.7, DBL +31.4, BWD −7.5, CONN +103.1) yet every
+// multi-term subset collapsed via a connectivity-axis double-count (ISO×CONN
+// −197.9; all-four −99.9), so ISO/DBL/BWD landed zeroed (kept as named
+// constants, term math live at zero weight) pending a joint re-tune. M6.I's
+// joint Texel (SPRT +93.86 vs `M6.F`) reshaped and activated the full set;
+// M6.J retuned to the current values. ADR-0032 §7;
+// docs/milestones/{m6.b,m6.i,m6.j}.md.
 //
 // These are data constants, not logic. They are excluded from `cargo mutants`
 // per `.cargo/mutants.toml` alongside the PST arrays.
 // ---------------------------------------------------------------------------
 
 // TEXEL-TUNABLE-BEGIN: iso_dbl_bwd
-/// Isolated pawn penalty, middlegame (per pawn). Negative = penalty.
-/// Zeroed in the shipped CONN-only config (M6.F re-tunes); see block comment.
+/// Isolated pawn penalty, middlegame (per pawn). Live (M6.J-tuned).
 pub(crate) const ISO_MG: i32 = 4;
-/// Isolated pawn penalty, endgame (per pawn). Zeroed — see `ISO_MG`.
+/// Isolated pawn penalty, endgame (per pawn). Live — see `ISO_MG`.
 pub(crate) const ISO_EG: i32 = -1;
 
-/// Doubled pawn penalty, middlegame (per *extra* pawn on a file).
-/// Zeroed in the shipped CONN-only config (M6.F re-tunes); see block comment.
+/// Doubled pawn penalty, middlegame (per *extra* pawn on a file). Live.
 pub(crate) const DBL_MG: i32 = -23;
-/// Doubled pawn penalty, endgame. Zeroed — see `DBL_MG`.
+/// Doubled pawn penalty, endgame. Live — see `DBL_MG`.
 pub(crate) const DBL_EG: i32 = -14;
 
-/// Backward pawn penalty, middlegame (CPW-simple predicate).
-/// Zeroed in the shipped CONN-only config (M6.F re-tunes); see block comment.
+/// Backward pawn penalty, middlegame (CPW-simple predicate). Live.
 pub(crate) const BWD_MG: i32 = -7;
-/// Backward pawn penalty, endgame. Zeroed — see `BWD_MG`.
+/// Backward pawn penalty, endgame. Live — see `BWD_MG`.
 pub(crate) const BWD_EG: i32 = -7;
 // TEXEL-TUNABLE-END: iso_dbl_bwd
 
@@ -74,11 +76,17 @@ pub(crate) const CONN_EG: [i32; 8] = [0, 0, 11, 9, 15, 27, 33, 0];
 // §8 (literature defaults — MadChess 3.0 Beta Build 103 rank+path, placeholder
 // king-distance).
 //
-// **Shipped config: all passed-pawn weights zeroed (score-neutral landing).**
-// A three-screen SPRT vs `M6.B` (env-mask subset filter, no value tuning —
-// the M6.B "Subset rework" method) proved the literature-default passed-pawn
-// weights have a *scale-invariant structural* mismatch with this engine, with
-// no global scalar that recovers Elo:
+// **LIVE since M6.I — the full passed-pawn weight set is active and
+// joint-Texel-reshaped; the values below are the M6.J meta-tune output. They
+// are NOT zeroed.** (Note the negative early-rank PASSED_MG entries — a
+// counterintuitive but SPRT-validated Texel shape; sign/monotonicity-
+// constrained retune backlogged.)
+//
+// History (why they once landed zeroed): a three-screen SPRT vs `M6.B`
+// (env-mask subset filter, no value tuning — the M6.B "Subset rework" method)
+// proved the *literature-default* passed-pawn weights had a *scale-invariant
+// structural* mismatch with this engine, with no global scalar that recovered
+// Elo:
 //   - **all-three** literature default: Δ Elo **−21.74** — the 60+0.6 bucket
 //     collapsed W15-L57 (KDIST slow-TC-toxic: distance-proportional, rank-
 //     scaled placeholder coeffs over-help shallow ordering and reverse with
@@ -91,18 +99,15 @@ pub(crate) const CONN_EG: [i32; 8] = [0, 0, 11, 9, 15, 27, 33, 0];
 //     signature; halving did not recover Elo, it merely migrated the failure
 //     to the 20+0.2 bucket. No global multiplier fixes a wrong-*shape* set.
 //
-// Conclusion: the failure is scale-invariant and structural, not a magnitude
-// knob → a joint *reshape* (not a rescale) is required. **M6.F joint Texel
-// re-introduces and reshapes the entire passed-pawn weight set** against the
-// shipped (CONN-only, passed-zeroed) baseline. The constants stay named and
-// referenced — `pawns::passed_pawn_term_white` exercises the full term math at
-// zero weight (M6.F-ready), the M6.B ISO/DBL/BWD `pawn_eval` precedent.
-// ADR-0032 §7; docs/milestones/m6.c.md.
+// The failure was scale-invariant and structural, not a magnitude knob → a
+// joint *reshape* (not a rescale) was required. That reshape landed: M6.I's
+// joint Texel re-derived and activated the entire passed-pawn weight set, and
+// M6.J retuned to the current values. ADR-0032 §7; docs/milestones/m6.c.md +
+// m6.i.md.
 //
 // `PASSED_KDIST_CAP` is a **structural clamp, not a weight** (it bounds the
-// Chebyshev distance regardless of coefficient magnitude); it is inert at zero
-// coeffs but kept as the named M6.F-tunable structural constant, mirroring how
-// M6.B kept its term math live.
+// Chebyshev distance regardless of coefficient magnitude); the king-tropism
+// coefficients it clamps are now live (non-zero), so the clamp is active.
 //
 // Index convention matches `CONN_*`: relative rank 0..7 (`sq.rank()` for
 // white, `7 - sq.rank()` for black). Indices 0/1 are 0 (back rank / starting
@@ -120,38 +125,37 @@ pub(crate) const CONN_EG: [i32; 8] = [0, 0, 11, 9, 15, 27, 33, 0];
 
 // TEXEL-TUNABLE-BEGIN: passed
 /// Passed pawn rank bonus, middlegame. Indexed by relative rank (0..7).
-/// Zeroed in the shipped score-neutral config (M6.F re-tunes); see block
-/// comment.
+/// Live (M6.J-tuned); see block comment.
 #[rustfmt::skip]
 pub(crate) const PASSED_MG: [i32; 8] = [0, 0, -28, -14, 23, 36, 40, 0];
 
 /// Passed pawn rank bonus, endgame. Same indexing as `PASSED_MG`.
-/// Zeroed — see `PASSED_MG`.
+/// Live — see `PASSED_MG`.
 #[rustfmt::skip]
 pub(crate) const PASSED_EG: [i32; 8] = [0, 0, 15, 37, 38, 35, 5, 0];
 
 /// EG-only path-clear delta (MadChess free-path minus base EG). `+` when the
 /// front-span is empty of all pieces, `−` when an enemy piece is on it, `0`
 /// when only a friendly piece is on it (three-state — research §3 / ADR-0032
-/// §6). Same indexing as `PASSED_MG`. Zeroed — see block comment.
+/// §6). Same indexing as `PASSED_MG`. Live — see block comment.
 #[rustfmt::skip]
 pub(crate) const PASSED_FREE_EG_DELTA: [i32; 8] = [0, 0, -1, 12, 22, 28, 35, 0];
 
 /// EG-only king-tropism: cp per Chebyshev step the **own** king is closer to
-/// the passer's promotion square (rank-scaled by relative rank). Zeroed in the
-/// shipped score-neutral config (M6.F re-tunes); see block comment.
+/// the passer's promotion square (rank-scaled by relative rank). Live
+/// (M6.J-tuned); see block comment.
 pub(crate) const PASSED_KDIST_OWN_PER_STEP: i32 = 6;
 
 /// EG-only king-tropism: cp per Chebyshev step the **enemy** king is closer
 /// to the promotion square (rank-scaled; a near enemy king is a penalty).
-/// Zeroed — see `PASSED_KDIST_OWN_PER_STEP`.
+/// Live — see `PASSED_KDIST_OWN_PER_STEP`.
 pub(crate) const PASSED_KDIST_ENEMY_PER_STEP: i32 = 3;
 // TEXEL-TUNABLE-END: passed
 
 /// Chebyshev-distance clamp for the king-tropism term: beyond 5 steps king
 /// intervention is too slow to matter at shallow depth (research §2.2). A
-/// **structural clamp, not a weight** — kept as the named M6.F-tunable
-/// constant even though inert at the zeroed coeffs (see block comment).
+/// **structural clamp, not a weight** — kept as a named tunable structural
+/// constant; active now that the king-tropism coefficients are live.
 pub(crate) const PASSED_KDIST_CAP: i32 = 5;
 
 // ---------------------------------------------------------------------------
@@ -160,11 +164,14 @@ pub(crate) const PASSED_KDIST_CAP: i32 = 5;
 // ADR-0003-clean, not engine source). Single co-calibrated Texel set,
 // index = popcount(piece_attacks ∩ mobility_area).
 //
-// **Shipped config: ALL mobility weights zeroed (score-neutral landing).**
-// A §11 per-kind env-mask screen ladder vs `M6.C` (single-TC 10+0.1,
-// elo0=0/elo1=10, RUN ALONE) proved the literature defaults have a
-// *scale-invariant structural mismatch* with this engine's PeSTO PSTs —
-// no global scalar recovers Elo:
+// **LIVE since M6.I — all four mobility tables are active, joint-Texel-
+// reshaped weights; the values below are the M6.J meta-tune output. They are
+// NOT zeroed.**
+//
+// History (why they once landed zeroed): a §11 per-kind env-mask screen ladder
+// vs `M6.C` (single-TC 10+0.1, elo0=0/elo1=10, RUN ALONE) proved the
+// *literature defaults* had a *scale-invariant structural mismatch* with this
+// engine's PeSTO PSTs — no global scalar recovered Elo:
 //   - all-four literature default: Δ Elo **−131.62** [−165, −100] H0.
 //   - per-kind: {R} −77.60 H0 / {Q} −55.88 H0 / {N} −10.43 (≈flat,
 //     CI [−36,+15]) / {B} −136.30 H0 — **no positive interaction-immune
@@ -176,16 +183,14 @@ pub(crate) const PASSED_KDIST_CAP: i32 = 5;
 //     rescued. A global multiplier cannot make a wrong-shaped term
 //     non-negative; the failure is scale-invariant and structural.
 //
-// Conclusion (the M6.C disposition reproduced for mobility): the literature
-// tables are mis-*shaped* for this engine, not mis-*scaled*. **M6.F joint
-// Texel re-derives and reshapes the entire mobility weight set** against our
-// PeSTO PSTs jointly with the M6.B ISO/DBL/BWD + CONN rescale and the M6.C
-// passed-pawn reshape. The constants stay named and referenced —
-// `mobility::mobility_term_white` exercises the full term math at zero weight
-// (M6.F-ready), the M6.B/M6.C `*_IN_EVAL` precedent. **No separate ADR** —
-// the mobility-area semantic + the score-neutral disposition are committed in
-// the roadmap M6.D row + docs/milestones/m6.d.md (ADR-0032 is
-// pawn-structure-scoped; mobility is a distinct concern, roadmap-committed).
+// The literature tables were mis-*shaped* for this engine, not mis-*scaled*,
+// so a joint *reshape* (not a rescale) was required. That reshape landed:
+// M6.I's joint Texel re-derived and activated the entire mobility weight set
+// against our PeSTO PSTs (jointly with the pawn-structure and passed-pawn
+// terms), and M6.J retuned to the current values. **No separate ADR** — the
+// mobility-area semantic is committed in the roadmap M6.D row +
+// docs/milestones/m6.d.md + m6.i.md (ADR-0032 is pawn-structure-scoped;
+// mobility is a distinct concern, roadmap-committed).
 //
 // The pre-zero literature defaults (the M6.F starting point) were:
 //   KNIGHT_MG = [-75,-56,-9,-2,6,15,22,30,36]
@@ -243,22 +248,22 @@ pub(crate) const QUEEN_MOBILITY_EG: [i32; 28] = [-28, -34, -34, -33, -31, -24, -
 // ---------------------------------------------------------------------------
 
 // TEXEL-TUNABLE-BEGIN: king_safety_shield_file
-/// Pawn-shield bonus: friendly pawn on king's 2nd rank, middlegame. Zeroed.
+/// Pawn-shield bonus: friendly pawn on king's 2nd rank, middlegame. Live (M6.I).
 pub(crate) const SHIELD_1_MG: i32 = 7; // lit  10
-/// Pawn-shield bonus: friendly pawn on king's 2nd rank, endgame. Zeroed.
+/// Pawn-shield bonus: friendly pawn on king's 2nd rank, endgame. Live (M6.I).
 pub(crate) const SHIELD_1_EG: i32 = 1; // lit   5
-/// Pawn-shield bonus: friendly pawn on king's 3rd rank, middlegame. Zeroed.
+/// Pawn-shield bonus: friendly pawn on king's 3rd rank, middlegame. Live (M6.I).
 pub(crate) const SHIELD_2_MG: i32 = 4; // lit   5
-/// Pawn-shield bonus: friendly pawn on king's 3rd rank, endgame. Zeroed.
+/// Pawn-shield bonus: friendly pawn on king's 3rd rank, endgame. Live (M6.I).
 pub(crate) const SHIELD_2_EG: i32 = -7; // lit   3
 
-/// MG penalty: king file is semi-open (no own pawn, enemy pawn present). Zeroed.
+/// MG penalty: king file is semi-open (no own pawn, enemy pawn present). Live.
 pub(crate) const KS_KFILE_SEMI_OPEN_MG: i32 = -20; // lit -15
-/// MG penalty: king file is fully open (no pawn of either color). Zeroed.
+/// MG penalty: king file is fully open (no pawn of either color). Live.
 pub(crate) const KS_KFILE_OPEN_MG: i32 = -42; // lit -20
-/// MG penalty per adjacent file that is semi-open (no own pawn). Zeroed.
+/// MG penalty per adjacent file that is semi-open (no own pawn). Live.
 pub(crate) const KS_ADJ_SEMI_OPEN_MG: i32 = -15; // lit -10
-/// MG amplification: both adjacent files semi-open (no-cover threshold). Zeroed.
+/// MG amplification: both adjacent files semi-open (no-cover threshold). Live.
 pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = -23; // lit -10
 // TEXEL-TUNABLE-END: king_safety_shield_file
 
@@ -267,17 +272,19 @@ pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = -23; // lit -10
 // File, CPW Bishops of Opposite Colors, MadChess dev-blog Elo figures (Knight
 // Outpost +25, Endgame Eval Scaling +12). ADR-0003-clean — not engine source.
 //
-// **Shipped config: ALL Tier-1 additive weights ZEROED; ALL endgame-scale
-// tunables = EG_SCALE_DEN (identity).** Score-neutral inert landing per the
-// M6.C/M6.D/M6.E precedent (ADR-0034 §2); the full term math is live and
-// M6.I-ready; M6.I joint Texel re-derives the entire weight/coefficient set.
+// **MIXED state — read carefully:**
+//   - **Additive terms (outpost, rook-file): LIVE since M6.I.** Joint-Texel-
+//     activated; the values below are the M6.J meta-tune output. NOT zeroed.
+//   - **Endgame-scale tunables (OCB / pawnless / 50-move floor): STILL at
+//     identity** — each = EG_SCALE_DEN = 64 ⇒ scale ≡ 1, i.e. inert. The
+//     M6.I/M6.J quiet-position Texel objective does not exercise the draw-scale
+//     terms, so they were left at the identity landing value. See each scale
+//     const's own note. ADR-0034 §2.
 //
-// Inert-identity construction:
-//   - Additive terms: weight = 0 ⇒ term ≡ (0, 0).
-//   - Multiplicative scale: every tunable = EG_SCALE_DEN ⇒ the min/taper
-//     returns EG_SCALE_DEN for all inputs ⇒ blended * D / D == blended exactly
-//     in i32. ⇒ evaluate byte-identical to M6.E ⇒ bench 1213649 / depth-4
-//     90591 byte-for-byte. ADR-0034 §2.
+// At the M6.F landing ALL these terms shipped inert (additive weight = 0 ⇒
+// term ≡ (0,0); every scale = EG_SCALE_DEN ⇒ blended * D / D == blended
+// exactly in i32 ⇒ eval byte-identical to M6.E). M6.I's joint Texel then
+// activated and reshaped the additive set; the scales remain inert (above).
 //
 // **Literature defaults (M6.I starting point, recorded verbatim):**
 //
@@ -314,60 +321,46 @@ pub(crate) const KS_BOTH_ADJ_SEMI_OPEN_MG: i32 = -23; // lit -10
 // Outpost — per-kind, per-relative-rank MG/EG (rel-rank 0..7; predicate gates
 // rel-rank ∈ 3..=5 i.e. chess ranks 4–6 so out-of-band entries never index).
 // TEXEL-TUNABLE-BEGIN: outpost
-/// Knight outpost bonus, middlegame, indexed by relative rank (0..7). Zeroed
-/// (M6.I re-derives); literature defaults ~[0,0,0,18,28,16,0,0].
-// Used from tier1.rs; #[allow] covers the stub-slice gap until impl is wired.
-#[allow(dead_code)]
+/// Knight outpost bonus, middlegame, indexed by relative rank (0..7). Live
+/// (M6.J-tuned); literature defaults ~[0,0,0,18,28,16,0,0]. Used from tier1.rs.
 pub(crate) const OUTPOST_KNIGHT_MG: [i32; 8] = [0, 0, 0, 11, 19, 18, 0, 0]; // lit ~[0,0,0,18,28,16,0,0]
-/// Knight outpost bonus, endgame. Zeroed — see `OUTPOST_KNIGHT_MG`.
-#[allow(dead_code)]
+/// Knight outpost bonus, endgame. Live — see `OUTPOST_KNIGHT_MG`.
 pub(crate) const OUTPOST_KNIGHT_EG: [i32; 8] = [0, 0, 0, 14, 16, 23, 0, 0]; // lit ~[0,0,0,12,18,10,0,0]
-/// Bishop outpost bonus, middlegame. Zeroed — see `OUTPOST_KNIGHT_MG`.
-#[allow(dead_code)]
+/// Bishop outpost bonus, middlegame. Live — see `OUTPOST_KNIGHT_MG`.
 pub(crate) const OUTPOST_BISHOP_MG: [i32; 8] = [0, 0, 0, 22, 22, 12, 0, 0]; // lit ~[0,0,0,12,18,10,0,0]
-/// Bishop outpost bonus, endgame. Zeroed — see `OUTPOST_KNIGHT_MG`.
-#[allow(dead_code)]
+/// Bishop outpost bonus, endgame. Live — see `OUTPOST_KNIGHT_MG`.
 pub(crate) const OUTPOST_BISHOP_EG: [i32; 8] = [0, 0, 0, 6, 1, -1, 0, 0]; // lit ~[0,0,0, 8,12, 6,0,0]
 // TEXEL-TUNABLE-END: outpost
 
 // TEXEL-TUNABLE-BEGIN: rook_file
-/// Rook on fully open file (no pawn either color) bonus, middlegame. Zeroed.
-#[allow(dead_code)]
+/// Rook on fully open file (no pawn either color) bonus, middlegame. Live.
 pub(crate) const ROOK_OPEN_FILE_MG: i32 = 28; // lit  20
-/// Rook on fully open file bonus, endgame. Zeroed — see `ROOK_OPEN_FILE_MG`.
-#[allow(dead_code)]
+/// Rook on fully open file bonus, endgame. Live — see `ROOK_OPEN_FILE_MG`.
 pub(crate) const ROOK_OPEN_FILE_EG: i32 = 16; // lit  10
-/// Rook on semi-open file (own pawn absent, enemy present) bonus, middlegame. Zeroed.
-#[allow(dead_code)]
+/// Rook on semi-open file (own pawn absent, enemy present) bonus, middlegame. Live.
 pub(crate) const ROOK_SEMI_OPEN_FILE_MG: i32 = 19; // lit  10
-/// Rook on semi-open file bonus, endgame. Zeroed — see `ROOK_SEMI_OPEN_FILE_MG`.
-#[allow(dead_code)]
+/// Rook on semi-open file bonus, endgame. Live — see `ROOK_SEMI_OPEN_FILE_MG`.
 pub(crate) const ROOK_SEMI_OPEN_FILE_EG: i32 = 6; // lit   5
 // TEXEL-TUNABLE-END: rook_file
 
 /// Endgame draw-scale fixed-point denominator. STRUCTURAL — not a tunable;
 /// the per-position scale = numerator / EG_SCALE_DEN ∈ [0, 1].
-/// Every scale tunable at ship = EG_SCALE_DEN ⇒ scale ≡ identity.
-#[allow(dead_code)]
+/// Every scale tunable = EG_SCALE_DEN ⇒ scale ≡ identity (still the case).
 pub(crate) const EG_SCALE_DEN: i32 = 64; // structural (not tuned)
 // TEXEL-TUNABLE-BEGIN: scale
-/// OCB-with-pawns draw-scale numerator. M6.I tunable; identity value =
-/// EG_SCALE_DEN. Shipped = EG_SCALE_DEN (identity); literature ~32 (0.5×DEN).
-#[allow(dead_code)]
+/// OCB-with-pawns draw-scale numerator. Texel-tunable but STILL at identity =
+/// EG_SCALE_DEN (the quiet-position objective doesn't exercise it); lit ~32.
 pub(crate) const OCB_WITH_PAWNS_SCALE: i32 = 64; // = DEN ⇒ identity; lit ~32 (0.5)
-/// Pawnless drawish endgame scale numerator. M6.I tunable; identity =
-/// EG_SCALE_DEN. Shipped = EG_SCALE_DEN (identity); literature ~8 (0.125×DEN).
-#[allow(dead_code)]
+/// Pawnless drawish endgame scale numerator. Texel-tunable but STILL at
+/// identity = EG_SCALE_DEN (see `OCB_WITH_PAWNS_SCALE`); literature ~8.
 pub(crate) const PAWNLESS_DRAW_SCALE: i32 = 64; // = DEN ⇒ identity; lit ~8
 // TEXEL-TUNABLE-END: scale
 /// 50-move proximity taper onset in halfmoves. STRUCTURAL — not a tunable
 /// (semantically correct onset; tuning changes meaning, not magnitude).
-#[allow(dead_code)]
 pub(crate) const FIFTY_MOVE_TAPER_FROM: i32 = 80; // structural onset (halfmoves)
 // TEXEL-TUNABLE-BEGIN: scale
-/// 50-move taper floor: scale value at halfmove 100. M6.I tunable; identity =
-/// EG_SCALE_DEN. Shipped = EG_SCALE_DEN (identity, ramp flat); lit ~16 (0.25).
-#[allow(dead_code)]
+/// 50-move taper floor: scale value at halfmove 100. Texel-tunable but STILL
+/// at identity = EG_SCALE_DEN (ramp flat; see `OCB_WITH_PAWNS_SCALE`); lit ~16.
 pub(crate) const FIFTY_MOVE_FLOOR: i32 = 64; // = DEN ⇒ identity; lit ~16
 // TEXEL-TUNABLE-END: scale
 
