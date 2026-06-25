@@ -1145,7 +1145,16 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
     // bench-node-count policy this is a determinism anchor, not a no-regression
     // signal; the strength claim is the SPRT (mixed-TC + virtual-clock vs the
     // M6.J/M5.K production HEAD). History prepend: M7.B `45_788`.
-    const DEPTH4_BENCH_NODES: u64 = 45_788;
+    // M8.A (PVS, ADR-0043): scouting non-first children with a null window +
+    // conditional full-window re-search changes the search tree — NOT
+    // bench-identical to M7.B.2 by design (the re-search node flips is_pv
+    // false→true, altering is_pv-gated prune firing). The depth-4 anchor moved
+    // 45_788 -> 47_763 (re-search overhead slightly exceeds scout savings at the
+    // shallow bench depth); the default (depth-7) bench moved 662_085 -> 654_940
+    // (−1.1%, scout savings dominate deeper). Determinism anchor, not a
+    // no-regression signal; the strength claim is the mixed-TC SPRT vs M7.B.2.
+    // History prepend: M8.A `47_763`.
+    const DEPTH4_BENCH_NODES: u64 = 47_763;
     assert_eq!(
         nodes1, DEPTH4_BENCH_NODES,
         "E51: bench node count changed from the M5.F.1 pin ({DEPTH4_BENCH_NODES} at depth=4); \

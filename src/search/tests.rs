@@ -17624,3 +17624,738 @@ fn go_publishes_root_depth_for_ramp() {
         "ID loop must publish the final iteration depth (5) to root_depth"
     );
 }
+
+// ===========================================================================
+// M8.A — Principal Variation Search (PVS) tests.
+//
+// These tests reference counters and harness flags that land with the
+// production implementation in §4 of docs/plans/m8.a.md. They will not
+// compile until Agent A adds the fields and accessors. Agent B (this file)
+// writes the test bodies per plan §5; Agent A's production work is the
+// prerequisite for a green build.
+//
+// New test-only API (all `pub(super) fn`, `#[cfg(test)]`):
+//   ab.pvs_scout_searches_for_test() -> u32
+//   ab.pvs_lmr_verify_searches_for_test() -> u32
+//   ab.pvs_research_full_window_for_test() -> u32
+//   ab.nodes_for_test() -> u64
+//   ab.set_test_force_all_pv(bool)   — forces every child is_pv=true
+//   ab.set_test_disable_scout(bool)  — replaces PVS loop with pre-PVS loop
+//
+// Harness flags persist across negamax_for_test calls; set them before
+// calling. Counters are reset at each negamax_for_test call AND are
+// TRACE-PLY-GATED like `lmr_reduced_searches` (NOT global like `nmp_firings`):
+// they count only events at the frame whose ply equals the `ply` argument
+// passed to `negamax_for_test` (`lmr_trace_root_ply`). This is required by
+// `pvs_first_move_searched_full_window`, whose `scouts <= legal_count - 1`
+// bound is a single-node property — a subtree-wide (global) count would far
+// exceed it. The counter tests therefore choose windows/plies where no
+// prune (NMP/RFP) cuts the traced frame before the move loop.
+//
+// Curated FEN set shared across the structured tests below.
+// ===========================================================================
+
+const PVS_FENS: &[&str] = &[
+    // startpos
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    // Kiwipete — complex middlegame with castling, pins, and tactics
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    // rook+pawn endgame — used in the existing FENS set
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    // standard quiet middlegame (E1) — used extensively by NMP/LMR tests
+    "r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9",
+    // asymmetric tactical position from M3.C test suite
+    "r2q1rk1/pP1p2pp/Q4n2/bbp1p3/Np6/1B3NBn/pPPP1PPP/R3K2R b KQ - 0 1",
+];
+
+// ---------------------------------------------------------------------------
+// Test 1: pvs_exact_under_all_pv_vs_full_window
+//
+// With test_force_all_pv=true, the PVS scout path is exercised but every
+// recursive child gets is_pv=true — so NMP/RFP/FFP/LMR are all suppressed.
+// The score and bestmove must match a full-window reference (test_disable_scout=true).
+// Node count is NOT asserted equal; PVS may legitimately save nodes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pvs_exact_under_all_pv_vs_full_window() {
+    for &fen in PVS_FENS {
+        for depth in 1u32..=4 {
+            let pos = Position::from_fen(fen)
+                .unwrap_or_else(|_| panic!("PVS_FENS entry must parse: {fen}"));
+            let (ctx, _stop) = non_aborting_ctx_at_depth(depth);
+
+            // PVS active (scout fires on non-first moves, Step-3 re-search if interior).
+            let mut ab_pvs = AlphaBetaMover::new();
+            ab_pvs.set_test_force_all_pv(true);
+            ab_pvs.set_test_disable_scout(false);
+            let score_pvs = ab_pvs.negamax_for_test(
+                &mut pos.clone(),
+                depth,
+                0,
+                -INF,
+                INF,
+                true,
+                true,
+                None,
+                &ctx,
+            );
+            let pv_pvs = ab_pvs.pv_root_for_test();
+
+            // Reference: pre-PVS full-window loop (no scout, same force_all_pv suppression).
+            let mut ab_ref = AlphaBetaMover::new();
+            ab_ref.set_test_force_all_pv(true);
+            ab_ref.set_test_disable_scout(true);
+            let score_ref = ab_ref.negamax_for_test(
+                &mut pos.clone(),
+                depth,
+                0,
+                -INF,
+                INF,
+                true,
+                true,
+                None,
+                &ctx,
+            );
+            let pv_ref = ab_ref.pv_root_for_test();
+
+            assert_eq!(
+                score_pvs, score_ref,
+                "PVS and reference must agree on score at depth={depth} fen={fen}; \
+                     pvs={score_pvs}, ref={score_ref}"
+            );
+            // Bestmove is the first PV move; compare the move identity directly.
+            assert_eq!(
+                pv_pvs.first().map(|m| m.bits()),
+                pv_ref.first().map(|m| m.bits()),
+                "PVS and reference must agree on bestmove at depth={depth} fen={fen}"
+            );
+
+            // NOTE: we do NOT assert nodes_pvs <= nodes_ref. PVS does not save
+            // nodes at every node — it trades a single full-window search for a
+            // scout plus a conditional full-window re-search, which costs MORE
+            // nodes when the move is interior (frequent at shallow depth / wide
+            // windows where moves keep improving alpha). PVS saves nodes only in
+            // aggregate over a real search, when most scouts fail low. Score and
+            // bestmove equality above is the exact, sound invariant.
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 2: prop_pvs_exact_under_all_pv — proptest variant of test 1.
+// ---------------------------------------------------------------------------
+
+mod pvs_proptest_all_pv {
+    use super::*;
+    use crate::movegen::test_strategies::arb_position;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            ..ProptestConfig::default()
+        })]
+
+        /// For arbitrary positions at depth 1–3, PVS and the pre-PVS reference
+        /// must agree on score and bestmove when test_force_all_pv=true
+        /// (NMP/RFP/FFP/LMR suppressed). Exercises the PV-node scout and the
+        /// Step-3 full-window re-search path in isolation from prune interactions.
+        #[test]
+        fn prop_pvs_exact_under_all_pv(
+            pos in arb_position(),
+            depth in 1u32..=3,
+        ) {
+            let (ctx, _stop) = non_aborting_ctx_at_depth(depth);
+
+            let mut ab_pvs = AlphaBetaMover::new();
+            ab_pvs.set_test_force_all_pv(true);
+            ab_pvs.set_test_disable_scout(false);
+            let score_pvs = ab_pvs.negamax_for_test(
+                &mut pos.clone(),
+                depth,
+                0,
+                -INF,
+                INF,
+                true,
+                true,
+                None,
+                &ctx,
+            );
+
+            let mut ab_ref = AlphaBetaMover::new();
+            ab_ref.set_test_force_all_pv(true);
+            ab_ref.set_test_disable_scout(true);
+            let score_ref = ab_ref.negamax_for_test(
+                &mut pos.clone(),
+                depth,
+                0,
+                -INF,
+                INF,
+                true,
+                true,
+                None,
+                &ctx,
+            );
+
+            prop_assert_eq!(
+                score_pvs, score_ref,
+                "PVS must equal reference score at depth={}", depth
+            );
+            prop_assert_eq!(
+                ab_pvs.pv_root_for_test().first().map(|m| m.bits()),
+                ab_ref.pv_root_for_test().first().map(|m| m.bits()),
+                "PVS must agree on bestmove at depth={}", depth
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: pvs_nonpv_bit_identical_to_reference
+//
+// At a non-PV node (width-1 window, ply=1, depth>=3 so LMR fires) under
+// normal config, PVS must be bit-identical to the pre-PVS reference on BOTH
+// score AND node count. At a non-PV node the scout window (alpha,alpha+1)
+// equals the node window (x,x+1), so PVS and the pre-PVS loop coincide
+// exactly. This value-covers Steps 1 and 2 (the places they actually fire),
+// catching any window/depth arithmetic error in the reduced/verify path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pvs_nonpv_bit_identical_to_reference() {
+    // x is chosen ABOVE every reasonable middlegame eval (+20 pawns) so that all
+    // root moves fail low at the top node and the loop searches the full breadth
+    // (rather than beta-cutting after move 1) — this makes the bit-identity check
+    // non-vacuous: Step-1 scouts fire at the top, and Step-2 verifies fire in the
+    // recursion (child nodes see a window near -x where their moves fail high).
+    let x: i32 = 2000;
+
+    for &fen in PVS_FENS {
+        for depth in [3u32, 4, 5] {
+            let pos = Position::from_fen(fen)
+                .unwrap_or_else(|_| panic!("PVS_FENS entry must parse: {fen}"));
+            let (ctx, _stop) = non_aborting_ctx_at_depth(depth);
+
+            // PVS active, no harness flags (production config).
+            let mut ab_pvs = AlphaBetaMover::new();
+            ab_pvs.set_test_disable_scout(false);
+            let score_pvs = ab_pvs.negamax_for_test(
+                &mut pos.clone(),
+                depth,
+                1,
+                x,
+                x + 1,
+                false,
+                true,
+                None,
+                &ctx,
+            );
+
+            // Reference: pre-PVS full-window loop.
+            let mut ab_ref = AlphaBetaMover::new();
+            ab_ref.set_test_disable_scout(true);
+            let score_ref = ab_ref.negamax_for_test(
+                &mut pos.clone(),
+                depth,
+                1,
+                x,
+                x + 1,
+                false,
+                true,
+                None,
+                &ctx,
+            );
+
+            assert_eq!(
+                score_pvs, score_ref,
+                "non-PV node: PVS and reference must be score-identical; \
+                     pvs={score_pvs}, ref={score_ref}, depth={depth}, fen={fen}"
+            );
+            assert_eq!(
+                ab_pvs.nodes_for_test(),
+                ab_ref.nodes_for_test(),
+                "non-PV node: PVS and reference must be node-count-identical \
+                     (scout window equals node window — no additional searches possible); \
+                     pvs_nodes={}, ref_nodes={}, depth={depth}, fen={fen}",
+                ab_pvs.nodes_for_test(),
+                ab_ref.nodes_for_test()
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proptest variant of test 3.
+// ---------------------------------------------------------------------------
+
+mod pvs_proptest_nonpv_identical {
+    use super::*;
+    use crate::movegen::test_strategies::arb_position;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            ..ProptestConfig::default()
+        })]
+
+        /// For arbitrary positions at depth 3–4, non-PV node (width-1 window):
+        /// PVS and pre-PVS reference must be bit-identical on score and node count.
+        #[test]
+        fn prop_pvs_nonpv_bit_identical(
+            // depth 3-4 (the curated sibling covers depth 5); the bit-identity
+            // invariant is structurally identical across depths, so the extra
+            // depth is a runtime tradeoff, not a coverage gap.
+            pos in arb_position(),
+            depth in 3u32..=4,
+        ) {
+            // Above any plausible eval so moves fail low and the search runs at
+            // full breadth — broad, non-vacuous bit-identity coverage. (Identity
+            // holds regardless of the window; a high x just maximizes coverage.)
+            let x: i32 = 2000;
+            let (ctx, _stop) = non_aborting_ctx_at_depth(depth);
+
+            let mut ab_pvs = AlphaBetaMover::new();
+            ab_pvs.set_test_disable_scout(false);
+            let score_pvs = ab_pvs.negamax_for_test(
+                &mut pos.clone(),
+                depth,
+                1,
+                x,
+                x + 1,
+                false,
+                true,
+                None,
+                &ctx,
+            );
+
+            let mut ab_ref = AlphaBetaMover::new();
+            ab_ref.set_test_disable_scout(true);
+            let score_ref = ab_ref.negamax_for_test(
+                &mut pos.clone(),
+                depth,
+                1,
+                x,
+                x + 1,
+                false,
+                true,
+                None,
+                &ctx,
+            );
+
+            prop_assert_eq!(
+                score_pvs,
+                score_ref,
+                "non-PV node: PVS must be score-identical to reference at depth={}", depth
+            );
+            prop_assert_eq!(
+                ab_pvs.nodes_for_test(),
+                ab_ref.nodes_for_test(),
+                "non-PV node: PVS must be node-count-identical to reference at depth={}", depth
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: pvs_research_fires_only_when_score_interior
+//
+// At a PV node with a wide window: assert that scouts actually happen on
+// non-first moves (anti-vacuous) and that every full-window re-search was
+// preceded by a scout (pvs_research <= pvs_scout).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pvs_research_fires_only_when_score_interior() {
+    // Standard middlegame position — complex enough for scouts to fire.
+    let pos =
+        Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+            .expect("E1 middlegame FEN must parse");
+    let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+
+    let mut ab = AlphaBetaMover::new();
+    let _ = ab.negamax_for_test(&mut pos.clone(), 4, 0, -INF, INF, true, true, None, &ctx);
+
+    let scouts = ab.pvs_scout_searches_for_test();
+    let researches = ab.pvs_research_full_window_for_test();
+
+    // Anti-vacuous: scouts must occur on non-first moves at a PV node.
+    assert!(
+        scouts > 0,
+        "PV-node depth-4 search from E1 must run at least one null-window scout \
+             on a non-first move; got scouts={scouts}"
+    );
+    // Structural: every re-search must have been preceded by a scout.
+    assert!(
+        researches <= scouts,
+        "full-window re-search count must not exceed scout count \
+             (every re-search requires a scout first); \
+             researches={researches}, scouts={scouts}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: pvs_non_pv_node_never_full_window_researches
+//
+// At a non-PV node (width-1 window, beta==alpha+1), Step 3 is statically
+// unreachable: score>alpha && score<beta requires score==alpha (impossible
+// after score>alpha). Assert pvs_research==0. Anti-vacuous: scouts > 0.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pvs_non_pv_node_never_full_window_researches() {
+    let pos =
+        Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+            .expect("E1 middlegame FEN must parse");
+    let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+
+    // Width-1 window at ply=1 (non-PV node), positioned ABOVE the position eval
+    // (+20 pawns) so all root moves fail low and the loop scouts every non-first
+    // move (rather than beta-cutting after move 1 — which would make the
+    // anti-vacuous `scouts > 0` check spuriously fail). `allow_null=false`
+    // additionally suppresses NMP at the traced frame so it cannot cut before
+    // the move loop (defense-in-depth — at x=2000 NMP's `static_eval >= beta`
+    // already cannot fire since `static_eval ≈ 0 ≪ 2001`).
+    let x: i32 = 2000;
+    let mut ab = AlphaBetaMover::new();
+    let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, x, x + 1, false, false, None, &ctx);
+
+    assert_eq!(
+        ab.pvs_research_full_window_for_test(),
+        0,
+        "non-PV node (width-1 window): Step-3 full-window re-search must never fire \
+             (score>alpha && score<beta is impossible when beta==alpha+1)"
+    );
+    // Anti-vacuous: the position must have multiple moves and scouts must fire.
+    assert!(
+        ab.pvs_scout_searches_for_test() > 0,
+        "anti-vacuous: non-PV node must still run scouts on non-first moves; \
+             got scouts={}",
+        ab.pvs_scout_searches_for_test()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: pvs_first_move_searched_full_window
+//
+// The first searched move is never scouted. Use a position with a known legal-
+// move count and assert scout_count <= legal_moves - 1.
+//
+// NOTE: The invariant pvs_scout_searches <= legal_count - 1 is an upper
+// bound (scouts happen on non-first moves, but cutoffs reduce the actual
+// count). The strict <=-1 form is correct since the first move is never
+// scouted regardless of how many subsequent moves get cut off early.
+// `generate_moves` is legal-direct (ADR-0007) — it emits LEGAL moves, not
+// pseudo-legal — so `legal_count` is exact, not an overcount, and the bound
+// is tight (not trivially satisfiable).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pvs_first_move_searched_full_window() {
+    // Kiwipete has 48 legal moves — enough to make the bound meaningful.
+    let pos =
+        Position::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1")
+            .expect("Kiwipete FEN must parse");
+    let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+
+    let mut ml = crate::movegen::MoveList::new();
+    crate::movegen::generate_moves(&pos, &mut ml);
+    let legal_count = ml.iter().count() as u32;
+
+    let mut ab = AlphaBetaMover::new();
+    let _ = ab.negamax_for_test(&mut pos.clone(), 4, 0, -INF, INF, true, true, None, &ctx);
+
+    let scouts = ab.pvs_scout_searches_for_test();
+    assert!(
+        scouts <= legal_count.saturating_sub(1),
+        "scout count must be strictly less than legal_count (the first move is never \
+             scouted); scouts={scouts}, legal_count={legal_count}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: pvs_lmr_three_step_ladder_counters
+//
+// At a non-PV node with depth >= 4 (LMR fires on quiet moves): assert that
+// LMR reduced pilots occur (Step 1) and that the Step-2 verify count is <=
+// the Step-1 count (a verify only follows a reduced pilot that beat alpha).
+//
+// NOTE: Step 2 == the existing LMR full-depth re-search at non-PV nodes
+// (relabeled by PVS). pvs_lmr_verify_searches corresponds to lmr_full_researches
+// at non-PV nodes; this test confirms the three-step framing is wired correctly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pvs_lmr_three_step_ladder_counters() {
+    let pos =
+        Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+            .expect("E1 middlegame FEN must parse");
+    // Non-PV node (LMR fires), depth 4 ensures at least some late quiets.
+    let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+
+    let mut ab = AlphaBetaMover::new();
+    let _ = ab.negamax_for_test(&mut pos.clone(), 4, 1, -INF, INF, false, true, None, &ctx);
+
+    let lmr_reduced = ab.lmr_reduced_searches_for_test();
+    let step2_verify = ab.pvs_lmr_verify_searches_for_test();
+
+    // Anti-vacuous: LMR must fire at this position/depth combination.
+    assert!(
+        lmr_reduced > 0,
+        "E1 position at depth=4 non-PV must have at least one LMR-reduced pilot; \
+             got lmr_reduced={lmr_reduced}"
+    );
+    // Anti-vacuous: Step-2 verifies must actually fire (kills the `+= → *=`
+    // counter mutant that would leave the count at 0). At this wide window
+    // (alpha = -INF) every reduced pilot scores above alpha, so each one
+    // escalates to a Step-2 full-depth verify.
+    assert!(
+        step2_verify > 0,
+        "Step-2 verify must fire at least once (every reduced pilot beats alpha=-INF); \
+             got step2_verify={step2_verify}"
+    );
+    // Structural: Step-2 verify count <= Step-1 reduced count (a verify only
+    // follows a reduced pilot that beat alpha).
+    assert!(
+        step2_verify <= lmr_reduced,
+        "Step-2 verify count must not exceed Step-1 reduced count \
+             (a verify only fires when the reduced pilot beats alpha); \
+             step2_verify={step2_verify}, lmr_reduced={lmr_reduced}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: pvs_high_alpha_null_window_no_overflow
+//
+// The scout computes `null_beta = alpha + 1`. The plan §3.4 framed the worry as
+// `alpha = INF-1 ⟹ alpha+1 = INF`, but that exact state is UNREACHABLE at a
+// searching node: mate-distance pruning bounds `alpha < MATE - ply` before the
+// move loop (with `alpha = INF-1` at ply 1, MDP returns `mating_value = MATE-1`
+// immediately and the move loop is never entered). So the meaningful boundary is
+// the highest alpha that still searches: just below `MATE - ply`. There,
+// `alpha + 1` is a large but valid i32 (≪ i32::MAX — no overflow is even close).
+// This test drives such a node, asserting no panic, a genuine fail-low, and a
+// correct Upper-bound TT store that round-trips through `score_from_tt`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pvs_high_alpha_null_window_no_overflow() {
+    let pos =
+        Position::from_fen("r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 9")
+            .expect("E1 middlegame FEN must parse");
+    let tt = Arc::new(TranspositionTable::new(1));
+    let (ctx, _stop) = non_aborting_ctx_at_depth(3);
+    let mut ab = AlphaBetaMover::new();
+    ab.history = vec![pos.zobrist()];
+    ab.set_tt_for_test(Some(tt.clone()));
+
+    // ply=1 ⟹ MDP threshold `mating_value = MATE - 1`. Use alpha just below it so
+    // the node actually searches; the scout then runs with `null_beta = alpha+1`,
+    // a high but valid bound. is_pv=false (non-PV width-1 node), allow_null=false
+    // (no NMP cut).
+    let alpha = MATE - 1 - 2; // strictly below MATE - ply, so MDP does not return
+    let beta = alpha + 1;
+    let score = ab.negamax_for_test(
+        &mut pos.clone(),
+        3,
+        1,
+        alpha,
+        beta,
+        false,
+        false,
+        None,
+        &ctx,
+    );
+
+    // Genuine fail-low: the middlegame eval is far below this near-mate alpha.
+    assert!(
+        score <= alpha,
+        "high-alpha window must produce a fail-low (score <= alpha); got {score}"
+    );
+    assert!(
+        score > -INF,
+        "score must be a real fail-soft value, not -INF; got {score}"
+    );
+
+    // The completed node stores an Upper bound (fail-low) whose score round-trips
+    // through score_from_tt — exercises the store path at a near-mate window.
+    let entry = tt
+        .probe(pos.zobrist())
+        .expect("high-alpha search must store a root TT entry");
+    assert_eq!(
+        entry.bound(),
+        TtBound::Upper,
+        "fail-low at the high-alpha window must store Upper; got {:?}",
+        entry.bound()
+    );
+    let round_tripped = score_from_tt(entry.score as i32, 1);
+    assert!(
+        round_tripped <= alpha && round_tripped > -INF,
+        "stored score must round-trip into the fail-low range; got {round_tripped}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: pvs_root_research_when_first_move_fails_low
+//
+// Research §5 gotcha: when the first root move fails low (alpha unmoved),
+// subsequent moves at the root receive the full aspiration window (no null
+// window to probe against — no bound has been established). PVS's re-search
+// condition `score>alpha && score<beta` handles this case correctly.
+//
+// Drive negamax_for_test at ply=0 with a narrow aspiration-like window that
+// the first root move is likely to fail low on. Assert: no panic, a legal
+// bestmove is found, and pvs_research_full_window is reachable (the engine
+// does not deadlock or short-circuit on an unmoved alpha).
+//
+// NOTE: We assert the weaker invariant (legal bestmove + no panic) rather
+// than a specific research count because forcing the first root move to fail
+// low at an exact position without poisoning the TT requires either a
+// specially constructed position or a searchmoves restriction — the general
+// narrow-window path is the meaningful gate here.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pvs_root_research_when_first_move_fails_low() {
+    // Kiwipete: many moves, complex position — the narrow window forces some
+    // root moves to fail low.
+    let pos =
+        Position::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1")
+            .expect("Kiwipete FEN must parse");
+
+    // Use a narrow window that is likely to fail low on many root moves.
+    // This simulates an aspiration window positioned well below the true
+    // score, so the first root move typically fails low. The window must
+    // be wide enough (>1) to allow a PV node Step-3 re-search.
+    let alpha: i32 = -200;
+    let beta: i32 = -100;
+    let (ctx, _stop) = non_aborting_ctx_at_depth(4);
+
+    let mut ab = AlphaBetaMover::new();
+    let score = ab.negamax_for_test(&mut pos.clone(), 4, 0, alpha, beta, true, true, None, &ctx);
+
+    // The search must complete and return a valid score (no panic/deadlock).
+    assert!(
+        (-INF..=INF).contains(&score),
+        "root search under narrow window must return a valid score; got {score}"
+    );
+
+    // The PV must contain a legal bestmove (the root found something).
+    let pv = ab.pv_root_for_test();
+    if let Some(&bestmove) = pv.first() {
+        let mut ml = crate::movegen::MoveList::new();
+        crate::movegen::generate_moves(&pos, &mut ml);
+        assert!(
+            ml.iter().any(|m| m == bestmove),
+            "root bestmove {} must be legal in Kiwipete",
+            bestmove.to_uci()
+        );
+    }
+    // NOTE: this is a no-panic / legal-bestmove smoke test for the root path
+    // under a narrow aspiration-like window — it does NOT reliably construct the
+    // §5 gotcha (first move fails low → later move re-searches), which needs a
+    // hand-engineered ordering. The re-search *condition itself* — `score > alpha`
+    // (the running alpha, NOT `original_alpha`) `&& score < beta` — is pinned
+    // directly and exhaustively by `pvs_needs_research_boundary_conditions`
+    // below, which is what would catch a `>alpha` vs `>original_alpha` confusion
+    // (that bug only adds spurious re-searches → same score/bestmove, so it is
+    // invisible to the exactness anchors and must be pinned at the predicate).
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: pvs_depth1_exact_vs_full_window
+//
+// Secondary, harness-INDEPENDENT exactness anchor. At depth 1 the root is a
+// PV node and every child is a depth-0 qsearch leaf, which carries NO
+// is_pv-gated prune (qsearch has no NMP/RFP/FFP/LMR/SE). So PVS is exactly
+// value-equivalent to a full-window search WITHOUT relying on the
+// `test_force_all_pv` harness being correct — this cross-checks that the
+// harness in test 1 is not itself masking a scout bug. Asserts score AND
+// bestmove equality on the curated set.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pvs_depth1_exact_vs_full_window() {
+    for &fen in PVS_FENS {
+        let pos =
+            Position::from_fen(fen).unwrap_or_else(|_| panic!("PVS_FENS entry must parse: {fen}"));
+        let (ctx, _stop) = non_aborting_ctx_at_depth(1);
+
+        // PVS active, NORMAL config (no harness flags) — depth-0 children are
+        // prune-free qsearch, so PVS is exact here without force_all_pv.
+        let mut ab_pvs = AlphaBetaMover::new();
+        ab_pvs.set_test_disable_scout(false);
+        let score_pvs =
+            ab_pvs.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, true, None, &ctx);
+        let pv_pvs = ab_pvs.pv_root_for_test();
+
+        // Reference: pre-PVS full-window loop, same normal config.
+        let mut ab_ref = AlphaBetaMover::new();
+        ab_ref.set_test_disable_scout(true);
+        let score_ref =
+            ab_ref.negamax_for_test(&mut pos.clone(), 1, 0, -INF, INF, true, true, None, &ctx);
+        let pv_ref = ab_ref.pv_root_for_test();
+
+        assert_eq!(
+            score_pvs, score_ref,
+            "depth-1 PVS and full-window reference must agree on score (children are \
+                 prune-free qsearch); pvs={score_pvs}, ref={score_ref}, fen={fen}"
+        );
+        assert_eq!(
+            pv_pvs.first().map(|m| m.bits()),
+            pv_ref.first().map(|m| m.bits()),
+            "depth-1 PVS and full-window reference must agree on bestmove; fen={fen}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: pvs_needs_research_boundary_conditions
+//
+// Exhaustively pin the Step-3 re-search predicate `score > alpha && score < beta`
+// (the `lmr_needs_full_research` precedent). This is the direct, mutation-killable
+// guard for the re-search condition — boundary-exact on both comparisons:
+//   - score == alpha        → false (not `>=`)
+//   - score == alpha + 1    → true  (interior, assuming < beta)
+//   - score == beta         → false (not `<=`; that is the beta-cutoff case)
+//   - score == beta - 1     → true  (interior, assuming > alpha)
+//   - non-PV width-1 window → never true (no interior exists)
+// Catches `>` → `>=`, `<` → `<=`, and `&&` → `||` mutants that the integration
+// tests cannot reach deterministically.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pvs_needs_research_boundary_conditions() {
+    let alpha = 100;
+    let beta = 200;
+    // Interior: strictly between alpha and beta → re-search.
+    assert!(pvs_needs_research(alpha + 1, alpha, beta));
+    assert!(pvs_needs_research(beta - 1, alpha, beta));
+    assert!(pvs_needs_research(150, alpha, beta));
+    // Boundaries are EXCLUSIVE on both ends.
+    assert!(
+        !pvs_needs_research(alpha, alpha, beta),
+        "score == alpha must not re-search"
+    );
+    assert!(
+        !pvs_needs_research(beta, alpha, beta),
+        "score == beta must not re-search"
+    );
+    // Fail-low / fail-high → no re-search.
+    assert!(
+        !pvs_needs_research(alpha - 1, alpha, beta),
+        "fail-low must not re-search"
+    );
+    assert!(
+        !pvs_needs_research(beta + 1, alpha, beta),
+        "fail-high must not re-search"
+    );
+    // A non-PV width-1 window has no interior: nothing is `> alpha && < alpha+1`.
+    for s in [99, 100, 101, 102] {
+        assert!(
+            !pvs_needs_research(s, 100, 101),
+            "width-1 window has no interior; score={s} must not re-search"
+        );
+    }
+}

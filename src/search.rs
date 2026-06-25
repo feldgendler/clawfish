@@ -298,6 +298,24 @@ fn lmr_needs_full_research(reduced_score: i32, alpha: i32) -> bool {
     reduced_score > alpha
 }
 
+/// M8.A PVS Step-3 re-search predicate: a null-window scout result is *interior*
+/// to the real window — and so needs a full-window re-search to establish an
+/// exact score — iff `alpha < score < beta`. Extracted as a named helper (the
+/// `lmr_needs_full_research` / M3.D `negate_window` precedent) so its exact
+/// boundary semantics are directly unit-testable and mutation-killable.
+///
+/// **Load-bearing:** `score > alpha` (not `> original_alpha`) — `alpha` is the
+/// node's *current, running* alpha (raised by earlier moves), per research §5 /
+/// ADR-0043 §2. Using the pre-move `original_alpha` here would trigger spurious
+/// full-window re-searches on moves worse than an already-found one (extra nodes,
+/// same value — invisible to the score/bestmove exactness anchors, which is why
+/// this predicate is pinned directly). `score < beta` excludes fail-high results
+/// (those cut without needing an exact score); the strict `<` is correct because
+/// `score >= beta` is the beta-cutoff case.
+fn pvs_needs_research(score: i32, alpha: i32, beta: i32) -> bool {
+    score > alpha && score < beta
+}
+
 /// TT bound classification for a completed negamax node, including the M5.C
 /// soundness rule that a node whose best score is only reduced-depth-proven
 /// must not advertise a full-depth TT bound.
@@ -596,6 +614,34 @@ pub(crate) struct AlphaBetaMover {
     /// convention.
     #[cfg(test)]
     qsearch_see_prune_firings: u32,
+    /// M8.A: per-`go` count of PVS Step-1 null-window scout pilots run on
+    /// non-first moves at the `lmr_trace_root_ply` frame. Test-only
+    /// instrumentation; gated by `#[cfg(test)]`. Naming follows the M5.A
+    /// `nmp_firings` / M5.C `lmr_*` convention.
+    #[cfg(test)]
+    pvs_scout_searches: u32,
+    /// M8.A: PVS Step-2 full-depth null-window verify count at the
+    /// `lmr_trace_root_ply` frame (the relabeled ADR-0025 §5 LMR re-search;
+    /// equals `lmr_full_researches` at the non-PV nodes where it fires).
+    #[cfg(test)]
+    pvs_lmr_verify_searches: u32,
+    /// M8.A: PVS Step-3 full-window re-search count at the
+    /// `lmr_trace_root_ply` frame (the genuinely-new PV-node re-search).
+    #[cfg(test)]
+    pvs_research_full_window: u32,
+    /// M8.A test-only harness: when `true`, force every recursive child to
+    /// `is_pv=true`, neutralizing all `is_pv`-gated prunes (NMP/RFP/FFP) and
+    /// LMR throughout the subtree. Used by the all-PV exactness anchor.
+    /// NOT reset by `negamax_for_test` — the test sets it before the call.
+    #[cfg(test)]
+    test_force_all_pv: bool,
+    /// M8.A test-only harness: when `true`, search non-first children
+    /// full-window at full depth (the pre-PVS reference move loop: LMR reduced
+    /// pilot at the full window → full-depth full-window re-search if `> alpha`).
+    /// The value reference for the exactness anchors. NOT reset by
+    /// `negamax_for_test`.
+    #[cfg(test)]
+    test_disable_scout: bool,
 }
 
 impl AlphaBetaMover {
@@ -647,6 +693,16 @@ impl AlphaBetaMover {
             se_tt_move_search_depth: None,
             #[cfg(test)]
             qsearch_see_prune_firings: 0,
+            #[cfg(test)]
+            pvs_scout_searches: 0,
+            #[cfg(test)]
+            pvs_lmr_verify_searches: 0,
+            #[cfg(test)]
+            pvs_research_full_window: 0,
+            #[cfg(test)]
+            test_force_all_pv: false,
+            #[cfg(test)]
+            test_disable_scout: false,
         }
     }
 }
@@ -688,6 +744,9 @@ impl Search for AlphaBetaMover {
             self.qsearch_tt_probes = 0;
             self.qsearch_tt_stores = 0;
             self.se_extensions = 0;
+            self.pvs_scout_searches = 0;
+            self.pvs_lmr_verify_searches = 0;
+            self.pvs_research_full_window = 0;
         }
         // M4.A: install the TT and advance its generation once per `go` (ADR-0018 §9).
         self.tt = ctx.tt.clone();
@@ -1313,8 +1372,12 @@ impl AlphaBetaMover {
             }
         }
 
-        // 13. Recurse fail-soft. `child_is_pv = is_pv && i == 0` per ADR-0018 §11
-        //     where `i` is the recursion-order index (post-step-12 reorder).
+        // 13. Recurse fail-soft via the M8.A PVS ladder (ADR-0043 §2-§4). Child
+        //     PV-ness is now PER-STEP, not the old single `is_pv && i == 0` rule:
+        //     the first searched move and the Step-3 full-window re-search inherit
+        //     the parent's PV-ness (`pv_full_child`); null-window scouts (Step-1
+        //     pilots / Step-2 verifies) are non-PV (`pv_scout_child`). The two are
+        //     computed once below; see the per-step dispatch for where each lands.
         let mut best = -INF;
         let mut best_is_full_depth = false;
         let mut cutoff_move: Option<Move> = None;
@@ -1351,6 +1414,34 @@ impl AlphaBetaMover {
             None
         };
 
+        // M8.A — PVS test-harness flags. `false` in production (the `let`
+        // bindings fold to constants under `cfg(not(test))`, so the harness
+        // branches optimize away — zero production cost). See ADR-0043 §"Test
+        // surface".
+        #[cfg(test)]
+        let test_force_all_pv = self.test_force_all_pv;
+        #[cfg(not(test))]
+        let test_force_all_pv = false;
+        #[cfg(test)]
+        let test_disable_scout = self.test_disable_scout;
+        #[cfg(not(test))]
+        let test_disable_scout = false;
+
+        // M8.A — PVS child PV-ness (loop-invariant). The first searched move and
+        // the Step-3 full-window re-search inherit the parent's PV-ness; scouts
+        // (Step-1 pilots / Step-2 verifies) are non-PV. `test_force_all_pv`
+        // forces every child PV, neutralizing is_pv-gated prunes for the
+        // exactness anchor (production: `pv_full_child == is_pv`,
+        // `pv_scout_child == false`).
+        let pv_full_child = if test_force_all_pv { true } else { is_pv };
+        let pv_scout_child = test_force_all_pv;
+
+        // M8.A — PVS first-move tracking. The first *non-excluded* searched move
+        // gets the full window at full depth (never a scout); robust to the
+        // excluded-move skip at SE verification frames (where `cur_i == 0` is the
+        // excluded TT move). Set `false` after the first real dispatch.
+        let mut first_searched = true;
+
         let mut quiet_index: u32 = 0;
         let mut i: usize = 0;
         while let Some(mv) = stager.next() {
@@ -1370,7 +1461,6 @@ impl AlphaBetaMover {
             // singular, 0 otherwise); it is zero for non-SE nodes and non-TT moves.
             let move_extension: u32 = if cur_i == 0 { tt_move_extension } else { 0 };
 
-            let child_is_pv = is_pv && cur_i == 0;
             let quiet_move = is_quiet(mv);
             let mut move_is_full_depth = true;
 
@@ -1451,81 +1541,192 @@ impl AlphaBetaMover {
                 None
             };
 
-            let score = if let Some(reduction) = lmr_reduction {
-                #[cfg(test)]
-                if self.lmr_trace_root_ply == Some(ply) {
-                    self.lmr_reduced_searches += 1;
-                    self.lmr_reduced_moves.push(mv);
-                }
+            // M8.A — PVS ladder. `R = lmr_reduction` (0 when LMR-ineligible).
+            // The first searched move gets the full window at full depth (+ SE
+            // extension); every later move is scouted with a null window and
+            // re-searched only when the scout result is interior. See ADR-0043
+            // §2–§4 and plan §3.2. At a non-PV node `beta == alpha+1`, so the
+            // null window equals the node window and Step 3 is statically
+            // unreachable — the loop degenerates to today's scout with no
+            // special-casing.
+            let r = lmr_reduction.unwrap_or(0);
+            let is_first = first_searched;
 
-                let reduced_score = self.search_child(
+            let score = if is_first {
+                // First non-excluded move: full window, full depth (+ extension),
+                // inherit parent PV-ness. SE depth recording (M5.G) lives here —
+                // the TT move (cur_i == 0) is the first searched move unless
+                // excluded, and only `cur_i == 0` carries `move_extension`.
+                // `first_move_depth` is computed ONCE and used for BOTH the
+                // search and the SE-test recording so a mutation of the
+                // `depth - 1 + move_extension` arithmetic is caught by
+                // `negamax_se_extension_increments_child_depth_by_one` (which
+                // pins the recorded depth) — the two must not drift apart.
+                let first_move_depth = depth - 1 + move_extension;
+                #[cfg(test)]
+                if cur_i == 0 && move_extension > 0 && self.se_tt_move_search_depth.is_none() {
+                    self.se_tt_move_search_depth = Some(first_move_depth);
+                }
+                self.search_child(
                     pos,
                     mv,
-                    depth - 1 - reduction,
+                    first_move_depth,
                     ply,
                     alpha,
                     beta,
-                    child_is_pv,
+                    pv_full_child,
                     ctx,
                     clock,
-                );
-                if self.aborted {
-                    return 0;
-                }
-
-                if lmr_needs_full_research(reduced_score, alpha) {
-                    #[cfg(test)]
-                    if self.lmr_trace_root_ply == Some(ply) {
-                        self.lmr_full_researches += 1;
-                        self.lmr_researched_moves.push(mv);
-                    }
-
-                    let full_score = self.search_child(
+                )
+            } else if test_disable_scout {
+                // Test-only reference: the pre-PVS move loop (full-window reduced
+                // pilot → full-window full-depth re-search). The value reference
+                // for the exactness anchors; never compiled into production
+                // (`test_disable_scout` is `false` under `cfg(not(test))`). It
+                // deliberately carries NO `lmr_*` counter instrumentation — the
+                // exactness anchors read only score and node count off the
+                // reference mover, so counters here would be dead (and their
+                // mutants unobservable). The PVS path below is the counter oracle.
+                if r > 0 {
+                    let reduced_score = self.search_child(
                         pos,
                         mv,
-                        depth - 1,
+                        depth - 1 - r,
                         ply,
                         alpha,
                         beta,
-                        child_is_pv,
+                        pv_scout_child,
                         ctx,
                         clock,
                     );
                     if self.aborted {
                         return 0;
                     }
-                    full_score
+                    if lmr_needs_full_research(reduced_score, alpha) {
+                        let full_score = self.search_child(
+                            pos,
+                            mv,
+                            depth - 1,
+                            ply,
+                            alpha,
+                            beta,
+                            pv_full_child,
+                            ctx,
+                            clock,
+                        );
+                        if self.aborted {
+                            return 0;
+                        }
+                        full_score
+                    } else {
+                        move_is_full_depth = false;
+                        reduced_score
+                    }
                 } else {
-                    move_is_full_depth = false;
-                    reduced_score
+                    self.search_child(
+                        pos,
+                        mv,
+                        depth - 1,
+                        ply,
+                        alpha,
+                        beta,
+                        pv_scout_child,
+                        ctx,
+                        clock,
+                    )
                 }
             } else {
-                // M5.G: the TT move (cur_i == 0) may be extended by 1 ply when
-                // singular_extension_eligible passed and verification returned
-                // fail-low. All other moves use `move_extension = 0` (plain
-                // `depth - 1`). The compile-time invariant `FFP_MAX_DEPTH <
-                // SE_MIN_DEPTH` guarantees SE and FFP never co-fire at the same
-                // node; the `cur_i == 0` predicate guarantees SE and LMR (which
-                // requires `quiet_index >= 2`) never co-fire on the same move.
+                // PVS ladder for a non-first move.
+                let null_beta = alpha + 1;
+
+                // Step 1 — pilot: reduced depth (or full when R == 0), null window.
+                // `lmr_reduced_*` count the reduced pilots (R > 0), preserving the
+                // ADR-0025 LMR-counter semantics; `pvs_scout_searches` counts every
+                // non-first pilot.
                 #[cfg(test)]
-                if cur_i == 0 && move_extension > 0 && self.se_tt_move_search_depth.is_none() {
-                    // Record the effective depth only when SE extension actually applies
-                    // (move_extension > 0). This isolates the singular-extension depth
-                    // increment from normal i==0 dispatches in recursive sub-calls.
-                    self.se_tt_move_search_depth = Some(depth - 1 + move_extension);
+                if self.lmr_trace_root_ply == Some(ply) {
+                    self.pvs_scout_searches += 1;
+                    if r > 0 {
+                        self.lmr_reduced_searches += 1;
+                        self.lmr_reduced_moves.push(mv);
+                    }
                 }
-                self.search_child(
+                let mut s = self.search_child(
                     pos,
                     mv,
-                    depth - 1 + move_extension,
+                    depth - 1 - r,
                     ply,
                     alpha,
-                    beta,
-                    child_is_pv,
+                    null_beta,
+                    pv_scout_child,
                     ctx,
                     clock,
-                )
+                );
+                if self.aborted {
+                    return 0;
+                }
+                move_is_full_depth = r == 0;
+
+                // Step 2 — verify: full depth, null window. Fires only after a
+                // reduced pilot beat alpha. At the non-PV nodes where R > 0,
+                // `null_beta == beta`, so this is byte-identical to the ADR-0025 §5
+                // full-depth LMR re-search (`pvs_lmr_verify_searches` and
+                // `lmr_full_researches` are the same event there).
+                if r > 0 && s > alpha {
+                    #[cfg(test)]
+                    if self.lmr_trace_root_ply == Some(ply) {
+                        self.pvs_lmr_verify_searches += 1;
+                        self.lmr_full_researches += 1;
+                        self.lmr_researched_moves.push(mv);
+                    }
+                    s = self.search_child(
+                        pos,
+                        mv,
+                        depth - 1,
+                        ply,
+                        alpha,
+                        null_beta,
+                        pv_scout_child,
+                        ctx,
+                        clock,
+                    );
+                    if self.aborted {
+                        return 0;
+                    }
+                    move_is_full_depth = true;
+                }
+
+                // Step 3 — exact: full depth, full window. Fires only when the
+                // scout result is interior to the real window (`alpha < s < beta`);
+                // statically unreachable at a non-PV node (`beta == alpha+1`).
+                if pvs_needs_research(s, alpha, beta) {
+                    #[cfg(test)]
+                    if self.lmr_trace_root_ply == Some(ply) {
+                        self.pvs_research_full_window += 1;
+                    }
+                    s = self.search_child(
+                        pos,
+                        mv,
+                        depth - 1,
+                        ply,
+                        alpha,
+                        beta,
+                        pv_full_child,
+                        ctx,
+                        clock,
+                    );
+                    if self.aborted {
+                        return 0;
+                    }
+                    move_is_full_depth = true;
+                }
+                s
             };
+
+            // M8.A: the first non-excluded move has now been searched; later
+            // moves take the scout path. (FFP-skipped quiets `continue` above
+            // without reaching here, so they never consume first-move status.)
+            first_searched = false;
 
             // Abort check: score from an aborted search is invalid.
             if self.aborted {
@@ -1675,6 +1876,12 @@ impl AlphaBetaMover {
         self.se_tt_move_search_depth = None;
         // M7.B: reset SEE-prune firing counter symmetrically.
         self.qsearch_see_prune_firings = 0;
+        // M8.A: reset PVS counters symmetrically. The harness flags
+        // (`test_force_all_pv` / `test_disable_scout`) are NOT reset — the test
+        // sets them before this call.
+        self.pvs_scout_searches = 0;
+        self.pvs_lmr_verify_searches = 0;
+        self.pvs_research_full_window = 0;
         // M7.B.2: reset root_depth so the depth-0 qsearch delegation uses the
         // flat-0 threshold (≡ M7.B) on a reused mover instance.
         self.root_depth = 0;
@@ -1775,6 +1982,41 @@ impl AlphaBetaMover {
     #[cfg(test)]
     pub(super) fn se_tt_move_search_depth_for_test(&self) -> Option<u32> {
         self.se_tt_move_search_depth
+    }
+
+    /// M8.A test-only accessors for the PVS counters. Mirror `nmp_firings_for_test`.
+    #[cfg(test)]
+    pub(super) fn pvs_scout_searches_for_test(&self) -> u32 {
+        self.pvs_scout_searches
+    }
+
+    #[cfg(test)]
+    pub(super) fn pvs_lmr_verify_searches_for_test(&self) -> u32 {
+        self.pvs_lmr_verify_searches
+    }
+
+    #[cfg(test)]
+    pub(super) fn pvs_research_full_window_for_test(&self) -> u32 {
+        self.pvs_research_full_window
+    }
+
+    /// M8.A test-only accessor for the per-`go` node count (bit-identity anchor).
+    #[cfg(test)]
+    pub(super) fn nodes_for_test(&self) -> u64 {
+        self.nodes
+    }
+
+    /// M8.A test-only setters for the exactness-harness flags. Production code
+    /// never sets these; they default to `false` and are not reset by
+    /// `negamax_for_test`.
+    #[cfg(test)]
+    pub(super) fn set_test_force_all_pv(&mut self, v: bool) {
+        self.test_force_all_pv = v;
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_test_disable_scout(&mut self, v: bool) {
+        self.test_disable_scout = v;
     }
 
     /// Test-only setter to install a TT directly without going through

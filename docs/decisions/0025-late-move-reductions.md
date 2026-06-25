@@ -168,3 +168,26 @@ The v1 commitments above are conservative and chosen for **clean SPRT attributio
 - **Pure helper tests**: `late_move_reduction` boundary + monotonicity + clamp tests; `is_lmr_eligible_quiet` per-arm rejection + acceptance tests; `lmr_needs_full_research` strict-greater-than-alpha; `tt_bound_for_completed_node` suppression + classification + the §6 worked-case Lower-arm anchor; `best_is_full_depth_after_score` equal-score upgrade + strict-improvement provenance replacement; `update_history_on_quiet_cutoff` direct +d² / -d² pin.
 - **Move-loop behavior tests**: PV / ply=0 / in-check / depth-below-min skip tests with anti-vacuous sister assertions; first-quiet-after-captures skip; killer-equality skip at quiet_index=2 (load-bearing — both killer slots seeded so the killer-arm is exercised, not the first-quiet arm); high-history skip at quiet_index=2 (same load-bearing pattern); reduces-when-eligible firing test; full-depth re-search firing test; behavioral no-re-search test pinning the move-loop wiring of `lmr_needs_full_research`; reduced-only quiet exclusion from `quiets_searched`; full-depth quiet inclusion in `quiets_searched` (anti-vacuous sister).
 - **Integration**: `tests/uci_integration.rs::bench_signature_deterministic_across_two_runs_with_lmr` (E50) pins the depth-4 bench signature at `130884` and asserts determinism across two consecutive runs with LMR active. E49 (M5.B's pin) drops its value pin and tests determinism only.
+
+## Amendment (M8.A — ADR-0043): PVS three-step ladder
+
+Under M8.A's Principal Variation Search (ADR-0043), the §5 re-search becomes a
+three-step ladder. The §5 "reduced-depth pilot → full-depth re-search" maps to **Step 1
+→ Step 2** (full-depth, *null-window* verify), and a new **Step 3** (full-window
+re-search) is appended.
+
+The key composition fact: LMR is gated `!is_pv` (§2), so Step 2 (`R > 0`) fires **only
+at non-PV nodes**, where `beta == alpha+1` and the Step-2 null window `(alpha, alpha+1)`
+**equals** the old full-window re-search `(alpha, beta)`. Step 2 is therefore
+**byte-identical to the pre-PVS §5 re-search** at every node where LMR fires — the
+window relabeling is a no-op there. Step 3 (full-window) fires only at **PV nodes**,
+where LMR does **not** (`R == 0`); the two are mutually exclusive per node-type.
+
+Consequently §6 (TT-store discipline) and §7 (history interaction) are **preserved
+unchanged**: the score that lands in `best` at an LMR node is still full-depth-witnessed
+(Step 2 escalates any reduced fail-high to full depth before it can update `best`), so
+the Lower/Exact arguments still hold and the cutter passed to
+`update_history_on_quiet_cutoff` is still full-depth. `move_is_full_depth` stays
+`false` only on a reduced-only fail-low (Step 1, no escalation) — the §6 provenance rule
+verbatim. The three-step framing matters for correctness only if a future change ever
+permits LMR at PV nodes.
