@@ -70,6 +70,29 @@
 #     has multiple mutants of the same shape but different semantic targets
 #     — the rule will silently over-filter sibling mutants.
 
+# ---- Per-mutant test timeout cap ------------------------------------------
+# cargo-mutants auto-sets the per-mutant test timeout from the baseline run ×
+# a default 5× multiplier. Our baseline (lib + integration) is ~384 s, so the
+# auto-timeout lands at ~1922 s (≈ 32 min) — and any mutant that makes a test
+# HANG (e.g. gutting `negamax` to `return 0` sends an ID-loop test infinite)
+# burns that full 32 min before it is killed. Observed live in the M8.A.1
+# in-diff run: 4 timeout mutants each ran `~2 s build + 1922 s test`, ~2 h of
+# the run. On a larger diff with many hanging mutants this is the ~12 h
+# pathology.
+#
+# Cap the multiplier at 2× (~768 s). This is SAFE w.r.t. the 0-missed gate:
+# only two cases run long — (1) a SURVIVOR runs the full passing suite once
+# (≈ baseline ~384 s ≪ 768 s, no false timeout), (2) a HANG runs unbounded
+# (killed at 768 s). Caught mutants return as soon as the first test fails
+# (often seconds), unaffected. A timeout is classified "timeout", never
+# "missed", so even an over-tight cap cannot manufacture a false survivor —
+# worst case a slow-but-caught mutant lands in the timeout bucket (which we
+# already treat as timeout-caught). Tighten toward ~1.5× only after observing
+# that no healthy survivor runs near the cap. The bigger lever (deferred —
+# see docs/tooling-backlog.md) is shrinking the baseline itself (the
+# integration suite dominates the 384 s).
+timeout_multiplier = 2.0
+
 # ---- File-level exclusions ------------------------------------------------
 exclude_globs = [
     # Auto-generated constants. The data is verified end-to-end by the

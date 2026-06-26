@@ -2,6 +2,33 @@
 
 Industry-best-practice items surfaced during the 2026-04-27 workflow review but not yet adopted. **Listed in recommended implementation order** — pick from the top when the next slot opens for tooling work.
 
+### `cargo mutants` per-mutant timeout cap (avoid the ~12 h hang pathology) — ◐ cap LANDED 2026-06-26; baseline-speedup DEFERRED
+
+**Problem.** cargo-mutants auto-sets the per-mutant test timeout from the baseline run × a
+default **5×** multiplier. Our baseline (lib + integration) is **~384 s**, so the auto-timeout
+landed at **~1922 s (≈ 32 min)**. Any mutant that makes a test **hang** (e.g. gutting `negamax`
+to `return 0` sends an iterative-deepening test into an infinite loop) burns that full 32 min
+before being killed. Observed live in the M8.A.1 in-diff run: **4 timeout mutants each ran
+`~2 s build + 1922 s test`** — ~2 h of a 20-mutant run. On a larger diff with many hanging
+mutants this is the ~12 h pathology.
+
+**Landed (2026-06-26).** `timeout_multiplier = 2.0` in `.cargo/mutants.toml` ⇒ ~768 s cap.
+**Safe w.r.t. the 0-missed gate:** only two cases run long — a SURVIVOR runs the full passing
+suite once (≈ baseline ~384 s ≪ 768 s, no false timeout) and a HANG runs unbounded (killed at
+768 s); CAUGHT mutants return on first test failure (often seconds). A timeout is classified
+*timeout*, never *missed*, so even an over-tight cap cannot manufacture a false survivor — worst
+case a slow-but-caught mutant lands in the (already-treated-as-caught) timeout bucket. Validated:
+`cargo mutants --list` parses the config (key accepted). Can be tightened toward ~1.5× after
+observing that no healthy survivor runs near the cap.
+
+**Deferred — the bigger lever.** The real cost driver is the **slow baseline** (the integration
+suite dominates the 384 s; the lib suite alone is ~46 s). Options for a future tooling slot:
+scope the in-diff mutation test command to the lib suite (risk: in-diff mutants only an
+integration test catches would be missed — needs a coverage check first), adopt `cargo-nextest`
+for faster test execution, or split a fast "mutation profile." Lowering the baseline lowers the
+auto-timeout floor and the whole run proportionally. Not urgent now that the 2× cap bounds the
+worst case.
+
 ### ~~Custom in-process Elo-iteration harness~~ — Done (ELOH.B/C/D/E, 2026-04-30 / 2026-05-01)
 
 Landed as `src/bin/elo-iterate.rs` on branches `tooling/elo-harness` (A/B/C), `tooling/eloh-d-mixed-tc` (D), `tooling/eloh-e-sprt` (E).
