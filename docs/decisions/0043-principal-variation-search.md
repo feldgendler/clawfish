@@ -1,6 +1,10 @@
 # ADR-0043 — Principal Variation Search (PVS): scout window, three-step LMR ladder, retained `is_pv`
 
-**Status:** Accepted (lands with M8.A).
+**Status:** Accepted (mechanism); M8.A **shelved** (2-seed SPRT net ≈ −20 Elo, depth-amplifying
+— see [`bench/sprt/2026-06-25-m8a-pvs-vs-m7b2.md`](../../bench/sprt/2026-06-25-m8a-pvs-vs-m7b2.md)).
+**Superseded for shipping by ADR-0044 (M8.A.1 depth-conditioned PVS)**, which conditions the
+scout on ID root depth via a smooth ramp; the "Tuning levers if the SPRT regresses" list in
+§Consequences below is superseded by that ramp.
 
 ## Context
 

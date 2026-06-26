@@ -316,6 +316,32 @@ fn pvs_needs_research(score: i32, alpha: i32, beta: i32) -> bool {
     score > alpha && score < beta
 }
 
+/// M8.A.1 depth-conditioned PVS ramp constants (ADR-0044). Tunable; see
+/// `docs/research/m8.a.1-depth-conditioned-pvs.md` §5.
+const PVS_RAMP_D0: u32 = 12; // root depth at/below which PVS is fully off (≡ M7.B.2)
+const PVS_RAMP_BASE: u32 = 16; // scout-start rank one ply above D0 (scout only the deep tail)
+const PVS_RAMP_SLOPE: u32 = 4; // move-ordering ranks unlocked for scouting per ply above D0
+
+/// M8.A.1: lowest move-ordering rank (`cur_i`) eligible for the PVS null-window
+/// scout at this ID *root* iteration depth (`AlphaBetaMover::root_depth`, ADR-0041
+/// — constant across the negamax tree for the iteration, NOT the local node depth).
+///
+/// `u32::MAX` ⇒ no move is scouted ⇒ every non-first move takes the reference
+/// full-window path ⇒ **byte-identical to `M7.B.2`** (the fast-TC safety guarantee).
+/// Monotonically non-increasing in `root_depth`; reaches 1 (all non-first moves
+/// scouted ⇒ full PVS ≡ M8.A) at `root_depth >= D1 = 16`. The off-regime ramp is
+/// the depth-mirror of the M7.B.2 qsearch SEE-prune ramp (ADR-0041): PVS hurts at
+/// shallow root depths (fast TC) and helps at deep ones (slow TC), so it is
+/// suppressed shallow and engaged deep. See ADR-0044.
+fn pvs_scout_start(root_depth: u32) -> u32 {
+    if root_depth <= PVS_RAMP_D0 {
+        return u32::MAX;
+    }
+    PVS_RAMP_BASE
+        .saturating_sub(PVS_RAMP_SLOPE * (root_depth - PVS_RAMP_D0))
+        .max(1)
+}
+
 /// TT bound classification for a completed negamax node, including the M5.C
 /// soundness rule that a node whose best score is only reduced-depth-proven
 /// must not advertise a full-depth TT bound.
@@ -1552,6 +1578,16 @@ impl AlphaBetaMover {
             let r = lmr_reduction.unwrap_or(0);
             let is_first = first_searched;
 
+            // M8.A.1 — depth-conditioned PVS (ADR-0044). A non-first move is
+            // scouted only when its move-ordering rank `cur_i` reaches the
+            // root-depth ramp's scout-start (≡ M7.B.2 below D0=12, full PVS at
+            // d≥16). Non-scouted non-first moves take the reference full-window
+            // path. `test_disable_scout` (test-only) forces the reference path
+            // for the exactness anchors; it is `false` under `cfg(not(test))`,
+            // so production scouting is governed purely by the ramp.
+            let should_scout =
+                !test_disable_scout && cur_i as u32 >= pvs_scout_start(self.root_depth);
+
             let score = if is_first {
                 // First non-excluded move: full window, full depth (+ extension),
                 // inherit parent PV-ness. SE depth recording (M5.G) lives here —
@@ -1578,16 +1614,26 @@ impl AlphaBetaMover {
                     ctx,
                     clock,
                 )
-            } else if test_disable_scout {
-                // Test-only reference: the pre-PVS move loop (full-window reduced
-                // pilot → full-window full-depth re-search). The value reference
-                // for the exactness anchors; never compiled into production
-                // (`test_disable_scout` is `false` under `cfg(not(test))`). It
-                // deliberately carries NO `lmr_*` counter instrumentation — the
-                // exactness anchors read only score and node count off the
-                // reference mover, so counters here would be dead (and their
-                // mutants unobservable). The PVS path below is the counter oracle.
+            } else if !should_scout {
+                // M8.A.1 reference full-window path: the pre-PVS move loop
+                // (full-window reduced pilot → full-window full-depth re-search).
+                // Taken in production for non-scouted non-first moves (the ramp's
+                // off-regime — `root_depth <= D0` ⇒ scout_start = MAX ⇒ every
+                // non-first move lands here ⇒ byte-identical to M7.B.2), and by
+                // every move under the `test_disable_scout` exactness anchor.
+                //
+                // LMR firing is instrumented here with the SAME `#[cfg(test)]`
+                // counters as the ladder's Steps 1/2 (scalars AND the move
+                // vectors, all trace-ply-gated) so the wide-window `is_pv=false`
+                // LMR-firing tests stay valid with `root_depth` unset (LMR fires
+                // identically on both paths — ADR-0044 §4). The `pvs_*` counters
+                // are NOT mirrored: scout/verify/re-search are ladder-only events.
                 if r > 0 {
+                    #[cfg(test)]
+                    if self.lmr_trace_root_ply == Some(ply) {
+                        self.lmr_reduced_searches += 1;
+                        self.lmr_reduced_moves.push(mv);
+                    }
                     let reduced_score = self.search_child(
                         pos,
                         mv,
@@ -1603,6 +1649,11 @@ impl AlphaBetaMover {
                         return 0;
                     }
                     if lmr_needs_full_research(reduced_score, alpha) {
+                        #[cfg(test)]
+                        if self.lmr_trace_root_ply == Some(ply) {
+                            self.lmr_full_researches += 1;
+                            self.lmr_researched_moves.push(mv);
+                        }
                         let full_score = self.search_child(
                             pos,
                             mv,
@@ -1853,6 +1904,75 @@ impl AlphaBetaMover {
         excluded_move: Option<Move>,
         ctx: &SearchContext,
     ) -> i32 {
+        self.negamax_for_test_inner(
+            pos,
+            depth,
+            ply,
+            alpha,
+            beta,
+            is_pv,
+            allow_null,
+            excluded_move,
+            ctx,
+            // M7.B.2: reset root_depth to 0 so the depth-0 qsearch delegation
+            // uses the flat-0 threshold (≡ M7.B) and the M8.A.1 PVS ramp is OFF
+            // (scout_start = MAX ⇒ reference path) on a reused mover instance.
+            0,
+        )
+    }
+
+    /// M8.A.1: test-only sibling of `negamax_for_test` that publishes
+    /// `root_depth` *after* the per-entry resets (so it survives the reset) to
+    /// drive the depth-conditioned PVS ramp (ADR-0044 §4). Direct mirror of
+    /// `qsearch_at_root_depth_for_test`. Pass `root_depth >= 16` for full PVS.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn negamax_at_root_depth_for_test(
+        &mut self,
+        pos: &mut Position,
+        depth: u32,
+        ply: u32,
+        alpha: i32,
+        beta: i32,
+        is_pv: bool,
+        allow_null: bool,
+        excluded_move: Option<Move>,
+        ctx: &SearchContext,
+        root_depth: u32,
+    ) -> i32 {
+        self.negamax_for_test_inner(
+            pos,
+            depth,
+            ply,
+            alpha,
+            beta,
+            is_pv,
+            allow_null,
+            excluded_move,
+            ctx,
+            root_depth,
+        )
+    }
+
+    /// Shared body of `negamax_for_test` / `negamax_at_root_depth_for_test`:
+    /// the per-entry counter resets, then `self.root_depth = root_depth` (set
+    /// AFTER the resets so it is not clobbered), then the traced `negamax` call.
+    /// Extracting it keeps the two entries from drifting (ADR-0044 §4).
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn negamax_for_test_inner(
+        &mut self,
+        pos: &mut Position,
+        depth: u32,
+        ply: u32,
+        alpha: i32,
+        beta: i32,
+        is_pv: bool,
+        allow_null: bool,
+        excluded_move: Option<Move>,
+        ctx: &SearchContext,
+        root_depth: u32,
+    ) -> i32 {
         let clock = SearchClock::start_for(ctx.virtual_clock, ctx.caps);
         self.lmr_reduced_searches = 0;
         self.lmr_full_researches = 0;
@@ -1882,9 +2002,9 @@ impl AlphaBetaMover {
         self.pvs_scout_searches = 0;
         self.pvs_lmr_verify_searches = 0;
         self.pvs_research_full_window = 0;
-        // M7.B.2: reset root_depth so the depth-0 qsearch delegation uses the
-        // flat-0 threshold (≡ M7.B) on a reused mover instance.
-        self.root_depth = 0;
+        // M7.B.2 / M8.A.1: publish root_depth AFTER the resets so it survives;
+        // it drives both the qsearch SEE-prune ramp and the PVS scout ramp.
+        self.root_depth = root_depth;
         self.lmr_trace_root_ply = Some(ply);
         let score = self.negamax(
             pos,

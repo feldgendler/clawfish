@@ -1154,7 +1154,15 @@ fn bench_signature_deterministic_across_two_runs_with_qsearch_tt() {
     // (−1.1%, scout savings dominate deeper). Determinism anchor, not a
     // no-regression signal; the strength claim is the mixed-TC SPRT vs M7.B.2.
     // History prepend: M8.A `47_763`.
-    const DEPTH4_BENCH_NODES: u64 = 47_763;
+    // M8.A.1 (depth-conditioned PVS ramp, ADR-0044): the PVS scout is gated by
+    // the root-depth ramp `pvs_scout_start` — OFF (scout_start = MAX ⇒ every
+    // non-first move takes the reference path) at root_depth <= D0 = 12. The
+    // bench runs at depth <= 7 <= D0, so the ramp is INERT and the anchor reverts
+    // EXACTLY to M7.B.2's `45_788` (depth-7 reverts to `662_085`). This byte-for-
+    // byte revert IS the proof of the off-regime byte-identity safety property: a
+    // mismatch here would mean the reference path has diverged from M7.B.2 — it is
+    // stop-the-line, not a number to update. History prepend: M8.A.1 `45_788`.
+    const DEPTH4_BENCH_NODES: u64 = 45_788;
     assert_eq!(
         nodes1, DEPTH4_BENCH_NODES,
         "E51: bench node count changed from the M5.F.1 pin ({DEPTH4_BENCH_NODES} at depth=4); \
