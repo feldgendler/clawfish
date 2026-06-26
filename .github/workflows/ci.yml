@@ -53,6 +53,17 @@ jobs:
       #    tests that prove those invariants fire. This fast debug `--lib` run
       #    (~46 s; no heavy self-play integration tests are in `--lib`) keeps that
       #    coverage cross-platform. It is NOT redundant with run 2.
+      #
+      #    `production_worker_tests` (lib unit tests) spawn the `mock-engine`
+      #    `[[bin]]` fixture by walking `current_exe()` to `target/debug/`.
+      #    `nextest run --lib` does NOT build `[[bin]]` targets, so the fixture
+      #    must be built explicitly first — otherwise its presence is
+      #    cache-dependent and the tests panic with "could not find mock-engine"
+      #    on a cache miss (the flake that reddened main after the nextest
+      #    adoption). The optimized full suite below builds all targets, so it
+      #    needs no such step. (CARGO_BIN_EXE_* is unavailable to lib unit tests,
+      #    so the path-walk + explicit build is the correct pattern here.)
+      - run: cargo build --locked --bin mock-engine
       - run: cargo nextest run --locked --lib --profile ci
       # 2. FULL suite under `release-checked` (optimized + overflow-checks). Built
       #    optimized so the heavy self-play integration tests run in seconds, not
