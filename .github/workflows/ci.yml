@@ -117,4 +117,18 @@ jobs:
       # (they exercise cross-module orchestration over code already covered
       # by lib unit tests). They still run in the `test` job above.
       # `--ignore-run-fail` keeps coverage informational rather than gating.
-      - run: cargo llvm-cov --lib --locked --summary-only --ignore-run-fail
+      #
+      # Like the `test` job, the `production_worker_tests` (lib) spawn the
+      # `mock-engine` [[bin]] fixture, which `--lib` does not build. cargo-llvm-cov
+      # builds into its OWN `target/llvm-cov-target` dir (not `target/debug`) and
+      # wipes stray artifacts at startup — so a plain pre-build there gets deleted.
+      # The working sequence: drop stale profraw, build the fixture INTO that dir,
+      # then run with `--no-clean` so the fixture survives the run. Without this the
+      # fixture tests panic ("could not find mock-engine") and contribute no
+      # coverage; `--ignore-run-fail` masks that to keep the job green, but the
+      # data is then missing. (`target/llvm-cov-target` is cargo-llvm-cov's default
+      # build dir; if a future version changes it, only this non-gating job breaks,
+      # visibly.)
+      - run: cargo llvm-cov clean --profraw-only
+      - run: cargo build --locked --bin mock-engine --target-dir target/llvm-cov-target
+      - run: cargo llvm-cov --lib --locked --summary-only --ignore-run-fail --no-clean
