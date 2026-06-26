@@ -8,35 +8,46 @@ This file also tracks **deferred features awaiting a precondition** — items re
 
 ---
 
-### M8.A.1 — joint prune-gate retune with PVS active (idiomatic PVS fix + NNUE re-tune hook) — ACTIVE (medium-term)
+### M8.A.1 — joint prune-gate retune with PVS active (idiomatic PVS fix + NNUE re-tune) — ⏸ DEFERRED — post-NNUE (M12)-gated
 
-**Why.** M8.A.1 (depth-conditioned PVS, ADR-0044, SHIPPED 2026-06-26, +28.7 Elo) fixes a
-regression caused by PVS Step-3 re-searches being marked `is_pv = true`, which **suppresses
-this engine's `is_pv`-gated prunes** (NMP/RFP/FFP/LMR) inside the re-search subtree. A focused
-prior-art pass ([`docs/research/m8.a1-pvs-lmr-prune-interaction.md`](research/m8.a1-pvs-lmr-prune-interaction.md))
+**Gating.** This is an **M13-class** campaign (eval-margin-dependent search tuning) and is
+**hard-gated on M12 (NNUE)**, for the same documented reason M13 is scheduled after NNUE:
+tuning eval-margin prunes (RFP/FFP margins) against the noisier HCE risks **false-negative
+SPRTs** — "the exact trap that shelved several M6/M7 ideas" — and the result would have to be
+re-tuned against NNUE anyway. The M8.A.1 ramp is shipped and SPRT-validated against the current
+eval, so there is **no urgency to retire it pre-NNUE**; doing this now would burn an SPSA
+campaign whose output gets discarded at M12. **Do not pull this into a pre-NNUE tuning slot.**
+
+**Why (the underlying interaction).** M8.A.1 (depth-conditioned PVS, ADR-0044, SHIPPED
+2026-06-26, +28.7 Elo) fixes a regression caused by PVS Step-3 re-searches being marked
+`is_pv = true`, which **suppresses this engine's `is_pv`-gated prunes** (NMP/RFP/FFP/LMR) inside
+the re-search subtree. A prior-art pass
+([`docs/research/m8.a1-pvs-lmr-prune-interaction.md`](research/m8.a1-pvs-lmr-prune-interaction.md))
 found the **idiomatic** resolution is to **tune the prune gates with PVS already active** — our
 prune margins/depths were tuned *pre-PVS* (M5.A–M5.D), so they are composition artifacts. The
 M8.A.1 ramp is a defensible band-aid (and extension-immune, unlike NegaScout's remaining-depth
 cousin), but the principled fix is a joint retune.
 
-**The lever.** SPSA (or staged SPRT) over the cross-ADR prune-gate parameter space with PVS on:
-NMP (ADR-0023), RFP (ADR-0024), LMR (ADR-0025), FFP (ADR-0026) depth gates + margins. Success
-target: recover (or exceed) M8.A.1's +28.7 with the prune gates re-fit to the PVS node
-distribution — ideally **retiring the `PVS_RAMP_{D0,BASE,SLOPE}` ramp entirely** (full
-unconditioned PVS + re-tuned prunes ≥ shipped M8.A.1).
+**Two post-NNUE deliverables (do together against the post-M12 baseline):**
+1. **Re-validate / re-tune M8.A.1 itself (the must-check).** The ramp constants
+   `PVS_RAMP_{D0=12,BASE,SLOPE}` are calibrated to HCE's depth-vs-TC mapping; NNUE is slower per
+   node ⇒ ~1–2 ply shallower at a given TC ⇒ the knee (`D0=12`) likely lands wrong. **Re-run the
+   M8.A.1 2-seed SPRT and, if marginal, re-fit `D0/BASE/SLOPE`** against the post-M12 baseline
+   (ADR-0044 §Consequences).
+2. **Joint prune-gate retune (the idiomatic fix; optional ramp retirement).** SPSA/staged-SPRT
+   over the cross-ADR prune-gate space with PVS on — NMP (ADR-0023), RFP (ADR-0024), LMR
+   (ADR-0025), FFP (ADR-0026) depth gates + margins. Target: recover/exceed M8.A.1's gain with
+   the prunes re-fit to the PVS node distribution — ideally **retiring the ramp entirely** (full
+   unconditioned PVS + re-tuned prunes ≥ ramped PVS).
 
-**Double duty — the NNUE (M12) re-tune hook.** The M8.A.1 ramp constants are calibrated to
-HCE's depth-vs-TC mapping; NNUE is slower per node ⇒ ~1–2 ply shallower at a given TC ⇒ the
-ramp knee (`D0=12`) likely needs re-fitting, and the prune margins themselves are eval-sensitive.
-This same joint-retune campaign is the natural place to re-validate/re-tune M8.A.1 against the
-post-NNUE baseline (ADR-0044 §Consequences). **Reminder: re-run the M8.A.1 2-seed SPRT (and, if
-marginal, re-fit `D0/BASE/SLOPE`) against the post-M12 baseline.**
-
-**Cheap probe (low prior, optional).** ADR-0043's deferred lever — mark the Step-3 re-search
-child `is_pv = false` (keep prunes firing) — would remove the suppression cost without a ramp,
-but the research found **no published advocate** and it departs from the canonical node-type
-classification (CPW: re-searches *are* PV nodes). Still a cheap single-arm SPRT vs M8.A.1 if a
-slot opens, but lower expected value than the joint retune.
+**Cheap probe (eval-agnostic mechanism; pre-NNUE-permissible but provisional).** ADR-0043's
+deferred lever — mark the Step-3 re-search child `is_pv = false` (keep prunes firing) — would
+remove the suppression cost without a ramp. The mechanism is structural (not a margin tune), so
+it *may* be sanity-checked pre-NNUE; **but** what it does is let the HCE-tuned margin-prunes fire
+in re-search subtrees, so its measured Elo is eval-sensitive and **could flip post-NNUE** — treat
+any pre-NNUE result as provisional. Prior art gives it **no published advocate** and it departs
+from the canonical node-type classification (CPW: re-searches *are* PV nodes), so it is low-prior
+either way.
 
 ---
 
