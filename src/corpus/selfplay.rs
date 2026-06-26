@@ -241,11 +241,11 @@ fn search_best_move(
     depth: u8,
     stop: &Arc<AtomicBool>,
 ) -> Option<crate::Move> {
+    // Depth-only search: `..default()` already supplies `nodes: None`,
+    // `movetime: None`, `infinite: false`, so they are not spelled out (doing so
+    // only generates equivalent `delete field` mutants — see .cargo/mutants.toml).
     let limits = SearchLimits {
         depth: Some(depth as u32),
-        nodes: None,
-        movetime: None,
-        infinite: false,
         ..SearchLimits::default()
     };
     let ctx = SearchContext {

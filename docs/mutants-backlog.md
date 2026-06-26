@@ -219,6 +219,53 @@ Update `docs/milestones/m4.b.md`'s, `docs/milestones/m4.c.md`'s, `docs/milestone
 - **If the campaign hangs**: per `.cargo/mutants.toml` guidance, the timeout multiplier should be enough; if a specific mutation hangs the test suite, it's almost always the cancellation-poll cadence interacting with the mutated code. Cancel via Ctrl-C; the mutation is caught-via-timeout.
 - **If a survivor maps outside the M4.B/M4.C/M4.D/M5.A/M5.B surface** (i.e., a mutation on a line outside `src/search.rs` killer / history / aspiration / NMP / RFP logic, `src/history.rs`, `src/mov.rs::from_bits` / null-move primitives, `src/movegen.rs::test_strategies` lift, `src/position.rs` delegators, the M4.C/M4.D/M5.A/M5.B-specific test surface): something's off with the diff scope. Re-check that `33a0d0d..<m5.b-merge-sha>` is the correct hash range and that no drift commits have landed.
 
+### corpus StructField delete-field survivors (genre not regex-excludable)
+
+Surfaced 2026-06-26 by the nextest-adoption mutation smoke — the corpus
+self-play / consumer / fetch modules had never had a full `cargo mutants` sweep,
+so cargo-mutants 27's **`StructField` genre** (`delete field <f> from struct <S>
+expression in <fn>`) produced previously-unseen mutants. The smoke ran a subset
+(7 of these); a full corpus sweep will surface more, so re-triage corpus
+StructField survivors against this entry.
+
+**Important tooling fact:** `exclude_re` in `.cargo/mutants.toml` does **not**
+match the `StructField` genre — even a bare `"in <fn>"` substring of the mutant
+name fails to suppress it, while the same form works for the `replace` / `delete
+-` genres (verified via `cargo mutants --list`). So these cannot be closed with
+an `exclude_re` rule; close them by **killing with a test** or **refactoring the
+field away**, else record them here as accepted/deferred.
+
+Disposition of the 7 from the smoke:
+- **KILLED** — `positions_committed` in `consumer_loop` (`src/corpus/consumer.rs`):
+  the seed `positions_committed: state.positions_at_resume` only survives when the
+  loop commits nothing (line 270 overwrites it on each commit). Killed by
+  `consumer_fully_resumed_zero_commit_reports_resumed_position_total` (a
+  fully-resumed corpus with `positions_at_resume = 7` and zero new commits ⇒
+  reported count must be 7, not the mutant's 0). Every prior consumer test used
+  `positions_at_resume = 0`, hiding it.
+- **ELIMINATED** — `nodes` / `movetime` / `infinite` in `search_best_move`
+  (`src/corpus/selfplay.rs`): these equalled `SearchLimits::default()`, so the
+  mutants were equivalent (byte-identical struct). The redundant fields were
+  removed (`..SearchLimits::default()` already supplies them), so cargo-mutants no
+  longer generates them.
+- **DEFERRED (real, expensive to test)** — no regex rule possible; revisit if/when
+  the cost is justified:
+  - `movetime` in `calibrate_ladder` (`selfplay.rs`): deleting it flips the
+    search's `wait` flag (search.rs `wait = … || movetime.is_some() || …`) ⇒
+    shallower calibration. But `calibrate_ladder` is **wall-clock-dependent by
+    design** (its only test is deliberately structural — depth ≥ 1 — because
+    depths jitter ±1 ply; the frozen dev-machine ladder in `manifest.json` is the
+    gate). A deterministic catch would need a flaky timing assertion.
+  - `fatal_io_error` in `run` (`selfplay.rs`): set when a worker **thread panics**
+    (`h.join().unwrap_or_else(...)`); deleting it swallows the panic. Exercising it
+    needs a real panicking worker inside `run()`'s pool — integration scope. The
+    `tests/corpus_crash_safety.rs` worker-panic test is the natural home for a
+    future assertion that the run surfaces the error.
+  - `cap_seed` in `cmd_fetch` (`src/bin/corpus.rs`): CLI arg-plumbing behind the
+    `corpus-fetch` feature; driving it needs the `corpus fetch` command (network /
+    fixtures). cap_seed's reproducibility contract is separately enforced by the
+    extend-time `cap_seed mismatch` guard.
+
 ## Done
 
 ### M5.D — Frontier futility pruning (campaign ran 2026-05-06 on the M5.D landing diff)

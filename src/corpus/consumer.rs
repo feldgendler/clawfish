@@ -635,6 +635,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn consumer_fully_resumed_zero_commit_reports_resumed_position_total() {
+        // Resume a corpus that is ALREADY complete: every game id is in
+        // `committed_ids_at_resume`, so the consumer skips them all via the
+        // skip-committed bypass and commits nothing new. The happy-path
+        // `stats.positions_committed = committer.committed()` line only runs on a
+        // commit, so with zero commits the only thing carrying the durable total
+        // is the entry seed `positions_committed: state.positions_at_resume`. The
+        // reported count must therefore be the resumed total (7), not 0.
+        //
+        // Every other consumer test starts at `positions_at_resume = 0`, so the
+        // seed and the mutant's fallback (0) coincide and the
+        // `delete field positions_committed from ConsumerStats` mutant survives
+        // them all. A nonzero resume + zero new commits is the distinguishing
+        // case.
+        let td = TempDir::new("fully-resumed-zero-commit");
+        let pending_dir = td.0.join("pending");
+        std::fs::create_dir_all(&pending_dir).unwrap();
+
+        let dispatcher = Dispatcher::new(vec![], 3, 3);
+        for id in 0..3 {
+            dispatcher.notify_completed(id);
+        }
+        let alive = Arc::new(AtomicUsize::new(0));
+        let stop = AtomicBool::new(false);
+        let cfg = base_cfg(td.0.clone(), 3);
+
+        let mut state = ConsumerState {
+            next_consume_id: 0,
+            fen_set: HashSet::new(),
+            committed_ids_at_resume: (0..3).collect(),
+            positions_at_resume: 7,
+        };
+
+        let stats = consumer_loop(&cfg, &mut state, &dispatcher, alive, &stop, &td.0).unwrap();
+
+        assert_eq!(
+            stats.games_committed, 0,
+            "a fully-resumed corpus commits no new games"
+        );
+        assert_eq!(
+            stats.positions_committed, 7,
+            "positions_committed must carry the resumed durable total \
+             (positions_at_resume = 7) when no new game commits; got {}",
+            stats.positions_committed
+        );
+    }
+
     // ── Cap → stop side-effect ───────────────────────────────────────────
 
     #[test]

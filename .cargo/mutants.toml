@@ -989,4 +989,24 @@ exclude_re = [
     #  re-triage on any endgame_scale refactor (already required — see above).
     "src/eval/tier1\\.rs:220:25: replace - with / in endgame_scale",
     "src/eval/tier1\\.rs:221:25: replace - with / in endgame_scale",
+
+    # ---- corpus `delete field from struct` (cargo-mutants StructField genre) --
+    #
+    # NOTE: `exclude_re` does NOT match the StructField (`delete field … from
+    # struct … expression`) mutation genre — empirically, even a bare
+    # `"in <fn>"` substring of the mutant name fails to suppress these, while it
+    # works for the `replace`/`delete -` genres (verified 2026-06-26 via
+    # `cargo mutants --list`). So there is no working regex rule for them; their
+    # disposition is recorded in `docs/mutants-backlog.md` §"corpus StructField
+    # delete-field survivors". Summary of the 7 surfaced by the nextest-adoption
+    # smoke:
+    #   - `positions_committed` (consumer_loop): KILLED by a new test
+    #     (`consumer_fully_resumed_zero_commit_reports_resumed_position_total`).
+    #   - `nodes`/`movetime`/`infinite` (search_best_move): were EQUIVALENT
+    #     (field == Default), now ELIMINATED by removing the redundant fields
+    #     (src/corpus/selfplay.rs — `..SearchLimits::default()` already supplies
+    #     them), so cargo-mutants no longer generates them.
+    #   - `movetime` (calibrate_ladder, wall-clock-dependent), `fatal_io_error`
+    #     (run, worker-panic integration path), `cap_seed` (cmd_fetch, feature-
+    #     gated CLI): REAL but expensive to test; DEFERRED (see mutants-backlog).
 ]
