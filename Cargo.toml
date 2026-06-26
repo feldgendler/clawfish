@@ -92,3 +92,23 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# Optimized build WITH integer-overflow checks, used by CI to run the FULL test
+# suite (`cargo nextest run --cargo-profile release-checked`). Optimized so the
+# heavy self-play integration tests run in seconds (a debug build makes them tens
+# of seconds and contention-sensitive — that slowness is largely the per-move
+# `debug_assert_consistent` scan). overflow-checks kept ON so the optimized run
+# still catches integer overflow. The production `release` profile above is
+# untouched (no engine perf cost). `panic = "abort"` is inherited but cargo forces
+# `unwind` for test/bench targets, so `#[should_panic]` tests work.
+#
+# NOTE: this profile does NOT restore `debug-assertions` (inherited `false` from
+# release) — so `debug_assert!`/`debug_assert_consistent` and the
+# `#[cfg(debug_assertions)]` guard tests are compiled out of this run. That
+# coverage is kept by a separate fast DEBUG `cargo nextest run --lib` step in CI
+# (.github/workflows/ci.yml). Do NOT just set `debug-assertions = true` here — it
+# would re-enable the per-move scan and re-slow the heavy integration tests,
+# defeating the profile's purpose.
+[profile.release-checked]
+inherits = "release"
+overflow-checks = true

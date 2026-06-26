@@ -1,0 +1,59 @@
+# cargo-nextest configuration. See https://nexte.st/.
+#
+# nextest is the project's primary test runner: CI's `test` job runs it under
+# the optimized `release-checked` cargo profile, and cargo-mutants drives the
+# suite through it in debug (`test_tool = "nextest"` in .cargo/mutants.toml). It
+# runs each test in its own process and schedules them across all cores.
+#
+# Two facts shape this config:
+#   1. DOCTESTS ARE NOT RUN BY NEXTEST. CI runs them separately via
+#      `cargo test --doc`; the pre-review mechanical-check sequence does too.
+#      Dropping that step would silently stop exercising doctests.
+#   2. The heavy corpus/texel integration tests spawn engine subprocesses doing
+#      self-play / crash-resume. In a DEBUG build each takes tens of seconds and
+#      is CPU-contention-sensitive (docs/workflow.md §"Resource contention
+#      discipline"). `cargo test` only avoids trouble incidentally by running
+#      integration binaries one at a time; nextest parallelizes everything, so
+#      they need an explicit concurrency cap (the `heavy-integration` group).
+#      CI sidesteps this entirely by building optimized (release-checked), where
+#      these tests run in 2-4 s and the cap/timeout are just a safety net.
+
+[test-groups]
+# Cap how many heavy self-play tests run at once so they don't oversubscribe the
+# box. 4 suits the dev machine (where cargo-mutants runs, debug); the ~2180 fast
+# unit tests still parallelize fully and finish in seconds. (CI runs optimized,
+# so this cap rarely binds there.)
+heavy-integration = { max-threads = 4 }
+
+[profile.default]
+# Fast tests: a hung one is killed quickly (60 s mark, SIGKILL after a second
+# period ≈ 120 s). No healthy fast test runs longer than ~4 s, so this is the
+# hang detector — a mutant that sends an iterative-deepening test infinite is
+# caught here in ~120 s, not the old ~768 s.
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+# Heavy tests in a DEBUG build legitimately run tens of seconds, more under the
+# throttled contention — give them a generous ceiling so none is falsely killed,
+# while still bounding a true infinite hang (300 s mark, SIGKILL after a third
+# period ≈ 900 s). A real engine-logic hang shows up in the FAST tests above
+# (killed at ~120 s); these heavy tests just need room to finish.
+filter = 'binary(/^corpus_/) + binary(=texel_resume)'
+test-group = 'heavy-integration'
+slow-timeout = { period = "300s", terminate-after = 3 }
+
+[profile.ci]
+# CI runs every test even after a failure (mirrors the matrix `fail-fast: false`)
+# so a red run reports all failures at once, not just the first. No retries: the
+# suite is deterministic and silent retries would mask a real flake. The
+# heavy-test override is duplicated below (rather than relied upon from the
+# default profile) so correctness does not depend on nextest's cross-profile
+# override inheritance, whose behavior has varied across versions.
+fail-fast = false
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = 'binary(/^corpus_/) + binary(=texel_resume)'
+test-group = 'heavy-integration'
+slow-timeout = { period = "300s", terminate-after = 3 }

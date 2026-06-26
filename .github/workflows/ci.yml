@@ -39,9 +39,29 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked --all-targets
+      # Two test runs, both via nextest (process-per-test, parallel across cores):
+      #
+      # 1. DEBUG lib suite. The full suite below builds optimized, which (a)
+      #    compiles out `debug_assert!`/`debug_assertions` — including the
+      #    per-move `Position::debug_assert_consistent` board-consistency scan —
+      #    and (b) drops the `#[cfg(debug_assertions)]` `#[should_panic]` guard
+      #    tests that prove those invariants fire. This fast debug `--lib` run
+      #    (~46 s; no heavy self-play integration tests are in `--lib`) keeps that
+      #    coverage cross-platform. It is NOT redundant with run 2.
+      - run: cargo nextest run --locked --lib --profile ci
+      # 2. FULL suite under `release-checked` (optimized + overflow-checks). Built
+      #    optimized so the heavy self-play integration tests run in seconds, not
+      #    the tens of seconds a debug build takes (which oversubscribes the runner
+      #    under nextest's parallelism — that slowness is itself caused by the
+      #    per-move debug-assert scan, so a debug full suite is not an option here).
+      #    overflow-checks stay ON. nextest does NOT run doctests — the `--doc`
+      #    step below stays. Benches get a compile check via `clippy --all-targets`.
+      - run: cargo nextest run --locked --cargo-profile release-checked --profile ci
       - run: cargo test --locked --doc
 
   fuzz-check:

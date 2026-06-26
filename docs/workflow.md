@@ -128,7 +128,8 @@ The pre-review mechanical-check sequence:
 ```sh
 cargo fmt --check                                                         # zero tolerance
 cargo clippy --all-targets -- -D warnings                                 # zero tolerance
-cargo test --release                                                       # all green; surface failures before review
+cargo nextest run --release                                                # all green; primary runner (process-per-test, ~5× faster)
+cargo test --release --doc                                                 # doctests — nextest does NOT run these
 cargo llvm-cov --summary-only --lib --release                              # surface report to reviewer
 git add -N $(git ls-files --others --exclude-standard 'src/**/*.rs')      # see "Mutation-testing scope" — load-bearing for new files
 git diff HEAD -- 'src/**/*.rs' 'tests/**/*.rs' > /tmp/<unit>.diff
@@ -202,6 +203,20 @@ Per-game `summary.txt` lines gain a `tc=<base>+<inc>` field; a `summary-by-tc:` 
 
 Decision-rule support is downstream: the harness emits per-game `(TC, W/L/D)` data; mixed-game SPRT verdict computation, Δ(TC) regression fit, and confidence-band visualisation live outside the harness. M4.D's mixed-TC width-tune campaign is the first consumer.
 
+## Test runner (nextest)
+
+[`cargo-nextest`](https://nexte.st/) is the primary test runner — CI's `test` job runs it, and cargo-mutants drives the suite through it (`test_tool = "nextest"` in `.cargo/mutants.toml`). It runs each test in its own process across all cores. Config: `.config/nextest.toml` (`default` + `ci` profiles, a `heavy-integration` test-group, hang-killing `slow-timeout`s).
+
+Two build profiles matter, because the heavy corpus/texel **self-play integration tests are ~tens-of-seconds each in a debug build but 2–4 s optimized**:
+- **Local / release:** `cargo nextest run --release` — whole suite ~18 s vs ~88 s for `cargo test --all-targets` (~5×, dev machine, 2213 tests). This is the day-to-day runner.
+- **CI:** the full suite runs under the optimized **`release-checked`** cargo profile (`cargo nextest run --cargo-profile release-checked --profile ci`) — optimized so the heavy tests don't oversubscribe the runner under nextest's parallelism, with `overflow-checks` ON. Production `release` is untouched. Because optimized builds compile out `debug_assertions` (the per-move `debug_assert_consistent` scan + the `#[cfg(debug_assertions)]` guard tests — the ~11-test 2224-vs-2213 delta), CI **also** runs a fast debug `cargo nextest run --lib --profile ci` step (~46 s) to keep that coverage cross-platform. (You can't just add `debug-assertions = true` to `release-checked` — the per-move scan is the main reason the heavy tests are slow in debug.)
+- **Debug (cargo-mutants):** mutants builds debug; there nextest is ~520 s vs ~997 s for `cargo test` (dev machine). The `heavy-integration` group caps how many self-play tests run at once so they don't oversubscribe + false-timeout.
+
+Other notes:
+- **Doctests are NOT run by nextest.** Run them separately with `cargo test --doc` (CI does; the pre-review sequence does). Dropping that step would silently stop exercising doctests.
+- `cargo test` still works unchanged — keep using it for the targeted single-test triage (`cargo test --lib <name>`) and the `#[ignore]`-gated perft commands; both runners coexist.
+- **Install** (required wherever the suite or cargo-mutants runs locally): `cargo install cargo-nextest --locked`, or the prebuilt binary from <https://get.nexte.st/>. CI installs it via `taiki-e/install-action`.
+
 ## Static analysis and dependency hygiene
 
 Standing checks that complement the review loops. The review loops catch reasoning errors; these catch mechanical drift.
@@ -227,6 +242,8 @@ Coverage-guided fuzzing of the project's string→AST parsers (FEN and UCI). Per
 ## Mutation-testing scope
 
 Mutation testing runtime grows roughly linearly with codebase size. A full-repo run is acceptable while the project is small, but doesn't scale — by the time the search layer lands, a full pass would take an hour-plus. Two scoping mechanisms keep the per-unit cost bounded; combine them as needed.
+
+cargo-mutants drives the suite through **nextest** (`test_tool = "nextest"` in `.cargo/mutants.toml`). In the debug build mutants uses, the baseline is ~520 s vs ~997 s under `cargo test` (dev machine) — a modest win, but nextest's per-test `slow-timeout` is the real prize: a mutant that hangs a fast test is SIGKILLed at ~120 s instead of a whole-suite-timeout multiple (the M8.A.1 ~1922 s pathology). One caveat: nextest skips doctests, so a line catchable *only* by a doctest would read as missed — re-confirm such a line with `cargo mutants --test-tool cargo`. See `.cargo/mutants.toml` for the full rationale.
 
 ### Default per-unit run: `--in-diff`
 

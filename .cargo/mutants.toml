@@ -70,27 +70,46 @@
 #     has multiple mutants of the same shape but different semantic targets
 #     — the rule will silently over-filter sibling mutants.
 
+# ---- Test runner: nextest -------------------------------------------------
+# Drive the suite through cargo-nextest (process-per-test, parallel across all
+# cores) instead of `cargo test`. cargo-mutants builds DEBUG, where the suite is
+# dominated by the heavy corpus/texel self-play integration tests; nextest still
+# beats `cargo test` here — ~520 s vs ~997 s on the dev machine (8 cores) — but
+# the larger win is RELEASE (CI), where the whole suite is ~18 s vs ~88 s.
+# nextest's concurrency cap on those heavy tests lives in `.config/nextest.toml`
+# (the `heavy-integration` test-group + the default-profile slow-timeout); a
+# mutant that HANGS a fast iterative-deepening test is killed at the
+# default-profile ~120 s ceiling (vs the old baseline-derived ~768 s).
+#
+# CAVEAT — nextest does NOT run doctests. A mutant catchable ONLY by a doctest
+# would be reported missed. The engine's catching tests are `#[test]` unit /
+# integration tests (not doctests), so in practice this does not move the
+# 0-missed gate; if a future doctest becomes the sole catcher for some line,
+# re-confirm that line with `cargo mutants --test-tool cargo` on the side.
+# nextest must be installed wherever mutants runs (dev machine; CI does not run
+# mutants). Install: `cargo install cargo-nextest --locked` or the prebuilt
+# binary from https://get.nexte.st/.
+test_tool = "nextest"
+
 # ---- Per-mutant test timeout cap ------------------------------------------
 # cargo-mutants auto-sets the per-mutant test timeout from the baseline run ×
-# a default 5× multiplier. Our baseline (lib + integration) is ~384 s, so the
-# auto-timeout lands at ~1922 s (≈ 32 min) — and any mutant that makes a test
-# HANG (e.g. gutting `negamax` to `return 0` sends an ID-loop test infinite)
-# burns that full 32 min before it is killed. Observed live in the M8.A.1
-# in-diff run: 4 timeout mutants each ran `~2 s build + 1922 s test`, ~2 h of
-# the run. On a larger diff with many hanging mutants this is the ~12 h
-# pathology.
+# a default 5× multiplier. The debug baseline under nextest is ~520 s (down from
+# ~997 s under `cargo test`), so the auto-timeout would be large — but the
+# nextest per-test slow-timeout (`.config/nextest.toml`) is the real hang guard:
+# a fast test sent infinite by a mutant (e.g. gutting `negamax` to `return 0`) is
+# SIGKILLed at ~120 s, and the heavy integration tests have their own generous
+# per-test ceiling. (Observed pre-nextest in the M8.A.1 in-diff run: 4 timeout
+# mutants each ran ~1922 s — ~2 h of the run; with nextest the hang is caught at
+# the per-test ceiling, not a whole-suite multiple.)
 #
-# Cap the multiplier at 2× (~768 s). This is SAFE w.r.t. the 0-missed gate:
-# only two cases run long — (1) a SURVIVOR runs the full passing suite once
-# (≈ baseline ~384 s ≪ 768 s, no false timeout), (2) a HANG runs unbounded
-# (killed at 768 s). Caught mutants return as soon as the first test fails
-# (often seconds), unaffected. A timeout is classified "timeout", never
-# "missed", so even an over-tight cap cannot manufacture a false survivor —
-# worst case a slow-but-caught mutant lands in the timeout bucket (which we
-# already treat as timeout-caught). Tighten toward ~1.5× only after observing
-# that no healthy survivor runs near the cap. The bigger lever (deferred —
-# see docs/tooling-backlog.md) is shrinking the baseline itself (the
-# integration suite dominates the 384 s).
+# Keep the 2× multiplier as belt-and-suspenders on the whole-suite timeout. This
+# is SAFE w.r.t. the 0-missed gate: only two cases run long — (1) a SURVIVOR runs
+# the full passing suite once (≈ baseline, well under the cap), (2) a HANG runs
+# until a timeout fires. Caught mutants return as soon as the first test fails
+# (often seconds), unaffected. A timeout is classified "timeout", never "missed",
+# so even an over-tight cap cannot manufacture a false survivor — worst case a
+# slow-but-caught mutant lands in the timeout bucket (which we already treat as
+# timeout-caught).
 timeout_multiplier = 2.0
 
 # ---- File-level exclusions ------------------------------------------------

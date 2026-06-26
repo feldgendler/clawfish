@@ -2,7 +2,7 @@
 
 Industry-best-practice items surfaced during the 2026-04-27 workflow review but not yet adopted. **Listed in recommended implementation order** — pick from the top when the next slot opens for tooling work.
 
-### `cargo mutants` per-mutant timeout cap (avoid the ~12 h hang pathology) — ◐ cap LANDED 2026-06-26; baseline-speedup DEFERRED
+### `cargo mutants` per-mutant timeout cap (avoid the ~12 h hang pathology) — ✅ DONE 2026-06-26 (cap LANDED + nextest baseline-speedup ADOPTED)
 
 **Problem.** cargo-mutants auto-sets the per-mutant test timeout from the baseline run × a
 default **5×** multiplier. Our baseline (lib + integration) is **~384 s**, so the auto-timeout
@@ -21,13 +21,38 @@ case a slow-but-caught mutant lands in the (already-treated-as-caught) timeout b
 `cargo mutants --list` parses the config (key accepted). Can be tightened toward ~1.5× after
 observing that no healthy survivor runs near the cap.
 
-**Deferred — the bigger lever.** The real cost driver is the **slow baseline** (the integration
-suite dominates the 384 s; the lib suite alone is ~46 s). Options for a future tooling slot:
-scope the in-diff mutation test command to the lib suite (risk: in-diff mutants only an
-integration test catches would be missed — needs a coverage check first), adopt `cargo-nextest`
-for faster test execution, or split a fast "mutation profile." Lowering the baseline lowers the
-auto-timeout floor and the whole run proportionally. Not urgent now that the 2× cap bounds the
-worst case.
+**The bigger lever — DONE (nextest adopted 2026-06-26).** Adopted
+[`cargo-nextest`](https://nexte.st/) (process-per-test, parallel across cores) as the suite runner:
+CI's `test` job and cargo-mutants (`test_tool = "nextest"` in `.cargo/mutants.toml`). The headline
+measurements (dev machine, 2213 tests):
+
+| build | `cargo test` | nextest | note |
+|---|---|---|---|
+| **release** | ~88 s | **~18 s** (~5×) | local / day-to-day runner |
+| **debug** (mutants) | ~997 s | **~520 s** (~2×) | heavy self-play tests dominate debug |
+
+The headline finding revised the premise: the old "~384 s baseline" was stale — the debug suite is
+now ~997 s, dominated by the heavy corpus/texel **self-play integration tests** (each tens of
+seconds in debug, contention-sensitive). nextest's full parallelism *exposes* that — run naively
+it oversubscribes the box and those tests blow the `slow-timeout`. Two fixes landed:
+- a **`heavy-integration` test-group** (`.config/nextest.toml`) caps how many self-play tests run
+  at once, with a generous per-test timeout so none false-times-out (debug); and
+- **CI builds the optimized `release-checked` cargo profile** for the full suite (`cargo nextest
+  run --cargo-profile release-checked`) — optimized so the heavy tests are 2–4 s (no contention
+  problem on the 4-core runners), `overflow-checks` ON. Production `release` is untouched. Optimized
+  builds compile out `debug_assertions`, so CI **also** runs a fast debug `cargo nextest run --lib`
+  step (~46 s) to keep the `debug_assert_consistent` scan + the `#[cfg(debug_assertions)]` guard
+  tests exercised cross-platform (can't just flip `debug-assertions = true` on `release-checked` —
+  the per-move scan is what makes the heavy tests slow in debug).
+
+The real mutation-gate win is less the ~2× baseline trim and more the **per-test hang guard**: a
+mutant that sends a fast test infinite is SIGKILLed at the default-profile ~120 s ceiling instead
+of the whole-suite ~768 s multiple (the M8.A.1 ~1922 s pathology). **Caveat — nextest does not run
+doctests**: CI keeps a separate `cargo test --doc` step, and a line catchable only by a doctest
+would read as missed under mutants (re-confirm with `cargo mutants --test-tool cargo`). The other
+two options (lib-suite-only in-diff scoping; a split mutation profile) are unneeded and **closed** —
+nextest delivers the win without dropping the integration suite from the mutation gate. Landing
+notes: `.cargo/mutants.toml`, `.config/nextest.toml`, `docs/workflow.md` §"Test runner (nextest)".
 
 ### ~~Custom in-process Elo-iteration harness~~ — Done (ELOH.B/C/D/E, 2026-04-30 / 2026-05-01)
 
