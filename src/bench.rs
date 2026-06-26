@@ -61,6 +61,52 @@ pub(crate) const BENCH_DEFAULT_DEPTH: u32 = 7;
 /// build, not just `cargo test`.
 const _: () = assert!(BENCH_DEFAULT_DEPTH >= 1 && BENCH_DEFAULT_DEPTH <= 63);
 
+/// Pinned bench node-count signatures — the deterministic regression tripwire.
+///
+/// Total `nodes` searched across the full `BENCH_POSITIONS` corpus at a fixed
+/// depth (the NPS field is hardware-variant and deliberately not pinned). These
+/// constants are the **machine-checked single source of truth** for "bench
+/// byte-identical to the prior tag" — the project's most-repeated manual
+/// verification (every provably-inert landing, every refactor, every
+/// off-regime byte-identity proof). The `bench_signature_d4_matches_pinned_value`
+/// and `bench_signature_d7_matches_pinned_value` tests in `src/engine.rs` drive
+/// the real `handle_bench` path and assert the live count equals these.
+///
+/// **On a real behavioral ship** (any eval/search change that moves the node
+/// count) update these IN THE SAME COMMIT as the change, deliberately. The gate
+/// then becomes a tripwire: a red bench-signature test means either a bug or an
+/// un-updated signature, forcing the author to confirm the behavior change was
+/// intended. These must stay in agreement with the per-milestone `bench/*.md`
+/// tables and the CLAUDE.md status line — those are the human-readable records;
+/// these constants are what CI enforces.
+///
+/// `D4` is the fast everyday figure used by most milestone bench-pins; `D7`
+/// matches [`BENCH_DEFAULT_DEPTH`] (the bare-`bench` default) and is the
+/// headline d7 figure. Both correspond to the M8.A.1 production HEAD.
+///
+/// `#[cfg(test)]`: these are consumed only by the gate tests in `src/engine.rs`
+/// (the non-test build never reads them), so scoping them to test builds keeps
+/// the production lib free of an otherwise-dead constant.
+#[cfg(test)]
+pub(crate) const BENCH_SIGNATURE_D4: u64 = 45788;
+
+/// d7 (default-depth) pinned node count. See [`BENCH_SIGNATURE_D4`] for the
+/// tripwire contract and update discipline.
+///
+/// `#[cfg(all(test, not(debug_assertions)))]` mirrors its sole consumer — the
+/// `bench_signature_d7_matches_pinned_value` test is gated to optimized builds
+/// (d7 is ~26 s in a debug build), so the constant must be absent in debug
+/// test builds too, or it reads as dead code there.
+#[cfg(all(test, not(debug_assertions)))]
+pub(crate) const BENCH_SIGNATURE_D7: u64 = 662085;
+
+/// Compile-time invariant: the d7 signature is the *default-depth* signature,
+/// so a future change to [`BENCH_DEFAULT_DEPTH`] that left `BENCH_SIGNATURE_D7`
+/// pinned to depth 7 would silently decouple the two. Pin the relationship at
+/// build time; if the default depth changes, this assert fails until the d7
+/// signature (and its test's drive depth) are re-derived for the new default.
+const _: () = assert!(BENCH_DEFAULT_DEPTH == 7);
+
 #[cfg(test)]
 mod tests {
     use super::*;

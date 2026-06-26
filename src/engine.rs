@@ -3687,6 +3687,70 @@ mod tests {
         );
     }
 
+    // ─── Bench-signature regression gate (tooling-backlog item) ───────────
+    //
+    // These two tests are the automated tripwire for "bench byte-identical to
+    // the prior tag" — the project's most-repeated manual verification. They
+    // drive the REAL `handle_bench` path (not a parallel reimplementation) via
+    // `drive`, parse the emitted signature line, and assert the deterministic
+    // total node count equals the pinned `bench::BENCH_SIGNATURE_D{4,7}`
+    // constants. A red test means either an unintended behavior change (a bug)
+    // or a real ship whose author forgot to update the pinned signature in the
+    // same commit. See `bench::BENCH_SIGNATURE_D4`'s doc-comment for the update
+    // discipline.
+
+    #[test]
+    fn bench_signature_d4_matches_pinned_value() {
+        // d4 is the fast everyday figure (≈0.05 s release, ≈1–2 s debug), so it
+        // runs in every build — including the debug `--lib` CI step. d7 (≈26 s
+        // debug) is gated to optimized builds in the sibling test below.
+        let (stdout, _) = drive(&["bench 4"]);
+        let sig = extract_bench_signature(&stdout)
+            .unwrap_or_else(|| panic!("missing `info string bench: …` signature in:\n{stdout}"));
+        assert_eq!(
+            sig.0,
+            crate::bench::BENCH_SIGNATURE_D4,
+            "bench d4 node count changed: live {} != pinned {}. \
+             If this is an intended behavioral ship, update bench::BENCH_SIGNATURE_D4 \
+             (and the bench/*.md tables + CLAUDE.md) in the same commit; otherwise it is a bug.",
+            sig.0,
+            crate::bench::BENCH_SIGNATURE_D4,
+        );
+    }
+
+    // d7 over 16 positions is ~26 s in a debug build (vs ~0.28 s release), which
+    // would blow the fast debug `--lib` CI step's budget. Gate it to optimized
+    // builds (the `release-checked` CI suite + local `cargo test --release`),
+    // where `debug_assertions` is compiled out. The d4 gate above runs
+    // everywhere and catches the overwhelming majority of behavioral drift (a
+    // change has to manifest only at depth ≥ 5 to move d7 while leaving d4
+    // identical — vanishingly rare); d7 is cheap deep-only insurance.
+    //
+    // CI-COUPLING: under `debug_assertions` this test and its `BENCH_SIGNATURE_D7`
+    // const vanish entirely (no compile-time signal), so its *only* CI carrier is
+    // the `release-checked` full-suite step in `.github/workflows/ci.yml`. If that
+    // step is ever removed/renamed, d7 stops being checked anywhere — keep them
+    // together.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn bench_signature_d7_matches_pinned_value() {
+        // Drive `bench 7` explicitly (decoupled from BENCH_DEFAULT_DEPTH at the
+        // call site; the `BENCH_DEFAULT_DEPTH == 7` const-assert in bench.rs
+        // pins that the default is in fact this depth).
+        let (stdout, _) = drive(&["bench 7"]);
+        let sig = extract_bench_signature(&stdout)
+            .unwrap_or_else(|| panic!("missing `info string bench: …` signature in:\n{stdout}"));
+        assert_eq!(
+            sig.0,
+            crate::bench::BENCH_SIGNATURE_D7,
+            "bench d7 node count changed: live {} != pinned {}. \
+             If this is an intended behavioral ship, update bench::BENCH_SIGNATURE_D7 \
+             (and the bench/*.md tables + CLAUDE.md) in the same commit; otherwise it is a bug.",
+            sig.0,
+            crate::bench::BENCH_SIGNATURE_D7,
+        );
+    }
+
     #[test]
     fn handle_bench_explicit_depth_overrides_default() {
         // Run bench at depths 1, 2, 3 — assert nodes(d=1) < nodes(d=2) < nodes(d=3).
