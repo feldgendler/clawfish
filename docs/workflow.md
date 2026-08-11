@@ -627,15 +627,17 @@ Subagents inherit the orchestrator's model unless their definition specifies oth
 
 ### When to flag a coder slice for Opus
 
-The default Sonnet coder does well on prescriptive transcription (signatures + test names + order spelled out). It is reliably weaker on judgment calls that require *generalizing across files or invariants*. Flag a slice for `model: opus` when it involves any of:
+The default coder tier does well on prescriptive transcription (signatures + test names + order spelled out). The failure mode to watch for is judgment calls that require *generalizing across files or invariants*. Flag a slice for the higher tier when it involves any of:
 
 - **Tricky lifetime / trait / generics gymnastics** — the original criterion.
 - **Novel invariants** that need to be *invented* during implementation, not just transcribed from the plan.
-- **Parallel-precedent application** — adding a helper, field, or test alongside an existing one (M3.A's `update_static_eval_after_make` next to `update_zobrist_after_make`, or M3.A's `make_move_no_from_scratch_in_release` after the M1.E sentinel). Sonnet tends to literal-pattern-match (duplicate the existing helper byte-for-byte with a different name) rather than think through whether the *discipline* of the existing helper applies and whether one helper or two is the right factoring. The plan must spell out: "match existing helper's order-agnostic param discipline; do not duplicate the test, expand its docstring."
-- **Project-discipline application across modules** — e.g. when a slice adds vendored data, the coder must remember to add a cargo-mutants exclusion mirroring `src/magic/constants.rs`. Sonnet missed this in M3.A; final-review caught it.
-- **Anticipating qualitative behavior shifts that break existing tests** — M3.A made `g1f3` the unique startpos best, breaking two engine tests that asserted "different seeds → different bestmoves from startpos." A careful pre-impl pass would have updated the test surface; Sonnet caught it during impl after the test failures, which is fine but late. Plan should pre-emptively flag tests that depend on the prior phase's non-determinism.
+- **Parallel-precedent application** — adding a helper, field, or test alongside an existing one (M3.A's `update_static_eval_after_make` next to `update_zobrist_after_make`, or M3.A's `make_move_no_from_scratch_in_release` after the M1.E sentinel). The risk is literal pattern-matching — duplicating the existing helper byte-for-byte under a new name — instead of reasoning about whether the *discipline* of the existing helper applies and whether one helper or two is the right factoring. The plan must spell out: "match existing helper's order-agnostic param discipline; do not duplicate the test, expand its docstring."
+- **Project-discipline application across modules** — e.g. a slice that adds vendored data must also add a cargo-mutants exclusion mirroring `src/magic/constants.rs`. This was missed at M3.A and caught by final review.
+- **Anticipating qualitative behavior shifts that break existing tests** — M3.A made `g1f3` the unique startpos best, breaking two engine tests that asserted "different seeds → different bestmoves from startpos." A careful pre-impl pass would have updated the test surface; at M3.A it was caught during impl after the test failures, which is fine but late. Plan should pre-emptively flag tests that depend on the prior phase's non-determinism.
 
-When the plan flags a slice with one of these markers, spawn the coder with `model: opus`. When in doubt, flag — the cost difference is bounded and final-review converges faster on Opus-implemented slices.
+When the plan flags a slice with one of these markers, spawn the coder with `model: opus`. When in doubt, flag — the cost difference is bounded and final-review converges faster on higher-tier slices.
+
+**Criteria, not model traits.** The list above is deliberately phrased as properties of the *slice*, not of a named model. The per-model observations that produced it are dated evidence and live in the calibration log; a trait attributed to "Sonnet" or "Haiku" silently stops being true when the alias moves to a new generation, while "this slice requires inventing an invariant" stays true forever.
 
 ### Calibration
 
