@@ -285,12 +285,15 @@ Cargo-mutants-specific tips — survivor triage technique (manual mutation + tar
 
 ### Continuously enforced (pre-commit hook)
 
-A Claude Code `PreToolUse` hook (`.claude/hooks/pre-commit-check.sh`, wired in `.claude/settings.json`) intercepts `git commit` invocations and runs:
+A Claude Code `PreToolUse` hook (`.claude/hooks/pre-commit-check.sh`, wired in `.claude/settings.json`) intercepts `git commit` invocations. **The script is the source of truth for what it runs** — its header comment carries the current scope and the rationale for it. As of `36b9502` (2026-05-21) that scope is:
 
-- **`rustfmt --check`** against the **staged `.rs` files only** (not the whole crate). This way, parallel agents' in-flight unstaged or untracked work doesn't block a clean commit in another scope.
-- **`cargo clippy --all-targets -- -D warnings`** and **`cargo test`** on the whole crate — but **only if the working tree exactly matches the staged set** (no unstaged tracked changes, no untracked files) **and** `cargo check` confirms it compiles. If a parallel agent has WIP in the tree or the build is mid-edit, clippy + tests are skipped with a note rather than blocking. Solo work stages everything before committing, so this naturally runs the full check.
+- **`cargo fmt --all -- --check`** across the whole workspace, then the same again inside `fuzz/` (its own workspace, outside the root one). Both invocations match the CI fmt steps exactly.
 
-Failure of any check that does run blocks the commit and surfaces the diagnostic to the agent. The hook is a safety net, not a replacement for running these inside the per-feature loop.
+Deliberately **out of scope**: `cargo check`, `cargo clippy`, `cargo test`. They scale with the project — with `--all-targets` compiling every bench and bin, and `tests/corpus_*.rs` at ~60 s each, total wallclock exceeds 5 min on a warm cache — which turns routine commits into multi-minute waits. CI runs them on every push; the per-feature loop runs them at step 9. The hook's contract is "seconds, not minutes."
+
+The earlier per-staged-file `rustfmt --check` form was replaced because file-scoped checking masks workspace-level drift: M5.H1 (`339fd7e`) shipped three fmt violations that CI flagged retroactively, and the per-file form did not catch them despite producing an identical diff.
+
+Failure of either check blocks the commit and surfaces the diagnostic to the agent. The hook is a safety net, not a replacement for running the full mechanical set inside the per-feature loop.
 
 If the hook ever blocks unexpectedly on something *in your scope*, fix the underlying issue rather than bypassing. Never use `--no-verify`.
 
