@@ -145,8 +145,6 @@ For each surviving mutant, the orchestrator triages BEFORE invoking the reviewer
 
 The reviewer then verifies the orchestrator's classifications are sound, checks the residual analysis aligns with the test surface, and judges whether the deferred-detection plan is reasonable. The reviewer does NOT re-run cargo-mutants.
 
-(One downstream simplification: the cost-quality calibration of having the reviewer be Opus is also less load-bearing now, since Opus's value-add was largely in the judgment dimensions, not in running tools. The model-tier choice for final-reviewer should be re-evaluated next time the role's calibration is checked.)
-
 ## Running a match
 
 Tournament smoke runs are driven by `scripts/match.sh`. As of ELOH.E (ADR-0022), the `self-play` and `vs-stockfish` arms invoke the in-process `elo-iterate` harness; only `compliance` still uses fastchess.
