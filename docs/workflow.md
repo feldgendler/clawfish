@@ -611,15 +611,19 @@ This is a documented discipline, not a hard-enforced hook (the 2026-06-16 decisi
 
 Subagents inherit the orchestrator's model unless their definition specifies otherwise. Custom agent definitions in `.claude/agents/` set the model per role. The assignment is **tiered to balance cost against the reasoning each role demands**, not flat.
 
-| Role | Agent file | Model | Why this tier |
-|---|---|---|---|
-| Main orchestrator | (no file — inherited) | Opus | Holds full conversation context; coordinates all subagents. |
-| Plan reviewer | `plan-reviewer.md` | Opus | Originally tiered to Sonnet; M2.C calibration found Sonnet missed two must-fix items Opus caught (Box<dyn Search> non-movability into `thread::spawn`; reader EOF / channel-disconnect dead code). Reverted to Opus per the stop-loss. |
-| Test-suite reviewer | `test-suite-reviewer.md` | Sonnet | Drops cleanly on confirmation-bias and corner-case dimensions. Haiku too risky on "would this pass against a stub?" reasoning. |
-| Final reviewer | `final-reviewer.md` | Sonnet | Was Opus; dropped after the M3.E parallel A/B (2026-04-29 — see calibration log) confirmed Sonnet matches Opus on must-fix coverage in the narrowed read+judgment surface. Opus caught 2 extra documentation/perf nits Sonnet missed; both verdicts were `no further substantive issues`. |
-| Research subagent | `chess-researcher.md` | Sonnet | Cross-source synthesis still needs reasoning. Output is reviewed downstream by the user reading chat and by the plan reviewer. |
-| Coder (default) | `chess-coder.md` | Sonnet | Plans here are prescriptive (signatures, test names, order spelled out). Transcription is largely model-independent. |
-| Coder (architecturally tricky) | (override via `Agent` tool's `model: opus`) | Opus | Plan flags which subtasks need it. See "When to flag a coder slice for Opus" below. Opt-in at spawn time. |
+**The live tier is the `model:` field in each agent file — that is what executes.** This table records *why* a tier was chosen; it deliberately does **not** restate the value. A duplicated value drifts, and this one did: the table claimed Sonnet for final-reviewer from 2026-04-29 while the frontmatter stayed `opus`, so every final review from M4 through M8 ran on a tier the table said had been dropped.
+
+| Role | Agent file | Why this tier |
+|---|---|---|
+| Main orchestrator | (no file — inherited) | Holds full conversation context; coordinates all subagents. Top tier. |
+| Plan reviewer | `plan-reviewer.md` | Top tier per the stop-loss: at M2.C calibration the cheaper tier missed two must-fix items (`Box<dyn Search>` non-movability into `thread::spawn`; reader EOF / channel-disconnect dead code). |
+| Test-suite reviewer | `test-suite-reviewer.md` | Mid tier is sufficient on the confirmation-bias and corner-case dimensions. The cheapest tier is too risky on "would this pass against a stub?" reasoning. |
+| Final reviewer | `final-reviewer.md` | The M3.E A/B verdict (2026-04-29) was to drop to mid tier, on the argument that the value-add is judgment, not running tools — the mechanical checks had just moved to the orchestrator. **The verdict was never applied.** See the open decision below. |
+| Research subagent | `chess-researcher.md` | Cross-source synthesis still needs reasoning, but the output is reviewed downstream by the user reading chat and by the plan reviewer. |
+| Coder (default) | `chess-coder.md` | Plans here are prescriptive (signatures, test names, order spelled out). Transcription is largely model-independent. |
+| Coder (architecturally tricky) | (override at spawn time via the `Agent` tool's `model:`) | Plan flags which subtasks need the higher tier. See "When to flag a coder slice for Opus" below. Opt-in at spawn time. |
+
+**Open decision — final-reviewer tier.** The 2026-04-29 verdict is now the only tier claim in this file not backed by the running configuration, and it predates the current model generation: the `opus`/`sonnet`/`haiku` aliases float, and the models behind them have turned over since the A/B was run. Do **not** resolve this by editing the frontmatter to match the table — re-run the calibration below against the current aliases and then set both the frontmatter and this row's rationale from the result.
 
 ### When to flag a coder slice for Opus
 
