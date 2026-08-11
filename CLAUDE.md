@@ -83,7 +83,8 @@ If the agent gets genuinely stuck (ambiguous spec, hard tool failure, architectu
 - `docs/architecture.md` — current architectural state.
 - `docs/roadmap.md` — forward-looking milestone plan, per-phase status, what's next.
 - `docs/milestones/` — per-phase retrospectives (what landed, highlights, verification numbers). [`README.md`](docs/milestones/README.md) is the phase index.
-- `docs/workflow.md` — collaboration loop, TDD scope, benchmarking conventions.
+- `docs/workflow.md` — collaboration loop, TDD scope, benchmarking conventions. Read in full by every subagent on spawn, so keep it prescriptive — dated evidence belongs in a referenced file.
+- `docs/model-calibration-log.md` — dated per-role A/B evidence behind the subagent model tiers in `docs/workflow.md` §"Model assignment". Evidence with an expiry, not standing rules.
 - `docs/prior-art.md` — reference landscape; per-feature research notes accumulate here.
 - `docs/decisions/` — ADR-style records, one file per substantive decision.
 - `docs/reference/` — vendored authoritative specs (FIDE Laws of Chess, UCI protocol).
